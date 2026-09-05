@@ -122,6 +122,13 @@ pub struct KernelState {
 
 impl Default for KernelState {
     fn default() -> Self {
+        Self::with_tap_capacity(4096)
+    }
+}
+
+impl KernelState {
+    /// A fresh state with a tap ring of the given capacity.
+    pub fn with_tap_capacity(tap_capacity: usize) -> Self {
         Self {
             cells: HashMap::new(),
             journals: HashMap::new(),
@@ -137,7 +144,7 @@ impl Default for KernelState {
             dead_letters: Vec::new(),
             topic_logs: HashMap::new(),
             topic_facts: Vec::new(),
-            tap: crate::tap::TapRing::new(4096),
+            tap: crate::tap::TapRing::new(tap_capacity),
             specs: HashMap::new(),
             failures: HashMap::new(),
         }

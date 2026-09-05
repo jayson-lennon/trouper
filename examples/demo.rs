@@ -324,7 +324,7 @@ impl Schema for ProbeOk {
 
 #[tokio::main]
 async fn main() {
-    let system = Arc::new(ActorSystem::new());
+    let system = Arc::new(ActorSystem::new(SystemConfig::production()));
 
     // -- 1. Dynamic add: register schemas, spawn the actors ----------------
     {

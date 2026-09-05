@@ -47,6 +47,56 @@ impl Default for SpawnOpts {
     }
 }
 
+/// Startup configuration for an [`ActorSystem`].
+#[derive(Clone)]
+pub struct SystemConfig {
+    /// The injected clock (leases, fact timestamps; tests use a fake).
+    pub clock: ClockService,
+    /// The tap ring's capacity (drop-oldest under pressure).
+    pub tap_capacity: usize,
+    /// Default mailbox capacity and overload policy for spawned actors
+    /// (per-spawn [`SpawnOpts`] override these).
+    pub default_mailbox: MailboxDefaults,
+}
+
+/// System-wide mailbox defaults.
+#[derive(Clone, Copy)]
+pub struct MailboxDefaults {
+    /// Default inbox capacity.
+    pub capacity: usize,
+    /// Default overload policy (Block = backpressure).
+    pub policy: OverloadPolicy,
+}
+
+impl Default for MailboxDefaults {
+    fn default() -> Self {
+        Self {
+            capacity: 64,
+            policy: OverloadPolicy::Block,
+        }
+    }
+}
+
+impl SystemConfig {
+    /// Wall-clock system with default capacities.
+    pub fn production() -> Self {
+        Self {
+            clock: ClockService::new(Arc::new(SystemClock::new())),
+            tap_capacity: 4096,
+            default_mailbox: MailboxDefaults::default(),
+        }
+    }
+
+    /// A config on an injected clock (tests).
+    pub fn with_clock(clock: ClockService) -> Self {
+        Self {
+            clock,
+            tap_capacity: 4096,
+            default_mailbox: MailboxDefaults::default(),
+        }
+    }
+}
+
 /// The actor system. One instance per machine; shared by reference.
 ///
 /// The registry is its own mutex (routing never blocks actor-table
@@ -62,6 +112,8 @@ pub struct ActorSystem {
     pub(crate) view: Arc<dyn RuntimeView>,
     /// Supervision engine shutdown handles (one per supervised child).
     child_shutdowns: std::sync::Mutex<Vec<tokio::sync::watch::Sender<bool>>>,
+    /// System-wide mailbox defaults (per-spawn opts override).
+    pub(crate) mailbox_defaults: MailboxDefaults,
 }
 
 /// One actor's row in a system export.
@@ -185,16 +237,36 @@ impl ActorSystem {
         ));
     }
 
-    /// Creates a system on the wall clock.
-    pub fn new() -> Self {
-        Self::with_clock(ClockService::new(Arc::new(SystemClock::new())))
+    /// Creates a system from a config.
+    pub fn new(config: SystemConfig) -> Self {
+        let registry = Arc::new(Mutex::new(Registry::default()));
+        let view = Arc::new(NullView {
+            registry: registry.clone(),
+        });
+        Self {
+            registry,
+            kernel: Arc::new(Mutex::new(KernelState::with_tap_capacity(
+                config.tap_capacity,
+            ))),
+            clock: config.clock,
+            view,
+            child_shutdowns: std::sync::Mutex::new(Vec::new()),
+            mailbox_defaults: config.default_mailbox,
+        }
     }
 
     /// Creates a system tuned for tests: a [`FakeClock`] starting at
-    /// 1_000 ms (reachable via the returned handle).
+    /// 1_000 ms and a small tap ring (reachable via the returned handle).
     pub fn test() -> (Arc<Self>, Arc<FakeClock>) {
         let (clock, fake) = ClockService::fake(1_000);
-        (Arc::new(Self::with_clock(clock)), fake)
+        (
+            Arc::new(Self::new(SystemConfig {
+                clock,
+                tap_capacity: 256,
+                default_mailbox: MailboxDefaults::default(),
+            })),
+            fake,
+        )
     }
 
     /// The fake clock behind this system, when tests installed one.
@@ -202,19 +274,26 @@ impl ActorSystem {
         self.clock.backend_fake()
     }
 
+    /// Fills unset mailbox fields from the system defaults.
+    fn resolve_opts(&self, opts: SpawnOpts) -> SpawnOpts {
+        SpawnOpts {
+            snapshot: opts.snapshot,
+            mailbox_capacity: if opts.mailbox_capacity == 0 {
+                self.mailbox_defaults.capacity
+            } else {
+                opts.mailbox_capacity
+            },
+            mailbox_policy: if opts.mailbox_policy == OverloadPolicy::default() {
+                self.mailbox_defaults.policy
+            } else {
+                opts.mailbox_policy
+            },
+        }
+    }
+
     /// Creates a system on an injected clock (tests: [`crate::clock::FakeClock`]).
     pub fn with_clock(clock: ClockService) -> Self {
-        let registry = Arc::new(Mutex::new(Registry::default()));
-        let view = Arc::new(NullView {
-            registry: registry.clone(),
-        });
-        Self {
-            registry,
-            kernel: Arc::new(Mutex::new(KernelState::default())),
-            clock,
-            view,
-            child_shutdowns: std::sync::Mutex::new(Vec::new()),
-        }
+        Self::new(SystemConfig::with_clock(clock))
     }
 
     /// Registers a Rust type's schema — the typed flavor.
@@ -276,6 +355,7 @@ impl ActorSystem {
         entries: Vec<Arc<dyn CommandEntry>>,
         opts: SpawnOpts,
     ) {
+        let opts = self.resolve_opts(opts);
         let (tx, rx) = tokio::sync::mpsc::channel::<Envelope>(opts.mailbox_capacity.max(1) * 2);
         {
             let mut registry = self.registry.lock().expect("registry lock");
@@ -353,6 +433,7 @@ impl ActorSystem {
         // `A::start` is async (I/O allowed); block briefly on a runtime
         // thread is not done — spawn the start inside the actor task and
         // register the slot immediately so senders never see a gap.
+        let opts = self.resolve_opts(opts);
         let (tx, rx) = tokio::sync::mpsc::channel::<Envelope>(opts.mailbox_capacity.max(1) * 2);
         {
             let mut registry = self.registry.lock().expect("registry lock");
@@ -955,7 +1036,7 @@ impl RuntimeView for ActorSystem {
 
 impl Default for ActorSystem {
     fn default() -> Self {
-        Self::new()
+        Self::new(SystemConfig::production())
     }
 }
 
@@ -1431,11 +1512,13 @@ mod tests {
     #[tokio::test]
     async fn tap_drop_oldest_under_pressure_keeps_delivery_working() {
         // Given a system whose tap ring is tiny (test-visible capacity).
-        let (system, _clock) = ActorSystem::test();
-        {
-            let mut kernel = system.kernel.lock().expect("lock");
-            kernel.tap = crate::tap::TapRing::new(4);
-        }
+        let (clock, fake) = ClockService::fake(1_000);
+        let system = Arc::new(ActorSystem::new(SystemConfig {
+            clock,
+            tap_capacity: 4,
+            default_mailbox: MailboxDefaults::default(),
+        }));
+        let _clock = fake;
         let path = Path::new("counter");
         system.spawn_es::<Counter, _>(path.clone(), &json!({}), SpawnOpts::default(), || {
             vec![Arc::new(TypedEsAdapter::<Counter, Add>::new::<Add>())]
@@ -2371,7 +2454,7 @@ mod tests {
     #[tokio::test]
     async fn reply_slots_carry_the_mechanism_and_expire_cleanly() {
         // Given a live reply table with two leases: one short, one long.
-        let system = ActorSystem::new();
+        let system = ActorSystem::new(SystemConfig::production());
         let kernel = system.kernel.lock().expect("lock");
         let (short_lease, _short_rx) = kernel
             .replies
@@ -2430,7 +2513,7 @@ mod tests {
     #[test]
     fn register_schema_is_idempotent_on_the_system() {
         // Given a system with Add registered.
-        let system = ActorSystem::new();
+        let system = ActorSystem::new(SystemConfig::production());
         let first = system.register_schema::<Add>();
 
         // When registering Add again.
@@ -2657,7 +2740,7 @@ mod tests {
     #[test]
     fn register_schema_json_accepts_foreign_descriptors() {
         // Given a system and a JSON-only descriptor.
-        let system = ActorSystem::new();
+        let system = ActorSystem::new(SystemConfig::production());
         let foreign = json!({
             "name": "ForeignPing",
             "version": 4,
