@@ -1055,6 +1055,7 @@ impl Default for ActorSystem {
 
 #[cfg(test)]
 mod tests {
+    use rstest::rstest;
     impl ActorSystem {
         /// Whether the "aud" test actor subscribes to `topic` (tests).
         pub fn topic_has_subscriber(&self, topic: &crate::types::Topic) -> bool {
@@ -3075,6 +3076,51 @@ mod tests {
                 .any(|f| matches!(f.kind, crate::tap::FactKind::SnapshotTaken { .. })),
             "no snapshot facts under Off"
         );
+    }
+
+    #[rstest]
+    #[case(0)]
+    #[case(1)]
+    #[case(3)]
+    #[case(7)]
+    #[case(16)]
+    fn rebuild_from_snapshot_over_k_events_equals_full_fold(#[case] k: usize) {
+        // Given a journal of k Added events folded from genesis.
+        let events: Vec<crate::envelope::Event> = (1..=k as i64)
+            .map(|n| crate::envelope::Event::new(Added::schema_id(), json!({ "n": n })))
+            .collect();
+        let mut folded = Counter::restore(&json!({}));
+        for event in &events {
+            folded.apply(event);
+        }
+
+        // When rebuilding from a snapshot anchored at EACH split point
+        // s (0 <= s <= k): snapshot = fold of the first s events, tail =
+        // the remaining k - s.
+        for s in 0..=k {
+            let mut snapshot_state = Counter::restore(&json!({}));
+            for event in &events[..s] {
+                snapshot_state.apply(event);
+            }
+            let snapshot = snapshot_state.capture().expect("capture");
+
+            // Rebuilding via the erased shell must reproduce the full
+            // fold — snapshot fast path + tail apply, for every split.
+            let shell: Box<dyn crate::actor::DynEsActor> =
+                Box::new(crate::actor::TypedEsState::<Counter>::new(
+                    Counter::restore(&json!({})),
+                ));
+            let rebuilt = shell
+                .rebuild(&json!({}), Some(snapshot), &events[s..])
+                .expect("rebuild");
+
+            // Then the rebuilt capture equals the full fold's capture.
+            assert_eq!(
+                rebuilt.capture_erased().expect("capture"),
+                folded.capture().expect("capture"),
+                "split at {s} of {k} diverged"
+            );
+        }
     }
 
     #[tokio::test]
