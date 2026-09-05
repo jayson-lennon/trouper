@@ -981,9 +981,8 @@ mod tests {
             let mut counts = HashMap::new();
             for fact in self.tap_facts() {
                 let kind = format!("{:?}", fact.kind);
-                *counts
-                    .entry(kind.split(['(', '{']).next().unwrap_or(&kind).to_owned())
-                    .or_default() += 1;
+                let name = kind.split(['(', '{']).next().unwrap_or(&kind).trim();
+                *counts.entry(name.to_owned()).or_default() += 1;
             }
             counts
         }
@@ -2611,5 +2610,317 @@ mod tests {
         // The envelope is queued iff the cursor has not advanced past it;
         // full inbox introspection lands with the atomic step (next task).
         true
+    }
+
+    // ---- test-table gap tests (Phase 10) ----
+
+    #[tokio::test]
+    async fn es_journal_and_fold_reconstruct_state_from_events_alone() {
+        // Given a spawned counter.
+        let (system, _clock) = ActorSystem::test();
+        let path = Path::new("counter");
+        system.register_schema::<Add>();
+        system.register_schema::<Added>();
+        system.spawn_es::<Counter, _>(path.clone(), &json!({}), SpawnOpts::default(), || {
+            vec![Arc::new(TypedEsAdapter::<Counter, Add>::new::<Add>())]
+        });
+
+        // When three Adds commit.
+        for n in 1..=3_i64 {
+            system
+                .send(system.envelope(Add::schema_id(), path.clone(), json!({ "n": n })))
+                .await
+                .expect("delivered");
+        }
+        wait_for_cursor(&system, &path, 3).await;
+
+        // Then the journal holds exactly the three events (no snapshots
+        // under the default Off policy) and the live fold matches.
+        assert_eq!(system.journal_len(&path), 3);
+        let entries = {
+            let kernel = system.kernel.lock().expect("lock");
+            kernel.journals[&path].entries().to_vec()
+        };
+        let mut folded = Counter::restore(&json!({}));
+        for entry in &entries {
+            if let crate::journal::JournalEntry::Event { event, .. } = entry {
+                folded.apply(event);
+            }
+        }
+        let state = system.es_state(&path).await.expect("live");
+        assert_eq!(state["total"], json!(6));
+        assert_eq!(folded.total, 6, "journal fold == live state");
+    }
+
+    #[tokio::test]
+    async fn snapshot_fast_path_skips_replaying_committed_events() {
+        // Given a counter with EveryN(2) snapshots that committed 4 Adds.
+        let (system, _clock) = ActorSystem::test();
+        let path = Path::new("counter");
+        system.register_schema::<Add>();
+        system.register_schema::<Added>();
+        let opts = SpawnOpts {
+            snapshot: crate::kernel::SnapshotPolicy::EveryN(2),
+            ..SpawnOpts::default()
+        };
+        system.spawn_es::<Counter, _>(path.clone(), &json!({}), opts, || {
+            vec![Arc::new(TypedEsAdapter::<Counter, Add>::new::<Add>())]
+        });
+        for n in 1..=4_i64 {
+            system
+                .send(system.envelope(Add::schema_id(), path.clone(), json!({ "n": n })))
+                .await
+                .expect("delivered");
+        }
+        wait_for_cursor(&system, &path, 4).await;
+
+        // Then snapshots landed at each n-boundary (seqs 1 and 3), the
+        // journal holds 4 events + 2 snapshots, and the LATEST snapshot
+        // anchors the fast path: rebuild replays only the tail after it.
+        {
+            let kernel = system.kernel.lock().expect("lock");
+            let journal = &kernel.journals[&path];
+            assert_eq!(journal.len(), 6, "4 events + 2 snapshots");
+            let last = journal.last_snapshot().expect("snapshot exists");
+            let crate::journal::JournalEntry::Snapshot { seq, .. } = last else {
+                panic!("expected a snapshot entry");
+            };
+            assert_eq!(
+                *seq,
+                crate::types::SeqNo::new(3),
+                "latest snapshot at seq 3 (4th Add)"
+            );
+        }
+        assert!(
+            system
+                .tap_facts()
+                .iter()
+                .any(|f| matches!(f.kind, crate::tap::FactKind::SnapshotTaken { .. })),
+            "SnapshotTaken fact emitted"
+        );
+        // The latest snapshot's fold already contains Adds 1-4 (total 10):
+        // the fast path restores it, then replays an empty tail.
+        {
+            let kernel = system.kernel.lock().expect("lock");
+            let snap = match kernel.journals[&path].last_snapshot().expect("snap") {
+                crate::journal::JournalEntry::Snapshot { state, .. } => state.clone(),
+                _ => unreachable!(),
+            };
+            assert_eq!(
+                snap["total"],
+                json!(10),
+                "snapshot captures the folded state"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn snapshot_policy_off_never_appends_snapshots() {
+        // Given a counter on the default (Off) policy that committed 5 Adds.
+        let (system, _clock) = ActorSystem::test();
+        let path = Path::new("counter");
+        system.register_schema::<Add>();
+        system.register_schema::<Added>();
+        system.spawn_es::<Counter, _>(path.clone(), &json!({}), SpawnOpts::default(), || {
+            vec![Arc::new(TypedEsAdapter::<Counter, Add>::new::<Add>())]
+        });
+        for n in 1..=5_i64 {
+            system
+                .send(system.envelope(Add::schema_id(), path.clone(), json!({ "n": n })))
+                .await
+                .expect("delivered");
+        }
+        wait_for_cursor(&system, &path, 5).await;
+
+        // Then the journal holds only events, and no SnapshotTaken fact.
+        {
+            let kernel = system.kernel.lock().expect("lock");
+            let journal = &kernel.journals[&path];
+            assert_eq!(journal.len(), 5);
+            assert!(journal.last_snapshot().is_none());
+        }
+        assert!(
+            !system
+                .tap_facts()
+                .iter()
+                .any(|f| matches!(f.kind, crate::tap::FactKind::SnapshotTaken { .. })),
+            "no snapshot facts under Off"
+        );
+    }
+
+    #[tokio::test]
+    async fn restore_from_hydration_hook_populates_skipped_caches() {
+        // Given a counter whose state carries a #[serde(skip)] cache that
+        // derives from `total`, with restore_from overridden to rebuild it.
+        #[derive(serde::Serialize, serde::Deserialize)]
+        struct Cached {
+            total: i64,
+            #[serde(skip)]
+            doubled: i64,
+        }
+        impl crate::actor::EventSourced for Cached {
+            fn manifest() -> crate::schema::ActorManifest {
+                ActorManifest::new().kind(crate::types::ActorKind::EventSourced)
+            }
+            fn restore(_args: &JsonValue) -> Self {
+                Self {
+                    total: 0,
+                    doubled: 0,
+                }
+            }
+            fn apply(&mut self, event: &crate::envelope::Event) {
+                self.total += event.payload["n"].as_i64().unwrap_or(0);
+            }
+            fn capture(
+                &self,
+            ) -> Result<JsonValue, error_stack::Report<crate::journal::JournalError>> {
+                // The cache is not persisted, but capture EXPOSES it when
+                // hydrated — making the hydration hook observable.
+                Ok(json!({ "total": self.total, "doubled": self.doubled }))
+            }
+            fn restore_from(
+                snap: JsonValue,
+            ) -> Result<Self, error_stack::Report<crate::journal::JournalError>> {
+                let total = snap["total"].as_i64().unwrap_or(0);
+                // THE sanctioned hydration: derive the skipped field.
+                Ok(Self {
+                    total,
+                    doubled: total * 2,
+                })
+            }
+        }
+
+        // When rebuilding from a snapshot blob through the erased shell.
+        let shell: Box<dyn crate::actor::DynEsActor> = Box::new(
+            crate::actor::TypedEsState::<Cached>::new(Cached::restore(&json!({}))),
+        );
+        let rebuilt = shell
+            .rebuild(&json!({}), Some(json!({ "total": 21 })), &[])
+            .expect("rebuild");
+
+        // Then the rebuilt state carries the hydrated cache: capture
+        // exposes `doubled`, which only restore_from could have set.
+        let captured = rebuilt.capture_erased().expect("capture");
+        assert_eq!(
+            captured["doubled"],
+            json!(42),
+            "cache hydrated by restore_from"
+        );
+        assert_eq!(captured["total"], json!(21));
+
+        // And folding the tail on top keeps the total invariant.
+        let tail = vec![crate::envelope::Event::new(
+            SchemaId::new("Added", 1),
+            json!({ "n": 3 }),
+        )];
+        let with_tail: Box<dyn crate::actor::DynEsActor> =
+            Box::new(crate::actor::TypedEsState::<Cached>::new(Cached::restore(
+                &json!({}),
+            )));
+        let with_tail = with_tail
+            .rebuild(&json!({}), Some(json!({ "total": 21 })), &tail)
+            .expect("rebuild");
+        let captured_tail = with_tail.capture_erased().expect("capture");
+        assert_eq!(captured_tail["total"], json!(24));
+    }
+
+    #[tokio::test]
+    async fn identity_survives_restart_at_the_same_path() {
+        // Given a counter that committed one Add and then crashed on Boom.
+        let (system, _clock) = ActorSystem::test();
+        let path = Path::new("counter");
+        system.register_schema::<Add>();
+        system.register_schema::<Added>();
+        system.register_schema::<Boom>();
+        system.spawn_es::<Counter, _>(path.clone(), &json!({}), SpawnOpts::default(), || {
+            vec![
+                Arc::new(TypedEsAdapter::<Counter, Add>::new::<Add>()),
+                Arc::new(TypedEsAdapter::<Counter, Boom>::new::<Boom>()),
+            ]
+        });
+        system
+            .send(system.envelope(Add::schema_id(), path.clone(), json!({ "n": 4 })))
+            .await
+            .expect("delivered");
+        wait_for_cursor(&system, &path, 1).await;
+        system
+            .send(system.envelope(Boom::schema_id(), path.clone(), json!({ "why": "poison" })))
+            .await
+            .expect("delivered");
+        wait_for_crash(&system, &path).await;
+
+        // When the supervisor restarts it (via the same spawn path —
+        // same name, fresh instance).
+        system.restart_es(&path, &json!({})).await.expect("restart");
+        // The same path resolves again and replays the journal.
+        wait_for(|| async { system.es_state(&path).await.is_some() }).await;
+        let state = system.es_state(&path).await.expect("identity intact");
+
+        // Then the identity's state is the journal fold and the pending
+        // poison is still queued at cursor 1.
+        assert_eq!(state["total"], json!(4), "state == fold(journal)");
+        assert_eq!(system.inbox_cursor(&path).map(|c| c.as_u64()), Some(1));
+    }
+
+    #[tokio::test]
+    async fn panic_redelivery_replays_pending_queue_after_restart() {
+        // Given a counter with a poison Boom queued BEHIND a good Add.
+        let (system, _clock) = ActorSystem::test();
+        let path = Path::new("counter");
+        system.register_schema::<Add>();
+        system.register_schema::<Added>();
+        system.register_schema::<Boom>();
+        system.spawn_es::<Counter, _>(path.clone(), &json!({}), SpawnOpts::default(), || {
+            vec![
+                Arc::new(TypedEsAdapter::<Counter, Add>::new::<Add>()),
+                Arc::new(TypedEsAdapter::<Counter, Boom>::new::<Boom>()),
+            ]
+        });
+
+        // When Add(4) commits, then Boom crashes the actor, then Add(1)
+        // queues behind the undelivered poison.
+        system
+            .send(system.envelope(Add::schema_id(), path.clone(), json!({ "n": 4 })))
+            .await
+            .expect("delivered");
+        wait_for_cursor(&system, &path, 1).await;
+        system
+            .send(system.envelope(Boom::schema_id(), path.clone(), json!({ "why": "poison" })))
+            .await
+            .expect("delivered");
+        wait_for_crash(&system, &path).await;
+        system
+            .send(system.envelope(Add::schema_id(), path.clone(), json!({ "n": 1 })))
+            .await
+            .expect("delivered");
+
+        // When the actor is restarted (the supervisor's rebuild path).
+        system.restart_es(&path, &json!({})).await.expect("restart");
+
+        // Then the pending queue replays FIFO: the poison redelivers FIRST
+        // and crashes the actor again (at-least-once); nothing is lost.
+        wait_for_crash(&system, &path).await;
+        {
+            let kernel = system.kernel.lock().expect("lock");
+            let events = kernel.journals[&path]
+                .entries()
+                .iter()
+                .filter(|e| matches!(e, crate::journal::JournalEntry::Event { .. }))
+                .count();
+            assert_eq!(events, 1, "poison never appended; only the first Add");
+        }
+        assert_eq!(
+            system.inbox_cursor(&path).map(|c| c.as_u64()),
+            Some(1),
+            "poison stays queued: redelivered, never acked"
+        );
+        let facts = system.fact_kind_counts();
+        let delivered = facts.get("Delivered").copied().unwrap_or(0);
+        let failed = facts.get("Failed").copied().unwrap_or(0);
+        assert_eq!(failed, 2, "poison attempted exactly once per crash");
+        assert!(
+            delivered >= 3,
+            "original Add + poison x2 delivered (at-least-once redelivery)"
+        );
     }
 }
