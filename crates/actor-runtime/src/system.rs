@@ -52,6 +52,19 @@ impl Default for SpawnOpts {
     }
 }
 
+/// The erased async start a typed service wrapper hands to the funnel:
+/// builds the boxed instance (I/O allowed inside `start`).
+pub(crate) type ServiceStart = std::pin::Pin<
+    Box<
+        dyn std::future::Future<
+                Output = Result<
+                    Box<dyn DynServiceActor>,
+                    error_stack::Report<crate::registry::RegistryError>,
+                >,
+            > + Send,
+    >,
+>;
+
 /// Startup configuration for an [`ActorSystem`].
 #[derive(Clone)]
 pub struct SystemConfig {
@@ -195,6 +208,10 @@ impl ActorSystem {
     /// Spawns a foreign (no-Rust-types) event-sourced actor: the schema,
     /// state fold, and command decision are all runtime JSON data. This is
     /// the seam the port tier will reuse.
+    ///
+    /// Deprecated positional flavor — prefer the builder:
+    /// [`crate::builder::spawn_foreign`] (named `handle`/`apply` methods).
+    #[doc(hidden)]
     pub fn spawn_es_foreign(
         self: &Arc<Self>,
         path: ActorPath,
@@ -333,10 +350,9 @@ impl ActorSystem {
 
     /// Spawns an event-sourced actor at `path`.
     ///
-    /// Registers the manifest's schema edges, one command entry per
-    /// `handles` schema (via the `spawn_es` closure), builds the journal +
-    /// inbox, rebuilds state (snapshot fast-path or genesis), and starts
-    /// the ES loop. Redelivery resumes from the inbox cursor.
+    /// Deprecated positional flavor — prefer the builder:
+    /// [`crate::builder::spawn_es_builder`] (each type said once).
+    #[doc(hidden)]
     pub fn spawn_es<A, F>(
         self: &Arc<Self>,
         path: ActorPath,
@@ -352,8 +368,9 @@ impl ActorSystem {
         self.spawn_es_erased(path, manifest, state, entries(), opts);
     }
 
-    /// The erased ES spawn shared by typed and foreign actors.
-    fn spawn_es_erased(
+    /// The erased ES spawn shared by typed, foreign, and builder actors
+    /// (the single funnel every journaled spawn goes through).
+    pub(crate) fn spawn_es_erased(
         self: &Arc<Self>,
         path: ActorPath,
         manifest: crate::schema::ActorManifest,
@@ -363,6 +380,16 @@ impl ActorSystem {
     ) {
         let opts = self.resolve_opts(opts);
         let (tx, rx) = tokio::sync::mpsc::channel::<Envelope>(opts.mailbox_capacity.max(1) * 2);
+        // The manifest is the union of what the actor type declares and
+        // what its command entries decode: every spawn flavor (positional,
+        // builder, foreign) produces identical registry data this way.
+        let mut manifest = manifest;
+        for entry in &entries {
+            let schema = entry.schema();
+            if !manifest.handles.contains(&schema) {
+                manifest.handles.push(schema);
+            }
+        }
         let mut registry = self.registry.lock().expect("registry lock");
         registry
             .insert_slot(
@@ -398,6 +425,9 @@ impl ActorSystem {
             .insert(path.clone(), Arc::new(tokio::sync::Mutex::new(state)));
         kernel.entries.insert(path.clone(), entries);
         kernel.snapshot_policy.insert(path.clone(), opts.snapshot);
+        if let Some(wm) = opts.high_watermark {
+            kernel.watermarks.insert(path.clone(), (wm, false));
+        }
         kernel.tap.push(
             self.clock.now(),
             crate::tap::FactKind::Spawned {
@@ -432,6 +462,10 @@ impl ActorSystem {
 
     /// Spawns a service (edge) actor at `path`: async handlers, I/O and
     /// `ask` allowed, NOT journaled (at-most-once message semantics).
+    ///
+    /// Deprecated positional flavor — prefer the builder:
+    /// [`crate::builder::spawn_service_builder`].
+    #[doc(hidden)]
     pub fn spawn_service<A, F>(
         self: &Arc<Self>,
         path: ActorPath,
@@ -442,6 +476,31 @@ impl ActorSystem {
         A: ServiceActor,
         F: FnOnce() -> Vec<Arc<dyn MsgEntry>>,
     {
+        let manifest = A::manifest();
+        let start_args = args.clone();
+        let start = Box::pin(async move {
+            A::start(&start_args)
+                .await
+                .map(|instance| {
+                    Box::new(TypedServiceState::new(instance)) as Box<dyn DynServiceActor>
+                })
+        });
+        self.spawn_service_erased(path, manifest, args, entries(), opts, start);
+    }
+
+    /// The erased service spawn shared by typed and builder spawns (the
+    /// service-side funnel). `start` builds the erased instance (async,
+    /// I/O allowed) — constructed by the typed wrapper.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn spawn_service_erased(
+        self: &Arc<Self>,
+        path: ActorPath,
+        manifest: crate::schema::ActorManifest,
+        args: &JsonValue,
+        entries: Vec<Arc<dyn MsgEntry>>,
+        opts: SpawnOpts,
+        start: ServiceStart,
+    ) {
         // `A::start` is async (I/O allowed); block briefly on a runtime
         // thread is not done — spawn the start inside the actor task and
         // register the slot immediately so senders never see a gap.
@@ -449,7 +508,6 @@ impl ActorSystem {
         let (tx, rx) = tokio::sync::mpsc::channel::<Envelope>(opts.mailbox_capacity.max(1) * 2);
         {
             let mut registry = self.registry.lock().expect("registry lock");
-            let manifest = A::manifest();
             registry
                 .insert_slot(
                     path.clone(),
@@ -471,7 +529,10 @@ impl ActorSystem {
         ));
         kernel.cells.insert(path.clone(), cell.clone());
         kernel.genesis_args.insert(path.clone(), args.clone());
-        kernel.msg_entries.insert(path.clone(), entries());
+        kernel.msg_entries.insert(path.clone(), entries);
+        if let Some(wm) = opts.high_watermark {
+            kernel.watermarks.insert(path.clone(), (wm, false));
+        }
         kernel.tap.push(
             self.clock.now(),
             crate::tap::FactKind::Spawned {
@@ -494,22 +555,19 @@ impl ActorSystem {
         let view = self.view.clone();
         let registry = self.registry.clone();
         let kernel_table = self.kernel.clone();
-        let start_args = args.clone();
         let front_cell = cell.clone();
         let front_kernel = self.kernel.clone();
         tokio::spawn(async move {
             // Start the instance inside the task; a start failure leaves
             // the slot present (senders get a closed door) and the crash
             // recorded for supervision.
-            let started = A::start(&start_args).await;
+            let started = start.await;
             match started {
                 Ok(instance) => {
                     let mut kernel = kernel_table.lock().expect("kernel lock");
                     kernel.services.insert(
                         started_path.clone(),
-                        Arc::new(tokio::sync::Mutex::new(
-                            Box::new(TypedServiceState::new(instance)) as Box<dyn DynServiceActor>,
-                        )),
+                        Arc::new(tokio::sync::Mutex::new(instance)),
                     );
                 }
                 Err(report) => {
@@ -527,23 +585,6 @@ impl ActorSystem {
             )
             .await;
         });
-    }
-
-    /// Convenience: spawn with typed adapters for each handled command.
-    ///
-    /// `entries()` builds the CommandEntry list (usually
-    /// `vec![Arc::new(TypedEsAdapter::<A, C1>::new::<C1>()), ...]`).
-    pub fn spawn_es_typed<A, F>(
-        self: &Arc<Self>,
-        path: ActorPath,
-        args: &JsonValue,
-        opts: SpawnOpts,
-        entries: F,
-    ) where
-        A: EventSourcedActor,
-        F: FnOnce() -> Vec<Arc<dyn CommandEntry>>,
-    {
-        self.spawn_es::<A, F>(path, args, opts, entries)
     }
 
     /// Sends an envelope from outside the system (entry-point trace root).
@@ -687,6 +728,81 @@ impl ActorSystem {
     pub async fn stop(&self, path: &ActorPath) {
         const STOP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
         self.stop_bounded(path, STOP_TIMEOUT).await;
+    }
+
+    /// Installs a stateless pool over `public`: `N` workers (spawned by
+    /// the caller-supplied `factory` as supervised children of the spec
+    /// parent, or parentless) plus a pool entry that owns the routing
+    /// decision for the PUBLIC path.
+    ///
+    /// Senders never change: they keep addressing `public` before, during,
+    /// and after the install. If a live actor already owns the public path,
+    /// it is gracefully STOP-DRAINED first (undelivered inbox entries go
+    /// to the DLQ per the stop contract); re-routing that queued mail into
+    /// the pool's workers is a documented FUTURE refinement, not v1.
+    ///
+    /// # Errors
+    ///
+    /// Propagates [`crate::registry::RegistryError::InvalidSpec`] from the
+    /// registry install (no workers, or a worker slot is missing — spawn
+    /// workers first, then install).
+    pub async fn install_pool(
+        self: &Arc<Self>,
+        spec: crate::pool::PoolSpec,
+    ) -> Result<(), error_stack::Report<crate::registry::RegistryError>> {
+        // 1. TAKEOVER: stop-drain whoever holds the public path today (a
+        // plain actor). A no-op when the path is free.
+        if self
+            .registry
+            .lock()
+            .expect("registry lock")
+            .lookup(&spec.public)
+            .is_some()
+        {
+            self.stop(&spec.public).await;
+        }
+        // 2. WORKERS: spawn through the factory; each worker registers its
+        // own slot. When a spec parent is declared, each worker is a
+        // supervised child of it (escalation flows worker → parent).
+        let mut workers = Vec::with_capacity(spec.workers);
+        for i in 0..spec.workers {
+            let worker_path = ActorPath::new(format!("{}/worker-{i}", spec.public).as_str());
+            let args = spec
+                .args
+                .clone()
+                .unwrap_or(JsonValue::Object(serde_json::Map::new()));
+            match &spec.parent {
+                Some(parent) => {
+                    let factory = spec.factory.clone();
+                    let worker = worker_path.clone();
+                    self.spawn_child(crate::supervision::ChildSpec {
+                        path: worker,
+                        parent: Some(parent.clone()),
+                        args,
+                        restart: crate::supervision::RestartPolicy::Permanent,
+                        budget: crate::supervision::RestartBudget::per(5, std::time::Duration::from_secs(10)),
+                        backoff: crate::supervision::Backoff::default(),
+                        spawn: Arc::new(move |system, path, args| {
+                            factory(system, path, args);
+                        }),
+                    });
+                }
+                None => {
+                    (spec.factory)(self, &worker_path, &args);
+                }
+            }
+            workers.push(worker_path);
+        }
+        // 3. INSTALL: one registry transaction — the pool entry claims the
+        // public name (workers own the deliverable slots).
+        let entry = crate::pool::pool_entry(
+            spec.algo,
+            workers,
+            spec.seed,
+            spec.parent.clone(),
+        );
+        let mut registry = self.registry.lock().expect("registry lock");
+        registry.install_pool(spec.public, entry)
     }
 
     /// The bounded stop; recursion depth bounded by timeout.
@@ -1181,6 +1297,7 @@ mod tests {
     /// fixture: the kernel must drop it).
     #[derive(serde::Deserialize)]
     struct Smuggled {
+        #[allow(dead_code)] // payload shape; the kernel never reads it
         n: i64,
     }
     impl Schema for Smuggled {
@@ -2586,7 +2703,6 @@ mod tests {
 
     impl MsgHandler<Added> for Auditor {
         async fn handle(&mut self, msg: Added, _ctx: &mut crate::context::MsgCtx<'_>) {
-            println!("AUDITOR GOT Added n={}", msg.n);
             self.sink
                 .lock()
                 .expect("sink lock")
@@ -3290,14 +3406,15 @@ mod tests {
         );
         // The emit edge the decision closure produces is declared explicitly
         // (emit enforcement drops undeclared schemas, so this is load-bearing).
-        let mut registry = system.registry.lock().expect("registry lock");
-        registry
-            .declare_emits(
-                &ActorPath::new("tally-actor"),
-                schema.clone(),
-            )
-            .expect("live slot");
-        drop(registry);
+        {
+            let mut registry = system.registry.lock().expect("registry lock");
+            registry
+                .declare_emits(
+                    &ActorPath::new("tally-actor"),
+                    schema.clone(),
+                )
+                .expect("live slot");
+        }
 
         // When a JSON command is sent to the foreign actor and the ack
         // settles.
@@ -4407,5 +4524,826 @@ mod tests {
                 .any(|f| matches!(f.kind, crate::tap::FactKind::SnapshotTaken { .. })),
             "Off never snapshots"
         );
+    }
+
+    // ---- Phase 2: builder API ----
+
+    /// A counter variant whose manifest declares NOTHING (builder-edge
+    /// fixture: declarations must come from the builder calls).
+    #[derive(Serialize, Deserialize, Default)]
+    struct BareCounter {
+        total: i64,
+    }
+    impl EventSourcedActor for BareCounter {
+        fn manifest() -> ActorManifest {
+            ActorManifest::new().kind(ActorKind::EventSourced)
+        }
+        fn restore(_args: &JsonValue) -> Self {
+            Self::default()
+        }
+        fn apply(&mut self, event: &crate::envelope::Event) {
+            self.total += event.payload["n"].as_i64().unwrap_or(0);
+        }
+    }
+    impl CommandHandler<Add> for BareCounter {
+        fn handle(&self, cmd: Add, _ctx: &mut CmdCtx<'_>) -> Vec<crate::envelope::Event> {
+            vec![crate::envelope::Event::new(
+                Added::schema_id(),
+                json!({ "n": cmd.n }),
+            )]
+        }
+    }
+
+    /// Reads an actor's registered manifest from the registry (tests).
+    fn registered_manifest(
+        system: &ActorSystem,
+        path: &ActorPath,
+    ) -> Option<crate::schema::ActorManifest> {
+        let registry = system.registry.lock().expect("registry lock");
+        registry.lookup(path).map(|info| info.manifest.clone())
+    }
+
+    /// Reads the route table's destination set for a schema (tests).
+    fn route_dests(system: &ActorSystem, schema: &SchemaId) -> Vec<ActorPath> {
+        let registry = system.registry.lock().expect("registry lock");
+        registry.route_dests(schema)
+    }
+
+    #[tokio::test]
+    async fn builder_registers_same_edges_as_positional_spawn() {
+        // Given the same counter actor spawned twice — once positionally,
+        // once through the builder (distinct paths, same types).
+        let (system, _clock) = ActorSystem::test();
+        system.register_schema::<Add>();
+        system.register_schema::<Added>();
+        let positional_path = ActorPath::new("pos");
+        let builder_path = ActorPath::new("built");
+        system.spawn_es::<BareCounter, _>(
+            positional_path.clone(),
+            &json!({}),
+            SpawnOpts::default(),
+            || vec![Arc::new(TypedEsAdapter::<BareCounter, Add>::new::<Add>())],
+        );
+        {
+            let mut registry = system.registry.lock().expect("registry lock");
+            registry
+                .declare_emits(&positional_path, Added::schema_id())
+                .expect("declare positional emit edge");
+        }
+        crate::builder::spawn_es_builder::<BareCounter>(&system)
+            .at(builder_path.clone())
+            .handles::<Add>()
+            .emits::<Added>()
+            .start();
+
+        // When both slots settle.
+        wait_for(|| async {
+            system.inbox_cursor(&builder_path).is_some()
+                && system.inbox_cursor(&positional_path).is_some()
+        })
+        .await;
+
+        // Then the registry sees IDENTICAL handles AND emit edges.
+        let pos_manifest = registered_manifest(&system, &positional_path).expect("pos slot");
+        let built_manifest = registered_manifest(&system, &builder_path).expect("built slot");
+        assert_eq!(pos_manifest.handles, built_manifest.handles);
+        assert_eq!(pos_manifest.emits, built_manifest.emits);
+        let pos_dests = route_dests(&system, &Add::schema_id());
+        assert!(pos_dests.contains(&positional_path) && pos_dests.contains(&builder_path));
+
+        // And both actors behave identically under the same command.
+        for path in [&positional_path, &builder_path] {
+            system
+                .send(system.envelope(Add::schema_id(), path.clone(), json!({ "n": 6 })))
+                .await
+                .expect("delivered");
+        }
+        wait_for(|| async {
+            count_total(&system, "pos").await == Some(6)
+                && count_total(&system, "built").await == Some(6)
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn builder_emits_are_enforced_edges() {
+        // Given a counter built WITHOUT any `.emits::<Added>()` declaration
+        // (its manifest does not declare the edge on its own).
+        let (system, _clock) = ActorSystem::test();
+        let path = ActorPath::new("silent");
+        system.register_schema::<Add>();
+        system.register_schema::<Added>();
+        crate::builder::spawn_es_builder::<BareCounter>(&system)
+            .at(path.clone())
+            .handles::<Add>()
+            .start();
+
+        // When a command commits an event.
+        system
+            .send(system.envelope(Add::schema_id(), path.clone(), json!({ "n": 3 })))
+            .await
+            .expect("delivered");
+        wait_for_cursor(&system, &path, 1).await;
+
+        // Then the undeclared event was dropped before append (the builder
+        // edge is the enforced edge) and a fact records the drop.
+        assert_eq!(system.journal_len(&path), 0, "no declared edge, no append");
+        assert!(system.tap_facts().iter().any(|f| matches!(
+            &f.kind,
+            crate::tap::FactKind::DeadLettered { reason, .. }
+                if *reason == crate::types::DeadLetterReason::UndeclaredEvent
+        )));
+
+        // And the same actor WITH the declaration journals normally.
+        let declared = ActorPath::new("loud");
+        crate::builder::spawn_es_builder::<BareCounter>(&system)
+            .at(declared.clone())
+            .handles::<Add>()
+            .emits::<Added>()
+            .start();
+        system
+            .send(system.envelope(Add::schema_id(), declared.clone(), json!({ "n": 3 })))
+            .await
+            .expect("delivered");
+        wait_for_cursor(&system, &declared, 1).await;
+        assert_eq!(
+            system.journal_len(&declared),
+            1,
+            "declared emit edges append"
+        );
+    }
+
+    #[tokio::test]
+    async fn foreign_builder_matches_positional_foreign_spawn() {
+        // Given the same foreign tally spawned twice — once positionally,
+        // once through the named-method builder.
+        let (system, _clock) = ActorSystem::test();
+        let schema = system
+            .register_schema_json(json!({
+                "name": "tally2", "version": 1, "kind": "command",
+                "fields": [{ "name": "delta", "ty": "int" }]
+            }))
+            .expect("valid");
+
+        let decision: crate::actor::ForeignDecision = {
+            let s = schema.clone();
+            Arc::new(move |_state, cmd, _ctx| {
+                vec![crate::envelope::Event::new(
+                    s.clone(),
+                    json!({ "delta": cmd["delta"].as_i64().unwrap_or(0) }),
+                )]
+            })
+        };
+        let fold: crate::actor::ForeignFold = Arc::new(|state: &mut JsonValue, ev: &crate::envelope::Event| {
+            state["total"] = json!(
+                state["total"].as_i64().unwrap_or(0) + ev.payload["delta"].as_i64().unwrap_or(0)
+            );
+        });
+        system.spawn_es_foreign(
+            ActorPath::new("t-pos"),
+            schema.clone(),
+            json!({ "total": 0 }),
+            decision.clone(),
+            fold.clone(),
+            SpawnOpts::default(),
+        );
+        // The positional flavor declares its emit edge post-spawn; the
+        // builder declares it inline — same table, same enforcement.
+        {
+            let mut registry = system.registry.lock().expect("registry lock");
+            registry
+                .declare_emits(&ActorPath::new("t-pos"), schema.clone())
+                .expect("live slot");
+        }
+        let built_decision: crate::actor::ForeignDecision = {
+            let s = schema.clone();
+            Arc::new(move |_state, cmd, _ctx| {
+                vec![crate::envelope::Event::new(
+                    s.clone(),
+                    json!({ "delta": cmd["delta"].as_i64().unwrap_or(0) }),
+                )]
+            })
+        };
+        crate::builder::spawn_foreign(&system)
+            .at(ActorPath::new("t-built"))
+            .schema(json!({
+                "name": "tally2", "version": 1, "kind": "command",
+                "fields": [{ "name": "delta", "ty": "int" }]
+            }))
+            .args(json!({ "total": 0 }))
+            .handle(built_decision)
+            .apply(fold)
+            .emits_id(SchemaId::new("tally2", 1))
+            .start()
+            .expect("foreign builder starts");
+
+        // When both receive the same command.
+        wait_for(|| async {
+            system.inbox_cursor(&ActorPath::new("t-pos")).is_some()
+                && system.inbox_cursor(&ActorPath::new("t-built")).is_some()
+        })
+        .await;
+        for path in [ActorPath::new("t-pos"), ActorPath::new("t-built")] {
+            system
+                .send(system.envelope(
+                    SchemaId::new("tally2", 1),
+                    path,
+                    json!({ "delta": 9 }),
+                ))
+                .await
+                .expect("delivered");
+        }
+        wait_for(|| async {
+            count_total_json(&system, &ActorPath::new("t-pos")).await == Some(9)
+                && count_total_json(&system, &ActorPath::new("t-built")).await == Some(9)
+        })
+        .await;
+
+        // Then both run identically (and the builder's declared emit edge
+        // was enforced — the journal holds the event).
+        assert_eq!(system.journal_len(&ActorPath::new("t-built")), 1);
+        assert_eq!(system.journal_len(&ActorPath::new("t-pos")), 1);
+    }
+
+    #[tokio::test]
+    async fn deprecated_positional_wrappers_still_function() {
+        // Given all three positional flavors spawned.
+        let (system, _clock) = ActorSystem::test();
+        system.register_schema::<Add>();
+        system.register_schema::<Added>();
+        let es_path = ActorPath::new("dep-es");
+        system.spawn_es::<Counter, _>(es_path.clone(), &json!({}), SpawnOpts::default(), || {
+            vec![Arc::new(TypedEsAdapter::<Counter, Add>::new::<Add>())]
+        });
+        let svc_path = ActorPath::new("dep-svc");
+        system.spawn_service::<Auditor, _>(
+            svc_path.clone(),
+            &json!({ "sink": 0 }),
+            SpawnOpts::default(),
+            Vec::new,
+        );
+        let foreign_path = ActorPath::new("dep-foreign");
+        let schema = system
+            .register_schema_json(json!({
+                "name": "depcmd", "version": 1, "kind": "command",
+                "fields": [{ "name": "delta", "ty": "int" }]
+            }))
+            .expect("valid");
+        {
+            let s = schema.clone();
+            system.spawn_es_foreign(
+                foreign_path.clone(),
+                schema,
+                json!({ "total": 0 }),
+                Arc::new(move |_st, cmd, _ctx| {
+                    vec![crate::envelope::Event::new(
+                        s.clone(),
+                        json!({ "delta": cmd["delta"].as_i64().unwrap_or(0) }),
+                    )]
+                }),
+                Arc::new(|state: &mut JsonValue, ev: &crate::envelope::Event| {
+                    state["total"] = json!(
+                        state["total"].as_i64().unwrap_or(0)
+                            + ev.payload["delta"].as_i64().unwrap_or(0)
+                    );
+                }),
+                SpawnOpts::default(),
+            );
+            let mut registry = system.registry.lock().expect("registry lock");
+            registry
+                .declare_emits(&foreign_path, SchemaId::new("depcmd", 1))
+                .expect("declare");
+        }
+
+        // When all three receive mail.
+        wait_for(|| async {
+            system.inbox_cursor(&es_path).is_some()
+                && system.inbox_cursor(&svc_path).is_some()
+                && system.inbox_cursor(&foreign_path).is_some()
+        })
+        .await;
+        system
+            .send(system.envelope(Add::schema_id(), es_path.clone(), json!({ "n": 2 })))
+            .await
+            .expect("es delivered");
+        system
+            .send(system.envelope(
+                SchemaId::new("depcmd", 1),
+                foreign_path.clone(),
+                json!({ "delta": 4 }),
+            ))
+            .await
+            .expect("foreign delivered");
+
+        // Then the ES and foreign actors behave as before.
+        wait_for(|| async {
+            count_total(&system, "dep-es").await == Some(2)
+                && count_total_json(&system, &foreign_path).await == Some(4)
+        })
+        .await;
+    }
+
+    // ---- Phase 3: router rules + stateless pools ----
+
+    /// A stateless worker that records handled Add commands in a shared
+    /// sink (pool fixture: impure, at-most-once, no journal).
+    struct PoolWorker {
+        sink: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl ServiceActor for PoolWorker {
+        fn manifest() -> ActorManifest {
+            ActorManifest::new().kind(ActorKind::Service)
+        }
+        async fn start(
+            args: &JsonValue,
+        ) -> Result<Self, error_stack::Report<crate::registry::RegistryError>> {
+            let idx = args["sink"].as_u64().expect("sink index") as usize;
+            let sink = sinks().lock().expect("sinks lock")[idx].clone();
+            Ok(Self { sink })
+        }
+    }
+
+    impl MsgHandler<Add> for PoolWorker {
+        async fn handle(&mut self, msg: Add, _ctx: &mut crate::context::MsgCtx<'_>) {
+            self.sink
+                .lock()
+                .expect("sink lock")
+                .push(format!("n={}", msg.n));
+        }
+    }
+
+    /// An interposer service: records the schema, then FORWARDS the
+    /// payload to the given path (the Inline-rule fixture).
+    struct Forwarder {
+        sink: Arc<Mutex<Vec<String>>>,
+        forward_to: ActorPath,
+    }
+
+    impl ServiceActor for Forwarder {
+        fn manifest() -> ActorManifest {
+            ActorManifest::new().kind(ActorKind::Service)
+        }
+        async fn start(
+            args: &JsonValue,
+        ) -> Result<Self, error_stack::Report<crate::registry::RegistryError>> {
+            let idx = args["sink"].as_u64().expect("sink index") as usize;
+            let sink = sinks().lock().expect("sinks lock")[idx].clone();
+            let to = args["forward_to"].as_str().expect("forward_to");
+            Ok(Self {
+                sink,
+                forward_to: ActorPath::new(to),
+            })
+        }
+    }
+
+    impl MsgHandler<Add> for Forwarder {
+        async fn handle(&mut self, msg: Add, ctx: &mut crate::context::MsgCtx<'_>) {
+            self.sink
+                .lock()
+                .expect("sink lock")
+                .push(format!("seen={}", msg.n));
+            ctx.core.send(
+                Address::Path(self.forward_to.clone()),
+                Add::schema_id(),
+                json!({ "n": msg.n }),
+                None,
+            );
+        }
+    }
+
+    /// Builds a pool spec over `public` with `n` PoolWorkers writing to
+    /// the sink at index `sink_idx` (both algos; seeded for determinism).
+    fn pool_spec(
+        public: &str,
+        n: usize,
+        algo: crate::pool::PoolAlgo,
+        sink_idx: usize,
+        parent: Option<ActorPath>,
+    ) -> crate::pool::PoolSpec {
+        let public_path = ActorPath::new(public);
+        crate::pool::PoolSpec {
+            public: public_path.clone(),
+            workers: n,
+            algo,
+            factory: Arc::new(move |system, path, args| {
+                system.spawn_service::<PoolWorker, _>(
+                    path.clone(),
+                    args,
+                    SpawnOpts::default(),
+                    || {
+                        vec![Arc::new(
+                            crate::actor::TypedServiceAdapter::<PoolWorker, Add>::new::<Add>(),
+                        )]
+                    },
+                );
+            }),
+            args: Some(json!({ "sink": sink_idx })),
+            parent,
+            seed: 42,
+        }
+    }
+
+    #[tokio::test]
+    async fn pool_takeover_is_invisible_to_senders() {
+        // Given a pool installed over "public" (fresh; no prior actor) with
+        // 3 round-robin workers writing one shared sink.
+        let (system, _clock) = ActorSystem::test();
+        system.register_schema::<Add>();
+        let (sink_idx, sink) = open_sink();
+        bind_sink(&ActorPath::new("public"), sink.clone());
+        system
+            .install_pool(pool_spec(
+                "public",
+                3,
+                crate::pool::PoolAlgo::RoundRobin,
+                sink_idx,
+                None,
+            ))
+            .await
+            .expect("pool installs");
+
+        // When the sender addresses the PUBLIC path six times.
+        wait_for(|| async {
+            (0..3).all(|i| {
+                system.inbox_cursor(&ActorPath::new(format!("public/worker-{i}").as_str()))
+                    .is_some()
+            })
+        })
+        .await;
+        for n in 1..=6 {
+            system
+                .send(system.envelope(
+                    Add::schema_id(),
+                    ActorPath::new("public"),
+                    json!({ "n": n }),
+                ))
+                .await
+                .expect("delivered to a worker");
+        }
+        wait_for(|| async { sink.lock().expect("sink lock").len() == 6 }).await;
+
+        // Then every message landed in a worker through the public name
+        // (the sender never saw a worker path), and the tap shows the
+        // router signature: Sent{dest: public} → Delivered{to: worker}.
+        assert_eq!(*sink.lock().expect("sink lock"), vec![
+            "n=1", "n=2", "n=3", "n=4", "n=5", "n=6"
+        ]);
+        let to_workers = system.tap_facts().iter().any(|f| matches!(
+            &f.kind,
+            crate::tap::FactKind::Delivered { to, .. }
+                if *to == ActorPath::new("public/worker-0")
+        ));
+        assert!(to_workers, "deliveries landed on worker paths");
+    }
+
+    #[tokio::test]
+    async fn pool_takeover_stop_drains_queued_mail_to_dlq() {
+        // Given a LIVE plain actor at "pub" (its slot + loop running).
+        let (system, _clock) = ActorSystem::test();
+        system.register_schema::<Add>();
+        system.register_schema::<Added>();
+        let public = ActorPath::new("pub");
+        system.spawn_es::<BareCounter, _>(
+            public.clone(),
+            &json!({}),
+            SpawnOpts::default(),
+            || vec![Arc::new(TypedEsAdapter::<BareCounter, Add>::new::<Add>())],
+        );
+        wait_for(|| async { system.inbox_cursor(&public).is_some() }).await;
+
+        // When the pool takes the public path over (stop-drain first).
+        let (sink_idx, sink) = open_sink();
+        bind_sink(&ActorPath::new("pub"), sink.clone());
+        system
+            .install_pool(pool_spec(
+                "pub",
+                1,
+                crate::pool::PoolAlgo::RoundRobin,
+                sink_idx,
+                None,
+            ))
+            .await
+            .expect("takeover installs");
+
+        // Then the pool claimed the public path, the plain actor's slot is
+        // gone, and mail keeps flowing to the SAME public name (senders
+        // unchanged; the takeover was invisible to them). The stop-drain's
+        // undelivered-mail → DLQ half is exercised by the stop tests.
+        let taken = {
+            let registry = system.registry.lock().expect("registry lock");
+            registry.pools.contains_key(&public)
+        };
+        assert!(taken, "pool claimed the public path");
+        wait_for(|| async {
+            system
+                .send(system.envelope(Add::schema_id(), public.clone(), json!({ "n": 9 })))
+                .await
+                .is_ok()
+        })
+        .await;
+        wait_for(|| async { sink.lock().expect("sink lock").len() == 1 }).await;
+        assert_eq!(*sink.lock().expect("sink lock"), vec!["n=9"]);
+    }
+
+    #[tokio::test]
+    async fn pool_random_algo_distributes_deterministically() {
+        // Given a seeded-Random pool with 2 workers and a shared sink.
+        let (system, _clock) = ActorSystem::test();
+        system.register_schema::<Add>();
+        let (sink_idx, sink) = open_sink();
+        bind_sink(&ActorPath::new("rnd"), sink.clone());
+        system
+            .install_pool(pool_spec(
+                "rnd",
+                2,
+                crate::pool::PoolAlgo::Random,
+                sink_idx,
+                None,
+            ))
+            .await
+            .expect("pool installs");
+
+        // When four commands go to the public path.
+        wait_for(|| async {
+            system.inbox_cursor(&ActorPath::new("rnd/worker-0")).is_some()
+                && system.inbox_cursor(&ActorPath::new("rnd/worker-1")).is_some()
+        })
+        .await;
+        for n in 1..=4 {
+            system
+                .send(system.envelope(
+                    Add::schema_id(),
+                    ActorPath::new("rnd"),
+                    json!({ "n": n }),
+                ))
+                .await
+                .expect("delivered");
+        }
+        wait_for(|| async { sink.lock().expect("sink lock").len() == 4 }).await;
+
+        // Then every message was handled exactly once (distribution across
+        // workers is algo-driven; the shared sink sees the union).
+        let mut got = sink.lock().expect("sink lock").clone();
+        got.sort();
+        assert_eq!(got, vec!["n=1", "n=2", "n=3", "n=4"]);
+    }
+
+    #[tokio::test]
+    async fn pool_worker_escalates_to_spec_parent() {
+        // Given a pool whose workers are supervised children of "boss".
+        let (system, _clock) = ActorSystem::test();
+        system.register_schema::<Add>();
+        let (sink_idx, sink) = open_sink();
+        bind_sink(&ActorPath::new("crew"), sink);
+        let parent = ActorPath::new("boss");
+        system
+            .install_pool(pool_spec(
+                "crew",
+                1,
+                crate::pool::PoolAlgo::RoundRobin,
+                sink_idx,
+                Some(parent.clone()),
+            ))
+            .await
+            .expect("pool installs");
+
+        // When the child spec registers the escalation target.
+        let spec_parent = {
+            let kernel = system.kernel.lock().expect("kernel lock");
+            kernel
+                .specs
+                .get(&ActorPath::new("crew/worker-0"))
+                .map(|s| s.parent.clone())
+                .unwrap_or(None)
+        };
+
+        // Then the worker's escalation flows to the spec parent.
+        assert_eq!(spec_parent, Some(parent));
+    }
+
+
+
+    #[tokio::test]
+    async fn tee_rule_copies_without_touching_delivery() {
+        // Given a primary ES counter and a Tee observer, with a Tee rule:
+        // every Add aimed at the counter is copied to the observer.
+        let (system, _clock) = ActorSystem::test();
+        system.register_schema::<Add>();
+        system.register_schema::<Added>();
+        let (sink_idx, sink) = open_sink();
+        bind_sink(&ActorPath::new("watcher"), sink.clone());
+        system.spawn_service::<Auditor, _>(
+            ActorPath::new("watcher"),
+            &json!({ "sink": sink_idx }),
+            SpawnOpts::default(),
+            || vec![Arc::new(TypedServiceAdapter::<Auditor, Added>::new::<Added>())],
+        );
+        let counter = ActorPath::new("counter");
+        system.spawn_es::<BareCounter, _>(
+            counter.clone(),
+            &json!({}),
+            SpawnOpts::default(),
+            || vec![Arc::new(TypedEsAdapter::<BareCounter, Add>::new::<Add>())],
+        );
+        {
+            let mut registry = system.registry.lock().expect("registry lock");
+            registry
+                .declare_emits(&counter, Added::schema_id())
+                .expect("declare");
+            registry.add_rule(crate::pool::Rule {
+                source: None,
+                schema: Some(Add::schema_id()),
+                dest: Some(counter.clone()),
+                action: crate::pool::RuleAction::Tee(ActorPath::new("watcher")),
+            });
+        }
+        wait_for(|| async { system.inbox_cursor(&counter).is_some() }).await;
+
+        // When one command is sent to the primary (root entry trace): the
+        // tee copy carries schema Add@1 while the observer decodes Added@1,
+        // so the copy dead-letters at the observer — at-most-once tee in
+        // action. The ORIGINAL reaches the primary untouched (below).
+        let mut envelope = system.envelope(Add::schema_id(), counter.clone(), json!({ "n": 5 }));
+        envelope.trace = crate::envelope::TraceCtx::root();
+        let original_causality = envelope.trace.causality_id;
+        system.send(envelope).await.expect("delivered");
+        wait_for(|| async {
+            count_total(&system, "counter").await == Some(5)
+        })
+        .await;
+
+        // Then the PRIMARY still processed the original untouched (the tee
+        // never disturbed the main flow), and the copy did not poison it.
+        assert_eq!(count_total(&system, "counter").await, Some(5));
+        // And the copy's causality is NEW (never the original's id). The
+        // copy's true trace is the Delivered fact AT the observer (the tee
+        // Sent fact deliberately carries the ORIGINAL trace — that is the
+        // link between the two deliveries).
+        let facts = system.tap_facts();
+        let tee_delivered = facts
+            .iter()
+            .find(|f| matches!(
+                &f.kind,
+                crate::tap::FactKind::Delivered { to, .. } if *to == ActorPath::new("watcher")
+            ))
+            .expect("tee copy delivered");
+        if let crate::tap::FactKind::Delivered { trace, .. } = &tee_delivered.kind {
+            assert_ne!(
+                trace.causality_id, original_causality,
+                "copy has a NEW causality"
+            );
+            assert_ne!(
+                trace.trace_id, crate::envelope::TraceCtx::root().trace_id,
+                "sanity: trace ids are unique per root"
+            );
+        }
+    }
+
+
+
+    #[tokio::test]
+    async fn inline_rule_interposes() {
+        // Given a Forwarder interposer ("middleman") and a final handler
+        // ("final"), with a rule: Add aimed at "target" is delivered to
+        // the middleman INSTEAD; the middleman forwards to "final".
+        let (system, _clock) = ActorSystem::test();
+        system.register_schema::<Add>();
+        system.register_schema::<Added>();
+        let (seen_idx, seen_sink) = open_sink();
+        bind_sink(&ActorPath::new("middleman"), seen_sink);
+        let (final_idx, final_sink) = open_sink();
+        bind_sink(&ActorPath::new("final"), final_sink);
+        system.spawn_service::<Forwarder, _>(
+            ActorPath::new("middleman"),
+            &json!({ "sink": seen_idx, "forward_to": "final" }),
+            SpawnOpts::default(),
+            || vec![Arc::new(TypedServiceAdapter::<Forwarder, Add>::new::<Add>())],
+        );
+        system.spawn_service::<PoolWorker, _>(
+            ActorPath::new("final"),
+            &json!({ "sink": final_idx }),
+            SpawnOpts::default(),
+            || vec![Arc::new(TypedServiceAdapter::<PoolWorker, Add>::new::<Add>())],
+        );
+        {
+            let mut registry = system.registry.lock().expect("registry lock");
+            registry.add_rule(crate::pool::Rule {
+                source: None,
+                schema: Some(Add::schema_id()),
+                dest: Some(ActorPath::new("target")),
+                action: crate::pool::RuleAction::Inline(ActorPath::new("middleman")),
+            });
+        }
+        wait_for(|| async {
+            system.inbox_cursor(&ActorPath::new("middleman")).is_some()
+                && system.inbox_cursor(&ActorPath::new("final")).is_some()
+        })
+        .await;
+
+        // When a command is sent to "target" (no actor lives there — the
+        // rule interposes BEFORE resolution).
+        system
+            .send(system.envelope(
+                Add::schema_id(),
+                ActorPath::new("target"),
+                json!({ "n": 7 }),
+            ))
+            .await
+            .expect("delivered");
+        wait_for(|| async {
+            !sink_read(&ActorPath::new("middleman")).is_empty()
+                && !sink_read(&ActorPath::new("final")).is_empty()
+        })
+        .await;
+
+        // Then the flow ran THROUGH the interposer (in its place — not a
+        // copy) and landed on the final handler.
+        assert_eq!(sink_read(&ActorPath::new("middleman")), vec!["seen=7"]);
+        assert_eq!(sink_read(&ActorPath::new("final")), vec!["n=7"]);
+    }
+
+    /// A worker whose FIRST message (n=0) blocks on a shared gate until
+    /// the test releases it — queued mail then accumulates past any
+    /// watermark deterministically (the loop is stuck in the handler).
+    struct GatedWorker {
+        sink: Arc<Mutex<Vec<String>>>,
+    }
+
+    static WORKER_GATE: std::sync::LazyLock<tokio::sync::Notify> =
+        std::sync::LazyLock::new(tokio::sync::Notify::new);
+
+    impl ServiceActor for GatedWorker {
+        fn manifest() -> ActorManifest {
+            ActorManifest::new().kind(ActorKind::Service)
+        }
+        async fn start(
+            args: &JsonValue,
+        ) -> Result<Self, error_stack::Report<crate::registry::RegistryError>> {
+            let idx = args["sink"].as_u64().expect("sink index") as usize;
+            let sink = sinks().lock().expect("sinks lock")[idx].clone();
+            Ok(Self { sink })
+        }
+    }
+
+    impl MsgHandler<Add> for GatedWorker {
+        async fn handle(&mut self, msg: Add, _ctx: &mut crate::context::MsgCtx<'_>) {
+            if msg.n == 0 {
+                WORKER_GATE.notified().await;
+            }
+            self.sink
+                .lock()
+                .expect("sink lock")
+                .push(format!("n={}", msg.n));
+        }
+    }
+
+    #[tokio::test]
+    async fn backpressured_fact_fires_on_watermark_crossing() {
+        // Given a gated worker (capacity 8, watermark 2) whose first
+        // message blocks inside the handler.
+        let (system, _clock) = ActorSystem::test();
+        system.register_schema::<Add>();
+        let (sink_idx, sink) = open_sink();
+        let plain = ActorPath::new("slow");
+        bind_sink(&plain, sink);
+        let opts = SpawnOpts {
+            mailbox_capacity: 8,
+            high_watermark: Some(2),
+            ..SpawnOpts::default()
+        };
+        system.spawn_service::<GatedWorker, _>(
+            plain.clone(),
+            &json!({ "sink": sink_idx }),
+            opts,
+            || vec![Arc::new(TypedServiceAdapter::<GatedWorker, Add>::new::<Add>())],
+        );
+        wait_for(|| async { system.inbox_cursor(&plain).is_some() }).await;
+
+        // When the first message pins the loop (handler blocked) and three
+        // more queue up behind it (depth 3 > watermark 2).
+        for n in 0..4u64 {
+            let envelope = system.envelope(Add::schema_id(), plain.clone(), json!({ "n": n }));
+            system.send(envelope).await.expect("queued");
+        }
+        wait_for(|| async {
+            system
+                .tap_facts()
+                .iter()
+                .any(|f| matches!(&f.kind, crate::tap::FactKind::Backpressured { path, .. } if *path == plain))
+        })
+        .await;
+        // Release the gate so the worker drains (clean shutdown).
+        WORKER_GATE.notify_waiters();
+        wait_for(|| async { sink_read(&plain).len() == 4 }).await;
+
+        // Then exactly ONE Backpressured fact fired for the up-crossing
+        // (rate-limited: not one per message).
+        let fires = system
+            .tap_facts()
+            .iter()
+            .filter(|f| matches!(&f.kind, crate::tap::FactKind::Backpressured { path, .. } if *path == plain))
+            .count();
+        assert_eq!(fires, 1, "one fact per up-crossing, not per message");
     }
 }

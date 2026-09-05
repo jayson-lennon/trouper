@@ -8,12 +8,14 @@
 //! See `.plans/actor-runtime-core/plan.md` for the authoritative spec.
 
 pub mod actor;
+pub mod builder;
 pub mod clock;
 pub mod context;
 pub mod envelope;
 pub mod inbox;
 pub mod journal;
 pub mod kernel;
+pub mod pool;
 pub mod registry;
 pub mod reply;
 pub mod schema;
@@ -25,6 +27,7 @@ pub mod types;
 
 /// Everything a typical actor author needs.
 pub mod prelude {
+    pub use crate::builder::{spawn_es_builder, spawn_foreign, spawn_service_builder};
     pub use crate::context::*;
     pub use crate::envelope::*;
     pub use crate::schema::*;

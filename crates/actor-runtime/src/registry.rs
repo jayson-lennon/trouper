@@ -209,15 +209,22 @@ pub enum RegistryError {
     PathTaken(ActorPath),
     /// No slot exists under this path.
     UnknownPath(ActorPath),
+    /// A pool/partition spec referenced no workers, or violated its own
+    /// contract (e.g. no command schema carries the declared shard key).
+    InvalidSpec,
 }
 
-/// All kernel tables: slots, schemas, routes, and the round-robin cursor.
+/// All kernel tables: slots, schemas, routes, pools/partitions, and rules.
 #[derive(Debug, Default)]
 pub struct Registry {
     schemas: SchemaTable,
     slots: HashMap<ActorPath, Slot>,
     routes: HashMap<SchemaId, RoutePolicy>,
     route_cursor: usize,
+    /// Stateless pools by PUBLIC path (workers own the real slots).
+    pub pools: HashMap<ActorPath, crate::pool::PoolEntry>,
+    /// Router rules in declaration (priority) order.
+    pub rules: Vec<crate::pool::Rule>,
 }
 
 impl Registry {
@@ -359,6 +366,51 @@ impl Registry {
             slot.manifest.emits.push(schema);
         }
         Ok(())
+    }
+
+    /// Installs a stateless pool over `public`: the pool owns the routing
+    /// decision for the public name; workers own the deliverable slots.
+    ///
+    /// # Errors
+    ///
+    /// [`RegistryError::InvalidSpec`] when the worker list is empty or any
+    /// worker has no slot (spawn workers BEFORE installing the pool).
+    pub fn install_pool(
+        &mut self,
+        public: ActorPath,
+        entry: crate::pool::PoolEntry,
+    ) -> Result<(), error_stack::Report<RegistryError>> {
+        use error_stack::IntoReport;
+        if entry.workers.is_empty() {
+            return Err(RegistryError::InvalidSpec
+                .into_report()
+                .attach(format!("pool {public} has no workers")));
+        }
+        for worker in &entry.workers {
+            if !self.slots.contains_key(worker) {
+                return Err(RegistryError::InvalidSpec
+                    .into_report()
+                    .attach(format!("pool worker {worker} has no slot")));
+            }
+        }
+        self.pools.insert(public, entry);
+        Ok(())
+    }
+
+    /// Appends a router rule (declaration order is priority order).
+    pub fn add_rule(&mut self, rule: crate::pool::Rule) {
+        self.rules.push(rule);
+    }
+
+    /// Destination set for a schema's route (tests/canvas introspection).
+    pub fn route_dests(&self, schema: &SchemaId) -> Vec<ActorPath> {
+        self.routes
+            .get(schema)
+            .map(|policy| match policy {
+                RoutePolicy::Single(path) => vec![path.clone()],
+                RoutePolicy::RoundRobin(paths) => paths.clone(),
+            })
+            .unwrap_or_default()
     }
 
     /// Resolves a path to a deliverable endpoint, if the actor is running.

@@ -120,6 +120,10 @@ pub struct KernelState {
     pub specs: HashMap<ActorPath, crate::supervision::ChildSpec>,
     /// Sliding-window failure records: path → window.
     pub failures: HashMap<ActorPath, crate::supervision::FailureWindow>,
+    /// Per-actor backpressure watermarks: path → (high watermark, fired).
+    /// `fired` latches the up-crossing (down-crossings re-arm it), so a
+    /// sustained overload produces ONE fact, not one per message.
+    pub watermarks: HashMap<ActorPath, (u64, bool)>,
 }
 
 impl Default for KernelState {
@@ -149,6 +153,7 @@ impl KernelState {
             tap: crate::tap::TapRing::new(tap_capacity),
             specs: HashMap::new(),
             failures: HashMap::new(),
+            watermarks: HashMap::new(),
         }
     }
 }
@@ -244,9 +249,66 @@ pub async fn route(
     let dest = envelope.dest.clone();
     match dest {
         Address::Path(ref path) => {
+            // RULES first: a matching rule places an observer relative to
+            // the flow (Tee copies with a linked causality; Inline
+            // interposes the observer in the primary's place).
+            let (delivery, primary_dest) = {
+                let reg = registry.lock().expect("registry lock");
+                apply_rules(&reg, &envelope, path.clone())
+            };
+            if let Some(tee) = delivery {
+                // Tee: deliver the copy BEFORE the primary (same position
+                // in the flow, at-most-once). The copy carries a NEW
+                // causality id under the ORIGINAL's trace id — the Sent
+                // fact keeps the original trace so the two deliveries
+                // link observably without looking like a two-hop chain.
+                let (mut copy, tee_dest, origin_trace) = tee;
+                copy.trace.trace_id = origin_trace.trace_id;
+                copy.trace.causality_id = crate::types::CausalityId::new();
+                let endpoint = {
+                    let reg = registry.lock().expect("registry lock");
+                    reg.resolve(&tee_dest)
+                };
+                if let Some(endpoint) = endpoint {
+                    let _ = deliver_with_retry(&endpoint, copy).await;
+                    let mut kernel_table = kernel.lock().expect("kernel lock");
+                    kernel_table.tap.push(
+                        origin_trace.causality_id.as_millis_ts(),
+                        crate::tap::FactKind::Sent {
+                            from: envelope.from.clone(),
+                            dest: Address::Path(tee_dest.clone()),
+                            schema: envelope.schema.clone(),
+                            trace: origin_trace,
+                        },
+                    );
+                }
+                // No tee endpoint → the copy is silently dropped: a tee is
+                // best-effort by contract (never blocks the primary flow).
+            }
+            let path = match primary_dest {
+                Some(interposed) => {
+                    // Inline: the envelope's primary delivery goes to the
+                    // interposer, which owns forwarding.
+                    interposed
+                }
+                None => path.clone(),
+            };
+            // POOLS: a public pool path resolves to ONE worker (algo pick).
+            let path = {
+                let reg = registry.lock().expect("registry lock");
+                match reg.pools.get(&path) {
+                    Some(pool) => {
+                        let idx = pool
+                            .algo
+                            .pick(pool.workers.len(), &pool.next);
+                        pool.workers[idx].clone()
+                    }
+                    None => path,
+                }
+            };
             let endpoint = {
                 let registry = registry.lock().expect("registry lock");
-                registry.resolve(path)
+                registry.resolve(&path)
             };
             match endpoint {
                 Some(endpoint) => deliver_with_retry(&endpoint, envelope.clone()).await?,
@@ -264,7 +326,7 @@ pub async fn route(
                     },
                 );
             }
-            Ok(path.clone())
+            Ok(path)
         }
         Address::Slot(_) => Err(envelope), // reply routing: ctx only
         Address::Schema(ref schema) => {
@@ -316,6 +378,71 @@ pub async fn route(
             Ok(ActorPath::new(label.as_str()))
         }
     }
+}
+
+/// Applies the first matching router rule to a path-addressed envelope.
+///
+/// Returns `(tee, inline_dest)`:
+/// - `tee`: `Some((copy, observer, origin_trace))` when a Tee rule matched —
+///   the copy carries a NEW causality id whose trace links to the original
+///   (two deliveries of one message never look like a chain of two hops).
+/// - `inline_dest`: `Some(interposer)` when an Inline rule matched — the
+///   primary envelope is delivered to the interposer in the original's place.
+///
+/// First match wins (declaration order is priority order).
+fn apply_rules(
+    registry: &Registry,
+    envelope: &Envelope,
+    dest: ActorPath,
+) -> (
+    Option<(Envelope, ActorPath, crate::envelope::TraceCtx)>,
+    Option<ActorPath>,
+) {
+    let mut tee = None;
+    let mut inline = None;
+    for rule in &registry.rules {
+        if let Some(src) = &rule.source
+            && envelope.from.as_ref() != Some(src)
+        {
+            continue;
+        }
+        if let Some(schema) = &rule.schema && envelope.schema != *schema {
+            continue;
+        }
+        if let Some(rule_dest) = &rule.dest && *rule_dest != dest {
+            continue;
+        }
+        match &rule.action {
+            crate::pool::RuleAction::Tee(observer) => {
+                let origin_trace = envelope.trace;
+                let mut trace = origin_trace;
+                // New causality for the copy, same trace id: a fresh cause
+                // INSIDE the original's trace, never a chain of two hops.
+                trace.causality_id = crate::types::CausalityId::new();
+                let Some(payload) = envelope.as_json().cloned() else {
+                    return (tee, inline); // typed payload: not teeable at the waist
+                };
+                let copy = Envelope::json(
+                    envelope.schema.clone(),
+                    Address::Path(observer.clone()),
+                    payload,
+                    trace,
+                )
+                .from(
+                    envelope
+                        .from
+                        .clone()
+                        .unwrap_or_else(|| ActorPath::new("anonymous")),
+                );
+                tee = Some((copy, observer.clone(), origin_trace));
+            }
+            crate::pool::RuleAction::Inline(interposer) => {
+                inline = Some(interposer.clone());
+            }
+        }
+        break; // first match wins
+    }
+    (tee, inline)
 }
 
 /// Dead-letters an envelope into the kernel's inspectable record.
@@ -409,6 +536,25 @@ pub async fn front_door_loop(
                 }
             }
         };
+        // WATERMARK CHECK (rate-limited): fires on the UP-crossing only;
+        // the latch re-arms when the depth falls back to/below the mark.
+        let depth = cell.inbox.lock().await.len() as u64;
+        let mut kernel_state = kernel.lock().expect("kernel lock");
+        if let Some((wm, fired)) = kernel_state.watermarks.get_mut(&cell.path) {
+            if depth > *wm && !*fired {
+                *fired = true;
+                kernel_state.tap.push(
+                    envelope.trace.causality_id.as_millis_ts(),
+                    crate::tap::FactKind::Backpressured {
+                        path: cell.path.clone(),
+                        depth,
+                    },
+                );
+            } else if depth <= *wm && *fired {
+                *fired = false;
+            }
+        }
+        drop(kernel_state);
         if accepted {
             cell.work.notify_one();
         }
