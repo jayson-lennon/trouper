@@ -1240,7 +1240,13 @@ pub async fn supervise_child(
         let now = system.clock.now().as_millis();
         let policy = spec.restart;
         if policy == crate::supervision::RestartPolicy::Never {
-            escalate(&system, &spec, "policy Never (crashed)").await;
+            escalate(
+                &system,
+                &spec,
+                "policy Never (crashed)",
+                crate::types::StopReason::Crashed,
+            )
+            .await;
             return;
         }
 
@@ -1253,7 +1259,13 @@ pub async fn supervise_child(
             window.exhausted(now, &spec.budget)
         };
         if budget_exhausted {
-            escalate(&system, &spec, "restart budget exhausted").await;
+            escalate(
+                &system,
+                &spec,
+                "restart budget exhausted",
+                crate::types::StopReason::Escalated,
+            )
+            .await;
             return;
         }
 
@@ -1338,10 +1350,20 @@ async fn escalate(
     system: &std::sync::Arc<crate::system::ActorSystem>,
     spec: &crate::supervision::ChildSpec,
     reason: &str,
+    stop_reason: crate::types::StopReason,
 ) {
     {
         let mut kernel = system.kernel.lock().expect("kernel lock");
         kernel.crashed.remove(&spec.path);
+        // The child is gone: record the stop WITH its typed reason, then
+        // the escalation.
+        kernel.tap.push(
+            system.clock.now(),
+            crate::tap::FactKind::Stopped {
+                path: spec.path.clone(),
+                reason: stop_reason,
+            },
+        );
         kernel.tap.push(
             system.clock.now(),
             crate::tap::FactKind::Escalated {

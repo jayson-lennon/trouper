@@ -1875,6 +1875,23 @@ mod tests {
             lines.iter().any(|l| l.starts_with("escalated:worker")),
             "parent received the escalation: {lines:?}"
         );
+
+        // And the tap recorded the child's stop WITH the typed
+        // budget-exhausted reason, before the escalation fact.
+        let facts = system.tap_facts();
+        let stopped_escalated = facts.iter().position(|f| {
+            matches!(&f.kind, crate::tap::FactKind::Stopped { path, reason }
+                if *path == worker && *reason == crate::types::StopReason::Escalated)
+        });
+        let escalated = facts.iter().position(
+            |f| matches!(&f.kind, crate::tap::FactKind::Escalated { path, .. } if *path == worker),
+        );
+        assert!(stopped_escalated.is_some(), "Stopped(Escalated) recorded");
+        assert!(escalated.is_some(), "Escalated recorded");
+        assert!(
+            stopped_escalated.unwrap() < escalated.unwrap(),
+            "stop precedes escalation"
+        );
     }
 
     #[tokio::test]
@@ -1996,6 +2013,86 @@ mod tests {
             )
         });
         assert!(notified, "parent notified of child stop");
+    }
+
+    #[tokio::test]
+    async fn never_policy_escalates_on_first_crash_without_restarting() {
+        // Given a supervised ES child with RestartPolicy::Never whose
+        // handler always panics.
+        let (system, _clock) = ActorSystem::test();
+        let child = Path::new("fragile");
+        system.register_schema::<Add>();
+        system.register_schema::<Added>();
+
+        #[derive(Serialize, Deserialize, Default)]
+        struct Fragile;
+        impl EventSourced for Fragile {
+            fn manifest() -> ActorManifest {
+                ActorManifest::new().kind(ActorKind::EventSourced)
+            }
+            fn restore(_args: &JsonValue) -> Self {
+                Self
+            }
+            fn apply(&mut self, _event: &crate::envelope::Event) {}
+        }
+        impl CommandHandler<Add> for Fragile {
+            fn handle(&self, _cmd: Add, _ctx: &mut CmdCtx<'_>) -> Vec<crate::envelope::Event> {
+                panic!("never survives");
+            }
+        }
+
+        let spec = crate::supervision::ChildSpec {
+            path: child.clone(),
+            parent: None,
+            restart: crate::supervision::RestartPolicy::Never,
+            budget: crate::supervision::RestartBudget::default(),
+            backoff: crate::supervision::Backoff::default(),
+            args: json!({}),
+            spawn: Arc::new(|sys: &Arc<ActorSystem>, path: &Path, args: &JsonValue| {
+                sys.spawn_es::<Fragile, _>(path.clone(), args, SpawnOpts::default(), || {
+                    vec![Arc::new(TypedEsAdapter::<Fragile, Add>::new::<Add>())]
+                });
+            }),
+        };
+        system.spawn_child(spec);
+
+        // When the child crashes once.
+        system
+            .send(system.envelope(Add::schema_id(), child.clone(), json!({ "n": 1 })))
+            .await
+            .expect("sent");
+
+        // Then it escalates immediately: the slot is gone and NEVER
+        // comes back (no restart despite the budget allowing 5).
+        let mut slot_gone = false;
+        for _ in 0..2_000 {
+            slot_gone = {
+                let registry = system.registry.lock().expect("lock");
+                registry.resolve(&child).is_none()
+            };
+            if slot_gone {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        assert!(slot_gone, "Never policy removed the slot after one crash");
+
+        // And exactly one stop was recorded, with the Crashed reason.
+        wait_for(|| async {
+            system.tap_facts().iter().any(|f| {
+                matches!(&f.kind, crate::tap::FactKind::Stopped { path, reason }
+                    if *path == child && *reason == crate::types::StopReason::Crashed)
+            })
+        })
+        .await;
+        let spawn_count = system
+            .tap_facts()
+            .iter()
+            .filter(
+                |f| matches!(&f.kind, crate::tap::FactKind::Spawned { path, .. } if *path == child),
+            )
+            .count();
+        assert_eq!(spawn_count, 1, "no restart after the crash");
     }
 
     #[tokio::test]
