@@ -1,6 +1,25 @@
-[package]
-name = "actor-canvas"
+[workspace]
+resolver = "2"
+members = ["crates/*"]
+
+[workspace.package]
 version = "0.1.0"
 edition = "2024"
 
-[dependencies]
+[workspace.dependencies]
+actor-runtime = { path = "crates/actor-runtime" }
+tokio = { version = "1.53", features = ["rt-multi-thread", "sync", "time", "macros"] }
+serde = { version = "1.0", features = ["derive", "rc"] }
+serde_json = "1.0"
+uuid = { version = "1.26", features = ["v7", "serde"] }
+arc-swap = "1.9"
+wherror = "2.4"
+error-stack = "0.8"
+derive_more = { version = "2.1", features = ["debug"] }
+# dev
+rstest = "0.26"
+futures = "0.3"
+
+[profile.release]
+lto = true
+codegen-units = 1
