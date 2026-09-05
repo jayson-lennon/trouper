@@ -3416,6 +3416,170 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn restart_policy_never_escalates_immediately_without_restart() {
+        // Given a supervised child with RestartPolicy::Never whose handler
+        // always panics, and an overseer to receive the escalation.
+        #[derive(Serialize, Deserialize, Default)]
+        struct AlwaysBoom2;
+        impl EventSourced for AlwaysBoom2 {
+            fn manifest() -> ActorManifest {
+                ActorManifest::new()
+                    .handles::<Add>()
+                    .kind(ActorKind::EventSourced)
+            }
+            fn restore(_args: &JsonValue) -> Self {
+                Self
+            }
+            fn apply(&mut self, _event: &crate::envelope::Event) {}
+        }
+        impl CommandHandler<Add> for AlwaysBoom2 {
+            fn handle(&self, _cmd: Add, _ctx: &mut CmdCtx<'_>) -> Vec<crate::envelope::Event> {
+                panic!("never-restart child panics");
+            }
+        }
+
+        #[derive(serde::Deserialize)]
+        struct EscalatedMsg2 {
+            escalated: String,
+        }
+        impl Schema for EscalatedMsg2 {
+            fn schema_def() -> SchemaDef {
+                SchemaDef {
+                    name: "Escalated".into(),
+                    version: 1,
+                    kind: SchemaKind::Command,
+                    fields: vec![FieldDef::required("escalated", FieldTy::Str)],
+                    description: None,
+                }
+            }
+        }
+
+        struct Overseer2;
+        impl ServiceActor for Overseer2 {
+            fn manifest() -> ActorManifest {
+                ActorManifest::new()
+                    .handles::<EscalatedMsg2>()
+                    .kind(ActorKind::Service)
+            }
+            async fn start(
+                _args: &JsonValue,
+            ) -> Result<Self, error_stack::Report<crate::registry::RegistryError>> {
+                Ok(Self)
+            }
+        }
+        fn overseer_path() -> Path {
+            Path::new("overseer2")
+        }
+        impl MsgHandler<EscalatedMsg2> for Overseer2 {
+            async fn handle(&mut self, msg: EscalatedMsg2, _ctx: &mut crate::context::MsgCtx<'_>) {
+                if let Some(sink) = sink_table()
+                    .lock()
+                    .expect("sink table lock")
+                    .get(&overseer_path().to_string())
+                {
+                    sink.lock()
+                        .expect("sink lock")
+                        .push(format!("escalated:{}", msg.escalated));
+                }
+            }
+        }
+
+        let (system, _clock) = ActorSystem::test();
+        let overseer = Path::new("overseer2");
+        let (_sink_idx, overseer_sink) = open_sink();
+        bind_sink(&overseer, overseer_sink);
+        system.spawn_service::<Overseer2, _>(
+            overseer.clone(),
+            &json!({}),
+            SpawnOpts::default(),
+            || {
+                vec![Arc::new(
+                    TypedServiceAdapter::<Overseer2, EscalatedMsg2>::new::<EscalatedMsg2>(),
+                )]
+            },
+        );
+
+        let worker = Path::new("never-worker");
+        let spec = crate::supervision::ChildSpec {
+            path: worker.clone(),
+            parent: Some(overseer.clone()),
+            restart: crate::supervision::RestartPolicy::Never,
+            budget: crate::supervision::RestartBudget::per(5, std::time::Duration::from_secs(10)),
+            backoff: crate::supervision::Backoff {
+                base: std::time::Duration::from_millis(5),
+                max: std::time::Duration::from_millis(20),
+                factor: 2.0,
+            },
+            args: json!({}),
+            spawn: Arc::new(|sys: &Arc<ActorSystem>, path: &Path, args: &JsonValue| {
+                sys.spawn_es::<AlwaysBoom2, _>(path.clone(), args, SpawnOpts::default(), || {
+                    vec![Arc::new(TypedEsAdapter::<AlwaysBoom2, Add>::new::<Add>())]
+                });
+            }),
+        };
+        system.spawn_child(spec);
+
+        // When the child crashes once.
+        let _ = system
+            .send(system.envelope(Add::schema_id(), worker.clone(), json!({ "n": 1 })))
+            .await;
+
+        // Then the child was NOT restarted: exactly one Spawned fact (the
+        // initial spawn), no restart flag anywhere.
+        wait_for(|| async {
+            system
+                .tap_facts()
+                .iter()
+                .any(|f| matches!(f.kind, crate::tap::FactKind::Escalated { .. }))
+        })
+        .await;
+        let facts = system.tap_facts();
+        let worker_spawns: Vec<&crate::tap::Fact> = facts
+            .iter()
+            .filter(|f| matches!(&f.kind, crate::tap::FactKind::Spawned { path, .. } if *path == worker))
+            .collect();
+        assert_eq!(
+            worker_spawns.len(),
+            1,
+            "only the initial spawn: {worker_spawns:?}"
+        );
+        assert!(
+            !matches!(
+                worker_spawns[0].kind,
+                crate::tap::FactKind::Spawned { restart: true, .. }
+            ),
+            "Never must not restart"
+        );
+
+        // And the child stopped with the typed Crashed reason (the crash
+        // is what stopped it; Never means no restart, hence no escalation
+        // restart-cycle — the crash IS the terminal stop).
+        let facts = system.tap_facts();
+        assert!(
+            facts.iter().any(|f| matches!(
+                &f.kind,
+                crate::tap::FactKind::Stopped { path, reason }
+                    if *path == worker && *reason == crate::types::StopReason::Crashed
+            )),
+            "Stopped {{ Crashed }} expected: {:?}",
+            facts
+                .iter()
+                .filter(|f| matches!(f.kind, crate::tap::FactKind::Stopped { .. }))
+                .collect::<Vec<_>>()
+        );
+
+        // And the overseer received the escalation naming the child.
+        wait_for(|| async { !sink_read(&overseer).is_empty() }).await;
+        let lines = sink_read(&overseer);
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.starts_with("escalated:never-worker")),
+            "overseer received the escalation: {lines:?}"
+        );
+    }
+
+    #[tokio::test]
     async fn schema_addressed_sends_round_robin_across_two_handlers() {
         // Given TWO actors handling the same Add schema: the route table
         // holds both (adding the second converts Single → RoundRobin).
