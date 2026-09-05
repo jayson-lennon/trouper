@@ -353,7 +353,7 @@ async fn main() {
 
     println!("== 1. dynamic add ==");
     system.spawn_es::<Inventory, _>(
-        Path::new("warehouse"),
+        ActorPath::new("warehouse"),
         &json!({}),
         SpawnOpts {
             snapshot: SnapshotPolicy::EveryN(3),
@@ -368,7 +368,7 @@ async fn main() {
         },
     );
     system.spawn_service::<AuditLog, _>(
-        Path::new("auditor"),
+        ActorPath::new("auditor"),
         &json!({}),
         SpawnOpts::default(),
         || {
@@ -385,7 +385,7 @@ async fn main() {
     );
     let tally_schema = foreign_schema.clone();
     system.spawn_es_foreign(
-        Path::new("tally"),
+        ActorPath::new("tally"),
         foreign_schema.clone(),
         json!({ "total": 0 }),
         Arc::new(move |_state, cmd, _ctx| {
@@ -407,24 +407,30 @@ async fn main() {
     println!("== 2. commands → events → topic ==");
     let topic = Topic::new("inventory.events");
     system
-        .subscribe(&Path::new("auditor"), &topic, None)
+        .subscribe(&ActorPath::new("auditor"), &topic, None)
         .expect("subscribe");
     for qty in [5, 4] {
         system
             .send(system.envelope(
                 ReserveStock::schema_id(),
-                Path::new("warehouse"),
+                ActorPath::new("warehouse"),
                 json!({ "sku": "widget", "qty": qty }),
             ))
             .await
             .expect("delivered");
     }
     system
-        .send(system.envelope(foreign_schema, Path::new("tally"), json!({ "delta": 9 })))
+        .send(system.envelope(
+            foreign_schema,
+            ActorPath::new("tally"),
+            json!({ "delta": 9 }),
+        ))
         .await
         .expect("delivered");
-    wait(|| async { system.es_state(&Path::new("tally")).await == Some(json!({ "total": 9 })) })
-        .await;
+    wait(|| async {
+        system.es_state(&ActorPath::new("tally")).await == Some(json!({ "total": 9 }))
+    })
+    .await;
     println!(
         "   tap facts: {:?}",
         system
@@ -449,7 +455,7 @@ async fn main() {
     system
         .send(system.envelope(
             Explode::schema_id(),
-            Path::new("warehouse"),
+            ActorPath::new("warehouse"),
             json!({ "why": "demo" }),
         ))
         .await
@@ -458,7 +464,7 @@ async fn main() {
     system
         .send(system.envelope(
             Restock::schema_id(),
-            Path::new("warehouse"),
+            ActorPath::new("warehouse"),
             json!({ "sku": "widget", "qty": 7 }),
         ))
         .await
@@ -467,7 +473,7 @@ async fn main() {
         system
             .tap_facts()
             .iter()
-            .any(|f| matches!(&f.kind, actor_runtime::tap::FactKind::Failed { path, .. } if path == &Path::new("warehouse")))
+            .any(|f| matches!(&f.kind, actor_runtime::tap::FactKind::Failed { path, .. } if path == &ActorPath::new("warehouse")))
     })
     .await;
     println!("   warehouse crashed mid-message (Failed fact emitted)");
@@ -477,20 +483,20 @@ async fn main() {
     // panics again, which is the contract: redelivery is at-least-once
     // and the failed command produced no events.
     system
-        .restart_es(&Path::new("warehouse"), &json!({}))
+        .restart_es(&ActorPath::new("warehouse"), &json!({}))
         .await
         .expect("restart");
     wait(|| async {
         system
             .tap_facts()
             .iter()
-            .filter(|f| matches!(&f.kind, actor_runtime::tap::FactKind::Failed { path, .. } if path == &Path::new("warehouse")))
+            .filter(|f| matches!(&f.kind, actor_runtime::tap::FactKind::Failed { path, .. } if path == &ActorPath::new("warehouse")))
             .count()
             >= 2
     })
     .await;
     let state = system
-        .es_state(&Path::new("warehouse"))
+        .es_state(&ActorPath::new("warehouse"))
         .await
         .expect("state");
     println!("   redelivered poison panicked again (at-least-once); state: {state}");
@@ -498,14 +504,14 @@ async fn main() {
     // Flush the poison out of the queue (stop → DLQ — the pending
     // restock is undeliverable while the actor is down), then re-add at
     // the SAME path: identity is the path, so senders never care.
-    system.stop(&Path::new("warehouse")).await;
+    system.stop(&ActorPath::new("warehouse")).await;
     let dead_letters = system.dead_letter_count().await;
     println!(
         "   stopped; undelivered flushed to the DLQ ({} total)",
         dead_letters
     );
     system.spawn_es::<Inventory, _>(
-        Path::new("warehouse"),
+        ActorPath::new("warehouse"),
         &json!({}),
         SpawnOpts {
             snapshot: SnapshotPolicy::EveryN(3),
@@ -522,21 +528,21 @@ async fn main() {
     system
         .send(system.envelope(
             Restock::schema_id(),
-            Path::new("warehouse"),
+            ActorPath::new("warehouse"),
             json!({ "sku": "widget", "qty": 7 }),
         ))
         .await
         .expect("delivered to the re-added path");
     wait(|| async {
         system
-            .es_state(&Path::new("warehouse"))
+            .es_state(&ActorPath::new("warehouse"))
             .await
             .and_then(|s| s["total"].as_i64())
             == Some(7)
     })
     .await;
     let state = system
-        .es_state(&Path::new("warehouse"))
+        .es_state(&ActorPath::new("warehouse"))
         .await
         .expect("state");
     println!("   re-added at the same path; fresh restock delivered: {state}");
@@ -549,7 +555,7 @@ async fn main() {
         system
             .send(system.envelope(
                 Restock::schema_id(),
-                Path::new("warehouse"),
+                ActorPath::new("warehouse"),
                 json!({ "sku": "widget", "qty": qty }),
             ))
             .await
@@ -557,7 +563,7 @@ async fn main() {
     }
     wait(|| async {
         system
-            .inbox_cursor(&Path::new("warehouse"))
+            .inbox_cursor(&ActorPath::new("warehouse"))
             .map(|c| c.as_u64())
             == Some(3)
     })
@@ -569,7 +575,7 @@ async fn main() {
     system
         .send(system.envelope(
             Explode::schema_id(),
-            Path::new("warehouse"),
+            ActorPath::new("warehouse"),
             json!({ "why": "snapshot demo" }),
         ))
         .await
@@ -578,17 +584,17 @@ async fn main() {
         system
             .tap_facts()
             .iter()
-            .filter(|f| matches!(&f.kind, actor_runtime::tap::FactKind::Failed { path, .. } if path == &Path::new("warehouse")))
+            .filter(|f| matches!(&f.kind, actor_runtime::tap::FactKind::Failed { path, .. } if path == &ActorPath::new("warehouse")))
             .count()
             >= 3
     })
     .await;
     system
-        .restart_es(&Path::new("warehouse"), &json!({}))
+        .restart_es(&ActorPath::new("warehouse"), &json!({}))
         .await
         .expect("restart");
     let state = system
-        .es_state(&Path::new("warehouse"))
+        .es_state(&ActorPath::new("warehouse"))
         .await
         .expect("state");
     println!("   state after snapshot-anchored restart: {state} (folded total survived)");
@@ -596,9 +602,9 @@ async fn main() {
     // The poison was redelivered (it panicked again — at-least-once);
     // flush it through stop → DLQ, and re-add at the same path so the
     // next beats start clean.
-    system.stop(&Path::new("warehouse")).await;
+    system.stop(&ActorPath::new("warehouse")).await;
     system.spawn_es::<Inventory, _>(
-        Path::new("warehouse"),
+        ActorPath::new("warehouse"),
         &json!({}),
         SpawnOpts::default(),
         || {
@@ -618,7 +624,7 @@ async fn main() {
     println!("== 5. topic re-consume ==");
     let (floor, _) = system.topic_range(&topic).expect("topic live");
     system
-        .reset_topic_cursor(&Path::new("auditor"), &topic, floor)
+        .reset_topic_cursor(&ActorPath::new("auditor"), &topic, floor)
         .expect("reset");
     let before = audit_log().lock().expect("lock").len();
     // A fresh publish triggers the pump pass that also serves the reset
@@ -627,14 +633,14 @@ async fn main() {
     system
         .send(system.envelope(
             Restock::schema_id(),
-            Path::new("warehouse"),
+            ActorPath::new("warehouse"),
             json!({ "sku": "widget", "qty": 1 }),
         ))
         .await
         .expect("delivered");
     wait(|| async {
         system
-            .inbox_cursor(&Path::new("warehouse"))
+            .inbox_cursor(&ActorPath::new("warehouse"))
             .map(|c| c.as_u64())
             == Some(1)
     })
@@ -647,14 +653,19 @@ async fn main() {
 
     // -- 6. Ask: reply + timeout -------------------------------------------
     println!("== 6. ask (reply and timeout) ==");
-    system.spawn_service::<Asker, _>(Path::new("asker"), &json!({}), SpawnOpts::default(), || {
-        vec![Arc::new(TypedServiceAdapter::<Asker, RunAsks>::new::<
-            RunAsks,
-        >())]
-    });
+    system.spawn_service::<Asker, _>(
+        ActorPath::new("asker"),
+        &json!({}),
+        SpawnOpts::default(),
+        || {
+            vec![Arc::new(TypedServiceAdapter::<Asker, RunAsks>::new::<
+                RunAsks,
+            >())]
+        },
+    );
     bind_ask_results(&system);
     system
-        .send(system.envelope(RunAsks::schema_id(), Path::new("asker"), json!({})))
+        .send(system.envelope(RunAsks::schema_id(), ActorPath::new("asker"), json!({})))
         .await
         .expect("enqueued");
     wait(|| async { ask_results().lock().expect("lock").len() >= 2 }).await;
@@ -664,7 +675,7 @@ async fn main() {
 
     // -- 7. Remove + export -------------------------------------------------
     println!("== 7. remove + export ==");
-    system.stop(&Path::new("tally")).await;
+    system.stop(&ActorPath::new("tally")).await;
     let export = system.export().await;
     println!("{}", serde_json::to_string_pretty(&export).expect("json"));
 
@@ -676,7 +687,7 @@ async fn main() {
         export
             .actors
             .iter()
-            .find(|a| a.path == Path::new("warehouse"))
+            .find(|a| a.path == ActorPath::new("warehouse"))
             .and_then(|a| a.state.clone())
     );
     println!("demo complete");
@@ -748,7 +759,7 @@ impl MsgHandler<RunAsks> for Asker {
         // Inline ask that replies in time.
         let reply = ctx
             .ask(
-                actor_runtime::envelope::Address::Path(Path::new("auditor")),
+                actor_runtime::envelope::Address::Path(ActorPath::new("auditor")),
                 Probe::schema_id(),
                 json!({ "body": "hello" }),
                 Duration::from_secs(2),
@@ -764,7 +775,7 @@ impl MsgHandler<RunAsks> for Asker {
         // produces an AskSettled(Timeout) fact.
         let outcome = ctx
             .ask(
-                actor_runtime::envelope::Address::Path(Path::new("nobody")),
+                actor_runtime::envelope::Address::Path(ActorPath::new("nobody")),
                 Probe::schema_id(),
                 json!({ "body": "anyone there?" }),
                 Duration::from_millis(80),

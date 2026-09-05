@@ -487,7 +487,7 @@ impl ServiceAny for dyn DynServiceActor {
 mod tests {
     use super::*;
     use crate::schema::{FieldDef, FieldTy, SchemaDef, SchemaKind};
-    use crate::types::{ActorKind, Path};
+    use crate::types::{ActorKind, ActorPath};
     use serde::Deserialize;
     use serde_json::json;
 
@@ -640,10 +640,10 @@ mod tests {
         use crate::context::{CtxCore, Outbox, RuntimeView};
         struct NullView;
         impl RuntimeView for NullView {
-            fn lookup(&self, _path: &Path) -> Option<crate::registry::EndpointInfo> {
+            fn lookup(&self, _path: &ActorPath) -> Option<crate::registry::EndpointInfo> {
                 None
             }
-            fn who_handles(&self, _schema: &SchemaId) -> Vec<Path> {
+            fn who_handles(&self, _schema: &SchemaId) -> Vec<ActorPath> {
                 Vec::new()
             }
             fn now(&self) -> crate::types::Timestamp {
@@ -651,7 +651,7 @@ mod tests {
             }
         }
         let trace = crate::envelope::TraceCtx::root();
-        let path = Path::new("counter");
+        let path = ActorPath::new("counter");
         let mut outbox = Outbox::new();
         let mut ctx = CmdCtx(CtxCore {
             self_path: &path,
@@ -692,10 +692,10 @@ mod tests {
         use crate::context::{CtxCore, Outbox, RuntimeView};
         struct NullView;
         impl RuntimeView for NullView {
-            fn lookup(&self, _path: &Path) -> Option<crate::registry::EndpointInfo> {
+            fn lookup(&self, _path: &ActorPath) -> Option<crate::registry::EndpointInfo> {
                 None
             }
-            fn who_handles(&self, _schema: &SchemaId) -> Vec<Path> {
+            fn who_handles(&self, _schema: &SchemaId) -> Vec<ActorPath> {
                 Vec::new()
             }
             fn now(&self) -> crate::types::Timestamp {
@@ -703,7 +703,7 @@ mod tests {
             }
         }
         let trace = crate::envelope::TraceCtx::root();
-        let path = Path::new("counter");
+        let path = ActorPath::new("counter");
         let mut outbox = Outbox::new();
         let mut ctx = CmdCtx(CtxCore {
             self_path: &path,
@@ -742,10 +742,10 @@ mod tests {
         use crate::context::{CtxCore, Outbox, RuntimeView};
         struct NullView;
         impl RuntimeView for NullView {
-            fn lookup(&self, _path: &Path) -> Option<crate::registry::EndpointInfo> {
+            fn lookup(&self, _path: &ActorPath) -> Option<crate::registry::EndpointInfo> {
                 None
             }
-            fn who_handles(&self, _schema: &SchemaId) -> Vec<Path> {
+            fn who_handles(&self, _schema: &SchemaId) -> Vec<ActorPath> {
                 Vec::new()
             }
             fn now(&self) -> crate::types::Timestamp {
@@ -753,7 +753,7 @@ mod tests {
             }
         }
         let trace = crate::envelope::TraceCtx::root();
-        let path = Path::new("foreign");
+        let path = ActorPath::new("foreign");
         let mut outbox = Outbox::new();
         let mut ctx = CmdCtx(CtxCore {
             self_path: &path,

@@ -16,7 +16,7 @@ use uuid::Uuid;
 /// maps the path to a swappable endpoint slot.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
-pub struct Path(Arc<str>);
+pub struct ActorPath(Arc<str>);
 
 /// A pub/sub topic name, e.g. `inventory.events`.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -94,7 +94,7 @@ pub enum DeadLetterReason {
     StoppedWithMail,
 }
 
-impl Path {
+impl ActorPath {
     /// Creates a path from a string.
     pub fn new(s: impl Into<Arc<str>>) -> Self {
         Self(s.into())
@@ -269,7 +269,7 @@ impl Timestamp {
     }
 }
 
-impl fmt::Display for Path {
+impl fmt::Display for ActorPath {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(&self.0)
     }
@@ -318,11 +318,11 @@ mod tests {
     #[test]
     fn path_survives_serde_roundtrip() {
         // Given an actor path.
-        let path = Path::new("inventory.west");
+        let path = ActorPath::new("inventory.west");
 
         // When round-tripping through JSON.
         let json = serde_json::to_string(&path).expect("serialize");
-        let round: Path = serde_json::from_str(&json).expect("deserialize");
+        let round: ActorPath = serde_json::from_str(&json).expect("deserialize");
 
         // Then the value is preserved as a bare string.
         assert_eq!(json, "\"inventory.west\"");
@@ -332,7 +332,7 @@ mod tests {
     #[test]
     fn path_displays_as_bare_name() {
         // Given an actor path.
-        let path = Path::new("inventory.west");
+        let path = ActorPath::new("inventory.west");
 
         // When displaying it.
         let rendered = path.to_string();

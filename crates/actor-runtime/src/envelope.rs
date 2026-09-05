@@ -8,13 +8,13 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 
-use crate::types::{CausalityId, LeaseId, Path, SchemaId, Topic, TraceId};
+use crate::types::{ActorPath, CausalityId, LeaseId, SchemaId, Topic, TraceId};
 
 /// Where a message is headed.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum Address {
     /// A named actor's inbox.
-    Path(Path),
+    Path(ActorPath),
     /// A topic's fan of subscriber inboxes.
     Topic(Topic),
     /// A reply slot for an in-flight `ask`; a mechanism, dies with the ask.
@@ -114,7 +114,7 @@ pub struct Envelope {
     /// Where the message is headed.
     pub dest: Address,
     /// The logical sending path, when the sender is an actor.
-    pub from: Option<Path>,
+    pub from: Option<ActorPath>,
     /// Where a reply should go: a durable [`Address::Path`] or a mechanism
     /// [`Address::Slot`].
     pub reply_to: Option<Address>,
@@ -166,7 +166,7 @@ impl Envelope {
     }
 
     /// Sets the logical sender.
-    pub fn from(mut self, from: Path) -> Self {
+    pub fn from(mut self, from: ActorPath) -> Self {
         self.from = Some(from);
         self
     }
@@ -206,7 +206,7 @@ mod tests {
     fn address_survives_serde_roundtrip_for_each_variant() {
         // Given one address of each variant.
         let addresses = [
-            Address::Path(Path::new("inventory.west")),
+            Address::Path(ActorPath::new("inventory.west")),
             Address::Topic(Topic::new("inventory.events")),
             Address::Slot(LeaseId::new()),
         ];
@@ -252,12 +252,12 @@ mod tests {
         // Given a JSON envelope with sender and reply-to set.
         let envelope = Envelope::json(
             SchemaId::new("ReserveStock", 1),
-            Address::Path(Path::new("inventory.west")),
+            Address::Path(ActorPath::new("inventory.west")),
             json!({ "sku": "widget", "qty": 2 }),
             TraceCtx::root(),
         )
-        .from(Path::new("storefront"))
-        .reply_to(Address::Path(Path::new("storefront")));
+        .from(ActorPath::new("storefront"))
+        .reply_to(Address::Path(ActorPath::new("storefront")));
 
         // When reading the payload back out.
         let payload = envelope.as_json().expect("json payload");
@@ -270,7 +270,7 @@ mod tests {
         );
         assert_eq!(
             envelope.reply_to,
-            Some(Address::Path(Path::new("storefront")))
+            Some(Address::Path(ActorPath::new("storefront")))
         );
         assert_eq!(payload["sku"], "widget");
     }
@@ -280,7 +280,7 @@ mod tests {
         // Given a typed envelope.
         let envelope = Envelope::typed(
             SchemaId::new("Tick", 1),
-            Address::Path(Path::new("a")),
+            Address::Path(ActorPath::new("a")),
             42u32,
             TraceCtx::root(),
         );

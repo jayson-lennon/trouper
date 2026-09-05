@@ -32,7 +32,7 @@ use crate::envelope::{Address, Envelope, TraceCtx};
 use crate::inbox::Inbox;
 use crate::journal::{Journal, JournalEntry, JournalError};
 use crate::registry::{Endpoint, Registry};
-use crate::types::{InboxOffset, Path, SchemaId, SeqNo};
+use crate::types::{ActorPath, InboxOffset, SchemaId, SeqNo};
 
 /// How often an ES actor takes journal snapshots. Default: OFF.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -91,23 +91,23 @@ pub struct AskFact {
 /// Guarded by one lock — these mutate together (spawn inserts into every
 /// table; restart swaps state + endpoint as one observation).
 pub struct KernelState {
-    pub cells: HashMap<Path, Arc<ActorCell>>,
-    pub journals: HashMap<Path, Journal>,
-    pub es_state: HashMap<Path, Arc<tokio::sync::Mutex<Box<dyn DynEsActor>>>>,
-    pub entries: HashMap<Path, Vec<Arc<dyn CommandEntry>>>,
-    pub snapshot_policy: HashMap<Path, SnapshotPolicy>,
+    pub cells: HashMap<ActorPath, Arc<ActorCell>>,
+    pub journals: HashMap<ActorPath, Journal>,
+    pub es_state: HashMap<ActorPath, Arc<tokio::sync::Mutex<Box<dyn DynEsActor>>>>,
+    pub entries: HashMap<ActorPath, Vec<Arc<dyn CommandEntry>>>,
+    pub snapshot_policy: HashMap<ActorPath, SnapshotPolicy>,
     /// Live service instances (service actors are not journaled).
-    pub services: HashMap<Path, Arc<tokio::sync::Mutex<Box<dyn DynServiceActor>>>>,
+    pub services: HashMap<ActorPath, Arc<tokio::sync::Mutex<Box<dyn DynServiceActor>>>>,
     /// Reply-slot leases (the mechanism half of reply addresses).
     pub replies: crate::reply::ReplyTable,
     /// Ask lifecycle facts (the tap consumes these in Phase 7).
     pub ask_facts: Vec<AskFact>,
     /// Per-actor async message dispatch entries.
-    pub msg_entries: HashMap<Path, Vec<Arc<dyn MsgEntry>>>,
+    pub msg_entries: HashMap<ActorPath, Vec<Arc<dyn MsgEntry>>>,
     /// Spawn args (genesis rebuild needs them at restart time).
-    pub genesis_args: HashMap<Path, JsonValue>,
+    pub genesis_args: HashMap<ActorPath, JsonValue>,
     /// Paths whose loop died to a handler panic (awaiting supervision).
-    pub crashed: HashSet<Path>,
+    pub crashed: HashSet<ActorPath>,
     /// Envelopes that could not be delivered or decoded.
     pub dead_letters: Vec<DeadLetter>,
     /// Topic logs: bounded rings with per-subscriber cursors.
@@ -117,9 +117,9 @@ pub struct KernelState {
     /// The global observation ring (drop-oldest).
     pub tap: crate::tap::TapRing,
     /// Supervised children: path → spec.
-    pub specs: HashMap<Path, crate::supervision::ChildSpec>,
+    pub specs: HashMap<ActorPath, crate::supervision::ChildSpec>,
     /// Sliding-window failure records: path → window.
-    pub failures: HashMap<Path, crate::supervision::FailureWindow>,
+    pub failures: HashMap<ActorPath, crate::supervision::FailureWindow>,
 }
 
 impl Default for KernelState {
@@ -174,7 +174,7 @@ pub struct ActorHandle {
 /// Everything the runtime owns for one actor across restarts.
 pub struct ActorCell {
     /// The actor's path (its identity).
-    pub path: Path,
+    pub path: ActorPath,
     /// The runtime-owned inbox (survives endpoint swaps).
     pub inbox: tokio::sync::Mutex<Inbox>,
     /// The mailbox front door registered in the registry slot.
@@ -188,7 +188,7 @@ pub struct ActorCell {
 
 impl ActorCell {
     /// Creates a cell with a fresh inbox; the endpoint arrives on start.
-    pub fn new(path: Path, inbox: Inbox) -> Self {
+    pub fn new(path: ActorPath, inbox: Inbox) -> Self {
         Self {
             path,
             inbox: tokio::sync::Mutex::new(inbox),
@@ -208,7 +208,7 @@ impl ActorCell {
 #[derive(Clone)]
 pub struct EsLoop {
     /// The actor's path.
-    pub path: Path,
+    pub path: ActorPath,
     /// The actor's cell (inbox + front door).
     pub cell: Arc<ActorCell>,
     /// The shared routing table.
@@ -240,7 +240,7 @@ pub async fn route(
     registry: &Mutex<Registry>,
     kernel: &Mutex<KernelState>,
     envelope: Envelope,
-) -> Result<Path, Envelope> {
+) -> Result<ActorPath, Envelope> {
     let dest = envelope.dest.clone();
     match dest {
         Address::Path(ref path) => {
@@ -313,7 +313,7 @@ pub async fn route(
                 );
             }
             let label = format!("topic:{topic}");
-            Ok(Path::new(label.as_str()))
+            Ok(ActorPath::new(label.as_str()))
         }
     }
 }
@@ -653,7 +653,7 @@ async fn flush_outbox(ctx: &EsLoop, mut outbox: Outbox) {
 fn apply_subscribe(
     kernel: &Mutex<KernelState>,
     registry: &Mutex<Registry>,
-    path: &Path,
+    path: &ActorPath,
     topic: &crate::types::Topic,
 ) {
     let policy = {
@@ -734,7 +734,7 @@ impl crate::context::AskPort for KernelAskPort {
                 kernel.tap.push(
                     now,
                     crate::tap::FactKind::AskOpened {
-                        from: Path::new("anonymous"),
+                        from: ActorPath::new("anonymous"),
                         dest: dest.clone(),
                         trace,
                     },
@@ -837,7 +837,7 @@ async fn pump_topic(
     registry: &Mutex<Registry>,
     topic: &crate::types::Topic,
 ) {
-    let targets: Vec<(Path, std::sync::Arc<Endpoint>)> = {
+    let targets: Vec<(ActorPath, std::sync::Arc<Endpoint>)> = {
         let kernel = kernel.lock().expect("kernel lock");
         let registry = registry.lock().expect("registry lock");
         kernel
@@ -1382,7 +1382,10 @@ pub async fn supervise_child(
 
 /// Whether `path` is a journaled (EventSourced) child: the engine must
 /// recover it through `restart_es` rather than a fresh spawn.
-fn system_is_es_child(system: &std::sync::Arc<crate::system::ActorSystem>, path: &Path) -> bool {
+fn system_is_es_child(
+    system: &std::sync::Arc<crate::system::ActorSystem>,
+    path: &ActorPath,
+) -> bool {
     let kernel = system.kernel.lock().expect("kernel lock");
     kernel.es_state.contains_key(path)
 }

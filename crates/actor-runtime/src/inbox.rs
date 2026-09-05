@@ -226,13 +226,13 @@ mod tests {
     use super::*;
     use crate::envelope::Envelope;
     use crate::envelope::TraceCtx;
-    use crate::types::{Path, SchemaId};
+    use crate::types::{ActorPath, SchemaId};
     use serde_json::json;
 
     fn envelope(n: u32) -> Envelope {
         Envelope::json(
             SchemaId::new("Ping", 1),
-            crate::envelope::Address::Path(Path::new("a")),
+            crate::envelope::Address::Path(ActorPath::new("a")),
             json!({ "n": n }),
             TraceCtx::root(),
         )

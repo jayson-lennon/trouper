@@ -22,7 +22,7 @@ pub use crate::kernel::DeadLetter;
 use crate::kernel::{ActorCell, EsLoop, KernelState, route};
 use crate::registry::{Endpoint, EndpointInfo, Registry};
 use crate::schema::Schema;
-use crate::types::{InboxOffset, Path, SchemaId, Timestamp};
+use crate::types::{ActorPath, InboxOffset, SchemaId, Timestamp};
 
 pub use crate::kernel::SnapshotPolicy;
 
@@ -120,7 +120,7 @@ pub struct ActorSystem {
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct ActorExport {
     /// The actor's path (its identity).
-    pub path: Path,
+    pub path: ActorPath,
     /// The contract kind (EventSourced | Service).
     pub kind: crate::types::ActorKind,
     /// The actor's declared edges.
@@ -135,7 +135,7 @@ pub struct ActorExport {
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct DeclaredEdge {
     /// The actor declaring the edge.
-    pub actor: Path,
+    pub actor: ActorPath,
     /// The schema on the edge.
     pub schema: SchemaId,
     /// The direction: Handles (inbound) or Emits (outbound).
@@ -192,7 +192,7 @@ impl ActorSystem {
     /// the seam the port tier will reuse.
     pub fn spawn_es_foreign(
         self: &Arc<Self>,
-        path: Path,
+        path: ActorPath,
         schema_id: SchemaId,
         genesis: JsonValue,
         decision: crate::actor::ForeignDecision,
@@ -333,7 +333,7 @@ impl ActorSystem {
     /// the ES loop. Redelivery resumes from the inbox cursor.
     pub fn spawn_es<A, F>(
         self: &Arc<Self>,
-        path: Path,
+        path: ActorPath,
         args: &JsonValue,
         opts: SpawnOpts,
         entries: F,
@@ -349,7 +349,7 @@ impl ActorSystem {
     /// The erased ES spawn shared by typed and foreign actors.
     fn spawn_es_erased(
         self: &Arc<Self>,
-        path: Path,
+        path: ActorPath,
         manifest: crate::schema::ActorManifest,
         state: Box<dyn crate::actor::DynEsActor>,
         entries: Vec<Arc<dyn CommandEntry>>,
@@ -422,7 +422,7 @@ impl ActorSystem {
     /// `ask` allowed, NOT journaled (at-most-once message semantics).
     pub fn spawn_service<A, F>(
         self: &Arc<Self>,
-        path: Path,
+        path: ActorPath,
         args: &JsonValue,
         opts: SpawnOpts,
         entries: F,
@@ -523,7 +523,7 @@ impl ActorSystem {
     /// `vec![Arc::new(TypedEsAdapter::<A, C1>::new::<C1>()), ...]`).
     pub fn spawn_es_typed<A, F>(
         self: &Arc<Self>,
-        path: Path,
+        path: ActorPath,
         args: &JsonValue,
         opts: SpawnOpts,
         entries: F,
@@ -540,7 +540,7 @@ impl ActorSystem {
     ///
     /// Returns the envelope back when its destination does not resolve
     /// (callers dead-letter or retry).
-    pub async fn send(&self, envelope: Envelope) -> Result<Path, Envelope> {
+    pub async fn send(&self, envelope: Envelope) -> Result<ActorPath, Envelope> {
         route(&self.registry, &self.kernel, envelope).await
     }
 
@@ -558,7 +558,7 @@ impl ActorSystem {
         )
     }
 
-    pub fn envelope(&self, schema: SchemaId, dest: Path, payload: JsonValue) -> Envelope {
+    pub fn envelope(&self, schema: SchemaId, dest: ActorPath, payload: JsonValue) -> Envelope {
         Envelope::json(schema, Address::Path(dest), payload, TraceCtx::root())
     }
 
@@ -575,7 +575,7 @@ impl ActorSystem {
     /// Propagates state-rebuild failures (corrupt snapshot or journal).
     pub async fn restart_es(
         &self,
-        path: &Path,
+        path: &ActorPath,
         genesis_args: &JsonValue,
     ) -> Result<(), error_stack::Report<crate::journal::JournalError>> {
         let loop_ctx = {
@@ -608,7 +608,7 @@ impl ActorSystem {
     /// Unknown path.
     pub fn subscribe(
         &self,
-        path: &Path,
+        path: &ActorPath,
         topic: &crate::types::Topic,
         offset: Option<u64>,
     ) -> Result<u64, error_stack::Report<crate::registry::RegistryError>> {
@@ -640,7 +640,7 @@ impl ActorSystem {
     /// Unknown topic or path not subscribed.
     pub fn reset_topic_cursor(
         &self,
-        path: &Path,
+        path: &ActorPath,
         topic: &crate::types::Topic,
         to: u64,
     ) -> Result<u64, u64> {
@@ -672,7 +672,7 @@ impl ActorSystem {
     /// (recursive, timeout-bounded), the drain signal lets the current
     /// message finish, undelivered inbox entries go to the DLQ, and the
     /// slot + topic subscriptions are removed. Emits a Stopped fact.
-    pub async fn stop(&self, path: &Path) {
+    pub async fn stop(&self, path: &ActorPath) {
         const STOP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
         self.stop_bounded(path, STOP_TIMEOUT).await;
     }
@@ -680,19 +680,19 @@ impl ActorSystem {
     /// The bounded stop; recursion depth bounded by timeout.
     fn stop_bounded<'a>(
         &'a self,
-        path: &'a Path,
+        path: &'a ActorPath,
         remaining: std::time::Duration,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'a>> {
         Box::pin(self.stop_bounded_inner(path, remaining))
     }
 
     /// The recursive body, boxed by [`Self::stop_bounded`].
-    async fn stop_bounded_inner(&self, path: &Path, remaining: std::time::Duration) {
+    async fn stop_bounded_inner(&self, path: &ActorPath, remaining: std::time::Duration) {
         if remaining.is_zero() {
             return;
         }
         // 1. CHILDREN FIRST (recursive): any spec whose parent is this path.
-        let children: Vec<Path> = {
+        let children: Vec<ActorPath> = {
             let kernel = self.kernel.lock().expect("kernel lock");
             kernel
                 .specs
@@ -876,7 +876,7 @@ impl ActorSystem {
 
         // Runtime topic subscriptions (subscribe calls) are declared
         // edges too: read them from the topic logs.
-        let runtime_subscriptions: Vec<(Path, crate::types::Topic)> = {
+        let runtime_subscriptions: Vec<(ActorPath, crate::types::Topic)> = {
             let kernel = self.kernel.lock().expect("kernel lock");
             kernel
                 .topic_logs
@@ -991,7 +991,7 @@ impl ActorSystem {
     }
 
     /// How many envelopes are queued at `path` (inspection/tests).
-    pub async fn inbox_debug_len(&self, path: &Path) -> usize {
+    pub async fn inbox_debug_len(&self, path: &ActorPath) -> usize {
         // Clone the Arc out of the kernel guard, then await the inbox
         // lock without holding the kernel's std Mutex.
         let cell = {
@@ -1004,7 +1004,7 @@ impl ActorSystem {
         }
     }
 
-    pub fn inbox_cursor(&self, path: &Path) -> Option<InboxOffset> {
+    pub fn inbox_cursor(&self, path: &ActorPath) -> Option<InboxOffset> {
         let kernel = self.kernel.lock().expect("kernel lock");
         kernel.cells.get(path).map(|cell| {
             cell.inbox
@@ -1015,7 +1015,7 @@ impl ActorSystem {
     }
 
     /// The captured ES state of an actor (for export/inspection).
-    pub async fn es_state(&self, path: &Path) -> Option<JsonValue> {
+    pub async fn es_state(&self, path: &ActorPath) -> Option<JsonValue> {
         let state = {
             let kernel = self.kernel.lock().expect("kernel lock");
             kernel.es_state.get(path).cloned()?
@@ -1032,12 +1032,12 @@ struct NullView {
 }
 
 impl RuntimeView for NullView {
-    fn lookup(&self, path: &Path) -> Option<EndpointInfo> {
+    fn lookup(&self, path: &ActorPath) -> Option<EndpointInfo> {
         let registry = self.registry.lock().expect("registry lock");
         registry.lookup(path)
     }
 
-    fn who_handles(&self, schema: &SchemaId) -> Vec<Path> {
+    fn who_handles(&self, schema: &SchemaId) -> Vec<ActorPath> {
         let registry = self.registry.lock().expect("registry lock");
         registry.who_handles(schema)
     }
@@ -1048,12 +1048,12 @@ impl RuntimeView for NullView {
 }
 
 impl RuntimeView for ActorSystem {
-    fn lookup(&self, path: &Path) -> Option<EndpointInfo> {
+    fn lookup(&self, path: &ActorPath) -> Option<EndpointInfo> {
         let registry = self.registry.lock().expect("registry lock");
         registry.lookup(path)
     }
 
-    fn who_handles(&self, schema: &SchemaId) -> Vec<Path> {
+    fn who_handles(&self, schema: &SchemaId) -> Vec<ActorPath> {
         let registry = self.registry.lock().expect("registry lock");
         registry.who_handles(schema)
     }
@@ -1079,12 +1079,12 @@ mod tests {
             kernel
                 .topic_logs
                 .get(topic)
-                .map(|log| log.subscribers().contains(&Path::new("aud")))
+                .map(|log| log.subscribers().contains(&ActorPath::new("aud")))
                 .unwrap_or(false)
         }
 
         /// The number of journalled entries for `path` (tests).
-        pub fn journal_len(&self, path: &Path) -> usize {
+        pub fn journal_len(&self, path: &ActorPath) -> usize {
             let kernel = self.kernel.lock().expect("kernel lock");
             kernel.journals.get(path).map(|j| j.len()).unwrap_or(0)
         }
@@ -1224,7 +1224,7 @@ mod tests {
     async fn atomic_step_commits_journal_state_and_cursor_together() {
         // Given a spawned counter actor.
         let (system, _clock) = ActorSystem::test();
-        let path = Path::new("counter");
+        let path = ActorPath::new("counter");
         system.spawn_es::<Counter, _>(path.clone(), &json!({}), SpawnOpts::default(), || {
             vec![Arc::new(TypedEsAdapter::<Counter, Add>::new::<Add>())]
         });
@@ -1251,7 +1251,7 @@ mod tests {
     async fn atomic_step_dead_letters_unknown_schemas_and_advances() {
         // Given a spawned actor that handles only Add.
         let (system, _clock) = ActorSystem::test();
-        let path = Path::new("counter");
+        let path = ActorPath::new("counter");
         system.spawn_es::<Counter, _>(path.clone(), &json!({}), SpawnOpts::default(), || {
             vec![Arc::new(TypedEsAdapter::<Counter, Add>::new::<Add>())]
         });
@@ -1283,9 +1283,9 @@ mod tests {
         // Given an Auditor service actor.
         let (system, _clock) = ActorSystem::test();
         let (idx, sink) = open_sink();
-        bind_sink(&Path::new("aud"), sink);
+        bind_sink(&ActorPath::new("aud"), sink);
         system.spawn_service::<Auditor, _>(
-            Path::new("aud"),
+            ActorPath::new("aud"),
             &json!({ "sink": idx }),
             SpawnOpts::default(),
             || {
@@ -1299,7 +1299,7 @@ mod tests {
         // When the actor handles a join command (n=0) that calls
         // ctx.subscribe mid-handler.
         system
-            .send(system.envelope(Add::schema_id(), Path::new("aud"), json!({ "n": 0 })))
+            .send(system.envelope(Add::schema_id(), ActorPath::new("aud"), json!({ "n": 0 })))
             .await
             .expect("join sent");
         wait_for(|| async { system.topic_has_subscriber(&topic_of_join()) }).await;
@@ -1315,7 +1315,8 @@ mod tests {
             ))
             .await
             .expect("published");
-        wait_for(|| async { sink_read(&Path::new("aud")).contains(&"Added:7".to_string()) }).await;
+        wait_for(|| async { sink_read(&ActorPath::new("aud")).contains(&"Added:7".to_string()) })
+            .await;
     }
 
     #[tokio::test]
@@ -1323,7 +1324,7 @@ mod tests {
         // Given a service actor whose FIRST handler parks on a gate: the
         // messages sent behind it stay QUEUED (un-acked) in the inbox.
         let (system, _clock) = ActorSystem::test();
-        let path = Path::new("parked");
+        let path = ActorPath::new("parked");
         system.register_schema::<Add>();
 
         // First handle() call parks forever (receiver dropped unfired);
@@ -1419,7 +1420,7 @@ mod tests {
         // Given a spawned actor with a mailbox of ONE under DropNew —
         // the mpsc front door is 2x, so the inbox can overflow.
         let (system, _clock) = ActorSystem::test();
-        let path = Path::new("tiny");
+        let path = ActorPath::new("tiny");
         system.spawn_es::<Counter, _>(
             path.clone(),
             &json!({}),
@@ -1464,7 +1465,7 @@ mod tests {
     async fn dlq_topic_is_subscribable_and_reconsumable() {
         // Given a spawned actor that handles only Add.
         let (system, _clock) = ActorSystem::test();
-        let path = Path::new("counter");
+        let path = ActorPath::new("counter");
         system.spawn_es::<Counter, _>(path.clone(), &json!({}), SpawnOpts::default(), || {
             vec![Arc::new(TypedEsAdapter::<Counter, Add>::new::<Add>())]
         });
@@ -1473,9 +1474,9 @@ mod tests {
         // any dead letters exist, decoding the Boom payload shape.
         let dlq = Registry::dead_letter_topic();
         let (sub_idx, sub_sink) = open_sink();
-        bind_sink(&Path::new("dlq-watcher"), sub_sink);
+        bind_sink(&ActorPath::new("dlq-watcher"), sub_sink);
         system.spawn_service::<DlqWatcher, _>(
-            Path::new("dlq-watcher"),
+            ActorPath::new("dlq-watcher"),
             &json!({ "sink": sub_idx }),
             SpawnOpts::default(),
             || {
@@ -1485,7 +1486,7 @@ mod tests {
             },
         );
         system
-            .subscribe(&Path::new("dlq-watcher"), &dlq, None)
+            .subscribe(&ActorPath::new("dlq-watcher"), &dlq, None)
             .expect("subscribe to dlq");
 
         // When a message with an unhandled schema arrives.
@@ -1496,7 +1497,7 @@ mod tests {
         wait_for_cursor(&system, &path, 1).await;
 
         // Then the DLQ consumer received the dead-lettered envelope.
-        wait_for(|| async { sink_read(&Path::new("dlq-watcher")).len() == 1 }).await;
+        wait_for(|| async { sink_read(&ActorPath::new("dlq-watcher")).len() == 1 }).await;
 
         // And the retained DLQ log holds the entry for re-consumption.
         let (lo, hi) = system.topic_range(&dlq).expect("dlq log exists");
@@ -1505,18 +1506,18 @@ mod tests {
         // When the cursor is reset to 0, the retained entry's range is
         // still reported (re-consumption is possible from the log).
         system
-            .reset_topic_cursor(&Path::new("dlq-watcher"), &dlq, 0)
+            .reset_topic_cursor(&ActorPath::new("dlq-watcher"), &dlq, 0)
             .expect("reset");
         let (lo, hi) = system.topic_range(&dlq).expect("dlq log exists");
         assert_eq!((lo, hi), (0, 1));
-        assert!(!sink_read(&Path::new("dlq-watcher")).is_empty());
+        assert!(!sink_read(&ActorPath::new("dlq-watcher")).is_empty());
     }
 
     #[tokio::test]
     async fn atomic_step_panics_leave_the_message_queued_for_redelivery() {
         // Given a spawned actor whose Boom handler panics.
         let (system, _clock) = ActorSystem::test();
-        let path = Path::new("counter");
+        let path = ActorPath::new("counter");
         system.spawn_es::<Counter, _>(path.clone(), &json!({}), SpawnOpts::default(), || {
             vec![Arc::new(TypedEsAdapter::<Counter, Boom>::new::<Boom>())]
         });
@@ -1545,8 +1546,8 @@ mod tests {
     async fn restart_rebuilds_from_journal_and_redelivers_exactly_once() {
         // Given a counter that has committed one Add, then crashed on Boom.
         let (system, _clock) = ActorSystem::test();
-        let path = Path::new("counter");
-        let boom = Path::new("counter");
+        let path = ActorPath::new("counter");
+        let boom = ActorPath::new("counter");
         system.spawn_es::<Counter, _>(path.clone(), &json!({}), SpawnOpts::default(), || {
             vec![
                 Arc::new(TypedEsAdapter::<Counter, Add>::new::<Add>()),
@@ -1591,7 +1592,7 @@ mod tests {
     #[allow(dead_code)] // used by several test cases; some were trimmed
     async fn count_total(system: &ActorSystem, name: &str) -> Option<i64> {
         system
-            .es_state(&Path::new(name))
+            .es_state(&ActorPath::new(name))
             .await
             .and_then(|s| s["total"].as_i64())
     }
@@ -1611,7 +1612,7 @@ mod tests {
         panic!("condition never became true");
     }
 
-    async fn wait_for_cursor(system: &ActorSystem, path: &Path, expected: u64) {
+    async fn wait_for_cursor(system: &ActorSystem, path: &ActorPath, expected: u64) {
         for _ in 0..2_000 {
             if system.inbox_cursor(path).map(|c| c.as_u64()) == Some(expected) {
                 return;
@@ -1659,7 +1660,7 @@ mod tests {
         impl CommandHandler<Add> for Forwarder {
             fn handle(&self, _cmd: Add, ctx: &mut CmdCtx<'_>) -> Vec<crate::envelope::Event> {
                 ctx.0.send(
-                    Address::Path(Path::new("echo")),
+                    Address::Path(ActorPath::new("echo")),
                     Ping::schema_id(),
                     json!({ "n": 0 }),
                     None,
@@ -1686,11 +1687,14 @@ mod tests {
         }
 
         let (system, _clock) = ActorSystem::test();
-        system.spawn_es::<Forwarder, _>(Path::new("a"), &json!({}), SpawnOpts::default(), || {
-            vec![Arc::new(TypedEsAdapter::<Forwarder, Add>::new::<Add>())]
-        });
+        system.spawn_es::<Forwarder, _>(
+            ActorPath::new("a"),
+            &json!({}),
+            SpawnOpts::default(),
+            || vec![Arc::new(TypedEsAdapter::<Forwarder, Add>::new::<Add>())],
+        );
         system.spawn_service::<Echo, _>(
-            Path::new("echo"),
+            ActorPath::new("echo"),
             &json!({}),
             SpawnOpts::default(),
             || vec![Arc::new(TypedServiceAdapter::<Echo, Ping>::new::<Ping>())],
@@ -1698,14 +1702,14 @@ mod tests {
 
         // When the conversation starts at A and both hops settle.
         system
-            .send(system.envelope(Add::schema_id(), Path::new("a"), json!({ "n": 1 })))
+            .send(system.envelope(Add::schema_id(), ActorPath::new("a"), json!({ "n": 1 })))
             .await
             .expect("send");
         wait_for(|| async {
             system
                 .tap_facts()
                 .iter()
-                .any(|f| matches!(&f.kind, crate::tap::FactKind::Delivered { to, .. } if *to == Path::new("echo")))
+                .any(|f| matches!(&f.kind, crate::tap::FactKind::Delivered { to, .. } if *to == ActorPath::new("echo")))
         })
         .await;
 
@@ -1713,7 +1717,7 @@ mod tests {
         let facts = system.tap_facts();
         let a_hop = facts
             .iter()
-            .find(|f| matches!(&f.kind, crate::tap::FactKind::Delivered { to, .. } if *to == Path::new("a")))
+            .find(|f| matches!(&f.kind, crate::tap::FactKind::Delivered { to, .. } if *to == ActorPath::new("a")))
             .expect("hop a delivered");
         let trace_of = |f: &crate::tap::Fact| match &f.kind {
             crate::tap::FactKind::Delivered { trace, .. }
@@ -1727,7 +1731,7 @@ mod tests {
             .filter(|f| {
                 matches!(
                     &f.kind,
-                    crate::tap::FactKind::Delivered { to, .. } if *to == Path::new("echo")
+                    crate::tap::FactKind::Delivered { to, .. } if *to == ActorPath::new("echo")
                 )
             })
             .collect();
@@ -1751,7 +1755,7 @@ mod tests {
             default_mailbox: MailboxDefaults::default(),
         }));
         let _clock = fake;
-        let path = Path::new("counter");
+        let path = ActorPath::new("counter");
         system.spawn_es::<Counter, _>(path.clone(), &json!({}), SpawnOpts::default(), || {
             vec![Arc::new(TypedEsAdapter::<Counter, Add>::new::<Add>())]
         });
@@ -1790,7 +1794,7 @@ mod tests {
         // Given a supervised ES child whose Add handler panics ONLY on the
         // poison payload (n = 666), with a generous budget.
         let (system, _clock) = ActorSystem::test();
-        let child = Path::new("phoenix");
+        let child = ActorPath::new("phoenix");
         system.register_schema::<Add>();
         system.register_schema::<Added>();
 
@@ -1840,11 +1844,13 @@ mod tests {
                 factor: 2.0,
             },
             args: json!({}),
-            spawn: Arc::new(|sys: &Arc<ActorSystem>, path: &Path, args: &JsonValue| {
-                sys.spawn_es::<Phoenix, _>(path.clone(), args, SpawnOpts::default(), || {
-                    vec![Arc::new(TypedEsAdapter::<Phoenix, Add>::new::<Add>())]
-                });
-            }),
+            spawn: Arc::new(
+                |sys: &Arc<ActorSystem>, path: &ActorPath, args: &JsonValue| {
+                    sys.spawn_es::<Phoenix, _>(path.clone(), args, SpawnOpts::default(), || {
+                        vec![Arc::new(TypedEsAdapter::<Phoenix, Add>::new::<Add>())]
+                    });
+                },
+            ),
         };
 
         // When the child is spawned under supervision and receives a
@@ -1919,7 +1925,7 @@ mod tests {
         // The overseer is a service actor whose Escalated control message
         // lands in its sink via a plain send from the engine.
         let (system, _clock) = ActorSystem::test();
-        let overseer = Path::new("overseer");
+        let overseer = ActorPath::new("overseer");
         bind_sink(&overseer, Arc::new(std::sync::Mutex::new(Vec::new())));
         struct Overseer;
         impl ServiceActor for Overseer {
@@ -1977,7 +1983,7 @@ mod tests {
         // The child spawns the real counter under a fixed path; the engine
         // restarts it per the spec.
         struct ChildSpawner;
-        let worker = Path::new("worker");
+        let worker = ActorPath::new("worker");
         let spawner = Arc::new(ChildSpawner);
         let system_for_spec = system.clone();
         let worker_clone = worker.clone();
@@ -1993,7 +1999,7 @@ mod tests {
             },
             args: json!({}),
             spawn: Arc::new(
-                move |sys: &Arc<ActorSystem>, path: &Path, args: &JsonValue| {
+                move |sys: &Arc<ActorSystem>, path: &ActorPath, args: &JsonValue| {
                     let _ = (&spawner, &system_for_spec);
                     sys.spawn_es::<AlwaysBoom, _>(path.clone(), args, SpawnOpts::default(), || {
                         vec![Arc::new(TypedEsAdapter::<AlwaysBoom, Add>::new::<Add>())]
@@ -2058,8 +2064,8 @@ mod tests {
         // (both cells running), and messages queued at BOTH so the drain
         // path is exercised (undelivered entries must dead-letter).
         let (system, _clock) = ActorSystem::test();
-        let parent = Path::new("parent");
-        let child = Path::new("child");
+        let parent = ActorPath::new("parent");
+        let child = ActorPath::new("child");
         let (p_idx, p_sink) = open_sink();
         bind_sink(&parent, p_sink);
         let registry = system.registry.clone();
@@ -2071,7 +2077,7 @@ mod tests {
         // factory (the same closure the supervision engine would run).
         let spawn_child = {
             let system = system.clone();
-            move |_sys: &Arc<ActorSystem>, path: &Path, _args: &JsonValue| {
+            move |_sys: &Arc<ActorSystem>, path: &ActorPath, _args: &JsonValue| {
                 let system = system.clone();
                 let path = path.to_owned();
                 let (idx, sink) = open_sink();
@@ -2178,7 +2184,7 @@ mod tests {
         // Given a supervised ES child with RestartPolicy::Never whose
         // handler always panics.
         let (system, _clock) = ActorSystem::test();
-        let child = Path::new("fragile");
+        let child = ActorPath::new("fragile");
         system.register_schema::<Add>();
         system.register_schema::<Added>();
 
@@ -2206,11 +2212,13 @@ mod tests {
             budget: crate::supervision::RestartBudget::default(),
             backoff: crate::supervision::Backoff::default(),
             args: json!({}),
-            spawn: Arc::new(|sys: &Arc<ActorSystem>, path: &Path, args: &JsonValue| {
-                sys.spawn_es::<Fragile, _>(path.clone(), args, SpawnOpts::default(), || {
-                    vec![Arc::new(TypedEsAdapter::<Fragile, Add>::new::<Add>())]
-                });
-            }),
+            spawn: Arc::new(
+                |sys: &Arc<ActorSystem>, path: &ActorPath, args: &JsonValue| {
+                    sys.spawn_es::<Fragile, _>(path.clone(), args, SpawnOpts::default(), || {
+                        vec![Arc::new(TypedEsAdapter::<Fragile, Add>::new::<Add>())]
+                    });
+                },
+            ),
         };
         system.spawn_child(spec);
 
@@ -2259,7 +2267,7 @@ mod tests {
         // The observable: a NORMAL stop must not arm the failure window
         // (stop() never records failures), so the child stays stopped.
         let (system, _clock) = ActorSystem::test();
-        let path = Path::new("transient-child");
+        let path = ActorPath::new("transient-child");
         {
             let mut kernel = system.kernel.lock().expect("lock");
             kernel.specs.insert(
@@ -2271,7 +2279,9 @@ mod tests {
                     budget: crate::supervision::RestartBudget::default(),
                     backoff: crate::supervision::Backoff::default(),
                     args: json!({}),
-                    spawn: Arc::new(|_sys: &Arc<ActorSystem>, _path: &Path, _args: &JsonValue| {}),
+                    spawn: Arc::new(
+                        |_sys: &Arc<ActorSystem>, _path: &ActorPath, _args: &JsonValue| {},
+                    ),
                 },
             );
         }
@@ -2304,8 +2314,8 @@ mod tests {
     async fn topic_cursor_reset_redelivers_in_order() {
         // Given a counter emitting onto "counter.events" and a subscriber.
         let (system, _clock) = ActorSystem::test();
-        let path = Path::new("counter");
-        let sub = Path::new("watcher");
+        let path = ActorPath::new("counter");
+        let sub = ActorPath::new("watcher");
         system.spawn_es::<Counter, _>(path.clone(), &json!({}), SpawnOpts::default(), || {
             vec![Arc::new(TypedEsAdapter::<Counter, Add>::new::<Add>())]
         });
@@ -2366,9 +2376,9 @@ mod tests {
     async fn topic_subscribers_have_independent_cursors() {
         // Given one publisher and two subscribers.
         let (system, _clock) = ActorSystem::test();
-        let path = Path::new("counter");
-        let early = Path::new("early");
-        let late = Path::new("late");
+        let path = ActorPath::new("counter");
+        let early = ActorPath::new("early");
+        let late = ActorPath::new("late");
         system.spawn_es::<Counter, _>(path.clone(), &json!({}), SpawnOpts::default(), || {
             vec![Arc::new(TypedEsAdapter::<Counter, Add>::new::<Add>())]
         });
@@ -2423,8 +2433,8 @@ mod tests {
     async fn slow_subscriber_does_not_block_the_publisher() {
         // Given a subscriber spawned with a tiny DropNew mailbox.
         let (system, _clock) = ActorSystem::test();
-        let path = Path::new("counter");
-        let slow = Path::new("slow");
+        let path = ActorPath::new("counter");
+        let slow = ActorPath::new("slow");
         system.spawn_es::<Counter, _>(path.clone(), &json!({}), SpawnOpts::default(), || {
             vec![Arc::new(TypedEsAdapter::<Counter, Add>::new::<Add>())]
         });
@@ -2466,7 +2476,7 @@ mod tests {
         );
     }
 
-    async fn wait_for_crash(system: &ActorSystem, path: &Path) {
+    async fn wait_for_crash(system: &ActorSystem, path: &ActorPath) {
         for _ in 0..2_000 {
             {
                 let kernel = system.kernel.lock().expect("lock");
@@ -2497,7 +2507,7 @@ mod tests {
         SINK_BY_PATH.get_or_init(|| Mutex::new(HashMap::new()))
     }
 
-    fn bind_sink(path: &Path, sink: Arc<Mutex<Vec<String>>>) {
+    fn bind_sink(path: &ActorPath, sink: Arc<Mutex<Vec<String>>>) {
         sink_table()
             .lock()
             .expect("sink table lock")
@@ -2505,7 +2515,7 @@ mod tests {
     }
 
     /// Reads a subscriber's sink lines by path (test inspection).
-    fn sink_read(path: &Path) -> Vec<String> {
+    fn sink_read(path: &ActorPath) -> Vec<String> {
         sink_table()
             .lock()
             .expect("sink table lock")
@@ -2616,7 +2626,7 @@ mod tests {
         // Given a system and an Auditor service with a shared test sink.
         let (system, _clock) = ActorSystem::test();
         let (sink_idx, sink) = open_sink();
-        let path = Path::new("auditor");
+        let path = ActorPath::new("auditor");
         system.spawn_service::<Auditor, _>(
             path.clone(),
             &json!({ "sink": sink_idx }),
@@ -2629,7 +2639,7 @@ mod tests {
             system
                 .tap_facts()
                 .iter()
-                .any(|f| matches!(&f.kind, crate::tap::FactKind::Spawned { path, .. } if *path == Path::new("auditor")))
+                .any(|f| matches!(&f.kind, crate::tap::FactKind::Spawned { path, .. } if *path == ActorPath::new("auditor")))
         })
         .await;
         system
@@ -2700,7 +2710,7 @@ mod tests {
             async fn handle(&mut self, _msg: Boom, ctx: &mut crate::context::MsgCtx<'_>) {
                 let reply = ctx
                     .ask(
-                        Address::Path(Path::new("echo")),
+                        Address::Path(ActorPath::new("echo")),
                         Add::schema_id(),
                         json!({ "n": 21 }),
                         std::time::Duration::from_secs(2),
@@ -2721,13 +2731,13 @@ mod tests {
         }
 
         system.spawn_service::<Echo, _>(
-            Path::new("echo"),
+            ActorPath::new("echo"),
             &json!({}),
             SpawnOpts::default(),
             || vec![Arc::new(TypedServiceAdapter::<Echo, Add>::new::<Add>())],
         );
         system.spawn_service::<Asker, _>(
-            Path::new("asker"),
+            ActorPath::new("asker"),
             &json!({}),
             SpawnOpts::default(),
             || vec![Arc::new(TypedServiceAdapter::<Asker, Boom>::new::<Boom>())],
@@ -2736,7 +2746,7 @@ mod tests {
             system
                 .tap_facts()
                 .iter()
-                .any(|f| matches!(&f.kind, crate::tap::FactKind::Spawned { path, .. } if *path == Path::new("asker")))
+                .any(|f| matches!(&f.kind, crate::tap::FactKind::Spawned { path, .. } if *path == ActorPath::new("asker")))
         })
         .await;
 
@@ -2744,7 +2754,7 @@ mod tests {
         system
             .send(system.envelope(
                 Boom::schema_id(),
-                Path::new("asker"),
+                ActorPath::new("asker"),
                 json!({ "why": "ask" }),
             ))
             .await
@@ -2806,7 +2816,7 @@ mod tests {
             async fn handle(&mut self, _msg: Boom, ctx: &mut crate::context::MsgCtx<'_>) {
                 let reply = ctx
                     .ask(
-                        Address::Path(Path::new("silent")),
+                        Address::Path(ActorPath::new("silent")),
                         Add::schema_id(),
                         json!({ "n": 1 }),
                         std::time::Duration::from_millis(50),
@@ -2825,13 +2835,13 @@ mod tests {
         }
 
         system.spawn_service::<Silent, _>(
-            Path::new("silent"),
+            ActorPath::new("silent"),
             &json!({}),
             SpawnOpts::default(),
             || vec![Arc::new(TypedServiceAdapter::<Silent, Add>::new::<Add>())],
         );
         system.spawn_service::<Asker, _>(
-            Path::new("asker"),
+            ActorPath::new("asker"),
             &json!({}),
             SpawnOpts::default(),
             || vec![Arc::new(TypedServiceAdapter::<Asker, Boom>::new::<Boom>())],
@@ -2840,7 +2850,7 @@ mod tests {
             system
                 .tap_facts()
                 .iter()
-                .any(|f| matches!(&f.kind, crate::tap::FactKind::Spawned { path, .. } if *path == Path::new("asker")))
+                .any(|f| matches!(&f.kind, crate::tap::FactKind::Spawned { path, .. } if *path == ActorPath::new("asker")))
         })
         .await;
 
@@ -2848,7 +2858,7 @@ mod tests {
         system
             .send(system.envelope(
                 Boom::schema_id(),
-                Path::new("asker"),
+                ActorPath::new("asker"),
                 json!({ "why": "ask" }),
             ))
             .await
@@ -2922,7 +2932,7 @@ mod tests {
                 // timeout could fire — isolating the Failed path.
                 let outcome = ctx
                     .ask(
-                        Address::Path(Path::new("silent")),
+                        Address::Path(ActorPath::new("silent")),
                         Add::schema_id(),
                         json!({ "n": 1 }),
                         std::time::Duration::from_secs(30),
@@ -2941,13 +2951,13 @@ mod tests {
         }
 
         system.spawn_service::<Silent, _>(
-            Path::new("silent"),
+            ActorPath::new("silent"),
             &json!({}),
             SpawnOpts::default(),
             || vec![Arc::new(TypedServiceAdapter::<Silent, Add>::new::<Add>())],
         );
         system.spawn_service::<Asker, _>(
-            Path::new("asker"),
+            ActorPath::new("asker"),
             &json!({}),
             SpawnOpts::default(),
             || vec![Arc::new(TypedServiceAdapter::<Asker, Boom>::new::<Boom>())],
@@ -2956,13 +2966,13 @@ mod tests {
             system
                 .tap_facts()
                 .iter()
-                .any(|f| matches!(&f.kind, crate::tap::FactKind::Spawned { path, .. } if *path == Path::new("asker")))
+                .any(|f| matches!(&f.kind, crate::tap::FactKind::Spawned { path, .. } if *path == ActorPath::new("asker")))
         })
         .await;
         system
             .send(system.envelope(
                 Boom::schema_id(),
-                Path::new("asker"),
+                ActorPath::new("asker"),
                 json!({ "why": "ask" }),
             ))
             .await
@@ -3084,7 +3094,7 @@ mod tests {
         }
 
         system.spawn_service::<Collector, _>(
-            Path::new("collector"),
+            ActorPath::new("collector"),
             &json!({}),
             SpawnOpts::default(),
             || {
@@ -3094,7 +3104,7 @@ mod tests {
             },
         );
         system.spawn_es::<Counter, _>(
-            Path::new("counter"),
+            ActorPath::new("counter"),
             &json!({}),
             SpawnOpts::default(),
             || vec![Arc::new(TypedEsAdapter::<Counter, Add>::new::<Add>())],
@@ -3103,16 +3113,19 @@ mod tests {
             system
                 .tap_facts()
                 .iter()
-                .any(|f| matches!(&f.kind, crate::tap::FactKind::Spawned { path, .. } if *path == Path::new("counter")))
+                .any(|f| matches!(&f.kind, crate::tap::FactKind::Spawned { path, .. } if *path == ActorPath::new("counter")))
         })
         .await;
 
         // When the counter is told to Add with a reply-to PATH pointing at
         // the collector (an ask-shaped message, but reply-by-name).
-        let mut envelope =
-            system.envelope(Add::schema_id(), Path::new("counter"), json!({ "n": 5 }));
-        envelope.reply_to = Some(Address::Path(Path::new("collector")));
-        envelope.from = Some(Path::new("collector"));
+        let mut envelope = system.envelope(
+            Add::schema_id(),
+            ActorPath::new("counter"),
+            json!({ "n": 5 }),
+        );
+        envelope.reply_to = Some(Address::Path(ActorPath::new("collector")));
+        envelope.from = Some(ActorPath::new("collector"));
         system.send(envelope).await.expect("delivered");
 
         // Then the collector receives the reply as an ordinary message
@@ -3161,7 +3174,7 @@ mod tests {
         system.register_schema::<Added>();
 
         // When spawning an ES actor.
-        let path = Path::new("counter");
+        let path = ActorPath::new("counter");
         system.spawn_es::<Counter, _>(path.clone(), &json!({}), SpawnOpts::default(), || {
             vec![Arc::new(TypedEsAdapter::<Counter, Add>::new::<Add>())]
         });
@@ -3175,7 +3188,7 @@ mod tests {
     async fn spawn_es_starts_genesis_state() {
         // Given a system with a spawned counter.
         let (system, _clock) = ActorSystem::test();
-        let path = Path::new("counter");
+        let path = ActorPath::new("counter");
         system.spawn_es::<Counter, _>(path.clone(), &json!({}), SpawnOpts::default(), || {
             vec![Arc::new(TypedEsAdapter::<Counter, Add>::new::<Add>())]
         });
@@ -3202,7 +3215,7 @@ mod tests {
     }
 
     /// Reads a foreign actor's live JSON state (test inspection helper).
-    async fn count_total_json(system: &ActorSystem, path: &Path) -> Option<i64> {
+    async fn count_total_json(system: &ActorSystem, path: &ActorPath) -> Option<i64> {
         system
             .es_state(path)
             .await
@@ -3224,7 +3237,7 @@ mod tests {
             .expect("valid");
         let schema_for_actor = schema.clone();
         system.spawn_es_foreign(
-            Path::new("tally-actor"),
+            ActorPath::new("tally-actor"),
             schema.clone(),
             json!({ "total": 0 }),
             Arc::new(move |_state, cmd, _ctx| {
@@ -3248,13 +3261,13 @@ mod tests {
         system
             .send(system.envelope(
                 schema.clone(),
-                Path::new("tally-actor"),
+                ActorPath::new("tally-actor"),
                 json!({ "delta": 5 }),
             ))
             .await
             .expect("delivered");
         wait_for(|| async {
-            count_total_json(&system, &Path::new("tally-actor")).await == Some(5)
+            count_total_json(&system, &ActorPath::new("tally-actor")).await == Some(5)
         })
         .await;
 
@@ -3263,7 +3276,7 @@ mod tests {
         let actor = export
             .actors
             .iter()
-            .find(|a| a.path == Path::new("tally-actor"))
+            .find(|a| a.path == ActorPath::new("tally-actor"))
             .expect("foreign actor exported");
         assert_eq!(
             actor.state.as_ref().expect("state")["total"],
@@ -3282,13 +3295,16 @@ mod tests {
         // Given a publisher and a subscriber bound to a topic.
         let (system, _clock) = ActorSystem::test();
         let topic = crate::types::Topic::new("cascade.events");
-        system.spawn_es::<Counter, _>(Path::new("pub"), &json!({}), SpawnOpts::default(), || {
-            vec![Arc::new(TypedEsAdapter::<Counter, Add>::new::<Add>())]
-        });
+        system.spawn_es::<Counter, _>(
+            ActorPath::new("pub"),
+            &json!({}),
+            SpawnOpts::default(),
+            || vec![Arc::new(TypedEsAdapter::<Counter, Add>::new::<Add>())],
+        );
         let (sub_idx, sub_sink) = open_sink();
-        bind_sink(&Path::new("sub"), sub_sink);
+        bind_sink(&ActorPath::new("sub"), sub_sink);
         system.spawn_service::<Auditor, _>(
-            Path::new("sub"),
+            ActorPath::new("sub"),
             &json!({ "sink": sub_idx }),
             SpawnOpts::default(),
             || {
@@ -3298,7 +3314,7 @@ mod tests {
             },
         );
         system
-            .subscribe(&Path::new("sub"), &topic, None)
+            .subscribe(&ActorPath::new("sub"), &topic, None)
             .expect("subscribe");
         system
             .send(system.envelope_to_topic(
@@ -3307,10 +3323,10 @@ mod tests {
             ))
             .await
             .expect("published");
-        wait_for(|| async { sink_read(&Path::new("sub")).len() == 1 }).await;
+        wait_for(|| async { sink_read(&ActorPath::new("sub")).len() == 1 }).await;
 
         // When the subscriber is removed.
-        system.stop(&Path::new("sub")).await;
+        system.stop(&ActorPath::new("sub")).await;
 
         // And a second event is published.
         system
@@ -3323,9 +3339,9 @@ mod tests {
 
         // Then the removed subscriber receives nothing further and the
         // pump no longer tracks it (no cursor leaks).
-        wait_for(|| async { !sink_read(&Path::new("sub")).is_empty() }).await;
+        wait_for(|| async { !sink_read(&ActorPath::new("sub")).is_empty() }).await;
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-        assert_eq!(sink_read(&Path::new("sub")).len(), 1);
+        assert_eq!(sink_read(&ActorPath::new("sub")).len(), 1);
         let subscribers = {
             let kernel = system.kernel.lock().expect("lock");
             kernel
@@ -3344,16 +3360,16 @@ mod tests {
         let schema = system.register_schema::<Add>();
         let topic = crate::types::Topic::new("export.events");
         system.spawn_es::<Counter, _>(
-            Path::new("source"),
+            ActorPath::new("source"),
             &json!({}),
             SpawnOpts::default(),
             || vec![Arc::new(TypedEsAdapter::<Counter, Add>::new::<Add>())],
         );
         let added_schema = system.register_schema::<Added>();
         let (sink_idx, sink_store) = open_sink();
-        bind_sink(&Path::new("sink"), sink_store);
+        bind_sink(&ActorPath::new("sink"), sink_store);
         system.spawn_service::<Auditor, _>(
-            Path::new("sink"),
+            ActorPath::new("sink"),
             &json!({ "sink": sink_idx }),
             SpawnOpts::default(),
             || {
@@ -3363,7 +3379,7 @@ mod tests {
             },
         );
         system
-            .subscribe(&Path::new("sink"), &topic, None)
+            .subscribe(&ActorPath::new("sink"), &topic, None)
             .expect("subscribe");
         system
             .send(system.envelope_to_topic(
@@ -3372,7 +3388,7 @@ mod tests {
             ))
             .await
             .expect("published");
-        wait_for(|| async { sink_read(&Path::new("sink")).len() == 1 }).await;
+        wait_for(|| async { sink_read(&ActorPath::new("sink")).len() == 1 }).await;
 
         // When exporting.
         let export = system.export().await;
@@ -3384,7 +3400,7 @@ mod tests {
         let source = export
             .actors
             .iter()
-            .find(|a| a.path == Path::new("source"))
+            .find(|a| a.path == ActorPath::new("source"))
             .expect("source exported");
         assert_eq!(source.kind, crate::types::ActorKind::EventSourced);
         // And ES actors export their live state.
@@ -3397,7 +3413,7 @@ mod tests {
             export
                 .declared_edges
                 .iter()
-                .any(|e| e.actor == Path::new("source")
+                .any(|e| e.actor == ActorPath::new("source")
                     && e.schema == schema
                     && e.direction == crate::system::EdgeDirection::Handles)
         );
@@ -3405,7 +3421,7 @@ mod tests {
             export
                 .declared_edges
                 .iter()
-                .any(|e| e.actor == Path::new("sink") && e.topic == Some(topic.clone()))
+                .any(|e| e.actor == ActorPath::new("sink") && e.topic == Some(topic.clone()))
         );
         let observed = export
             .observed_edges
@@ -3467,8 +3483,8 @@ mod tests {
                 Ok(Self)
             }
         }
-        fn overseer_path() -> Path {
-            Path::new("overseer2")
+        fn overseer_path() -> ActorPath {
+            ActorPath::new("overseer2")
         }
         impl MsgHandler<EscalatedMsg2> for Overseer2 {
             async fn handle(&mut self, msg: EscalatedMsg2, _ctx: &mut crate::context::MsgCtx<'_>) {
@@ -3485,7 +3501,7 @@ mod tests {
         }
 
         let (system, _clock) = ActorSystem::test();
-        let overseer = Path::new("overseer2");
+        let overseer = ActorPath::new("overseer2");
         let (_sink_idx, overseer_sink) = open_sink();
         bind_sink(&overseer, overseer_sink);
         system.spawn_service::<Overseer2, _>(
@@ -3499,7 +3515,7 @@ mod tests {
             },
         );
 
-        let worker = Path::new("never-worker");
+        let worker = ActorPath::new("never-worker");
         let spec = crate::supervision::ChildSpec {
             path: worker.clone(),
             parent: Some(overseer.clone()),
@@ -3511,11 +3527,16 @@ mod tests {
                 factor: 2.0,
             },
             args: json!({}),
-            spawn: Arc::new(|sys: &Arc<ActorSystem>, path: &Path, args: &JsonValue| {
-                sys.spawn_es::<AlwaysBoom2, _>(path.clone(), args, SpawnOpts::default(), || {
-                    vec![Arc::new(TypedEsAdapter::<AlwaysBoom2, Add>::new::<Add>())]
-                });
-            }),
+            spawn: Arc::new(
+                |sys: &Arc<ActorSystem>, path: &ActorPath, args: &JsonValue| {
+                    sys.spawn_es::<AlwaysBoom2, _>(
+                        path.clone(),
+                        args,
+                        SpawnOpts::default(),
+                        || vec![Arc::new(TypedEsAdapter::<AlwaysBoom2, Add>::new::<Add>())],
+                    );
+                },
+            ),
         };
         system.spawn_child(spec);
 
@@ -3587,7 +3608,7 @@ mod tests {
         system.register_schema::<Add>();
         system.register_schema::<Added>();
         for name in ["w1", "w2"] {
-            let path = Path::new(name);
+            let path = ActorPath::new(name);
             let (idx, sink) = open_sink();
             bind_sink(&path, sink);
             system.spawn_service::<Auditor, _>(
@@ -3609,13 +3630,13 @@ mod tests {
             system.send(envelope).await.expect("schema send delivered");
         }
         wait_for(|| async {
-            sink_read(&Path::new("w1")).len() + sink_read(&Path::new("w2")).len() == 4
+            sink_read(&ActorPath::new("w1")).len() + sink_read(&ActorPath::new("w2")).len() == 4
         })
         .await;
 
         // Then the handlers rotated: each saw two messages.
-        let w1 = sink_read(&Path::new("w1")).len();
-        let w2 = sink_read(&Path::new("w2")).len();
+        let w1 = sink_read(&ActorPath::new("w1")).len();
+        let w2 = sink_read(&ActorPath::new("w2")).len();
         assert_eq!(w1, 2, "w1 got its share");
         assert_eq!(w2, 2, "w2 got its share");
     }
@@ -3627,16 +3648,20 @@ mod tests {
         let (system, _clock) = ActorSystem::test();
         let schema = system.register_schema::<Add>();
         system.spawn_es::<Counter, _>(
-            Path::new("counter"),
+            ActorPath::new("counter"),
             &json!({}),
             SpawnOpts::default(),
             || vec![Arc::new(TypedEsAdapter::<Counter, Add>::new::<Add>())],
         );
         system
-            .send(system.envelope(Add::schema_id(), Path::new("counter"), json!({ "n": 3 })))
+            .send(system.envelope(
+                Add::schema_id(),
+                ActorPath::new("counter"),
+                json!({ "n": 3 }),
+            ))
             .await
             .expect("sent");
-        wait_for_cursor(&system, &Path::new("counter"), 1).await;
+        wait_for_cursor(&system, &ActorPath::new("counter"), 1).await;
         let export = system.export().await;
 
         // When it is serialized to JSON and deserialized back.
@@ -3673,7 +3698,7 @@ mod tests {
     async fn send_routes_through_the_kernel_to_the_inbox() {
         // Given a system with one spawned actor.
         let (system, _clock) = ActorSystem::test();
-        let path = Path::new("counter");
+        let path = ActorPath::new("counter");
         system.spawn_es::<Counter, _>(
             path.clone(),
             &json!({}),
@@ -3700,7 +3725,7 @@ mod tests {
         panic!("envelope never reached the inbox");
     }
 
-    fn inbox_has_work(_system: &ActorSystem, _path: &Path) -> bool {
+    fn inbox_has_work(_system: &ActorSystem, _path: &ActorPath) -> bool {
         // The envelope is queued iff the cursor has not advanced past it;
         // full inbox introspection lands with the atomic step (next task).
         true
@@ -3712,7 +3737,7 @@ mod tests {
     async fn es_journal_and_fold_reconstruct_state_from_events_alone() {
         // Given a spawned counter.
         let (system, _clock) = ActorSystem::test();
-        let path = Path::new("counter");
+        let path = ActorPath::new("counter");
         system.register_schema::<Add>();
         system.register_schema::<Added>();
         system.spawn_es::<Counter, _>(path.clone(), &json!({}), SpawnOpts::default(), || {
@@ -3750,7 +3775,7 @@ mod tests {
     async fn snapshot_fast_path_skips_replaying_committed_events() {
         // Given a counter with EveryN(2) snapshots that committed 4 Adds.
         let (system, _clock) = ActorSystem::test();
-        let path = Path::new("counter");
+        let path = ActorPath::new("counter");
         system.register_schema::<Add>();
         system.register_schema::<Added>();
         let opts = SpawnOpts {
@@ -3812,7 +3837,7 @@ mod tests {
     async fn snapshot_policy_off_never_appends_snapshots() {
         // Given a counter on the default (Off) policy that committed 5 Adds.
         let (system, _clock) = ActorSystem::test();
-        let path = Path::new("counter");
+        let path = ActorPath::new("counter");
         system.register_schema::<Add>();
         system.register_schema::<Added>();
         system.spawn_es::<Counter, _>(path.clone(), &json!({}), SpawnOpts::default(), || {
@@ -3967,7 +3992,7 @@ mod tests {
     async fn identity_survives_restart_at_the_same_path() {
         // Given a counter that committed one Add and then crashed on Boom.
         let (system, _clock) = ActorSystem::test();
-        let path = Path::new("counter");
+        let path = ActorPath::new("counter");
         system.register_schema::<Add>();
         system.register_schema::<Added>();
         system.register_schema::<Boom>();
@@ -4005,7 +4030,7 @@ mod tests {
     async fn panic_redelivery_replays_pending_queue_after_restart() {
         // Given a counter with a poison Boom queued BEHIND a good Add.
         let (system, _clock) = ActorSystem::test();
-        let path = Path::new("counter");
+        let path = ActorPath::new("counter");
         system.register_schema::<Add>();
         system.register_schema::<Added>();
         system.register_schema::<Boom>();

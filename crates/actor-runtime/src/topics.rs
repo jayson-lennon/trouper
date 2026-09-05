@@ -14,7 +14,7 @@ use std::collections::{HashMap, VecDeque};
 
 use crate::envelope::Envelope;
 use crate::inbox::OverloadPolicy;
-use crate::types::{InboxOffset, Path, SchemaId, Topic};
+use crate::types::{ActorPath, InboxOffset, SchemaId, Topic};
 
 /// The fact recorded when an envelope is published onto a topic.
 #[derive(Debug, Clone)]
@@ -26,7 +26,7 @@ pub struct TopicPublishFact {
     /// The payload's schema.
     pub schema: SchemaId,
     /// The logical publisher, when known.
-    pub from: Option<Path>,
+    pub from: Option<ActorPath>,
     /// The publish's trace.
     pub trace: crate::envelope::TraceCtx,
 }
@@ -51,9 +51,9 @@ pub struct TopicLog {
     /// The lowest offset still retained (everything below was evicted).
     floor: u64,
     /// Per-subscriber cursor: the next log offset to deliver.
-    cursors: HashMap<Path, u64>,
+    cursors: HashMap<ActorPath, u64>,
     /// Per-subscriber inbox policy, applied by the pump.
-    policies: HashMap<Path, OverloadPolicy>,
+    policies: HashMap<ActorPath, OverloadPolicy>,
 }
 
 impl TopicLog {
@@ -86,7 +86,7 @@ impl TopicLog {
     /// Subscribes a path with an inbox policy, starting per `from`.
     ///
     /// Re-subscribing resets the cursor (the caller's choice).
-    pub fn subscribe(&mut self, path: Path, policy: OverloadPolicy, from: CursorFrom) -> u64 {
+    pub fn subscribe(&mut self, path: ActorPath, policy: OverloadPolicy, from: CursorFrom) -> u64 {
         let start = match from {
             CursorFrom::Latest => self.next_offset,
             CursorFrom::Offset(o) => o.max(self.floor),
@@ -97,7 +97,7 @@ impl TopicLog {
     }
 
     /// Removes a subscriber (cascades on actor removal).
-    pub fn unsubscribe(&mut self, path: &Path) -> bool {
+    pub fn unsubscribe(&mut self, path: &ActorPath) -> bool {
         let had = self.cursors.remove(path).is_some();
         self.policies.remove(path);
         had
@@ -110,7 +110,7 @@ impl TopicLog {
     ///
     /// Returns the requested offset unchanged if the path is not a
     /// subscriber; offsets below the ring floor clamp to the floor.
-    pub fn reset_cursor(&mut self, path: &Path, to: u64) -> Result<u64, u64> {
+    pub fn reset_cursor(&mut self, path: &ActorPath, to: u64) -> Result<u64, u64> {
         let cursor = self.cursors.get_mut(path).ok_or(to)?;
         let clamped = to.max(self.floor);
         *cursor = clamped;
@@ -118,12 +118,12 @@ impl TopicLog {
     }
 
     /// Whether the path is subscribed.
-    pub fn is_subscribed(&self, path: &Path) -> bool {
+    pub fn is_subscribed(&self, path: &ActorPath) -> bool {
         self.cursors.contains_key(path)
     }
 
     /// The subscriber paths (registry snapshots).
-    pub fn subscribers(&self) -> Vec<Path> {
+    pub fn subscribers(&self) -> Vec<ActorPath> {
         self.cursors.keys().cloned().collect()
     }
 
@@ -140,7 +140,7 @@ impl TopicLog {
     /// Returns `(delivered, skipped)` counts for the tap/tests.
     pub fn pump_once(
         &mut self,
-        mut deliver: impl FnMut(&Path, &Envelope, OverloadPolicy) -> bool,
+        mut deliver: impl FnMut(&ActorPath, &Envelope, OverloadPolicy) -> bool,
     ) -> (usize, usize) {
         let mut delivered = 0;
         let mut skipped = 0;
@@ -207,7 +207,7 @@ mod tests {
 
         // When subscribing with CursorFrom::Latest.
         let start = log.subscribe(
-            Path::new("watcher"),
+            ActorPath::new("watcher"),
             OverloadPolicy::DropNew,
             CursorFrom::Latest,
         );
@@ -226,7 +226,7 @@ mod tests {
 
         // When subscribing from offset zero (evicted).
         let start = log.subscribe(
-            Path::new("watcher"),
+            ActorPath::new("watcher"),
             OverloadPolicy::DropNew,
             CursorFrom::Offset(0),
         );
@@ -243,7 +243,7 @@ mod tests {
         log.append(envelope(1));
         log.append(envelope(2));
         log.subscribe(
-            Path::new("sub"),
+            ActorPath::new("sub"),
             OverloadPolicy::DropNew,
             CursorFrom::Offset(0),
         );
@@ -273,14 +273,14 @@ mod tests {
         log.append(envelope(1));
         log.append(envelope(2));
         log.subscribe(
-            Path::new("ahead"),
+            ActorPath::new("ahead"),
             OverloadPolicy::DropNew,
             CursorFrom::Latest,
         );
-        log.reset_cursor(&Path::new("ahead"), 2)
+        log.reset_cursor(&ActorPath::new("ahead"), 2)
             .expect("subscribed");
         log.subscribe(
-            Path::new("behind"),
+            ActorPath::new("behind"),
             OverloadPolicy::DropNew,
             CursorFrom::Offset(0),
         );
@@ -300,14 +300,16 @@ mod tests {
         log.append(envelope(0));
         log.append(envelope(1));
         log.subscribe(
-            Path::new("sub"),
+            ActorPath::new("sub"),
             OverloadPolicy::DropNew,
             CursorFrom::Offset(0),
         );
         log.pump_once(|_, _, _| true);
 
         // When resetting the cursor to offset zero.
-        let cursor = log.reset_cursor(&Path::new("sub"), 0).expect("subscribed");
+        let cursor = log
+            .reset_cursor(&ActorPath::new("sub"), 0)
+            .expect("subscribed");
 
         // Then the next pump re-delivers from there.
         let (delivered, _) = log.pump_once(|_, _, _| true);
@@ -319,7 +321,9 @@ mod tests {
         while log.retained().0 == 0 {
             log.append(envelope(9));
         }
-        let clamped = log.reset_cursor(&Path::new("sub"), 0).expect("subscribed");
+        let clamped = log
+            .reset_cursor(&ActorPath::new("sub"), 0)
+            .expect("subscribed");
         assert_eq!(clamped, log.retained().0);
     }
 
@@ -328,18 +332,18 @@ mod tests {
         // Given a subscribed path.
         let mut log = TopicLog::new(8);
         log.subscribe(
-            Path::new("sub"),
+            ActorPath::new("sub"),
             OverloadPolicy::DropNew,
             CursorFrom::Latest,
         );
 
         // When unsubscribing.
-        let removed = log.unsubscribe(&Path::new("sub"));
+        let removed = log.unsubscribe(&ActorPath::new("sub"));
 
         // Then the path is gone and re-unsubscribe reports nothing.
         assert!(removed);
-        assert!(!log.unsubscribe(&Path::new("sub")));
-        assert!(!log.is_subscribed(&Path::new("sub")));
+        assert!(!log.unsubscribe(&ActorPath::new("sub")));
+        assert!(!log.is_subscribed(&ActorPath::new("sub")));
     }
 
     #[test]
@@ -348,7 +352,7 @@ mod tests {
         let mut log = TopicLog::new(8);
 
         // When resetting a non-subscriber's cursor.
-        let result = log.reset_cursor(&Path::new("ghost"), 4);
+        let result = log.reset_cursor(&ActorPath::new("ghost"), 4);
 
         // Then the reset is refused, echoing the requested offset.
         assert_eq!(result, Err(4));

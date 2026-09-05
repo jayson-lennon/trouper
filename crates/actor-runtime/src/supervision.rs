@@ -80,9 +80,9 @@ impl Default for Backoff {
 #[derive(Clone)]
 pub struct ChildSpec {
     /// The child's path (its identity across restarts).
-    pub path: crate::types::Path,
+    pub path: crate::types::ActorPath,
     /// The child's parent (escalation target); `None` = the system itself.
-    pub parent: Option<crate::types::Path>,
+    pub parent: Option<crate::types::ActorPath>,
     /// When a failed child may be restarted.
     pub restart: RestartPolicy,
     /// The sliding-window restart budget.
@@ -95,8 +95,11 @@ pub struct ChildSpec {
     /// Ok(()) after the child runs again; the kernel drives restarts.
     #[allow(clippy::type_complexity)]
     pub spawn: std::sync::Arc<
-        dyn Fn(&std::sync::Arc<crate::system::ActorSystem>, &crate::types::Path, &serde_json::Value)
-            + Send
+        dyn Fn(
+                &std::sync::Arc<crate::system::ActorSystem>,
+                &crate::types::ActorPath,
+                &serde_json::Value,
+            ) + Send
             + Sync,
     >,
 }
@@ -253,7 +256,7 @@ mod tests {
     #[test]
     fn escalation_message_carries_path_and_reason() {
         // Given a child spec's identity.
-        let spec_path = crate::types::Path::new("worker");
+        let spec_path = crate::types::ActorPath::new("worker");
 
         // When the escalation message is built.
         let message = json!({

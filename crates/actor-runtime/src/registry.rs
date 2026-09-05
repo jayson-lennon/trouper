@@ -14,7 +14,7 @@ use tokio::sync::mpsc;
 
 use crate::envelope::Envelope;
 use crate::schema::{ActorManifest, Schema, SchemaDef, SchemaError};
-use crate::types::{ActorKind, Path, SchemaId, Topic};
+use crate::types::{ActorKind, ActorPath, SchemaId, Topic};
 
 /// The topic every undeliverable message lands on; created at system boot.
 pub const DEAD_LETTER_TOPIC: &str = "system.deadletters";
@@ -90,7 +90,7 @@ impl Slot {
 #[derive(Debug, Clone)]
 pub struct EndpointInfo {
     /// The actor's path.
-    pub path: Path,
+    pub path: ActorPath,
     /// The actor's contract kind.
     pub kind: ActorKind,
     /// A copy of the actor's manifest.
@@ -101,9 +101,9 @@ pub struct EndpointInfo {
 #[derive(Debug, Clone)]
 pub enum RoutePolicy {
     /// Exactly one handler path.
-    Single(Path),
+    Single(ActorPath),
     /// Handlers rotate in registration order.
-    RoundRobin(Vec<Path>),
+    RoundRobin(Vec<ActorPath>),
 }
 
 impl RoutePolicy {
@@ -111,7 +111,7 @@ impl RoutePolicy {
     ///
     /// Round-robin state is a cursor carried by the caller (the registry),
     /// keeping this type pure data.
-    fn pick(&self, cursor: &mut usize) -> Option<Path> {
+    fn pick(&self, cursor: &mut usize) -> Option<ActorPath> {
         match self {
             Self::Single(path) => Some(path.clone()),
             Self::RoundRobin(paths) if !paths.is_empty() => {
@@ -206,16 +206,16 @@ impl SchemaTable {
 #[error(debug)]
 pub enum RegistryError {
     /// A slot already exists under this path.
-    PathTaken(Path),
+    PathTaken(ActorPath),
     /// No slot exists under this path.
-    UnknownPath(Path),
+    UnknownPath(ActorPath),
 }
 
 /// All kernel tables: slots, schemas, routes, and the round-robin cursor.
 #[derive(Debug, Default)]
 pub struct Registry {
     schemas: SchemaTable,
-    slots: HashMap<Path, Slot>,
+    slots: HashMap<ActorPath, Slot>,
     routes: HashMap<SchemaId, RoutePolicy>,
     route_cursor: usize,
 }
@@ -255,7 +255,7 @@ impl Registry {
 
     /// The shared schema table (for export).
     /// A snapshot of every live slot for export: (path, manifest).
-    pub fn slot_manifests(&self) -> Vec<(Path, ActorManifest)> {
+    pub fn slot_manifests(&self) -> Vec<(ActorPath, ActorManifest)> {
         self.slots
             .iter()
             .map(|(path, slot)| (path.clone(), slot.manifest.clone()))
@@ -274,7 +274,7 @@ impl Registry {
     /// Returns [`RegistryError::PathTaken`] when the path is registered.
     pub fn insert_slot(
         &mut self,
-        path: Path,
+        path: ActorPath,
         manifest: ActorManifest,
         endpoint: Endpoint,
         inbox_policy: crate::inbox::OverloadPolicy,
@@ -304,7 +304,7 @@ impl Registry {
     /// Returns [`RegistryError::UnknownPath`] when no slot exists.
     pub fn swap_endpoint(
         &mut self,
-        path: &Path,
+        path: &ActorPath,
         endpoint: Endpoint,
     ) -> Result<(), error_stack::Report<RegistryError>> {
         use error_stack::ResultExt;
@@ -325,7 +325,7 @@ impl Registry {
     /// Returns [`RegistryError::UnknownPath`] when no slot exists.
     pub fn remove_slot(
         &mut self,
-        path: &Path,
+        path: &ActorPath,
     ) -> Result<ActorManifest, error_stack::Report<RegistryError>> {
         use error_stack::ResultExt;
         let slot = self
@@ -337,12 +337,12 @@ impl Registry {
     }
 
     /// Resolves a path to a deliverable endpoint, if the actor is running.
-    pub fn resolve(&self, path: &Path) -> Option<std::sync::Arc<Endpoint>> {
+    pub fn resolve(&self, path: &ActorPath) -> Option<std::sync::Arc<Endpoint>> {
         self.slots.get(path)?.endpoint.load_full()
     }
 
     /// The inbox policy a path spawned with (topic pump delivery).
-    pub fn inbox_policy(&self, path: &Path) -> crate::inbox::OverloadPolicy {
+    pub fn inbox_policy(&self, path: &ActorPath) -> crate::inbox::OverloadPolicy {
         self.slots
             .get(path)
             .map(|s| s.inbox_policy)
@@ -350,7 +350,7 @@ impl Registry {
     }
 
     /// Snapshot info about a path, for `ctx.lookup`.
-    pub fn lookup(&self, path: &Path) -> Option<EndpointInfo> {
+    pub fn lookup(&self, path: &ActorPath) -> Option<EndpointInfo> {
         let slot = self.slots.get(path)?;
         Some(EndpointInfo {
             path: path.clone(),
@@ -360,7 +360,7 @@ impl Registry {
     }
 
     /// Whether a path is registered (running or mid-restart).
-    pub fn is_registered(&self, path: &Path) -> bool {
+    pub fn is_registered(&self, path: &ActorPath) -> bool {
         self.slots.contains_key(path)
     }
 
@@ -368,7 +368,7 @@ impl Registry {
     ///
     /// For [`RoutePolicy::Single`] the sole path wins; for round-robin the
     /// registry's shared cursor rotates.
-    pub fn route(&mut self, schema: &SchemaId) -> Option<Path> {
+    pub fn route(&mut self, schema: &SchemaId) -> Option<ActorPath> {
         let policy = self.routes.get(schema)?;
         policy.pick(&mut self.route_cursor)
     }
@@ -378,7 +378,7 @@ impl Registry {
     /// Registering a second handler for a schema converts the route to
     /// round-robin over registration order — multiple independent actors
     /// sharing one schema is exactly the load-balancing case.
-    pub fn add_route(&mut self, schema: SchemaId, path: Path) {
+    pub fn add_route(&mut self, schema: SchemaId, path: ActorPath) {
         match self.routes.entry(schema) {
             std::collections::hash_map::Entry::Vacant(v) => {
                 v.insert(RoutePolicy::Single(path));
@@ -400,7 +400,7 @@ impl Registry {
     }
 
     /// Drops every route pointing at `path` (slot removal cascade).
-    pub fn drop_routes_of(&mut self, path: &Path) {
+    pub fn drop_routes_of(&mut self, path: &ActorPath) {
         self.routes.retain(|_, policy| match policy {
             RoutePolicy::Single(single) => single != path,
             RoutePolicy::RoundRobin(paths) => {
@@ -411,7 +411,7 @@ impl Registry {
     }
 
     /// Every path registered as a handler for `schema`, for `ctx.who_handles`.
-    pub fn who_handles(&self, schema: &SchemaId) -> Vec<Path> {
+    pub fn who_handles(&self, schema: &SchemaId) -> Vec<ActorPath> {
         match self.routes.get(schema) {
             Some(RoutePolicy::Single(path)) => vec![path.clone()],
             Some(RoutePolicy::RoundRobin(paths)) => paths.clone(),
@@ -438,7 +438,7 @@ mod tests {
     fn envelope(n: u32) -> Envelope {
         Envelope::json(
             SchemaId::new("Ping", 1),
-            crate::envelope::Address::Path(Path::new("a")),
+            crate::envelope::Address::Path(ActorPath::new("a")),
             json!({ "n": n }),
             TraceCtx::root(),
         )
@@ -541,7 +541,7 @@ mod tests {
     fn insert_slot_then_resolve_delivers_to_the_endpoint() {
         // Given a registry with one slot inserted.
         let mut registry = Registry::default();
-        let path = Path::new("inventory.west");
+        let path = ActorPath::new("inventory.west");
         let (_rx, ep) = endpoint(4);
         registry
             .insert_slot(
@@ -566,7 +566,7 @@ mod tests {
     fn insert_slot_fails_when_path_is_taken() {
         // Given a registry with a slot at `dup`.
         let mut registry = Registry::default();
-        let path = Path::new("dup");
+        let path = ActorPath::new("dup");
         let (_rx, ep) = endpoint(1);
         registry
             .insert_slot(
@@ -597,7 +597,7 @@ mod tests {
     fn swap_endpoint_replaces_the_handle_under_the_same_identity() {
         // Given a slot whose first endpoint's receiver is dropped on swap.
         let mut registry = Registry::default();
-        let path = Path::new("inventory.west");
+        let path = ActorPath::new("inventory.west");
         let (rx1, ep1) = endpoint(4);
         registry
             .insert_slot(
@@ -626,7 +626,7 @@ mod tests {
     fn remove_slot_makes_the_path_unresolvable() {
         // Given a registry with a slot.
         let mut registry = Registry::default();
-        let path = Path::new("temp");
+        let path = ActorPath::new("temp");
         let (_rx, ep) = endpoint(1);
         registry
             .insert_slot(
@@ -650,7 +650,7 @@ mod tests {
     fn lookup_reports_kind_and_manifest() {
         // Given a slot spawned with an event-sourced manifest.
         let mut registry = Registry::default();
-        let path = Path::new("inventory.west");
+        let path = ActorPath::new("inventory.west");
         let (ep_manifest, _rx, ep) = {
             let m = ActorManifest::new()
                 .kind(ActorKind::EventSourced)
@@ -683,7 +683,7 @@ mod tests {
         // Given a single route from a schema to an actor.
         let mut registry = Registry::default();
         let schema = SchemaId::new("Ping", 1);
-        let path = Path::new("ponger");
+        let path = ActorPath::new("ponger");
         registry.add_route(schema.clone(), path.clone());
 
         // When routing the schema twice.
@@ -701,7 +701,7 @@ mod tests {
         let mut registry = Registry::default();
         let schema = SchemaId::new("Ping", 1);
         for name in ["a", "b", "c"] {
-            registry.add_route(schema.clone(), Path::new(name));
+            registry.add_route(schema.clone(), ActorPath::new(name));
         }
 
         // When routing four times.
@@ -726,8 +726,8 @@ mod tests {
         // Given a schema routed to two handlers.
         let mut registry = Registry::default();
         let schema = SchemaId::new("Ping", 1);
-        registry.add_route(schema.clone(), Path::new("a"));
-        registry.add_route(schema.clone(), Path::new("b"));
+        registry.add_route(schema.clone(), ActorPath::new("a"));
+        registry.add_route(schema.clone(), ActorPath::new("b"));
 
         // When asking who handles it.
         let handlers = registry.who_handles(&schema);
@@ -740,8 +740,8 @@ mod tests {
     fn drop_routes_of_removes_only_the_removed_path() {
         // Given two schemas routed through `gone` and one through `kept`.
         let mut registry = Registry::default();
-        let gone = Path::new("gone");
-        let kept = Path::new("kept");
+        let gone = ActorPath::new("gone");
+        let kept = ActorPath::new("kept");
         registry.add_route(SchemaId::new("Ping", 1), gone.clone());
         registry.add_route(SchemaId::new("Ping", 1), kept.clone());
         registry.add_route(SchemaId::new("Pong", 1), gone.clone());
@@ -760,7 +760,7 @@ mod tests {
         let registry = Registry::default();
 
         // When resolving a path no actor owns.
-        let resolved = registry.resolve(&Path::new("ghost"));
+        let resolved = registry.resolve(&ActorPath::new("ghost"));
 
         // Then resolution is None — the kernel turns this into a
         // DeadLettered fact on the dead-letter topic.

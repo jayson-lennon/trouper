@@ -13,7 +13,7 @@ use serde_json::json;
 
 use crate::envelope::{Address, TraceCtx};
 use crate::kernel::AskOutcome;
-use crate::types::{ActorKind, DeadLetterReason, Path, SchemaId, SeqNo, StopReason, Topic};
+use crate::types::{ActorKind, ActorPath, DeadLetterReason, SchemaId, SeqNo, StopReason, Topic};
 
 /// One observed runtime fact.
 #[derive(Debug, Clone)]
@@ -31,26 +31,26 @@ pub struct Fact {
 pub enum FactKind {
     /// An envelope was routed to a destination.
     Sent {
-        from: Option<Path>,
+        from: Option<ActorPath>,
         dest: Address,
         schema: SchemaId,
         trace: TraceCtx,
     },
     /// A loop picked an envelope out of its inbox.
     Delivered {
-        to: Path,
+        to: ActorPath,
         schema: SchemaId,
         trace: TraceCtx,
     },
     /// An ES actor durably committed a message (journal + ack).
     Acked {
-        to: Path,
+        to: ActorPath,
         schema: SchemaId,
         trace: TraceCtx,
     },
     /// A service actor opened an ask.
     AskOpened {
-        from: Path,
+        from: ActorPath,
         dest: Address,
         trace: TraceCtx,
     },
@@ -61,14 +61,14 @@ pub enum FactKind {
     },
     /// An actor was spawned (fresh or restarted).
     Spawned {
-        path: Path,
+        path: ActorPath,
         kind: ActorKind,
         restart: bool,
     },
     /// An actor stopped gracefully.
-    Stopped { path: Path, reason: StopReason },
+    Stopped { path: ActorPath, reason: StopReason },
     /// A handler failed (panic or dispatch error).
-    Failed { path: Path, error: String },
+    Failed { path: ActorPath, error: String },
     /// An envelope was published onto a topic.
     TopicPublished {
         topic: Topic,
@@ -76,15 +76,15 @@ pub enum FactKind {
         trace: TraceCtx,
     },
     /// An ES actor took a snapshot at a journal seq.
-    SnapshotTaken { path: Path, seq: SeqNo },
+    SnapshotTaken { path: ActorPath, seq: SeqNo },
     /// A restart budget was exhausted; escalation to the parent.
-    Escalated { path: Path, reason: String },
+    Escalated { path: ActorPath, reason: String },
     /// A parent was notified that its linked child stopped/removed.
     LinkNotified {
         /// The parent that was (would have been) notified.
-        parent: Path,
+        parent: ActorPath,
         /// The child whose stop triggered the notification.
-        child: Path,
+        child: ActorPath,
     },
     /// An envelope was dead-lettered.
     DeadLettered {
@@ -288,7 +288,7 @@ mod tests {
 
     fn spawned_fact(path: &str) -> FactKind {
         FactKind::Spawned {
-            path: Path::new(path),
+            path: ActorPath::new(path),
             kind: crate::types::ActorKind::EventSourced,
             restart: false,
         }
@@ -334,7 +334,7 @@ mod tests {
         ring.push(
             ts(42),
             FactKind::Acked {
-                to: Path::new("counter"),
+                to: ActorPath::new("counter"),
                 schema: SchemaId::new("Add", 1),
                 trace: TraceCtx::root(),
             },
