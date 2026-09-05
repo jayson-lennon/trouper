@@ -14,7 +14,7 @@ use crate::actor::{
     CommandEntry, DynServiceActor, EventSourced, MsgEntry, ServiceActor, TypedEsState,
     TypedServiceState,
 };
-use crate::clock::{ClockService, SystemClock};
+use crate::clock::{ClockService, FakeClock, SystemClock};
 use crate::context::RuntimeView;
 use crate::envelope::{Address, Envelope, TraceCtx};
 use crate::inbox::{Inbox, OverloadPolicy};
@@ -188,6 +188,18 @@ impl ActorSystem {
     /// Creates a system on the wall clock.
     pub fn new() -> Self {
         Self::with_clock(ClockService::new(Arc::new(SystemClock::new())))
+    }
+
+    /// Creates a system tuned for tests: a [`FakeClock`] starting at
+    /// 1_000 ms (reachable via the returned handle).
+    pub fn test() -> (Arc<Self>, Arc<FakeClock>) {
+        let (clock, fake) = ClockService::fake(1_000);
+        (Arc::new(Self::with_clock(clock)), fake)
+    }
+
+    /// The fake clock behind this system, when tests installed one.
+    pub fn fake_clock(&self) -> Option<Arc<FakeClock>> {
+        self.clock.backend_fake()
     }
 
     /// Creates a system on an injected clock (tests: [`crate::clock::FakeClock`]).
@@ -947,6 +959,49 @@ impl Default for ActorSystem {
 
 #[cfg(test)]
 mod tests {
+    impl ActorSystem {
+        /// The number of journalled entries for `path` (tests).
+        pub fn journal_len(&self, path: &Path) -> usize {
+            let kernel = self.kernel.lock().expect("kernel lock");
+            kernel.journals.get(path).map(|j| j.len()).unwrap_or(0)
+        }
+
+        /// Dead-letter schemas collected so far (tests).
+        pub fn dead_letter_schemas(&self) -> Vec<SchemaId> {
+            let kernel = self.kernel.lock().expect("kernel lock");
+            kernel
+                .dead_letters
+                .iter()
+                .map(|d| d.schema.clone())
+                .collect()
+        }
+
+        /// The tap as a compact census of fact kinds (tests).
+        pub fn fact_kind_counts(&self) -> HashMap<String, usize> {
+            let mut counts = HashMap::new();
+            for fact in self.tap_facts() {
+                let kind = format!("{:?}", fact.kind);
+                *counts
+                    .entry(kind.split(['(', '{']).next().unwrap_or(&kind).to_owned())
+                    .or_default() += 1;
+            }
+            counts
+        }
+    }
+
+    /// Waits until `predicate` holds (polling with tiny yields); panics
+    /// after ~5s so a regression surfaces as a failure, not a hang.
+    #[allow(dead_code)] // adopted by the remaining test-table work
+    pub(crate) async fn wait_until(mut predicate: impl AsyncFnMut() -> bool) {
+        for _ in 0..500 {
+            if predicate().await {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        panic!("condition never became true within 5s");
+    }
+
     use super::*;
     use crate::actor::{CommandHandler, MsgHandler, TypedEsAdapter, TypedServiceAdapter};
     use crate::context::CmdCtx;
@@ -1046,7 +1101,7 @@ mod tests {
     #[tokio::test]
     async fn atomic_step_commits_journal_state_and_cursor_together() {
         // Given a spawned counter actor.
-        let system = Arc::new(ActorSystem::new());
+        let (system, _clock) = ActorSystem::test();
         let path = Path::new("counter");
         system.spawn_es::<Counter, _>(path.clone(), &json!({}), SpawnOpts::default(), || {
             vec![Arc::new(TypedEsAdapter::<Counter, Add>::new::<Add>())]
@@ -1073,7 +1128,7 @@ mod tests {
     #[tokio::test]
     async fn atomic_step_dead_letters_unknown_schemas_and_advances() {
         // Given a spawned actor that handles only Add.
-        let system = Arc::new(ActorSystem::new());
+        let (system, _clock) = ActorSystem::test();
         let path = Path::new("counter");
         system.spawn_es::<Counter, _>(path.clone(), &json!({}), SpawnOpts::default(), || {
             vec![Arc::new(TypedEsAdapter::<Counter, Add>::new::<Add>())]
@@ -1100,7 +1155,7 @@ mod tests {
     #[tokio::test]
     async fn atomic_step_panics_leave_the_message_queued_for_redelivery() {
         // Given a spawned actor whose Boom handler panics.
-        let system = Arc::new(ActorSystem::new());
+        let (system, _clock) = ActorSystem::test();
         let path = Path::new("counter");
         system.spawn_es::<Counter, _>(path.clone(), &json!({}), SpawnOpts::default(), || {
             vec![Arc::new(TypedEsAdapter::<Counter, Boom>::new::<Boom>())]
@@ -1129,7 +1184,7 @@ mod tests {
     #[tokio::test]
     async fn restart_rebuilds_from_journal_and_redelivers_exactly_once() {
         // Given a counter that has committed one Add, then crashed on Boom.
-        let system = Arc::new(ActorSystem::new());
+        let (system, _clock) = ActorSystem::test();
         let path = Path::new("counter");
         let boom = Path::new("counter");
         system.spawn_es::<Counter, _>(path.clone(), &json!({}), SpawnOpts::default(), || {
@@ -1270,7 +1325,7 @@ mod tests {
             async fn handle(&mut self, _msg: Ping, _ctx: &mut crate::context::MsgCtx<'_>) {}
         }
 
-        let system = Arc::new(ActorSystem::new());
+        let (system, _clock) = ActorSystem::test();
         system.spawn_es::<Forwarder, _>(Path::new("a"), &json!({}), SpawnOpts::default(), || {
             vec![Arc::new(TypedEsAdapter::<Forwarder, Add>::new::<Add>())]
         });
@@ -1323,7 +1378,7 @@ mod tests {
     #[tokio::test]
     async fn tap_drop_oldest_under_pressure_keeps_delivery_working() {
         // Given a system whose tap ring is tiny (test-visible capacity).
-        let system = Arc::new(ActorSystem::new());
+        let (system, _clock) = ActorSystem::test();
         {
             let mut kernel = system.kernel.lock().expect("lock");
             kernel.tap = crate::tap::TapRing::new(4);
@@ -1387,7 +1442,7 @@ mod tests {
 
         // The overseer is a service actor whose Escalated control message
         // lands in its sink via a plain send from the engine.
-        let system = Arc::new(ActorSystem::new());
+        let (system, _clock) = ActorSystem::test();
         let overseer = Path::new("overseer");
         bind_sink(&overseer, Arc::new(std::sync::Mutex::new(Vec::new())));
         struct Overseer;
@@ -1506,7 +1561,7 @@ mod tests {
     async fn graceful_shutdown_stops_children_before_the_parent() {
         // Given a parent path with a supervised child spec (no running
         // cell for either: the cascade itself is the behavior under test).
-        let system = Arc::new(ActorSystem::new());
+        let (system, _clock) = ActorSystem::test();
         let parent = Path::new("parent");
         let child = Path::new("child");
         {
@@ -1554,7 +1609,7 @@ mod tests {
         // Given a supervised child spec with Transient restart policy.
         // The observable: a NORMAL stop must not arm the failure window
         // (stop() never records failures), so the child stays stopped.
-        let system = Arc::new(ActorSystem::new());
+        let (system, _clock) = ActorSystem::test();
         let path = Path::new("transient-child");
         {
             let mut kernel = system.kernel.lock().expect("lock");
@@ -1599,7 +1654,7 @@ mod tests {
     #[tokio::test]
     async fn topic_cursor_reset_redelivers_in_order() {
         // Given a counter emitting onto "counter.events" and a subscriber.
-        let system = Arc::new(ActorSystem::new());
+        let (system, _clock) = ActorSystem::test();
         let path = Path::new("counter");
         let sub = Path::new("watcher");
         system.spawn_es::<Counter, _>(path.clone(), &json!({}), SpawnOpts::default(), || {
@@ -1662,7 +1717,7 @@ mod tests {
     #[tokio::test]
     async fn topic_subscribers_have_independent_cursors() {
         // Given one publisher and two subscribers.
-        let system = Arc::new(ActorSystem::new());
+        let (system, _clock) = ActorSystem::test();
         let path = Path::new("counter");
         let early = Path::new("early");
         let late = Path::new("late");
@@ -1720,7 +1775,7 @@ mod tests {
     #[tokio::test]
     async fn slow_subscriber_does_not_block_the_publisher() {
         // Given a subscriber spawned with a tiny DropNew mailbox.
-        let system = Arc::new(ActorSystem::new());
+        let (system, _clock) = ActorSystem::test();
         let path = Path::new("counter");
         let slow = Path::new("slow");
         system.spawn_es::<Counter, _>(path.clone(), &json!({}), SpawnOpts::default(), || {
@@ -1861,7 +1916,7 @@ mod tests {
     #[tokio::test]
     async fn service_actor_receives_typed_messages_impurely() {
         // Given a system and an Auditor service with a shared test sink.
-        let system = Arc::new(ActorSystem::new());
+        let (system, _clock) = ActorSystem::test();
         let (sink_idx, sink) = open_sink();
         let path = Path::new("auditor");
         system.spawn_service::<Auditor, _>(
@@ -1892,7 +1947,7 @@ mod tests {
     async fn ask_settles_replied_when_the_callee_answers_the_slot() {
         // Given a callee that replies to whatever asks it, and an asker
         // service that calls ctx.ask on it.
-        let system = Arc::new(ActorSystem::new());
+        let (system, _clock) = ActorSystem::test();
         system.register_schema::<Add>();
 
         static RESULTS: std::sync::OnceLock<Mutex<Vec<String>>> = std::sync::OnceLock::new();
@@ -2001,7 +2056,7 @@ mod tests {
     #[tokio::test]
     async fn ask_settles_timeout_when_the_callee_never_replies() {
         // Given a silent callee and an asker with a short timeout.
-        let system = Arc::new(ActorSystem::new());
+        let (system, _clock) = ActorSystem::test();
         system.register_schema::<Add>();
 
         static RESULTS: std::sync::OnceLock<Mutex<Vec<String>>> = std::sync::OnceLock::new();
@@ -2106,7 +2161,7 @@ mod tests {
     async fn ask_over_a_durable_path_continues_as_an_ordinary_message() {
         // Given an ES counter whose Add handler REPLIES to a reply-to
         // PATH (not a slot): the reply continues as a normal envelope.
-        let system = Arc::new(ActorSystem::new());
+        let (system, _clock) = ActorSystem::test();
         system.register_schema::<Add>();
         system.register_schema::<Added>();
 
@@ -2243,7 +2298,7 @@ mod tests {
     #[tokio::test]
     async fn spawn_es_registers_slot_and_edges() {
         // Given a system.
-        let system = Arc::new(ActorSystem::new());
+        let (system, _clock) = ActorSystem::test();
         system.register_schema::<Add>();
         system.register_schema::<Added>();
 
@@ -2261,7 +2316,7 @@ mod tests {
     #[tokio::test]
     async fn spawn_es_starts_genesis_state() {
         // Given a system with a spawned counter.
-        let system = Arc::new(ActorSystem::new());
+        let (system, _clock) = ActorSystem::test();
         let path = Path::new("counter");
         system.spawn_es::<Counter, _>(path.clone(), &json!({}), SpawnOpts::default(), || {
             vec![Arc::new(TypedEsAdapter::<Counter, Add>::new::<Add>())]
@@ -2300,7 +2355,7 @@ mod tests {
     async fn foreign_schema_roundtrip() {
         // Given a system with a foreign schema registered from a JSON
         // descriptor and a foreign ES actor whose state is pure JSON.
-        let system = Arc::new(ActorSystem::new());
+        let (system, _clock) = ActorSystem::test();
         let schema = system
             .register_schema_json(json!({
                 "name": "tally", "version": 1, "kind": "command",
@@ -2367,7 +2422,7 @@ mod tests {
     #[tokio::test]
     async fn subscription_cascade_on_remove() {
         // Given a publisher and a subscriber bound to a topic.
-        let system = Arc::new(ActorSystem::new());
+        let (system, _clock) = ActorSystem::test();
         let topic = crate::types::Topic::new("cascade.events");
         system.spawn_es::<Counter, _>(Path::new("pub"), &json!({}), SpawnOpts::default(), || {
             vec![Arc::new(TypedEsAdapter::<Counter, Add>::new::<Add>())]
@@ -2426,7 +2481,7 @@ mod tests {
     async fn export_shows_schemas_actors_and_edge_kinds() {
         // Given a system with an ES actor declaring handles/emits, a
         // subscriber on a topic, and some send traffic.
-        let system = Arc::new(ActorSystem::new());
+        let (system, _clock) = ActorSystem::test();
         let schema = system.register_schema::<Add>();
         let topic = crate::types::Topic::new("export.events");
         system.spawn_es::<Counter, _>(
@@ -2524,7 +2579,7 @@ mod tests {
     #[tokio::test]
     async fn send_routes_through_the_kernel_to_the_inbox() {
         // Given a system with one spawned actor.
-        let system = Arc::new(ActorSystem::new());
+        let (system, _clock) = ActorSystem::test();
         let path = Path::new("counter");
         system.spawn_es::<Counter, _>(
             path.clone(),

@@ -37,12 +37,34 @@ pub struct ClockError;
 pub struct ClockService {
     #[debug("ClockService<{}>", self.backend.name())]
     backend: Arc<dyn ClockBackend>,
+    /// The backend as a fake clock, when one was installed (tests).
+    fake: Option<Arc<FakeClock>>,
 }
 
 impl ClockService {
     /// Wraps a backend.
     pub fn new(backend: Arc<dyn ClockBackend>) -> Self {
-        Self { backend }
+        Self {
+            backend,
+            fake: None,
+        }
+    }
+
+    /// Wraps a [`FakeClock`], keeping a handle so tests can advance it.
+    pub fn fake(start_millis: u64) -> (Self, Arc<FakeClock>) {
+        let fake = FakeClock::new(start_millis);
+        (
+            Self {
+                backend: fake.clone(),
+                fake: Some(fake.clone()),
+            },
+            fake,
+        )
+    }
+
+    /// The backend as a [`FakeClock`], when one was installed (tests).
+    pub fn backend_fake(&self) -> Option<Arc<FakeClock>> {
+        self.fake.clone()
     }
 
     /// The current time.
