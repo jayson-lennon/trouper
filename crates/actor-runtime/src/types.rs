@@ -79,6 +79,19 @@ pub enum StopReason {
     Escalated,
 }
 
+/// Why an envelope was dead-lettered.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum DeadLetterReason {
+    /// No slot or route resolved for the destination.
+    Unresolvable,
+    /// No handler is registered for the payload's schema.
+    UnknownSchema,
+    /// The payload did not decode against its registered schema.
+    Decode,
+    /// The destination inbox refused the envelope (overload/closed).
+    InboxRefused,
+}
+
 impl Path {
     /// Creates a path from a string.
     pub fn new(s: impl Into<Arc<str>>) -> Self {

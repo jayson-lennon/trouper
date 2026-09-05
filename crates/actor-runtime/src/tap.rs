@@ -11,8 +11,9 @@ use std::collections::VecDeque;
 
 use serde_json::json;
 
-use crate::envelope::TraceCtx;
-use crate::types::{Path, SchemaId, SeqNo, Topic};
+use crate::envelope::{Address, TraceCtx};
+use crate::kernel::AskOutcome;
+use crate::types::{ActorKind, DeadLetterReason, Path, SchemaId, SeqNo, StopReason, Topic};
 
 /// One observed runtime fact.
 #[derive(Debug, Clone)]
@@ -31,7 +32,7 @@ pub enum FactKind {
     /// An envelope was routed to a destination.
     Sent {
         from: Option<Path>,
-        dest: String,
+        dest: Address,
         schema: SchemaId,
         trace: TraceCtx,
     },
@@ -50,15 +51,22 @@ pub enum FactKind {
     /// A service actor opened an ask.
     AskOpened {
         from: Path,
-        dest: String,
+        dest: Address,
         trace: TraceCtx,
     },
     /// An ask settled.
-    AskSettled { outcome: String, trace: TraceCtx },
+    AskSettled {
+        outcome: AskOutcome,
+        trace: TraceCtx,
+    },
     /// An actor was spawned (fresh or restarted).
-    Spawned { path: Path, restart: bool },
+    Spawned {
+        path: Path,
+        kind: ActorKind,
+        restart: bool,
+    },
     /// An actor stopped gracefully.
-    Stopped { path: Path, reason: String },
+    Stopped { path: Path, reason: StopReason },
     /// A handler failed (panic or dispatch error).
     Failed { path: Path, error: String },
     /// An envelope was published onto a topic.
@@ -73,9 +81,9 @@ pub enum FactKind {
     Escalated { path: Path, reason: String },
     /// An envelope was dead-lettered.
     DeadLettered {
-        dest: String,
+        dest: Address,
         schema: SchemaId,
-        reason: String,
+        reason: DeadLetterReason,
         trace: TraceCtx,
     },
 }
@@ -97,7 +105,7 @@ impl Fact {
             } => json!({
                 "kind": "sent",
                 "from": from.as_ref().map(|p| p.to_string()),
-                "dest": dest,
+                "dest": dest.to_string(),
                 "schema": schema.to_string(),
                 "trace_id": trace.trace_id.to_string(),
                 "causality_id": trace.causality_id.to_string(),
@@ -119,7 +127,7 @@ impl Fact {
             FactKind::AskOpened { from, dest, trace } => json!({
                 "kind": "ask_opened",
                 "from": from.to_string(),
-                "dest": dest,
+                "dest": dest.to_string(),
                 "trace_id": trace.trace_id.to_string(),
                 "causality_id": trace.causality_id.to_string(),
             }),
@@ -129,9 +137,14 @@ impl Fact {
                 "trace_id": trace.trace_id.to_string(),
                 "causality_id": trace.causality_id.to_string(),
             }),
-            FactKind::Spawned { path, restart } => json!({
+            FactKind::Spawned {
+                path,
+                kind,
+                restart,
+            } => json!({
                 "kind": "spawned",
                 "path": path.to_string(),
+                "actor_kind": kind,
                 "restart": restart,
             }),
             FactKind::Stopped { path, reason } => json!({
@@ -172,7 +185,7 @@ impl Fact {
                 trace,
             } => json!({
                 "kind": "dead_lettered",
-                "dest": dest,
+                "dest": dest.to_string(),
                 "schema": schema.to_string(),
                 "reason": reason,
                 "trace_id": trace.trace_id.to_string(),
@@ -264,6 +277,7 @@ mod tests {
     fn spawned_fact(path: &str) -> FactKind {
         FactKind::Spawned {
             path: Path::new(path),
+            kind: crate::types::ActorKind::EventSourced,
             restart: false,
         }
     }
@@ -332,13 +346,7 @@ mod tests {
         // Given a tiny ring flooded past capacity.
         let mut ring = TapRing::new(3);
         for i in 0..10 {
-            ring.push(
-                ts(i),
-                FactKind::Spawned {
-                    path: Path::new("a"),
-                    restart: false,
-                },
-            );
+            ring.push(ts(i), spawned_fact("a"));
         }
 
         // When subscribing at the newest possible offset.

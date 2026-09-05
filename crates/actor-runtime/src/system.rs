@@ -310,6 +310,7 @@ impl ActorSystem {
             self.clock.now(),
             crate::tap::FactKind::Spawned {
                 path: path.clone(),
+                kind: crate::types::ActorKind::EventSourced,
                 restart: false,
             },
         );
@@ -376,6 +377,7 @@ impl ActorSystem {
             self.clock.now(),
             crate::tap::FactKind::Spawned {
                 path: path.clone(),
+                kind: crate::types::ActorKind::Service,
                 restart: false,
             },
         );
@@ -637,7 +639,7 @@ impl ActorSystem {
                     self.clock.now(),
                     crate::tap::FactKind::Stopped {
                         path: path.clone(),
-                        reason: "graceful".to_owned(),
+                        reason: crate::types::StopReason::Normal,
                     },
                 );
                 return;
@@ -702,7 +704,7 @@ impl ActorSystem {
                 self.clock.now(),
                 crate::tap::FactKind::Stopped {
                     path: path.clone(),
-                    reason: "graceful".to_owned(),
+                    reason: crate::types::StopReason::Normal,
                 },
             );
         }
@@ -831,7 +833,7 @@ impl ActorSystem {
                 from, dest, schema, ..
             } = &fact.kind
             {
-                let to_str = dest.clone();
+                let to_str = dest.to_string();
                 let from_str = from.as_ref().map(|p| p.to_string());
                 *counts
                     .entry((from_str, to_str, schema.clone()))
@@ -2550,7 +2552,7 @@ mod tests {
         let observed = export
             .observed_edges
             .iter()
-            .find(|e| e.to == format!("topic:{topic}") && e.schema == added_schema)
+            .find(|e| e.to == topic.to_string() && e.schema == added_schema)
             .expect("observed topic edge");
         assert!(observed.count >= 1, "at least the one send: {observed:?}");
     }

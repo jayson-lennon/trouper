@@ -701,7 +701,7 @@ fn bind_ask_results(system: &Arc<ActorSystem>) {
             let mut results = ask_results().lock().expect("lock");
             for fact in facts {
                 if let actor_runtime::tap::FactKind::AskSettled { outcome, .. } = &fact.kind {
-                    let line = format!("ask settled: {outcome}");
+                    let line = format!("ask settled: {outcome:?}");
                     if !results.contains(&line) {
                         results.push(line);
                     }

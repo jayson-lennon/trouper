@@ -61,7 +61,7 @@ pub struct DeadLetter {
 }
 
 /// An ask lifecycle event (tap facts from Phase 7 read these).
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum AskOutcome {
     /// The callee replied in time.
     Replied,
@@ -249,7 +249,7 @@ pub async fn route(
                     envelope.trace.causality_id.as_millis_ts(),
                     crate::tap::FactKind::Sent {
                         from: envelope.from.clone(),
-                        dest: path.to_string(),
+                        dest: Address::Path(path.clone()),
                         schema: envelope.schema.clone(),
                         trace: envelope.trace,
                     },
@@ -266,7 +266,7 @@ pub async fn route(
                     envelope.trace.causality_id.as_millis_ts(),
                     crate::tap::FactKind::Sent {
                         from: envelope.from.clone(),
-                        dest: format!("topic:{topic}"),
+                        dest: Address::Topic(topic.clone()),
                         schema: envelope.schema.clone(),
                         trace: envelope.trace,
                     },
@@ -279,20 +279,28 @@ pub async fn route(
 }
 
 /// Dead-letters an envelope into the kernel's inspectable record.
-pub fn dead_letter(kernel: &Mutex<KernelState>, envelope: &Envelope, reason: &str) {
+///
+/// `detail` is the human-readable elaboration (e.g. the decode error);
+/// `reason` is the typed category.
+pub fn dead_letter(
+    kernel: &Mutex<KernelState>,
+    envelope: &Envelope,
+    reason: crate::types::DeadLetterReason,
+    detail: &str,
+) {
     let mut kernel = kernel.lock().expect("kernel lock");
     kernel.dead_letters.push(DeadLetter {
         schema: envelope.schema.clone(),
         dest: envelope.dest.clone(),
-        reason: reason.to_owned(),
+        reason: format!("{reason:?}: {detail}"),
         trace: envelope.trace,
     });
     kernel.tap.push(
         envelope.trace.causality_id.as_millis_ts(),
         crate::tap::FactKind::DeadLettered {
-            dest: envelope.dest.to_string(),
+            dest: envelope.dest.clone(),
             schema: envelope.schema.clone(),
-            reason: reason.to_owned(),
+            reason,
             trace: envelope.trace,
         },
     );
@@ -327,10 +335,20 @@ pub async fn front_door_loop(
                 Ok(_) => true,
                 Err(refused) => {
                     if !refused.queued_anyway() {
-                        dead_letter(&kernel, &envelope, "inbox refused (overload/closed)");
+                        dead_letter(
+                            &kernel,
+                            &envelope,
+                            crate::types::DeadLetterReason::InboxRefused,
+                            "inbox refused (overload/closed)",
+                        );
                     } else {
                         let evicted = refused.into_envelope();
-                        dead_letter(&kernel, &evicted, "inbox evicted oldest (DropOld)");
+                        dead_letter(
+                            &kernel,
+                            &evicted,
+                            crate::types::DeadLetterReason::InboxRefused,
+                            "inbox evicted oldest (DropOld)",
+                        );
                     }
                     false
                 }
@@ -414,7 +432,12 @@ async fn step_es(ctx: &EsLoop) -> Step {
     let Some(entry) = entry else {
         // Unknown schema: dead-letter and ADVANCE the cursor (the message
         // can never be handled; redelivering it would be futile).
-        dead_letter(&ctx.kernel, &envelope, "unknown schema");
+        dead_letter(
+            &ctx.kernel,
+            &envelope,
+            crate::types::DeadLetterReason::UnknownSchema,
+            "no entry for this schema",
+        );
         ctx.cell.inbox.lock().await.ack();
         return Step::Work;
     };
@@ -448,7 +471,12 @@ async fn step_es(ctx: &EsLoop) -> Step {
             // Decode failure: dead-letter and advance (kernel bug only if
             // the schema registry and adapter disagree).
             let reason = format!("{report}");
-            dead_letter(&ctx.kernel, &envelope, &reason);
+            dead_letter(
+                &ctx.kernel,
+                &envelope,
+                crate::types::DeadLetterReason::Decode,
+                &reason,
+            );
             ctx.cell.inbox.lock().await.ack();
             return Step::Work;
         }
@@ -537,7 +565,12 @@ async fn flush_outbox(ctx: &EsLoop, mut outbox: Outbox) {
         match intent {
             crate::context::Intent::Send(envelope) => {
                 if let Err(undeliverable) = route(&ctx.registry, &ctx.kernel, envelope).await {
-                    dead_letter(&ctx.kernel, &undeliverable, "destination unresolved");
+                    dead_letter(
+                        &ctx.kernel,
+                        &undeliverable,
+                        crate::types::DeadLetterReason::Unresolvable,
+                        "destination unresolved",
+                    );
                 }
             }
             crate::context::Intent::Publish { topic, envelope } => {
@@ -622,7 +655,7 @@ impl crate::context::AskPort for KernelAskPort {
                     now,
                     crate::tap::FactKind::AskOpened {
                         from: Path::new("anonymous"),
-                        dest: dest.to_string(),
+                        dest: dest.clone(),
                         trace,
                     },
                 );
@@ -656,10 +689,7 @@ impl crate::context::AskPort for KernelAskPort {
         });
         kernel.tap.push(
             trace.causality_id.as_millis_ts(),
-            crate::tap::FactKind::AskSettled {
-                outcome: format!("{outcome:?}"),
-                trace,
-            },
+            crate::tap::FactKind::AskSettled { outcome, trace },
         );
         let _ = dest;
         // Drop the lease: settled (consumed) or timed out (late replies
@@ -756,7 +786,12 @@ async fn resolve_reply(
             // on; unresolvable replies dead-letter like any send).
             let envelope = Envelope::json(schema, Address::Path(path.clone()), payload, trace);
             if let Err(undeliverable) = route(registry, kernel, envelope).await {
-                dead_letter(kernel, &undeliverable, "reply destination unresolved");
+                dead_letter(
+                    kernel,
+                    &undeliverable,
+                    crate::types::DeadLetterReason::Unresolvable,
+                    "reply destination unresolved",
+                );
             }
         }
         Address::Topic(_) => {
@@ -913,7 +948,12 @@ async fn step_service(ctx: &ServiceLoop) -> Step {
         })
     };
     let Some(entry) = entry else {
-        dead_letter(&ctx.es.kernel, &envelope, "unknown schema");
+        dead_letter(
+            &ctx.es.kernel,
+            &envelope,
+            crate::types::DeadLetterReason::UnknownSchema,
+            "no entry for this schema",
+        );
         ctx.es.cell.inbox.lock().await.ack();
         return Step::Work;
     };
@@ -927,7 +967,12 @@ async fn step_service(ctx: &ServiceLoop) -> Step {
         Ok(msg) => msg,
         Err(report) => {
             let reason = format!("{report}");
-            dead_letter(&ctx.es.kernel, &envelope, &reason);
+            dead_letter(
+                &ctx.es.kernel,
+                &envelope,
+                crate::types::DeadLetterReason::Decode,
+                &reason,
+            );
             ctx.es.cell.inbox.lock().await.ack();
             return Step::Work;
         }
@@ -1052,6 +1097,7 @@ pub async fn restart_es(
             ctx.clock.now(),
             crate::tap::FactKind::Spawned {
                 path: ctx.path.clone(),
+                kind: crate::types::ActorKind::EventSourced,
                 restart: true,
             },
         );
