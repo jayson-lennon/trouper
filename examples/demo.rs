@@ -18,7 +18,7 @@ use actor_runtime::actor::{
     CommandHandler, EventSourcedActor, MsgHandler, ServiceActor, TypedEsAdapter,
     TypedServiceAdapter,
 };
-use actor_runtime::kernel::SnapshotPolicy;
+use actor_runtime::system::SnapshotCadence;
 use actor_runtime::prelude::*;
 use actor_runtime::registry::RegistryError;
 use error_stack::Report;
@@ -356,7 +356,7 @@ async fn main() {
         ActorPath::new("warehouse"),
         &json!({}),
         SpawnOpts {
-            snapshot: SnapshotPolicy::EveryN(3),
+            snapshot: SnapshotCadence::Messages(3),
             ..SpawnOpts::default()
         },
         || {
@@ -514,7 +514,7 @@ async fn main() {
         ActorPath::new("warehouse"),
         &json!({}),
         SpawnOpts {
-            snapshot: SnapshotPolicy::EveryN(3),
+            snapshot: SnapshotCadence::Messages(3),
             ..SpawnOpts::default()
         },
         || {

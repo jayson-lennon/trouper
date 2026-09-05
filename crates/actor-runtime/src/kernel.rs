@@ -95,7 +95,7 @@ pub struct KernelState {
     pub journals: HashMap<ActorPath, Journal>,
     pub es_state: HashMap<ActorPath, Arc<tokio::sync::Mutex<Box<dyn DynEsActor>>>>,
     pub entries: HashMap<ActorPath, Vec<Arc<dyn CommandEntry>>>,
-    pub snapshot_policy: HashMap<ActorPath, SnapshotPolicy>,
+    pub snapshot_policy: HashMap<ActorPath, crate::types::SnapshotCadence>,
     /// Live service instances (service actors are not journaled).
     pub services: HashMap<ActorPath, Arc<tokio::sync::Mutex<Box<dyn DynServiceActor>>>>,
     /// Reply-slot leases (the mechanism half of reply addresses).
@@ -426,7 +426,12 @@ pub async fn es_actor_loop(loop_ctx: EsLoop, mut shutdown: watch::Receiver<bool>
         }
         match step_es(&loop_ctx).await {
             Step::Work => continue,
-            Step::Idle => {}
+            Step::Idle => {
+                // Idle window: the time-based snapshot cadence is checked
+                // here (the 20ms poll arm below is the wake), never
+                // mid-step — snapshots stay BETWEEN messages.
+                maybe_snapshot_on_idle(&loop_ctx).await;
+            }
             Step::Crashed => break, // supervisor (Phase 8) takes over
         }
         let notified = loop_ctx.cell.work.notified();
@@ -557,6 +562,51 @@ async fn step_es(ctx: &EsLoop) -> Step {
         }
     };
 
+    // 4.5 EMIT FILTER (declaration enforcement, PRE-append). The declared
+    // surface is the only surface: events whose schema the actor never
+    // declared are dropped here — never journalled, never applied — with a
+    // DeadLettered fact + tracing error as the observable record. The step
+    // CONTINUES with the declared remainder: dropping is a state-consistent
+    // outcome (apply runs per appended event), while failing the step would
+    // burn restart budget on a static condition redelivery can never heal.
+    let declared = {
+        let registry = ctx.registry.lock().expect("registry lock");
+        registry
+            .lookup(&ctx.path)
+            .map(|info| info.manifest.emits)
+            .unwrap_or_default()
+    };
+    let events: Vec<crate::envelope::Event> = events
+        .into_iter()
+        .filter(|event| {
+            let is_declared = declared.contains(&event.schema);
+            if !is_declared {
+                tracing::error!(
+                    actor = %ctx.path,
+                    schema = %event.schema,
+                    "undeclared event dropped before journal append"
+                );
+                // The dropped EVENT is what died: it is dead-lettered as an
+                // envelope addressed back to the emitting actor (same trace,
+                // so the drop stays causally linked to the command).
+                let dropped = Envelope::json(
+                    event.schema.clone(),
+                    crate::envelope::Address::Path(ctx.path.clone()),
+                    event.payload.clone(),
+                    envelope.trace,
+                )
+                .from(ctx.path.clone());
+                dead_letter(
+                    &ctx.kernel,
+                    &dropped,
+                    crate::types::DeadLetterReason::UndeclaredEvent,
+                    "emitted undeclared schema (dropped before journal append)",
+                );
+            }
+            is_declared
+        })
+        .collect();
+
     // 5. JOURNAL APPEND (durable record first).
     let seqs = {
         let mut kernel = ctx.kernel.lock().expect("kernel lock");
@@ -599,7 +649,7 @@ async fn step_es(ctx: &EsLoop) -> Step {
     // in Phase 6 — the named step exists so the order never changes).
     fan_out_emits(ctx, &events).await;
 
-    // 10. MAYBE SNAPSHOT (policy EveryN, BETWEEN messages).
+    // 10. MAYBE SNAPSHOT (policy-gated, BETWEEN messages).
     maybe_snapshot(ctx, seqs).await;
     Step::Work
 }
@@ -945,12 +995,14 @@ async fn fan_out_emits(ctx: &EsLoop, events: &[crate::envelope::Event]) {
     }
 }
 
-/// Takes the between-messages snapshot if the policy asks for one.
+/// Takes a between-messages snapshot if the cadence asks for one: a
+/// message-count cadence snapshots when the last committed event landed on
+/// an n-boundary; a time cadence is checked on the idle path instead.
 async fn maybe_snapshot(
     ctx: &EsLoop,
     (next_seq, seqs): (crate::types::SeqNo, Vec<crate::types::SeqNo>),
 ) {
-    let policy = {
+    let cadence = {
         let kernel = ctx.kernel.lock().expect("kernel lock");
         kernel
             .snapshot_policy
@@ -958,7 +1010,7 @@ async fn maybe_snapshot(
             .copied()
             .unwrap_or_default()
     };
-    let SnapshotPolicy::EveryN(n) = policy else {
+    let crate::types::SnapshotCadence::Messages(n) = cadence else {
         return;
     };
     if n == 0 || seqs.is_empty() {
@@ -969,21 +1021,65 @@ async fn maybe_snapshot(
     if last.as_u64() % n != n - 1 {
         return;
     }
+    snapshot_now(ctx, last).await;
+    let _ = next_seq;
+}
+
+/// Writes one snapshot of the live state at `seq` (the shared tail of both
+/// cadence checks; always BETWEEN messages, never mid-step).
+async fn snapshot_now(ctx: &EsLoop, last: crate::types::SeqNo) {
     let state = ctx.state().await;
     let state = state.lock().await;
     if let Ok(blob) = state.capture_erased() {
+        let now = ctx.clock.now();
         let mut kernel = ctx.kernel.lock().expect("kernel lock");
         let journal = kernel.journals.entry(ctx.path.clone()).or_default();
-        journal.append_snapshot(last, blob);
+        journal.append_snapshot(last, blob, now.as_millis());
         kernel.tap.push(
-            ctx.clock.now(),
+            now,
             crate::tap::FactKind::SnapshotTaken {
                 path: ctx.path.clone(),
                 seq: last,
             },
         );
     }
-    let _ = next_seq;
+}
+
+/// The time-cadence half of snapshotting: checked on the ES loop's idle
+/// path (the 20ms poll arm is the wake), so an actor that never receives
+/// another message still snapshots when the interval elapses. BETWEEN
+/// messages by construction — the idle check runs after a full step drained
+/// the inbox.
+async fn maybe_snapshot_on_idle(ctx: &EsLoop) {
+    let cadence = {
+        let kernel = ctx.kernel.lock().expect("kernel lock");
+        kernel
+            .snapshot_policy
+            .get(&ctx.path)
+            .copied()
+            .unwrap_or_default()
+    };
+    let crate::types::SnapshotCadence::Time(interval) = cadence else {
+        return;
+    };
+    let (last_seq, since_snapshot_ms) = {
+        let mut kernel = ctx.kernel.lock().expect("kernel lock");
+        let journal = kernel.journals.entry(ctx.path.clone()).or_default();
+        // An empty journal never snapshots: the anchor seq would be
+        // "genesis", and a later restore would wrongly skip event seq 0.
+        if journal.next_seq().as_u64() == 0 {
+            return;
+        }
+        let since = journal.since_snapshot_ms(ctx.clock.now());
+        (journal.last_seq(), since)
+    };
+    let Some(elapsed) = since_snapshot_ms else {
+        return; // unanchored: not due (safe default)
+    };
+    if elapsed < interval.as_millis() as u64 {
+        return;
+    }
+    snapshot_now(ctx, last_seq).await;
 }
 
 /// Closes the inbox on stop; Phase 8 flushes undelivered entries to the DLQ.

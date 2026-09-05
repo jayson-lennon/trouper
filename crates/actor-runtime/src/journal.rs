@@ -69,6 +69,9 @@ pub struct Journal {
     entries: Vec<JournalEntry>,
     /// Count of appended events — the anchor for the next event's seq.
     event_count: u64,
+    /// Epoch millis (injected clock) of the last snapshot; `None` before the
+    /// first one. Drives the time-based snapshot cadence.
+    last_snapshot_ms: Option<u64>,
 }
 
 impl Journal {
@@ -82,6 +85,12 @@ impl Journal {
         SeqNo::new(self.event_count)
     }
 
+    /// The sequence of the last appended event; [`SeqNo::genesis`] when
+    /// the journal holds no events (the idle snapshot target).
+    pub fn last_seq(&self) -> SeqNo {
+        SeqNo::new(self.event_count.saturating_sub(1))
+    }
+
     /// Appends an event, assigning it the next event sequence.
     ///
     /// Snapshots never consume event sequences: they anchor to the event
@@ -93,9 +102,28 @@ impl Journal {
         seq
     }
 
-    /// Appends a snapshot anchored at `seq` (the last folded event).
-    pub fn append_snapshot(&mut self, seq: SeqNo, state: JsonValue) {
+    /// Appends a snapshot anchored at `seq` (the last folded event),
+    /// stamped with `now_ms` for the time cadence.
+    pub fn append_snapshot(&mut self, seq: SeqNo, state: JsonValue, now_ms: u64) {
+        self.last_snapshot_ms = Some(now_ms);
         self.entries.push(JournalEntry::Snapshot { seq, state });
+    }
+
+    /// Anchors the time cadence at `now_ms` (spawn time), without writing
+    /// a snapshot: the first time-cadence snapshot becomes due one full
+    /// interval after the journal began.
+    pub fn anchor_time_cadence(&mut self, now_ms: u64) {
+        if self.last_snapshot_ms.is_none() {
+            self.last_snapshot_ms = Some(now_ms);
+        }
+    }
+
+    /// Millis elapsed since the last snapshot (or since the spawn-time
+    /// anchor); `None` when the cadence was never anchored — the caller
+    /// treats that as "not due" (never snapshot on an unanchored journal).
+    pub fn since_snapshot_ms(&self, now: crate::types::Timestamp) -> Option<u64> {
+        self.last_snapshot_ms
+            .map(|ms| now.as_millis().saturating_sub(ms))
     }
 
     /// The highest snapshot in the journal, if any.
@@ -221,10 +249,10 @@ mod tests {
         // Given a journal with two snapshots and events after each.
         let mut journal = Journal::new();
         journal.append_event(event(1));
-        journal.append_snapshot(SeqNo::new(0), json!({ "v": 1 }));
+        journal.append_snapshot(SeqNo::new(0), json!({ "v": 1 }), 0);
         journal.append_event(event(2));
         journal.append_event(event(3));
-        journal.append_snapshot(SeqNo::new(2), json!({ "v": 2 }));
+        journal.append_snapshot(SeqNo::new(2), json!({ "v": 2 }), 0);
         journal.append_event(event(4));
 
         // When asking for the last snapshot.
@@ -254,7 +282,7 @@ mod tests {
         for _ in 0..4 {
             journal.append_event(event(1));
         }
-        journal.append_snapshot(SeqNo::new(1), json!({}));
+        journal.append_snapshot(SeqNo::new(1), json!({}), 0);
 
         // When asking for events after seq 1.
         let tail: Vec<SeqNo> = journal.after(SeqNo::new(1)).map(|e| e.seq()).collect();

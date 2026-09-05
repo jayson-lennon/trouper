@@ -93,6 +93,13 @@ pub enum FactKind {
         reason: DeadLetterReason,
         trace: TraceCtx,
     },
+    /// An actor's inbox depth crossed its configured high watermark.
+    /// Fires once per crossing (down-crossings re-arm it), never per
+    /// message — sustained overload stays observable without flooding.
+    Backpressured {
+        path: ActorPath,
+        depth: u64,
+    },
 }
 
 impl Fact {
@@ -202,6 +209,11 @@ impl Fact {
                 "reason": reason,
                 "trace_id": trace.trace_id.to_string(),
                 "causality_id": trace.causality_id.to_string(),
+            }),
+            FactKind::Backpressured { path, depth } => json!({
+                "kind": "backpressured",
+                "path": path.to_string(),
+                "depth": depth,
             }),
         };
         let object = value.as_object_mut().expect("fact json is an object");

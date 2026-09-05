@@ -24,25 +24,30 @@ use crate::registry::{Endpoint, EndpointInfo, Registry};
 use crate::schema::Schema;
 use crate::types::{ActorPath, InboxOffset, SchemaId, Timestamp};
 
-pub use crate::kernel::SnapshotPolicy;
+pub use crate::types::SnapshotCadence;
 
 /// Spawn-time options for an actor.
 #[derive(Debug, Clone)]
 pub struct SpawnOpts {
-    /// Snapshot policy (ES actors only).
-    pub snapshot: SnapshotPolicy,
+    /// Snapshot cadence (ES actors only).
+    pub snapshot: SnapshotCadence,
     /// Mailbox capacity (the logical inbox; the front door is 2× this).
     pub mailbox_capacity: usize,
     /// Inbox overload policy (default Block = backpressure).
     pub mailbox_policy: OverloadPolicy,
+    /// Inbox depth at which a [`crate::tap::FactKind::Backpressured`] fact
+    /// fires (once per crossing); `None` = never. Pool/partition specs use
+    /// it to make sustained overload observable.
+    pub high_watermark: Option<u64>,
 }
 
 impl Default for SpawnOpts {
     fn default() -> Self {
         Self {
-            snapshot: SnapshotPolicy::Off,
+            snapshot: SnapshotCadence::Off,
             mailbox_capacity: 64,
             mailbox_policy: OverloadPolicy::Block,
+            high_watermark: None,
         }
     }
 }
@@ -288,6 +293,7 @@ impl ActorSystem {
             } else {
                 opts.mailbox_policy
             },
+            high_watermark: opts.high_watermark,
         }
     }
 
@@ -357,30 +363,36 @@ impl ActorSystem {
     ) {
         let opts = self.resolve_opts(opts);
         let (tx, rx) = tokio::sync::mpsc::channel::<Envelope>(opts.mailbox_capacity.max(1) * 2);
-        {
-            let mut registry = self.registry.lock().expect("registry lock");
-            registry
-                .insert_slot(
-                    path.clone(),
-                    manifest.clone(),
-                    Endpoint::new(tx),
-                    opts.mailbox_policy,
-                )
-                .expect("path free at spawn");
-            // Declared edges become routes: each handled schema is routable
-            // to this path (adding a second actor for a schema converts the
-            // route to round-robin).
-            for schema in manifest.handles.clone() {
-                registry.add_route(schema, path.clone());
-            }
+        let mut registry = self.registry.lock().expect("registry lock");
+        registry
+            .insert_slot(
+                path.clone(),
+                manifest.clone(),
+                Endpoint::new(tx),
+                opts.mailbox_policy,
+            )
+            .expect("path free at spawn");
+        // Declared edges become routes: each handled schema is routable
+        // to this path (adding a second actor for a schema converts the
+        // route to round-robin).
+        for schema in manifest.handles.clone() {
+            registry.add_route(schema, path.clone());
         }
+        // Emit edges are ENFORCED against the manifest (the kernel drops
+        // undeclared schemas pre-append) — the builder/foreign paths feed
+        // extra declarations through `declare_emits` before the first step.
+        drop(registry);
         let mut kernel = self.kernel.lock().expect("kernel lock");
         let cell = Arc::new(ActorCell::new(
             path.clone(),
             Inbox::new(opts.mailbox_capacity.max(1), opts.mailbox_policy),
         ));
         kernel.cells.insert(path.clone(), cell.clone());
-        kernel.journals.entry(path.clone()).or_default();
+        kernel
+            .journals
+            .entry(path.clone())
+            .or_default()
+            .anchor_time_cadence(self.clock.now().as_millis());
         kernel
             .es_state
             .insert(path.clone(), Arc::new(tokio::sync::Mutex::new(state)));
@@ -1165,6 +1177,24 @@ mod tests {
         }
     }
 
+    /// An event schema the test actors NEVER declare (emit-enforcement
+    /// fixture: the kernel must drop it).
+    #[derive(serde::Deserialize)]
+    struct Smuggled {
+        n: i64,
+    }
+    impl Schema for Smuggled {
+        fn schema_def() -> SchemaDef {
+            SchemaDef {
+                name: "Smuggled".into(),
+                version: 1,
+                kind: SchemaKind::Event,
+                fields: vec![FieldDef::required("n", FieldTy::Int)],
+                description: None,
+            }
+        }
+    }
+
     #[derive(Serialize, Deserialize, Default)]
     struct Counter {
         total: i64,
@@ -1425,9 +1455,10 @@ mod tests {
             path.clone(),
             &json!({}),
             SpawnOpts {
-                snapshot: SnapshotPolicy::Off,
+                snapshot: SnapshotCadence::Off,
                 mailbox_capacity: 1,
                 mailbox_policy: OverloadPolicy::DropNew,
+                high_watermark: None,
             },
             || vec![Arc::new(TypedEsAdapter::<Counter, Add>::new::<Add>())],
         );
@@ -1811,7 +1842,9 @@ mod tests {
         }
         impl EventSourcedActor for Phoenix {
             fn manifest() -> ActorManifest {
-                ActorManifest::new().kind(ActorKind::EventSourced)
+                ActorManifest::new()
+                    .emits::<Added>()
+                    .kind(ActorKind::EventSourced)
             }
             fn restore(_args: &JsonValue) -> Self {
                 Self::default()
@@ -3255,6 +3288,16 @@ mod tests {
             }),
             SpawnOpts::default(),
         );
+        // The emit edge the decision closure produces is declared explicitly
+        // (emit enforcement drops undeclared schemas, so this is load-bearing).
+        let mut registry = system.registry.lock().expect("registry lock");
+        registry
+            .declare_emits(
+                &ActorPath::new("tally-actor"),
+                schema.clone(),
+            )
+            .expect("live slot");
+        drop(registry);
 
         // When a JSON command is sent to the foreign actor and the ack
         // settles.
@@ -3773,13 +3816,13 @@ mod tests {
 
     #[tokio::test]
     async fn snapshot_fast_path_skips_replaying_committed_events() {
-        // Given a counter with EveryN(2) snapshots that committed 4 Adds.
+        // Given a counter with Messages(2) snapshots that committed 4 Adds.
         let (system, _clock) = ActorSystem::test();
         let path = ActorPath::new("counter");
         system.register_schema::<Add>();
         system.register_schema::<Added>();
         let opts = SpawnOpts {
-            snapshot: crate::kernel::SnapshotPolicy::EveryN(2),
+            snapshot: SnapshotCadence::Messages(2),
             ..SpawnOpts::default()
         };
         system.spawn_es::<Counter, _>(path.clone(), &json!({}), opts, || {
@@ -4085,6 +4128,284 @@ mod tests {
         assert!(
             delivered >= 3,
             "original Add + poison x2 delivered (at-least-once redelivery)"
+        );
+    }
+
+    // ---- dynamic actor primitives (Phase 1: emit enforcement + cadence) ----
+
+    /// A counter whose Add handler emits ONE declared `Added` and ONE
+    /// undeclared `Smuggled` per command (emit-enforcement fixture).
+    #[derive(Serialize, Deserialize, Default)]
+    struct MixedEmitter {
+        total: i64,
+    }
+    impl EventSourcedActor for MixedEmitter {
+        fn manifest() -> ActorManifest {
+            // NOTE: deliberately does NOT declare Smuggled.
+            ActorManifest::new()
+                .handles::<Add>()
+                .emits::<Added>()
+                .kind(ActorKind::EventSourced)
+        }
+        fn restore(_args: &JsonValue) -> Self {
+            Self::default()
+        }
+        fn apply(&mut self, event: &crate::envelope::Event) {
+            self.total += event.payload["n"].as_i64().unwrap_or(0);
+        }
+    }
+    impl CommandHandler<Add> for MixedEmitter {
+        fn handle(&self, cmd: Add, _ctx: &mut CmdCtx<'_>) -> Vec<crate::envelope::Event> {
+            vec![
+                crate::envelope::Event::new(Added::schema_id(), json!({ "n": cmd.n })),
+                crate::envelope::Event::new(Smuggled::schema_id(), json!({ "n": cmd.n })),
+            ]
+        }
+    }
+
+    #[tokio::test]
+    async fn undeclared_emit_dropped_pre_append_with_trace_error() {
+        // Given a mixed emitter (declares Added only) that committed one Add.
+        let (system, _clock) = ActorSystem::test();
+        let path = ActorPath::new("mixed");
+        system.register_schema::<Add>();
+        system.register_schema::<Added>();
+        system.register_schema::<Smuggled>();
+        system.spawn_es::<MixedEmitter, _>(path.clone(), &json!({}), SpawnOpts::default(), || {
+            vec![Arc::new(TypedEsAdapter::<MixedEmitter, Add>::new::<Add>())]
+        });
+        system
+            .send(system.envelope(Add::schema_id(), path.clone(), json!({ "n": 4 })))
+            .await
+            .expect("delivered");
+        wait_for_cursor(&system, &path, 1).await;
+
+        // Then the declared event journalled and applied, the smuggled one
+        // never touched the journal, a DeadLettered(UndeclaredEvent) fact
+        // records the drop, and the actor keeps running (step not failed).
+        let state = system.es_state(&path).await.expect("live");
+        assert_eq!(state["total"], json!(4), "only the declared event applied");
+        {
+            let kernel = system.kernel.lock().expect("lock");
+            let event_schemas: Vec<_> = kernel.journals[&path]
+                .entries()
+                .iter()
+                .filter_map(|e| e.as_event().map(|ev| ev.schema.clone()))
+                .collect();
+            assert_eq!(
+                event_schemas,
+                [Added::schema_id()],
+                "journal contains only declared schemas"
+            );
+            assert_eq!(kernel.dead_letters.len(), 1);
+            assert_eq!(
+                kernel.dead_letters[0].reason,
+                crate::types::DeadLetterReason::UndeclaredEvent
+            );
+            assert_eq!(kernel.dead_letters[0].schema, Smuggled::schema_id());
+        }
+        assert!(
+            system.tap_facts().iter().any(|f| matches!(
+                &f.kind,
+                crate::tap::FactKind::DeadLettered { reason, .. }
+                    if *reason == crate::types::DeadLetterReason::UndeclaredEvent
+            )),
+            "DeadLettered(UndeclaredEvent) fact on the tap"
+        );
+        assert!(
+            !kernel_has_crash(&system, &path),
+            "the step continued; the actor was not failed"
+        );
+    }
+
+    /// Kernel crash-record peek (tests).
+    fn kernel_has_crash(system: &ActorSystem, path: &ActorPath) -> bool {
+        let kernel = system.kernel.lock().expect("lock");
+        kernel.crashed.contains(path)
+    }
+
+    #[tokio::test]
+    async fn mixed_decision_applies_declared_and_drops_undeclared() {
+        // Given a mixed emitter that commits TWO commands.
+        let (system, _clock) = ActorSystem::test();
+        let path = ActorPath::new("mixed");
+        system.register_schema::<Add>();
+        system.register_schema::<Added>();
+        system.spawn_es::<MixedEmitter, _>(path.clone(), &json!({}), SpawnOpts::default(), || {
+            vec![Arc::new(TypedEsAdapter::<MixedEmitter, Add>::new::<Add>())]
+        });
+        for n in 1..=2_i64 {
+            system
+                .send(system.envelope(Add::schema_id(), path.clone(), json!({ "n": n })))
+                .await
+                .expect("delivered");
+        }
+        wait_for_cursor(&system, &path, 2).await;
+
+        // Then fold(journal) == live state == declared events only: the
+        // mixed decisions stayed state-consistent (drop, not fail).
+        let state = system.es_state(&path).await.expect("live");
+        assert_eq!(state["total"], json!(3));
+        let mut folded = MixedEmitter::restore(&json!({}));
+        {
+            let kernel = system.kernel.lock().expect("lock");
+            for entry in kernel.journals[&path].entries() {
+                if let crate::journal::JournalEntry::Event { event, .. } = entry {
+                    folded.apply(event);
+                }
+            }
+            assert_eq!(
+                kernel.journals[&path].len(),
+                2,
+                "exactly the two declared events journalled"
+            );
+        }
+        assert_eq!(folded.total, 3, "fold(journal) == live state");
+    }
+
+    #[tokio::test]
+    async fn snapshot_cadence_messages_matches_old_every_n() {
+        // Given a counter on Messages(2) that commits 4 Adds.
+        let (system, _clock) = ActorSystem::test();
+        let path = ActorPath::new("counter");
+        system.register_schema::<Add>();
+        system.register_schema::<Added>();
+        let opts = SpawnOpts {
+            snapshot: SnapshotCadence::Messages(2),
+            ..SpawnOpts::default()
+        };
+        system.spawn_es::<Counter, _>(path.clone(), &json!({}), opts, || {
+            vec![Arc::new(TypedEsAdapter::<Counter, Add>::new::<Add>())]
+        });
+        for n in 1..=4_i64 {
+            system
+                .send(system.envelope(Add::schema_id(), path.clone(), json!({ "n": n })))
+                .await
+                .expect("delivered");
+        }
+        wait_for_cursor(&system, &path, 4).await;
+
+        // Then snapshots landed exactly on the old EveryN(2) boundaries
+        // (after the 2nd and 4th events, i.e. seqs 1 and 3).
+        let snap_seqs: Vec<u64> = {
+            let kernel = system.kernel.lock().expect("lock");
+            kernel.journals[&path]
+                .entries()
+                .iter()
+                .filter_map(|e| match e {
+                    crate::journal::JournalEntry::Snapshot { seq, .. } => Some(seq.as_u64()),
+                    _ => None,
+                })
+                .collect()
+        };
+        assert_eq!(snap_seqs, [1, 3], "EveryN(2) boundaries preserved");
+    }
+
+    #[tokio::test]
+    async fn snapshot_cadence_time_fires_on_idle() {
+        // Given a counter on Time(100ms) that committed ONE Add and then
+        // went fully idle (no further messages ever arrive).
+        let (system, clock) = ActorSystem::test();
+        let path = ActorPath::new("counter");
+        system.register_schema::<Add>();
+        system.register_schema::<Added>();
+        let opts = SpawnOpts {
+            snapshot: SnapshotCadence::Time(std::time::Duration::from_millis(100)),
+            ..SpawnOpts::default()
+        };
+        system.spawn_es::<Counter, _>(path.clone(), &json!({}), opts, || {
+            vec![Arc::new(TypedEsAdapter::<Counter, Add>::new::<Add>())]
+        });
+        system
+            .send(system.envelope(Add::schema_id(), path.clone(), json!({ "n": 7 })))
+            .await
+            .expect("delivered");
+        wait_for_cursor(&system, &path, 1).await;
+
+        // When the clock advances past the interval (the actor idles; the
+        // 20ms poll arm is the wake that runs the idle cadence check).
+        clock.advance(std::time::Duration::from_millis(150));
+
+        // Then the idle actor snapshots BETWEEN messages, anchored at the
+        // last event's seq (0).
+        wait_for(|| async {
+            system
+                .tap_facts()
+                .iter()
+                .any(|f| matches!(f.kind, crate::tap::FactKind::SnapshotTaken { .. }))
+        })
+        .await;
+        let snap_seq = {
+            let kernel = system.kernel.lock().expect("lock");
+            let snap = kernel.journals[&path].last_snapshot().expect("snapshots");
+            match snap {
+                crate::journal::JournalEntry::Snapshot { seq, .. } => seq.as_u64(),
+                _ => panic!("expected snapshot"),
+            }
+        };
+        assert_eq!(snap_seq, 0, "anchored at the last event, not a fake seq");
+    }
+
+    #[tokio::test]
+    async fn snapshot_cadence_time_never_fires_before_the_interval() {
+        // Given a counter on Time(1h) that committed one Add.
+        let (system, clock) = ActorSystem::test();
+        let path = ActorPath::new("counter");
+        system.register_schema::<Add>();
+        system.register_schema::<Added>();
+        let opts = SpawnOpts {
+            snapshot: SnapshotCadence::Time(std::time::Duration::from_secs(3600)),
+            ..SpawnOpts::default()
+        };
+        system.spawn_es::<Counter, _>(path.clone(), &json!({}), opts, || {
+            vec![Arc::new(TypedEsAdapter::<Counter, Add>::new::<Add>())]
+        });
+        system
+            .send(system.envelope(Add::schema_id(), path.clone(), json!({ "n": 1 })))
+            .await
+            .expect("delivered");
+        wait_for_cursor(&system, &path, 1).await;
+
+        // When a modest amount of clock time passes (idle checks run).
+        clock.advance(std::time::Duration::from_millis(500));
+        tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+
+        // Then no snapshot fired: the cadence was not yet due.
+        assert!(
+            !system
+                .tap_facts()
+                .iter()
+                .any(|f| matches!(f.kind, crate::tap::FactKind::SnapshotTaken { .. })),
+            "time cadence must not fire before its interval elapses"
+        );
+    }
+
+    #[tokio::test]
+    async fn snapshot_cadence_off_never_snapshots() {
+        // Given a counter on the default Off cadence that committed 5 Adds.
+        let (system, _clock) = ActorSystem::test();
+        let path = ActorPath::new("counter");
+        system.register_schema::<Add>();
+        system.register_schema::<Added>();
+        system.spawn_es::<Counter, _>(path.clone(), &json!({}), SpawnOpts::default(), || {
+            vec![Arc::new(TypedEsAdapter::<Counter, Add>::new::<Add>())]
+        });
+        for n in 1..=5_i64 {
+            system
+                .send(system.envelope(Add::schema_id(), path.clone(), json!({ "n": n })))
+                .await
+                .expect("delivered");
+        }
+        wait_for_cursor(&system, &path, 5).await;
+
+        // Then the journal holds only events and no snapshot ever fired.
+        assert_eq!(system.journal_len(&path), 5);
+        assert!(
+            !system
+                .tap_facts()
+                .iter()
+                .any(|f| matches!(f.kind, crate::tap::FactKind::SnapshotTaken { .. })),
+            "Off never snapshots"
         );
     }
 }

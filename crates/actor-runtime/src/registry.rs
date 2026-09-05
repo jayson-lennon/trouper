@@ -336,6 +336,31 @@ impl Registry {
         Ok(slot.manifest)
     }
 
+    /// Declares an emit edge on a LIVE slot (adds `schema` to the slot
+    /// manifest's `emits`). Used by foreign spawns to declare the event
+    /// schemas their decision closures produce — undeclared emits are
+    /// dropped by the kernel, so this declaration is load-bearing.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RegistryError::UnknownPath`] when no slot exists.
+    pub fn declare_emits(
+        &mut self,
+        path: &ActorPath,
+        schema: SchemaId,
+    ) -> Result<(), error_stack::Report<RegistryError>> {
+        use error_stack::ResultExt;
+        let slot = self
+            .slots
+            .get_mut(path)
+            .ok_or_else(|| RegistryError::UnknownPath(path.clone()))
+            .attach(format!("declaring emits on unknown path {path}"))?;
+        if !slot.manifest.emits.contains(&schema) {
+            slot.manifest.emits.push(schema);
+        }
+        Ok(())
+    }
+
     /// Resolves a path to a deliverable endpoint, if the actor is running.
     pub fn resolve(&self, path: &ActorPath) -> Option<std::sync::Arc<Endpoint>> {
         self.slots.get(path)?.endpoint.load_full()

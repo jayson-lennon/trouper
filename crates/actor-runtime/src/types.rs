@@ -92,6 +92,26 @@ pub enum DeadLetterReason {
     InboxRefused,
     /// The actor was stopped with undelivered inbox entries.
     StoppedWithMail,
+    /// The actor emitted an event whose schema it never declared.
+    UndeclaredEvent,
+    /// A partition-set command arrived without its shard key.
+    ShardKeyMissing,
+}
+
+/// How often an event-sourced actor takes journal snapshots. Default: OFF.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub enum SnapshotCadence {
+    /// Never snapshot (replay is always full).
+    #[default]
+    Off,
+    /// Snapshot every `n` events (taken BETWEEN messages, never mid-step) —
+    /// bounds recovery cost deterministically.
+    Messages(u64),
+    /// Snapshot when at least this much clock time passed since the last
+    /// snapshot. Checked while the actor idles (never mid-step), so a
+    /// steady-trickle actor that never reaches a message count still gets
+    /// bounded recovery cost.
+    Time(std::time::Duration),
 }
 
 impl ActorPath {
