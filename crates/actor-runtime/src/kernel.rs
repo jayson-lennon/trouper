@@ -1257,7 +1257,11 @@ pub async fn supervise_child(
             return;
         }
 
-        // Backoff, then restart through the spec's spawn closure.
+        // Backoff, then restart. The restart mechanism follows the
+        // child's contract: an EventSourced child recovers through
+        // `restart_es` (journal rebuild + endpoint swap + inbox reopen
+        // with pending mail intact); a Service child restarts through
+        // the spec's spawn closure (a fresh start — no journal).
         let consecutive = {
             let kernel = system.kernel.lock().expect("kernel lock");
             kernel
@@ -1268,21 +1272,63 @@ pub async fn supervise_child(
         };
         let delay = spec.backoff.delay(consecutive);
         tokio::time::sleep(delay).await;
-        // The spawn closure does a FULL spawn (slot insert included);
-        // clear the dead instance's slot first so the path is free.
-        {
-            let mut registry = system.registry.lock().expect("registry lock");
-            let _ = registry.remove_slot(&spec.path);
-        }
-        (spec.spawn)(&system, &spec.path, &spec.args);
-        // The fresh instance is running (the spawn closure re-runs the
-        // loop); clear the stale crash flag so the next wait observes a
-        // NEW crash, not the one we just handled.
-        {
-            let mut kernel = system.kernel.lock().expect("kernel lock");
-            kernel.crashed.remove(&spec.path);
+        let is_es_child = system_is_es_child(&system, &spec.path);
+        if is_es_child {
+            // Journal-anchored recovery: rebuild from snapshot-or-genesis,
+            // apply the tail, swap the endpoint under the SAME path, and
+            // reopen the inbox (redelivery resumes from the cursor).
+            let ctx = crate::kernel::EsLoop {
+                path: spec.path.clone(),
+                cell: {
+                    let kernel = system.kernel.lock().expect("kernel lock");
+                    kernel
+                        .cells
+                        .get(&spec.path)
+                        .cloned()
+                        .expect("crashed ES child keeps its cell for redelivery")
+                },
+                registry: system.registry.clone(),
+                kernel: system.kernel.clone(),
+                view: system.view.clone(),
+                clock: system.clock.clone(),
+            };
+            let genesis_args = {
+                let kernel = system.kernel.lock().expect("kernel lock");
+                kernel
+                    .genesis_args
+                    .get(&spec.path)
+                    .cloned()
+                    .unwrap_or(JsonValue::Object(serde_json::Map::new()))
+            };
+            restart_es(&ctx, &genesis_args)
+                .await
+                .expect("supervised ES child restart");
+            // restart_es already cleared the crash flag.
+        } else {
+            // Service child: the spawn closure does a FULL spawn (slot
+            // insert included); clear the dead instance's slot first so
+            // the path is free.
+            {
+                let mut registry = system.registry.lock().expect("registry lock");
+                let _ = registry.remove_slot(&spec.path);
+            }
+            (spec.spawn)(&system, &spec.path, &spec.args);
+            // The fresh instance is running (the spawn closure re-runs the
+            // loop); clear the stale crash flag so the next wait observes a
+            // NEW crash, not the one we just handled.
+            {
+                let mut kernel = system.kernel.lock().expect("kernel lock");
+                kernel.crashed.remove(&spec.path);
+            }
         }
     }
+}
+
+/// Whether `path` is a journaled (EventSourced) child: the engine must
+/// recover it through `restart_es` rather than a fresh spawn.
+fn system_is_es_child(system: &std::sync::Arc<crate::system::ActorSystem>, path: &Path) -> bool {
+    let kernel = system.kernel.lock().expect("kernel lock");
+    kernel.es_state.contains_key(path)
 }
 
 /// Stops the child (slot + crash record) and escalates a control message

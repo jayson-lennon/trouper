@@ -1628,6 +1628,114 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn supervision_engine_restarts_a_crashed_es_child_and_redelivery_succeeds() {
+        // Given a supervised ES child whose Add handler panics ONLY on the
+        // poison payload (n = 666), with a generous budget.
+        let (system, _clock) = ActorSystem::test();
+        let child = Path::new("phoenix");
+        system.register_schema::<Add>();
+        system.register_schema::<Added>();
+
+        // A TRANSIENT fault: the 666 command panics the FIRST time it is
+        // processed; after the engine restarts the child, the redelivered
+        // command commits normally (models a crash caused by bad external
+        // state that the restart clears).
+        static CRASHED_YET: std::sync::atomic::AtomicBool =
+            std::sync::atomic::AtomicBool::new(false);
+
+        #[derive(Serialize, Deserialize, Default)]
+        struct Phoenix {
+            total: i64,
+        }
+        impl EventSourced for Phoenix {
+            fn manifest() -> ActorManifest {
+                ActorManifest::new().kind(ActorKind::EventSourced)
+            }
+            fn restore(_args: &JsonValue) -> Self {
+                Self::default()
+            }
+            fn apply(&mut self, event: &crate::envelope::Event) {
+                self.total += event.payload["n"].as_i64().unwrap_or(0);
+            }
+        }
+        impl CommandHandler<Add> for Phoenix {
+            fn handle(&self, cmd: Add, _ctx: &mut CmdCtx<'_>) -> Vec<crate::envelope::Event> {
+                if cmd.n == 666 && !CRASHED_YET.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                    // First sight only: crash once, then recover.
+                    panic!("transient fault");
+                }
+                vec![crate::envelope::Event::new(
+                    Added::schema_id(),
+                    json!({ "n": cmd.n }),
+                )]
+            }
+        }
+
+        let spec = crate::supervision::ChildSpec {
+            path: child.clone(),
+            parent: None,
+            restart: crate::supervision::RestartPolicy::Permanent,
+            budget: crate::supervision::RestartBudget::per(5, std::time::Duration::from_secs(10)),
+            backoff: crate::supervision::Backoff {
+                base: std::time::Duration::from_millis(5),
+                max: std::time::Duration::from_millis(20),
+                factor: 2.0,
+            },
+            args: json!({}),
+            spawn: Arc::new(|sys: &Arc<ActorSystem>, path: &Path, args: &JsonValue| {
+                sys.spawn_es::<Phoenix, _>(path.clone(), args, SpawnOpts::default(), || {
+                    vec![Arc::new(TypedEsAdapter::<Phoenix, Add>::new::<Add>())]
+                });
+            }),
+        };
+
+        // When the child is spawned under supervision and receives a
+        // poison command (with a good one queued BEHIND it).
+        system.spawn_child(spec);
+        wait_for(|| async {
+            system.tap_facts().iter().any(
+                |f| matches!(&f.kind, crate::tap::FactKind::Spawned { path, .. } if *path == child),
+            )
+        })
+        .await;
+        system
+            .send(system.envelope(Add::schema_id(), child.clone(), json!({ "n": 666 })))
+            .await
+            .expect("poison delivered");
+        system
+            .send(system.envelope(Add::schema_id(), child.clone(), json!({ "n": 5 })))
+            .await
+            .expect("good delivered");
+
+        // Then the engine restarted it: the poison command was retried and
+        // panicked again — but the pending GOOD command was also redelivered
+        // and SUCCEEDED (the queue survived the crash through the engine).
+        wait_for(|| async {
+            let state = system.es_state(&child).await;
+            state.as_ref().map(|s| s["total"] == 671).unwrap_or(false)
+        })
+        .await;
+
+        // And the engine marked the restart with Spawned { restart: true }.
+        let facts = system.tap_facts();
+        let restarted = facts.iter().any(|f| {
+            matches!(
+                &f.kind,
+                crate::tap::FactKind::Spawned { path, restart, .. }
+                    if *path == child && *restart
+            )
+        });
+        assert!(
+            restarted,
+            "engine emitted Spawned{{restart:true}}: {facts:?}"
+        );
+
+        // And the journal survived the engine restart: the retried 666
+        // committed its event once, plus the queued 5.
+        assert_eq!(system.journal_len(&child), 2);
+    }
+
+    #[tokio::test]
     async fn restart_budget_escalates_to_the_parent() {
         // Given a supervised counter whose Add handler always panics,
         // with a budget of 2 restarts per 10 seconds, parent "overseer".
