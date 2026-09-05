@@ -1303,6 +1303,52 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn inbox_overflow_dead_letters_through_the_front_door() {
+        // Given a spawned actor with a mailbox of ONE under DropNew —
+        // the mpsc front door is 2x, so the inbox can overflow.
+        let (system, _clock) = ActorSystem::test();
+        let path = Path::new("tiny");
+        system.spawn_es::<Counter, _>(
+            path.clone(),
+            &json!({}),
+            SpawnOpts {
+                snapshot: SnapshotPolicy::Off,
+                mailbox_capacity: 1,
+                mailbox_policy: OverloadPolicy::DropNew,
+            },
+            || vec![Arc::new(TypedEsAdapter::<Counter, Add>::new::<Add>())],
+        );
+        wait_for(|| async {
+            system
+                .tap_facts()
+                .iter()
+                .any(|f| matches!(&f.kind, crate::tap::FactKind::Spawned { path, .. } if *path == path.clone()))
+        })
+        .await;
+
+        // When more envelopes than the inbox holds are sent quickly.
+        for n in 1..=3_i64 {
+            let _ = system
+                .send(system.envelope(Add::schema_id(), path.clone(), json!({ "n": n })))
+                .await;
+        }
+
+        // Then at least one envelope was refused by the inbox and
+        // dead-lettered through the front door (InboxRefused + DLQ log).
+        wait_for(|| async { !system.dead_letter_reasons().await.is_empty() }).await;
+        let reasons = system.dead_letter_reasons().await;
+        assert!(
+            reasons.iter().any(|r| r.starts_with("InboxRefused")),
+            "front-door refusal recorded: {reasons:?}"
+        );
+
+        // And the DLQ topic retained the refused envelope.
+        let dlq = Registry::dead_letter_topic();
+        let (lo, hi) = system.topic_range(&dlq).expect("dlq log exists");
+        assert!(hi > lo, "DLQ holds the refused envelope: ({lo}, {hi})");
+    }
+
+    #[tokio::test]
     async fn dlq_topic_is_subscribable_and_reconsumable() {
         // Given a spawned actor that handles only Add.
         let (system, _clock) = ActorSystem::test();
