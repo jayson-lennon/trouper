@@ -144,6 +144,12 @@ impl Inbox {
         self.open = false;
     }
 
+    /// Reopens a closed inbox (restart: redelivery resumes from the
+    /// cursor — queued entries were never dropped).
+    pub fn reopen(&mut self) {
+        self.open = true;
+    }
+
     /// Whether the inbox accepts new deliveries.
     pub fn is_open(&self) -> bool {
         self.open

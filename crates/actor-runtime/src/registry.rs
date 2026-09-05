@@ -556,7 +556,7 @@ mod tests {
         // Given a slot whose first endpoint's receiver is dropped on swap.
         let mut registry = Registry::default();
         let path = Path::new("inventory.west");
-        let (mut rx1, ep1) = endpoint(4);
+        let (rx1, ep1) = endpoint(4);
         registry
             .insert_slot(path.clone(), manifest(ActorKind::EventSourced), ep1)
             .expect("insert");
@@ -564,7 +564,7 @@ mod tests {
 
         // When the actor "restarts": the old receiver dies (the task ended)
         // and a fresh endpoint is swapped in under the same path.
-        drop(rx1);
+        drop(rx1); // the actor task ended: its receiver is gone
         let (_rx2, ep2) = endpoint(4);
         registry.swap_endpoint(&path, ep2).expect("swap");
 

@@ -178,6 +178,12 @@ impl SeqNo {
         Self(0)
     }
 
+    /// The sequence "before genesis": replaying `after(this)` yields every
+    /// event, including the first.
+    pub fn before_genesis() -> Self {
+        Self(u64::MAX)
+    }
+
     /// Wraps a raw sequence value.
     pub fn new(v: u64) -> Self {
         Self(v)
@@ -186,6 +192,12 @@ impl SeqNo {
     /// The raw sequence value.
     pub fn as_u64(self) -> u64 {
         self.0
+    }
+
+    /// Whether this is the [`before_genesis`] sentinel (compare by value,
+    /// since `u64::MAX` is unreachable by honest counting).
+    pub fn is_before_genesis(self) -> bool {
+        self.0 == u64::MAX
     }
 }
 

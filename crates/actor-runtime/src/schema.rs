@@ -268,7 +268,9 @@ mod tests {
 
     /// A test command with a hand-written schema (no macros, per spec).
     struct ReserveStock {
+        #[allow(dead_code)] // descriptor data; exercised via schema_def only
         sku: String,
+        #[allow(dead_code)]
         qty: u32,
     }
 
