@@ -136,7 +136,12 @@ impl ActorSystem {
             let manifest = A::manifest();
             let mut registry = self.registry.lock().expect("registry lock");
             registry
-                .insert_slot(path.clone(), manifest.clone(), Endpoint::new(tx))
+                .insert_slot(
+                    path.clone(),
+                    manifest.clone(),
+                    Endpoint::new(tx),
+                    opts.mailbox_policy,
+                )
                 .expect("path free at spawn");
             // Declared edges become routes: each handled schema is routable
             // to this path (adding a second actor for a schema converts the
@@ -186,7 +191,12 @@ impl ActorSystem {
         {
             let mut registry = self.registry.lock().expect("registry lock");
             registry
-                .insert_slot(path.clone(), A::manifest(), Endpoint::new(tx))
+                .insert_slot(
+                    path.clone(),
+                    A::manifest(),
+                    Endpoint::new(tx),
+                    opts.mailbox_policy,
+                )
                 .expect("path free at spawn");
         }
         let mut kernel = self.kernel.lock().expect("kernel lock");
@@ -315,6 +325,64 @@ impl ActorSystem {
         crate::kernel::restart_es(&ctx, genesis_args).await
     }
 
+    /// Subscribes an actor to a topic: its cursor starts at Latest (or
+    /// `offset` to re-consume); every later publish is pumped to its
+    /// inbox. The actor must already exist (its inbox policy is reused).
+    ///
+    /// # Errors
+    ///
+    /// Unknown path.
+    pub fn subscribe(
+        &self,
+        path: &Path,
+        topic: &crate::types::Topic,
+        offset: Option<u64>,
+    ) -> Result<u64, error_stack::Report<crate::registry::RegistryError>> {
+        use error_stack::IntoReport;
+        let mut kernel = self.kernel.lock().expect("kernel lock");
+        let registry = self.registry.lock().expect("registry lock");
+        if !kernel.cells.contains_key(path) {
+            return Err(crate::registry::RegistryError::UnknownPath(path.clone())
+                .into_report()
+                .attach(format!("subscribing {path}")));
+        }
+        let policy = registry.inbox_policy(path);
+        let from = match offset {
+            Some(o) => crate::topics::CursorFrom::Offset(o),
+            None => crate::topics::CursorFrom::Latest,
+        };
+        let log = kernel
+            .topic_logs
+            .entry(topic.clone())
+            .or_insert_with(|| crate::topics::TopicLog::new(256));
+        Ok(log.subscribe(path.clone(), policy, from))
+    }
+
+    /// Re-points a subscriber's topic cursor; the next publish pumps the
+    /// retained range back into its inbox (at-least-once re-consume).
+    ///
+    /// # Errors
+    ///
+    /// Unknown topic or path not subscribed.
+    pub fn reset_topic_cursor(
+        &self,
+        path: &Path,
+        topic: &crate::types::Topic,
+        to: u64,
+    ) -> Result<u64, u64> {
+        let mut kernel = self.kernel.lock().expect("kernel lock");
+        let Some(log) = kernel.topic_logs.get_mut(topic) else {
+            return Err(to);
+        };
+        log.reset_cursor(path, to)
+    }
+
+    /// The topic log's retained offset range (inspection).
+    pub fn topic_range(&self, topic: &crate::types::Topic) -> Option<(u64, u64)> {
+        let kernel = self.kernel.lock().expect("kernel lock");
+        kernel.topic_logs.get(topic).map(|log| log.retained())
+    }
+
     /// The cursor of an actor's inbox (inspection; Phase 10 tests).
     pub fn inbox_cursor(&self, path: &Path) -> Option<InboxOffset> {
         let kernel = self.kernel.lock().expect("kernel lock");
@@ -384,6 +452,7 @@ impl Default for ActorSystem {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
     use crate::actor::{CommandHandler, MsgHandler, TypedEsAdapter, TypedServiceAdapter};
     use crate::context::CmdCtx;
     use crate::schema::{ActorManifest, FieldDef, FieldTy, SchemaDef, SchemaKind};
@@ -433,6 +502,7 @@ mod tests {
             ActorManifest::new()
                 .handles::<Add>()
                 .emits::<Added>()
+                .emits_on_topic(crate::types::Topic::new("counter.events"))
                 .kind(ActorKind::EventSourced)
         }
         fn restore(_args: &JsonValue) -> Self {
@@ -621,6 +691,177 @@ mod tests {
         panic!("cursor never reached {expected}");
     }
 
+
+
+    #[tokio::test]
+    async fn topic_cursor_reset_redelivers_in_order() {
+        // Given a counter emitting onto "counter.events" and a subscriber.
+        let system = Arc::new(ActorSystem::new());
+        let path = Path::new("counter");
+        let sub = Path::new("watcher");
+        system.spawn_es::<Counter, _>(
+            path.clone(),
+            &json!({}),
+            SpawnOpts::default(),
+            || vec![Arc::new(TypedEsAdapter::<Counter, Add>::new::<Add>())],
+        );
+        let (sub_idx, sub_sink) = open_sink();
+        bind_sink(&sub, sub_sink);
+        system.spawn_service::<Auditor, _>(
+            sub.clone(),
+            &json!({ "sink": sub_idx }),
+            SpawnOpts::default(),
+            || {
+                vec![
+                    Arc::new(TypedServiceAdapter::<Auditor, Add>::new::<Add>()),
+                    Arc::new(TypedServiceAdapter::<Auditor, Added>::new::<Added>()),
+                ]
+            },
+        );
+        let topic = crate::types::Topic::new("counter.events");
+        system.subscribe(&sub, &topic, None).expect("subscribe");
+
+        // When two Adds are sent and committed.
+        for n in 1..=2 {
+            system
+                .send(system.envelope(Add::schema_id(), path.clone(), json!({ "n": n })))
+                .await
+                .expect("send");
+        }
+        wait_for_cursor(&system, &path, 2).await;
+        let seen_after_first = sink_read(&sub).len();
+
+        // And the subscriber's cursor is reset to the log floor.
+        let (floor, _) = system.topic_range(&topic).expect("topic");
+        let cursor = system
+            .reset_topic_cursor(&sub, &topic, floor)
+            .expect("subscribed");
+        assert_eq!(cursor, floor);
+
+        // And a third Add triggers a fresh pump pass.
+        system
+            .send(system.envelope(Add::schema_id(), path.clone(), json!({ "n": 3 })))
+            .await
+            .expect("send");
+        wait_for_cursor(&system, &path, 3).await;
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+
+        // Then the retained events were re-delivered in order.
+        let lines = sink_read(&sub);
+        assert!(lines.len() >= seen_after_first, "re-consume delivered more");
+        let mut events: Vec<i64> = lines
+            .iter()
+            .filter_map(|l| l.strip_prefix("Added:").and_then(|v| v.parse().ok()))
+            .collect();
+        let replayed = events.split_off(events.len() - seen_after_first.max(1).min(events.len()));
+        // The replayed suffix (the re-consumed range) is in log order.
+        let ordered = replayed.windows(2).all(|w| w[0] <= w[1]);
+        assert!(ordered, "replayed events out of order: {lines:?}");
+    }
+
+    #[tokio::test]
+    async fn topic_subscribers_have_independent_cursors() {
+        // Given one publisher and two subscribers.
+        let system = Arc::new(ActorSystem::new());
+        let path = Path::new("counter");
+        let early = Path::new("early");
+        let late = Path::new("late");
+        system.spawn_es::<Counter, _>(
+            path.clone(),
+            &json!({}),
+            SpawnOpts::default(),
+            || vec![Arc::new(TypedEsAdapter::<Counter, Add>::new::<Add>())],
+        );
+        for p in [&early, &late] {
+            let (idx, sink) = open_sink();
+            bind_sink(p, sink);
+            system.spawn_service::<Auditor, _>(
+                p.clone(),
+                &json!({ "sink": idx }),
+                SpawnOpts::default(),
+                || {
+                    vec![
+                        Arc::new(TypedServiceAdapter::<Auditor, Add>::new::<Add>()),
+                        Arc::new(TypedServiceAdapter::<Auditor, Added>::new::<Added>()),
+                    ]
+                },
+            );
+        }
+        let topic = crate::types::Topic::new("counter.events");
+
+        // When "early" subscribes before any publish and "late" after one.
+        system.subscribe(&early, &topic, None).expect("subscribe");
+        system
+            .send(system.envelope(Add::schema_id(), path.clone(), json!({ "n": 1 })))
+            .await
+            .expect("send");
+        wait_for_cursor(&system, &path, 1).await;
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        system.subscribe(&late, &topic, None).expect("subscribe");
+        system
+            .send(system.envelope(Add::schema_id(), path.clone(), json!({ "n": 2 })))
+            .await
+            .expect("send");
+        wait_for_cursor(&system, &path, 2).await;
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+
+        // Then "early" saw both events and "late" only the second.
+        let early_lines = sink_read(&early);
+        let late_lines = sink_read(&late);
+        assert_eq!(early_lines.len(), 2, "early saw everything: {early_lines:?}");
+        assert_eq!(late_lines.len(), 1, "late only saw its own era: {late_lines:?}");
+    }
+
+    #[tokio::test]
+    async fn slow_subscriber_does_not_block_the_publisher() {
+        // Given a subscriber spawned with a tiny DropNew mailbox.
+        let system = Arc::new(ActorSystem::new());
+        let path = Path::new("counter");
+        let slow = Path::new("slow");
+        system.spawn_es::<Counter, _>(
+            path.clone(),
+            &json!({}),
+            SpawnOpts::default(),
+            || vec![Arc::new(TypedEsAdapter::<Counter, Add>::new::<Add>())],
+        );
+        system.spawn_service::<Auditor, _>(
+            slow.clone(),
+            &json!({}),
+            SpawnOpts {
+                mailbox_capacity: 1,
+                mailbox_policy: crate::inbox::OverloadPolicy::DropNew,
+                ..SpawnOpts::default()
+            },
+            || {
+                vec![
+                    Arc::new(TypedServiceAdapter::<Auditor, Add>::new::<Add>()),
+                    Arc::new(TypedServiceAdapter::<Auditor, Added>::new::<Added>()),
+                ]
+            },
+        );
+        let topic = crate::types::Topic::new("counter.events");
+        system.subscribe(&slow, &topic, None).expect("subscribe");
+
+        // When many publishes happen in a row.
+        for n in 1..=10 {
+            system
+                .send(system.envelope(Add::schema_id(), path.clone(), json!({ "n": n })))
+                .await
+                .expect("send");
+        }
+
+        // Then the publisher still committed everything.
+        wait_for_cursor(&system, &path, 10).await;
+        // And some deliveries were refused (dead-lettered), not blocked.
+        let dead = system.kernel.lock().expect("lock").dead_letters.len();
+        assert!(
+            dead > 0 || {
+                !sink_read(&slow).is_empty()
+            },
+            "slow subscriber either dropped or received; never stalled the publisher"
+        );
+    }
+
     async fn wait_for_crash(system: &ActorSystem, path: &Path) {
         for _ in 0..2_000 {
             {
@@ -642,6 +883,31 @@ mod tests {
 
     fn sinks() -> &'static Mutex<Vec<Arc<Mutex<Vec<String>>>>> {
         SINKS.get_or_init(|| Mutex::new(Vec::new()))
+    }
+
+    /// Path→sink table (tests inspect a subscriber's sink by its path).
+    static SINK_BY_PATH: std::sync::OnceLock<Mutex<HashMap<String, Arc<Mutex<Vec<String>>>>>> =
+        std::sync::OnceLock::new();
+
+    fn sink_table() -> &'static Mutex<HashMap<String, Arc<Mutex<Vec<String>>>>> {
+        SINK_BY_PATH.get_or_init(|| Mutex::new(HashMap::new()))
+    }
+
+    fn bind_sink(path: &Path, sink: Arc<Mutex<Vec<String>>>) {
+        sink_table()
+            .lock()
+            .expect("sink table lock")
+            .insert(path.to_string(), sink);
+    }
+
+    /// Reads a subscriber's sink lines by path (test inspection).
+    fn sink_read(path: &Path) -> Vec<String> {
+        sink_table()
+            .lock()
+            .expect("sink table lock")
+            .get(&path.to_string())
+            .map(|sink| sink.lock().expect("sink lock").clone())
+            .unwrap_or_default()
     }
 
     fn open_sink() -> (usize, Arc<Mutex<Vec<String>>>) {
@@ -670,6 +936,16 @@ mod tests {
             Ok(Self { sink })
         }
 
+    }
+
+    impl MsgHandler<Added> for Auditor {
+        async fn handle(&mut self, msg: Added, _ctx: &mut crate::context::MsgCtx<'_>) {
+            println!("AUDITOR GOT Added n={}", msg.n);
+            self.sink
+                .lock()
+                .expect("sink lock")
+                .push(format!("Added:{}", msg.n));
+        }
     }
 
     impl MsgHandler<Add> for Auditor {

@@ -119,6 +119,14 @@ impl Envelope {
         }
     }
 
+    /// The JSON view of the payload (the waist representation).
+    pub fn payload_json(&self) -> &JsonValue {
+        match &self.payload {
+            Payload::Json(value) => value,
+            Payload::Typed(_) => &JsonValue::Null,
+        }
+    }
+
     /// Assembles a typed envelope for the in-process fast path.
     pub fn typed<T: Send + Sync + 'static>(
         schema: SchemaId,

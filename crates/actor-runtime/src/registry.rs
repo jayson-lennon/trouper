@@ -63,6 +63,9 @@ pub struct Slot {
     pub manifest: ActorManifest,
     /// The running endpoint; `None` while stopped (between restarts).
     pub endpoint: arc_swap::ArcSwapOption<Endpoint>,
+    /// The inbox overload policy this actor spawned with (topic pumps
+    /// consult it when delivering published envelopes).
+    pub inbox_policy: crate::inbox::OverloadPolicy,
 }
 
 impl Slot {
@@ -257,6 +260,7 @@ impl Registry {
         path: Path,
         manifest: ActorManifest,
         endpoint: Endpoint,
+        inbox_policy: crate::inbox::OverloadPolicy,
     ) -> Result<(), error_stack::Report<RegistryError>> {
         use error_stack::IntoReport;
         if self.slots.contains_key(&path) {
@@ -269,6 +273,7 @@ impl Registry {
             Slot {
                 manifest,
                 endpoint: arc_swap::ArcSwapOption::from_pointee(endpoint),
+                inbox_policy,
             },
         );
         Ok(())
@@ -320,6 +325,14 @@ impl Registry {
             .get(path)?
             .endpoint
             .load_full()
+    }
+
+    /// The inbox policy a path spawned with (topic pump delivery).
+    pub fn inbox_policy(&self, path: &Path) -> crate::inbox::OverloadPolicy {
+        self.slots
+            .get(path)
+            .map(|s| s.inbox_policy)
+            .unwrap_or(crate::inbox::OverloadPolicy::DropNew)
     }
 
     /// Snapshot info about a path, for `ctx.lookup`.
@@ -517,7 +530,12 @@ mod tests {
         let path = Path::new("inventory.west");
         let (_rx, ep) = endpoint(4);
         registry
-            .insert_slot(path.clone(), manifest(ActorKind::EventSourced), ep)
+            .insert_slot(
+                path.clone(),
+                manifest(ActorKind::EventSourced),
+                ep,
+                crate::inbox::OverloadPolicy::DropNew,
+            )
             .expect("insert");
 
         // When resolving the path and delivering an envelope.
@@ -537,12 +555,22 @@ mod tests {
         let path = Path::new("dup");
         let (_rx, ep) = endpoint(1);
         registry
-            .insert_slot(path.clone(), manifest(ActorKind::Service), ep)
+            .insert_slot(
+                path.clone(),
+                manifest(ActorKind::Service),
+                ep,
+                crate::inbox::OverloadPolicy::DropNew,
+            )
             .expect("insert");
 
         // When inserting another slot at the same path.
         let (_rx, ep2) = endpoint(1);
-        let result = registry.insert_slot(path, manifest(ActorKind::Service), ep2);
+        let result = registry.insert_slot(
+            path,
+            manifest(ActorKind::Service),
+            ep2,
+            crate::inbox::OverloadPolicy::DropNew,
+        );
 
         // Then it fails with PathTaken.
         assert!(matches!(
@@ -558,7 +586,12 @@ mod tests {
         let path = Path::new("inventory.west");
         let (rx1, ep1) = endpoint(4);
         registry
-            .insert_slot(path.clone(), manifest(ActorKind::EventSourced), ep1)
+            .insert_slot(
+                path.clone(),
+                manifest(ActorKind::EventSourced),
+                ep1,
+                crate::inbox::OverloadPolicy::DropNew,
+            )
             .expect("insert");
         let stale = registry.resolve(&path).expect("live");
 
@@ -582,7 +615,12 @@ mod tests {
         let path = Path::new("temp");
         let (_rx, ep) = endpoint(1);
         registry
-            .insert_slot(path.clone(), manifest(ActorKind::Service), ep)
+            .insert_slot(
+                path.clone(),
+                manifest(ActorKind::Service),
+                ep,
+                crate::inbox::OverloadPolicy::DropNew,
+            )
             .expect("insert");
 
         // When removing the slot.
@@ -606,7 +644,14 @@ mod tests {
             let (rx, ep) = endpoint(1);
             (m, rx, ep)
         };
-        registry.insert_slot(path.clone(), ep_manifest, ep).expect("insert");
+        registry
+            .insert_slot(
+                path.clone(),
+                ep_manifest,
+                ep,
+                crate::inbox::OverloadPolicy::DropNew,
+            )
+            .expect("insert");
 
         // When looking the path up.
         let info = registry.lookup(&path).expect("info");

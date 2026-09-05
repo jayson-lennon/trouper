@@ -109,6 +109,10 @@ pub struct KernelState {
     pub crashed: HashSet<Path>,
     /// Envelopes that could not be delivered or decoded.
     pub dead_letters: Vec<DeadLetter>,
+    /// Topic logs: bounded rings with per-subscriber cursors.
+    pub topic_logs: HashMap<crate::types::Topic, crate::topics::TopicLog>,
+    /// Topic publish facts (tap consumes in Phase 7).
+    pub topic_facts: Vec<crate::topics::TopicPublishFact>,
 }
 
 /// Kernel-facing handle for one running actor loop.
@@ -421,10 +425,7 @@ async fn flush_outbox(ctx: &EsLoop, mut outbox: Outbox) {
                 }
             }
             crate::context::Intent::Publish { topic, envelope } => {
-                // Topic pumps land in Phase 6; until then the publish is
-                // recorded so it stays observable.
-                let _ = topic;
-                dead_letter(&ctx.kernel, &envelope, "topics pending (Phase 6)");
+                publish_to_topic(&ctx.kernel, &ctx.registry, topic, envelope).await;
             }
             crate::context::Intent::Reply {
                 to,
@@ -533,6 +534,69 @@ impl crate::context::AskPort for KernelAskPort {
     }
 }
 
+/// Publishes one envelope onto a topic: appends to the bounded log,
+/// pumps subscribers (each offered entries past its own cursor), and
+/// records the publish fact. Never blocks on a slow subscriber — its
+/// cursor simply falls behind.
+async fn publish_to_topic(
+    kernel: &Mutex<KernelState>,
+    registry: &Mutex<Registry>,
+    topic: crate::types::Topic,
+    envelope: Envelope,
+) {
+    // Resolve subscribers once; the pump runs while kernel/registry locks
+    // are NOT held (deliver may await on Block inboxes).
+    let targets: Vec<(Path, std::sync::Arc<Endpoint>, crate::inbox::OverloadPolicy)> = {
+        let mut kernel = kernel.lock().expect("kernel lock");
+        let registry = registry.lock().expect("registry lock");
+        // Auto-create the topic log on first publish.
+        let log = kernel
+            .topic_logs
+            .entry(topic.clone())
+            .or_insert_with(|| crate::topics::TopicLog::new(256));
+        let offset = log.append(envelope.clone());
+        let mut targets = Vec::new();
+        for path in log.subscribers() {
+            if let Some(endpoint) = registry.resolve(&path) {
+                let policy = registry.inbox_policy(&path);
+                targets.push((path, endpoint, policy));
+            }
+        }
+        kernel.topic_facts.push(crate::topics::TopicPublishFact {
+            topic: topic.clone(),
+            offset: crate::types::InboxOffset::new(offset),
+            schema: envelope.schema.clone(),
+            from: envelope.from.clone(),
+            trace: envelope.trace,
+        });
+        targets
+    };
+    for (_path, endpoint, policy) in targets {
+        match deliver_policy(&endpoint, envelope.clone(), policy).await {
+            Ok(()) => {}
+            Err(undeliverable) => dead_letter(kernel, &undeliverable, "subscriber inbox refused"),
+        }
+    }
+}
+
+/// Delivers honoring the subscriber's policy: Block waits for capacity
+/// (a pump MAY wait on one subscriber), DropNew/DropOld refuse fast and
+/// the refusal dead-letters — a slow subscriber never blocks others.
+async fn deliver_policy(
+    endpoint: &Endpoint,
+    envelope: Envelope,
+    policy: crate::inbox::OverloadPolicy,
+) -> Result<(), Envelope> {
+    use tokio::sync::mpsc::error::TrySendError;
+    match (policy, endpoint.try_deliver(envelope)) {
+        (_, Ok(())) => Ok(()),
+        (crate::inbox::OverloadPolicy::Block, Err(TrySendError::Full(env))) => {
+            endpoint.deliver(env).await.map_err(|send_err| send_err.0)
+        }
+        (_, Err(TrySendError::Full(env))) | (_, Err(TrySendError::Closed(env))) => Err(env),
+    }
+}
+
 /// Resolves one reply: a slot goes straight to the asker's oneshot (the
 /// mechanism); a path routes an ordinary envelope through the registry
 /// (the durable name).
@@ -570,10 +634,33 @@ async fn resolve_reply(
     }
 }
 
-/// Fans the committed events out to the manifest's emit topics (Phase 6).
-async fn fan_out_emits(_ctx: &EsLoop, _events: &[crate::envelope::Event]) {
-    // Wired when TopicLog + pumps exist; the step's position in the atomic
-    // order is fixed NOW so the wiring cannot reorder it.
+/// Fans the committed events out to the manifest's emit topics. Position
+/// in the atomic order is AFTER ack — replay never re-runs this (a
+/// restart must not duplicate topic deliveries).
+async fn fan_out_emits(ctx: &EsLoop, events: &[crate::envelope::Event]) {
+    let topics = {
+        let registry = ctx.registry.lock().expect("registry lock");
+        let Some(info) = registry.lookup(&ctx.path) else {
+            return;
+        };
+        info.manifest.emits_on_topics.clone()
+    };
+    if topics.is_empty() {
+        return;
+    }
+    let cause = crate::envelope::TraceCtx::root();
+    for topic in &topics {
+        for event in events {
+            let envelope = Envelope::json(
+                event.schema.clone(),
+                Address::Topic(topic.clone()),
+                event.payload.clone(),
+                cause,
+            )
+            .from(ctx.path.clone());
+            publish_to_topic(&ctx.kernel, &ctx.registry, topic.clone(), envelope).await;
+        }
+    }
 }
 
 /// Takes the between-messages snapshot if the policy asks for one.
@@ -668,6 +755,7 @@ async fn step_service(ctx: &ServiceLoop) -> Step {
             })
     };
     let Some(entry) = entry else {
+
         dead_letter(&ctx.es.kernel, &envelope, "unknown schema");
         ctx.es.cell.inbox.lock().await.ack();
         return Step::Work;
