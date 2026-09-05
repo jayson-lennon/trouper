@@ -1758,8 +1758,6 @@ mod tests {
         let child = Path::new("child");
         let (p_idx, p_sink) = open_sink();
         bind_sink(&parent, p_sink);
-        let (c_idx, c_sink) = open_sink();
-        bind_sink(&child, c_sink);
         let registry = system.registry.clone();
         let kernel = system.kernel.clone();
         let view = system.view.clone();
@@ -1769,7 +1767,6 @@ mod tests {
         // factory (the same closure the supervision engine would run).
         let spawn_child = {
             let system = system.clone();
-            let child = child.clone();
             move |_sys: &Arc<ActorSystem>, path: &Path, _args: &JsonValue| {
                 let system = system.clone();
                 let path = path.to_owned();
