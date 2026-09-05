@@ -759,14 +759,24 @@ impl ActorSystem {
         };
         {
             let mut kernel = self.kernel.lock().expect("kernel lock");
-            for envelope in undelivered {
-                kernel.dead_letters.push(crate::kernel::DeadLetter {
-                    schema: envelope.schema,
-                    dest: envelope.dest,
+            let mut letters = Vec::with_capacity(undelivered.len());
+            for envelope in &undelivered {
+                letters.push(crate::kernel::DeadLetter {
+                    schema: envelope.schema.clone(),
+                    dest: envelope.dest.clone(),
                     reason: crate::types::DeadLetterReason::StoppedWithMail,
                     detail: "stopped with a non-empty inbox".to_owned(),
                     trace: envelope.trace,
                 });
+            }
+            kernel.dead_letters.extend(letters);
+            // The DLQ is a real topic: retained for re-consumption.
+            let log = kernel
+                .topic_logs
+                .entry(Registry::dead_letter_topic())
+                .or_insert_with(|| crate::topics::TopicLog::new(256));
+            for envelope in undelivered {
+                log.append(envelope);
             }
         }
 
@@ -1300,6 +1310,102 @@ mod tests {
             .await
             .expect("published");
         wait_for(|| async { sink_read(&Path::new("aud")).contains(&"Added:7".to_string()) }).await;
+    }
+
+    #[tokio::test]
+    async fn stop_with_queued_mail_flushes_undelivered_to_dlq() {
+        // Given a service actor whose FIRST handler parks on a gate: the
+        // messages sent behind it stay QUEUED (un-acked) in the inbox.
+        let (system, _clock) = ActorSystem::test();
+        let path = Path::new("parked");
+        system.register_schema::<Add>();
+
+        // First handle() call parks forever (receiver dropped unfired);
+        // later calls return immediately so the remaining two messages
+        // stay queued, and stop()'s drain sees them.
+        static PARK_ONE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        static PARKING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+        struct Parked;
+        impl ServiceActor for Parked {
+            fn manifest() -> ActorManifest {
+                ActorManifest::new().kind(ActorKind::Service)
+            }
+            async fn start(
+                _args: &JsonValue,
+            ) -> Result<Self, error_stack::Report<crate::registry::RegistryError>> {
+                Ok(Self)
+            }
+        }
+        impl MsgHandler<Add> for Parked {
+            async fn handle(&mut self, _msg: Add, _ctx: &mut crate::context::MsgCtx<'_>) {
+                if !PARK_ONE.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                    PARKING.store(true, std::sync::atomic::Ordering::SeqCst);
+                    // Park until the test ends (dropped sender).
+                    let (_tx, rx) = tokio::sync::oneshot::channel::<()>();
+                    let _ = rx.await;
+                }
+            }
+        }
+
+        system.spawn_service::<Parked, _>(path.clone(), &json!({}), SpawnOpts::default(), || {
+            vec![Arc::new(TypedServiceAdapter::<Parked, Add>::new::<Add>())]
+        });
+        wait_for(|| async {
+            system.tap_facts().iter().any(
+                |f| matches!(&f.kind, crate::tap::FactKind::Spawned { path: p, .. } if *p == path),
+            )
+        })
+        .await;
+
+        // Send one message (the loop takes it and parks in the handler),
+        // then two more (they queue behind it, un-acked).
+        for n in 1..=3_i64 {
+            system
+                .send(system.envelope(Add::schema_id(), path.clone(), json!({ "n": n })))
+                .await
+                .expect("delivered");
+        }
+        // Wait until the parked handler has the first message IN.
+        wait_for(|| async { PARKING.load(std::sync::atomic::Ordering::SeqCst) }).await;
+
+        // The remaining two are still in the inbox (capacity allows).
+        {
+            let kernel = system.kernel.lock().expect("lock");
+            let cell = kernel.cells.get(&path).expect("cell");
+            let inbox = cell.inbox.try_lock().expect("inbox free between messages");
+            assert_eq!(
+                inbox.len(),
+                2,
+                "two messages queued behind the parked handler"
+            );
+        }
+
+        // When the actor is stopped while mail is queued.
+        system.stop(&path).await;
+
+        // Then the queued envelopes were flushed to the dead-letter
+        // mirror with the typed StoppedWithMail reason.
+        let kernel = system.kernel.lock().expect("lock");
+        assert!(
+            kernel
+                .dead_letters
+                .iter()
+                .any(|l| l.reason == crate::types::DeadLetterReason::StoppedWithMail),
+            "undelivered mail typed StoppedWithMail: {:?}",
+            kernel.dead_letters
+        );
+        drop(kernel);
+
+        // And the DLQ topic log holds them for re-consumption.
+        let dlq_entries = system
+            .topic_range(&Registry::dead_letter_topic())
+            .map(|(lo, hi)| hi - lo)
+            .unwrap_or(0);
+        assert!(
+            dlq_entries >= 2,
+            "DLQ holds the flushed mail: {dlq_entries}"
+        );
     }
 
     #[tokio::test]
