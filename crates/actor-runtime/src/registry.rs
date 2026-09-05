@@ -1,21 +1,116 @@
 //! The registry: kernel, not actor.
 //!
 //! Bootstrap paradox resolved by construction: the registry must never
-//! deadlock and must survive every actor restart, so it is plain kernel data
-//! owned by the [`crate::system::ActorSystem`] — path→endpoint slots, the
-//! schema table, schema→handler routes, and topic→subscriber tables. Actor
-//! identity is its registered path; handles survive restarts because slots
-//! are swapped, never invalidated.
-//!
-//! This phase holds the schema table; slots, handler routes, and topics
-//! arrive with the delivery kernel.
+//! deadlock and must survive every actor restart, so it is plain kernel data.
+//! It holds four tables — path→endpoint slots, the schema table,
+//! schema→handler routes, and (with the topics phase) topic→subscribers.
+//! Actor identity is its registered path; handles survive restarts because
+//! slots are swapped, never invalidated.
 
 use std::collections::{BTreeMap, HashMap};
 
 use serde_json::Value as JsonValue;
+use tokio::sync::mpsc;
 
-use crate::schema::{Schema, SchemaDef, SchemaError};
-use crate::types::SchemaId;
+use crate::envelope::Envelope;
+use crate::schema::{ActorManifest, Schema, SchemaDef, SchemaError};
+use crate::types::{ActorKind, Path, SchemaId, Topic};
+
+/// The topic every undeliverable message lands on; created at system boot.
+pub const DEAD_LETTER_TOPIC: &str = "system.deadletters";
+
+/// The deliverable front door of one running actor endpoint.
+///
+/// Senders clone this handle; a restart swaps in a fresh endpoint under the
+/// same path, so pre-crash handles die quietly while the path keeps working.
+/// The mpsc is the inbox's "Block" overload made concrete: a full mailbox
+/// backpressures senders via `.send().await`.
+#[derive(Debug)]
+pub struct Endpoint {
+    tx: mpsc::Sender<Envelope>,
+}
+
+impl Endpoint {
+    /// Wraps the front-door sender.
+    pub fn new(tx: mpsc::Sender<Envelope>) -> Self {
+        Self { tx }
+    }
+
+    /// Tries to enqueue an envelope without waiting.
+    ///
+    /// # Errors
+    ///
+    /// Fails when the front door is full (`try_send`) or the endpoint is
+    /// gone (receiver dropped mid-restart).
+    pub fn try_deliver(&self, envelope: Envelope) -> Result<(), mpsc::error::TrySendError<Envelope>> {
+        self.tx.try_send(envelope)
+    }
+
+    /// Delivers an envelope, waiting for capacity (backpressure = Block).
+    ///
+    /// # Errors
+    ///
+    /// Fails when the endpoint is gone (receiver dropped mid-restart).
+    pub async fn deliver(&self, envelope: Envelope) -> Result<(), mpsc::error::SendError<Envelope>> {
+        self.tx.send(envelope).await
+    }
+}
+
+/// A registered actor identity: its manifest plus a swappable endpoint.
+#[derive(Debug)]
+pub struct Slot {
+    /// The actor's declared edges and contract kind.
+    pub manifest: ActorManifest,
+    /// The running endpoint; `None` while stopped (between restarts).
+    pub endpoint: arc_swap::ArcSwapOption<Endpoint>,
+}
+
+impl Slot {
+    /// The actor kind this slot was spawned as.
+    pub fn kind(&self) -> ActorKind {
+        self.manifest
+            .kind
+            .expect("slots are always spawned with a manifest kind")
+    }
+}
+
+/// What the caller sees from a successful lookup.
+#[derive(Debug, Clone)]
+pub struct EndpointInfo {
+    /// The actor's path.
+    pub path: Path,
+    /// The actor's contract kind.
+    pub kind: ActorKind,
+    /// A copy of the actor's manifest.
+    pub manifest: ActorManifest,
+}
+
+/// How messages for one schema find their actor.
+#[derive(Debug, Clone)]
+pub enum RoutePolicy {
+    /// Exactly one handler path.
+    Single(Path),
+    /// Handlers rotate in registration order.
+    RoundRobin(Vec<Path>),
+}
+
+impl RoutePolicy {
+    /// Picks the next path for this route.
+    ///
+    /// Round-robin state is a cursor carried by the caller (the registry),
+    /// keeping this type pure data.
+    fn pick(&self, cursor: &mut usize) -> Option<Path> {
+        match self {
+            Self::Single(path) => Some(path.clone()),
+            Self::RoundRobin(paths) if !paths.is_empty() => {
+                let path = paths[*cursor % paths.len()].clone();
+                *cursor = (*cursor + 1) % paths.len();
+                Some(path)
+            }
+            Self::RoundRobin(_) => None,
+        }
+    }
+}
 
 /// The runtime's schema table: every message shape the system knows,
 /// however it was defined.
@@ -94,32 +189,242 @@ impl SchemaTable {
     }
 }
 
+/// Errors surfaced by registry mutations.
+#[derive(Debug, wherror::Error)]
+#[error(debug)]
+pub enum RegistryError {
+    /// A slot already exists under this path.
+    PathTaken(Path),
+    /// No slot exists under this path.
+    UnknownPath(Path),
+}
+
+/// All kernel tables: slots, schemas, routes, and the round-robin cursor.
+#[derive(Debug, Default)]
+pub struct Registry {
+    schemas: SchemaTable,
+    slots: HashMap<Path, Slot>,
+    routes: HashMap<SchemaId, RoutePolicy>,
+    route_cursor: usize,
+}
+
+impl Registry {
+    /// The dead-letter topic (created at boot, always valid).
+    pub fn dead_letter_topic() -> Topic {
+        Topic::new(DEAD_LETTER_TOPIC)
+    }
+
+    /// Registers a schema descriptor; idempotent per name+version.
+    pub fn register_schema(&mut self, def: SchemaDef) -> SchemaId {
+        self.schemas.register(def)
+    }
+
+    /// Registers a schema from JSON; the foreign flavor.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when `json` is not a valid [`SchemaDef`].
+    pub fn register_schema_json(
+        &mut self,
+        json: JsonValue,
+    ) -> Result<SchemaId, error_stack::Report<SchemaError>> {
+        self.schemas.register_json(json)
+    }
+
+    /// Registers a Rust type's schema; the typed flavor.
+    pub fn register_schema_of<S: Schema>(&mut self) -> SchemaId {
+        self.schemas.register_of::<S>()
+    }
+
+    /// The descriptor for an exact schema id.
+    pub fn schema(&self, id: &SchemaId) -> Option<&SchemaDef> {
+        self.schemas.by_id(id)
+    }
+
+    /// The shared schema table (for export).
+    pub fn schemas(&self) -> &SchemaTable {
+        &self.schemas
+    }
+
+    /// Inserts a slot; fails if the path is already taken (a live actor owns
+    /// its path — remove it first).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RegistryError::PathTaken`] when the path is registered.
+    pub fn insert_slot(
+        &mut self,
+        path: Path,
+        manifest: ActorManifest,
+        endpoint: Endpoint,
+    ) -> Result<(), error_stack::Report<RegistryError>> {
+        use error_stack::IntoReport;
+        if self.slots.contains_key(&path) {
+            return Err(RegistryError::PathTaken(path.clone())
+                .into_report()
+                .attach(format!("spawning over live path {path}")));
+        }
+        self.slots.insert(
+            path,
+            Slot {
+                manifest,
+                endpoint: arc_swap::ArcSwapOption::from_pointee(endpoint),
+            },
+        );
+        Ok(())
+    }
+
+    /// Swaps a slot's endpoint — the restart mechanism. Identity (the path,
+    /// the manifest, the inbox cursor held by the kernel) persists.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RegistryError::UnknownPath`] when no slot exists.
+    pub fn swap_endpoint(
+        &mut self,
+        path: &Path,
+        endpoint: Endpoint,
+    ) -> Result<(), error_stack::Report<RegistryError>> {
+        use error_stack::ResultExt;
+        let slot = self
+            .slots
+            .get_mut(path)
+            .ok_or_else(|| RegistryError::UnknownPath(path.clone()))
+            .attach(format!("restarting unknown path {path}"))?;
+        slot.endpoint.store(Some(std::sync::Arc::new(endpoint)));
+        Ok(())
+    }
+
+    /// Removes a slot entirely; returns its manifest (topics phase uses the
+    /// subscriptions for cascade removal).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RegistryError::UnknownPath`] when no slot exists.
+    pub fn remove_slot(
+        &mut self,
+        path: &Path,
+    ) -> Result<ActorManifest, error_stack::Report<RegistryError>> {
+        use error_stack::ResultExt;
+        let slot = self
+            .slots
+            .remove(path)
+            .ok_or_else(|| RegistryError::UnknownPath(path.clone()))
+            .attach(format!("removing unknown path {path}"))?;
+        Ok(slot.manifest)
+    }
+
+    /// Resolves a path to a deliverable endpoint, if the actor is running.
+    pub fn resolve(&self, path: &Path) -> Option<std::sync::Arc<Endpoint>> {
+        self.slots
+            .get(path)?
+            .endpoint
+            .load_full()
+    }
+
+    /// Snapshot info about a path, for `ctx.lookup`.
+    pub fn lookup(&self, path: &Path) -> Option<EndpointInfo> {
+        let slot = self.slots.get(path)?;
+        Some(EndpointInfo {
+            path: path.clone(),
+            kind: slot.kind(),
+            manifest: slot.manifest.clone(),
+        })
+    }
+
+    /// Whether a path is registered (running or mid-restart).
+    pub fn is_registered(&self, path: &Path) -> bool {
+        self.slots.contains_key(path)
+    }
+
+    /// Routes `schema` to a handler path and registers the route.
+    ///
+    /// For [`RoutePolicy::Single`] the sole path wins; for round-robin the
+    /// registry's shared cursor rotates.
+    pub fn route(&mut self, schema: &SchemaId) -> Option<Path> {
+        let policy = self.routes.get(schema)?;
+        policy.pick(&mut self.route_cursor)
+    }
+
+    /// Declares (or extends) the route for a schema.
+    ///
+    /// Registering a second handler for a schema converts the route to
+    /// round-robin over registration order — multiple independent actors
+    /// sharing one schema is exactly the load-balancing case.
+    pub fn add_route(&mut self, schema: SchemaId, path: Path) {
+        match self.routes.entry(schema) {
+            std::collections::hash_map::Entry::Vacant(v) => {
+                v.insert(RoutePolicy::Single(path));
+            }
+            std::collections::hash_map::Entry::Occupied(mut o) => match o.get_mut() {
+                RoutePolicy::Single(existing) => {
+                    if *existing != path {
+                        let first = existing.clone();
+                        *o.get_mut() = RoutePolicy::RoundRobin(vec![first, path]);
+                    }
+                }
+                RoutePolicy::RoundRobin(paths) => {
+                    if !paths.contains(&path) {
+                        paths.push(path);
+                    }
+                }
+            },
+        }
+    }
+
+    /// Drops every route pointing at `path` (slot removal cascade).
+    pub fn drop_routes_of(&mut self, path: &Path) {
+        self.routes.retain(|_, policy| match policy {
+            RoutePolicy::Single(single) => single != path,
+            RoutePolicy::RoundRobin(paths) => {
+                paths.retain(|p| p != path);
+                !paths.is_empty()
+            }
+        });
+    }
+
+    /// Every path registered as a handler for `schema`, for `ctx.who_handles`.
+    pub fn who_handles(&self, schema: &SchemaId) -> Vec<Path> {
+        match self.routes.get(schema) {
+            Some(RoutePolicy::Single(path)) => vec![path.clone()],
+            Some(RoutePolicy::RoundRobin(paths)) => paths.clone(),
+            None => Vec::new(),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::envelope::TraceCtx;
     use serde_json::json;
 
-    fn reserve_stock_v(version: u32) -> SchemaDef {
-        SchemaDef {
-            name: "ReserveStock".into(),
-            version,
-            kind: crate::schema::SchemaKind::Command,
-            fields: vec![crate::schema::FieldDef::required(
-                "sku",
-                crate::schema::FieldTy::Str,
-            )],
-            description: None,
-        }
+    fn manifest(kind: ActorKind) -> ActorManifest {
+        ActorManifest::new().kind(kind)
+    }
+
+    fn endpoint(capacity: usize) -> (mpsc::Receiver<Envelope>, Endpoint) {
+        let (tx, rx) = mpsc::channel(capacity);
+        (rx, Endpoint::new(tx))
+    }
+
+    fn envelope(n: u32) -> Envelope {
+        Envelope::json(
+            SchemaId::new("Ping", 1),
+            crate::envelope::Address::Path(Path::new("a")),
+            json!({ "n": n }),
+            TraceCtx::root(),
+        )
     }
 
     #[test]
     fn register_is_idempotent_per_name_and_version() {
         // Given a schema table with ReserveStock@1 already registered.
         let mut table = SchemaTable::default();
-        let first = table.register(reserve_stock_v(1));
+        let first = table.register_of::<TestSchema>();
 
         // When registering ReserveStock@1 again.
-        let second = table.register(reserve_stock_v(1));
+        let second = table.register_of::<TestSchema>();
 
         // Then the id is stable and only one entry exists.
         assert_eq!(first, second);
@@ -128,28 +433,28 @@ mod tests {
 
     #[test]
     fn register_keeps_versions_sorted_and_latest_reports_highest() {
-        // Given ReserveStock registered at versions 1 and 3.
+        // Given the schema registered at versions 1 and 3.
         let mut table = SchemaTable::default();
-        table.register(reserve_stock_v(1));
-        table.register(reserve_stock_v(3));
+        table.register(versioned_schema(1));
+        table.register(versioned_schema(3));
 
-        // When asking for the latest ReserveStock.
-        let latest = table.latest("ReserveStock").expect("present");
+        // When asking for the latest.
+        let latest = table.latest("TestSchema").expect("present");
 
         // Then it is version 3.
-        assert_eq!(latest.id(), SchemaId::new("ReserveStock", 3));
+        assert_eq!(latest.id(), SchemaId::new("TestSchema", 3));
     }
 
     #[test]
     fn by_id_requires_exact_version_match() {
-        // Given ReserveStock at versions 1 and 2.
+        // Given TestSchema at versions 1 and 2.
         let mut table = SchemaTable::default();
-        table.register(reserve_stock_v(1));
-        table.register(reserve_stock_v(2));
+        table.register(versioned_schema(1));
+        table.register(versioned_schema(2));
 
         // When looking up by id — exact and missing.
-        let exact = table.by_id(&SchemaId::new("ReserveStock", 1));
-        let missing = table.by_id(&SchemaId::new("ReserveStock", 9));
+        let exact = table.by_id(&SchemaId::new("TestSchema", 1));
+        let missing = table.by_id(&SchemaId::new("TestSchema", 9));
 
         // Then only the exact version is found.
         assert!(exact.is_some());
@@ -160,36 +465,30 @@ mod tests {
     fn rust_and_json_flavors_produce_identical_registrations() {
         // Given a typed schema and its hand-written JSON twin.
         let json_twin = json!({
-            "name": "ReserveStock",
+            "name": "TestSchema",
             "version": 1,
             "kind": "command",
-            "fields": [{ "name": "sku", "ty": "str" }]
+            "fields": []
         });
 
         // When registering each flavor into its own table.
-        let mut typed_table = SchemaTable::default();
-        let mut foreign_table = SchemaTable::default();
-        let typed_id = typed_table.register(reserve_stock_v(1));
-        let foreign_id = foreign_table
-            .register_json(json_twin)
-            .expect("valid descriptor");
+        let mut typed = SchemaTable::default();
+        let mut foreign = SchemaTable::default();
+        let typed_id = typed.register(versioned_schema(1));
+        let foreign_id = foreign.register_json(json_twin).expect("valid");
 
         // Then both tables hold identical descriptors under identical ids.
         assert_eq!(typed_id, foreign_id);
-        assert_eq!(
-            typed_table.by_id(&typed_id),
-            foreign_table.by_id(&foreign_id)
-        );
+        assert_eq!(typed.by_id(&typed_id), foreign.by_id(&foreign_id));
     }
 
     #[test]
     fn register_json_rejects_invalid_descriptors() {
         // Given a garbage descriptor.
         let mut table = SchemaTable::default();
-        let garbage = json!({ "name": ["not", "a", "schema"] });
 
         // When registering it as JSON.
-        let result = table.register_json(garbage);
+        let result = table.register_json(json!({ "name": ["nope"] }));
 
         // Then registration fails and the table stays empty.
         assert!(result.is_err());
@@ -200,21 +499,237 @@ mod tests {
     fn all_lists_every_schema_in_name_then_version_order() {
         // Given schemas registered out of order across two names.
         let mut table = SchemaTable::default();
-        table.register(reserve_stock_v(2));
-        table.register({
-            let mut def = reserve_stock_v(1);
-            def.name = "AuditNote".into();
-            def
-        });
-        table.register(reserve_stock_v(1));
+        table.register(versioned_schema(2));
+        table.register(other_schema());
+        table.register(versioned_schema(1));
 
         // When listing all schemas.
-        let ids: Vec<String> = table.all().iter().map(|def| def.id().to_string()).collect();
+        let ids: Vec<String> = table.all().iter().map(|d| d.id().to_string()).collect();
 
         // Then they are sorted by name, then version.
+        assert_eq!(ids, ["OtherSchema@1", "TestSchema@1", "TestSchema@2"]);
+    }
+
+    #[test]
+    fn insert_slot_then_resolve_delivers_to_the_endpoint() {
+        // Given a registry with one slot inserted.
+        let mut registry = Registry::default();
+        let path = Path::new("inventory.west");
+        let (_rx, ep) = endpoint(4);
+        registry
+            .insert_slot(path.clone(), manifest(ActorKind::EventSourced), ep)
+            .expect("insert");
+
+        // When resolving the path and delivering an envelope.
+        let delivered = registry
+            .resolve(&path)
+            .map(|ep| ep.try_deliver(envelope(1)))
+            .is_some();
+
+        // Then delivery succeeds.
+        assert!(delivered);
+    }
+
+    #[test]
+    fn insert_slot_fails_when_path_is_taken() {
+        // Given a registry with a slot at `dup`.
+        let mut registry = Registry::default();
+        let path = Path::new("dup");
+        let (_rx, ep) = endpoint(1);
+        registry
+            .insert_slot(path.clone(), manifest(ActorKind::Service), ep)
+            .expect("insert");
+
+        // When inserting another slot at the same path.
+        let (_rx, ep2) = endpoint(1);
+        let result = registry.insert_slot(path, manifest(ActorKind::Service), ep2);
+
+        // Then it fails with PathTaken.
+        assert!(matches!(
+            result.expect_err("must fail").current_context(),
+            RegistryError::PathTaken(_)
+        ));
+    }
+
+    #[test]
+    fn swap_endpoint_replaces_the_handle_under_the_same_identity() {
+        // Given a slot whose first endpoint's receiver is dropped on swap.
+        let mut registry = Registry::default();
+        let path = Path::new("inventory.west");
+        let (mut rx1, ep1) = endpoint(4);
+        registry
+            .insert_slot(path.clone(), manifest(ActorKind::EventSourced), ep1)
+            .expect("insert");
+        let stale = registry.resolve(&path).expect("live");
+
+        // When the actor "restarts": the old receiver dies (the task ended)
+        // and a fresh endpoint is swapped in under the same path.
+        drop(rx1);
+        let (_rx2, ep2) = endpoint(4);
+        registry.swap_endpoint(&path, ep2).expect("swap");
+
+        // Then the stale handle no longer delivers (its receiver is gone),
+        // but the path still resolves to a fresh live endpoint.
+        let fresh = registry.resolve(&path).expect("still registered");
+        assert!(stale.try_deliver(envelope(1)).is_err());
+        assert!(fresh.try_deliver(envelope(2)).is_ok());
+    }
+
+    #[test]
+    fn remove_slot_makes_the_path_unresolvable() {
+        // Given a registry with a slot.
+        let mut registry = Registry::default();
+        let path = Path::new("temp");
+        let (_rx, ep) = endpoint(1);
+        registry
+            .insert_slot(path.clone(), manifest(ActorKind::Service), ep)
+            .expect("insert");
+
+        // When removing the slot.
+        registry.remove_slot(&path).expect("remove");
+
+        // Then resolution fails and lookups return None.
+        assert!(registry.resolve(&path).is_none());
+        assert!(registry.lookup(&path).is_none());
+        assert!(!registry.is_registered(&path));
+    }
+
+    #[test]
+    fn lookup_reports_kind_and_manifest() {
+        // Given a slot spawned with an event-sourced manifest.
+        let mut registry = Registry::default();
+        let path = Path::new("inventory.west");
+        let (ep_manifest, _rx, ep) = {
+            let m = ActorManifest::new()
+                .kind(ActorKind::EventSourced)
+                .emits_on_topic(Topic::new("inventory.events"));
+            let (rx, ep) = endpoint(1);
+            (m, rx, ep)
+        };
+        registry.insert_slot(path.clone(), ep_manifest, ep).expect("insert");
+
+        // When looking the path up.
+        let info = registry.lookup(&path).expect("info");
+
+        // Then kind and topic edges are visible.
+        assert_eq!(info.kind, ActorKind::EventSourced);
+        assert_eq!(info.manifest.emits_on_topics, [Topic::new("inventory.events")]);
+    }
+
+    #[test]
+    fn route_returns_the_single_handler_path() {
+        // Given a single route from a schema to an actor.
+        let mut registry = Registry::default();
+        let schema = SchemaId::new("Ping", 1);
+        let path = Path::new("ponger");
+        registry.add_route(schema.clone(), path.clone());
+
+        // When routing the schema twice.
+        let first = registry.route(&schema);
+        let second = registry.route(&schema);
+
+        // Then both route to the same sole path.
+        assert_eq!(first, Some(path.clone()));
+        assert_eq!(second, Some(path));
+    }
+
+    #[test]
+    fn round_robin_rotates_across_registered_handlers() {
+        // Given a schema routed to three handlers.
+        let mut registry = Registry::default();
+        let schema = SchemaId::new("Ping", 1);
+        for name in ["a", "b", "c"] {
+            registry.add_route(schema.clone(), Path::new(name));
+        }
+
+        // When routing four times.
+        let picks: Vec<Option<String>> = (0..4)
+            .map(|_| registry.route(&schema).map(|p| p.to_string()))
+            .collect();
+
+        // Then handlers rotate and wrap.
         assert_eq!(
-            ids,
-            ["AuditNote@1", "ReserveStock@1", "ReserveStock@2"]
+            picks,
+            [
+                Some("a".into()),
+                Some("b".into()),
+                Some("c".into()),
+                Some("a".into())
+            ]
         );
+    }
+
+    #[test]
+    fn who_handles_lists_every_handler_of_a_schema() {
+        // Given a schema routed to two handlers.
+        let mut registry = Registry::default();
+        let schema = SchemaId::new("Ping", 1);
+        registry.add_route(schema.clone(), Path::new("a"));
+        registry.add_route(schema.clone(), Path::new("b"));
+
+        // When asking who handles it.
+        let handlers = registry.who_handles(&schema);
+
+        // Then both paths are listed.
+        assert_eq!(handlers.len(), 2);
+    }
+
+    #[test]
+    fn drop_routes_of_removes_only_the_removed_path() {
+        // Given two schemas routed through `gone` and one through `kept`.
+        let mut registry = Registry::default();
+        let gone = Path::new("gone");
+        let kept = Path::new("kept");
+        registry.add_route(SchemaId::new("Ping", 1), gone.clone());
+        registry.add_route(SchemaId::new("Ping", 1), kept.clone());
+        registry.add_route(SchemaId::new("Pong", 1), gone.clone());
+
+        // When dropping routes of `gone`.
+        registry.drop_routes_of(&gone);
+
+        // Then `kept` still handles Ping and Pong is unrouted.
+        assert_eq!(registry.who_handles(&SchemaId::new("Ping", 1)), [kept]);
+        assert!(registry.who_handles(&SchemaId::new("Pong", 1)).is_empty());
+    }
+
+    #[test]
+    fn unresolvable_paths_resolve_to_none_for_dead_lettering() {
+        // Given an empty registry.
+        let registry = Registry::default();
+
+        // When resolving a path no actor owns.
+        let resolved = registry.resolve(&Path::new("ghost"));
+
+        // Then resolution is None — the kernel turns this into a
+        // DeadLettered fact on the dead-letter topic.
+        assert!(resolved.is_none());
+        assert_eq!(Registry::dead_letter_topic().as_str(), DEAD_LETTER_TOPIC);
+    }
+
+    fn versioned_schema(version: u32) -> SchemaDef {
+        SchemaDef {
+            name: "TestSchema".into(),
+            version,
+            kind: crate::schema::SchemaKind::Command,
+            fields: vec![],
+            description: None,
+        }
+    }
+
+    fn other_schema() -> SchemaDef {
+        SchemaDef {
+            name: "OtherSchema".into(),
+            version: 1,
+            kind: crate::schema::SchemaKind::Event,
+            fields: vec![],
+            description: None,
+        }
+    }
+
+    struct TestSchema;
+    impl Schema for TestSchema {
+        fn schema_def() -> SchemaDef {
+            versioned_schema(1)
+        }
     }
 }

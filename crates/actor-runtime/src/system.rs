@@ -75,8 +75,10 @@ impl ActorSystem {
         table.by_id(id).cloned()
     }
 
-    /// The system's clock.
-    pub(crate) fn clock(&self) -> &ClockService {
+    /// The system's clock (tests use this to reach the [`FakeClock`]).
+    ///
+    /// [`FakeClock`]: crate::clock::FakeClock
+    pub fn clock(&self) -> &ClockService {
         &self.clock
     }
 }

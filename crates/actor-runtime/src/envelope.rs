@@ -49,9 +49,14 @@ impl TraceCtx {
 }
 
 /// What an envelope carries.
+///
+/// Clonable so the kernel can peek a message without consuming it: the
+/// envelope stays at the inbox cursor until acked, which is what makes
+/// redelivery possible. The typed arm is an `Arc` clone (cheap).
+#[derive(Clone)]
 pub enum Payload {
     /// In-process typed fast path; erased to JSON at the schema waist.
-    Typed(Box<dyn std::any::Any + Send>),
+    Typed(std::sync::Arc<dyn std::any::Any + Send + Sync>),
     /// The waist representation: plain JSON.
     Json(JsonValue),
 }
@@ -84,7 +89,7 @@ impl Event {
 
 /// The runtime-internal message wrapper. Not serializable as a whole: the
 /// durable parts (trace, schema, JSON payload) are copied out at the waist.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Envelope {
     /// The payload's schema.
     pub schema: SchemaId,
@@ -115,7 +120,7 @@ impl Envelope {
     }
 
     /// Assembles a typed envelope for the in-process fast path.
-    pub fn typed<T: Send + 'static>(
+    pub fn typed<T: Send + Sync + 'static>(
         schema: SchemaId,
         dest: Address,
         payload: T,
@@ -127,7 +132,7 @@ impl Envelope {
             from: None,
             reply_to: None,
             trace,
-            payload: Payload::Typed(Box::new(payload)),
+            payload: Payload::Typed(std::sync::Arc::new(payload)),
         }
     }
 
@@ -252,3 +257,4 @@ mod tests {
         assert!(envelope.as_json().is_none());
     }
 }
+

@@ -24,7 +24,6 @@ pub mod types;
 
 /// Everything a typical actor author needs.
 pub mod prelude {
-    pub use crate::actor::*;
     pub use crate::context::*;
     pub use crate::envelope::*;
     pub use crate::schema::*;
