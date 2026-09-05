@@ -607,8 +607,31 @@ async fn flush_outbox(ctx: &EsLoop, mut outbox: Outbox) {
             } => {
                 resolve_reply(&ctx.kernel, &ctx.registry, to, schema, payload, trace).await;
             }
+            crate::context::Intent::Subscribe { path, topic } => {
+                apply_subscribe(&ctx.kernel, &ctx.registry, &path, &topic);
+            }
         }
     }
+}
+
+/// Performs one deferred subscription: the actor joins its topic at the
+/// next offset ( Latest); the topic log is created on demand.
+fn apply_subscribe(
+    kernel: &Mutex<KernelState>,
+    registry: &Mutex<Registry>,
+    path: &Path,
+    topic: &crate::types::Topic,
+) {
+    let policy = {
+        let registry = registry.lock().expect("registry lock");
+        registry.inbox_policy(path)
+    };
+    let mut kernel = kernel.lock().expect("kernel lock");
+    let log = kernel
+        .topic_logs
+        .entry(topic.clone())
+        .or_insert_with(|| crate::topics::TopicLog::new(256));
+    log.subscribe(path.clone(), policy, crate::topics::CursorFrom::Latest);
 }
 
 /// The kernel's ask port: opens leases, routes request envelopes,

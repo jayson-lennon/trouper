@@ -47,6 +47,9 @@ pub enum Intent {
         /// The trace of the message being replied to (causality links).
         trace: TraceCtx,
     },
+    /// Subscribe the handling actor to a topic (performed post-ack, so a
+    /// crash before ack never leaves a half-applied subscription).
+    Subscribe { path: Path, topic: Topic },
 }
 
 /// Effects recorded by a handler, flushed by the kernel after ack.
@@ -80,6 +83,11 @@ impl Outbox {
             payload,
             trace,
         });
+    }
+
+    /// Records a subscription intent (performed by the kernel post-ack).
+    pub fn push_subscribe(&mut self, path: Path, topic: Topic) {
+        self.intents.push(Intent::Subscribe { path, topic });
     }
 
     /// Records a publish intent.
@@ -289,6 +297,15 @@ impl MsgCtx<'_> {
         }
     }
 
+    /// Subscribes the handling actor to `topic`. Recorded as a deferred
+    /// intent and performed by the kernel after the message is acked
+    /// (subscription starts at the topic's next offset).
+    pub fn subscribe(&mut self, topic: Topic) {
+        self.core
+            .outbox
+            .push_subscribe(self.core.self_path.clone(), topic);
+    }
+
     /// THE ask: send a request and await its reply, with a MANDATORY
     /// timeout. Exclusive to service actors — an ES decision function is
     /// sync and cannot await (AC5).
@@ -424,6 +441,7 @@ mod tests {
             }
             Intent::Publish { .. } => panic!("expected a send"),
             Intent::Reply { .. } => panic!("expected a send"),
+            Intent::Subscribe { .. } => panic!("expected a send"),
         }
     }
 
@@ -452,6 +470,7 @@ mod tests {
             Intent::Reply { to, .. } => {
                 assert_eq!(*to, Address::Path(Path::new("client")));
             }
+            Intent::Subscribe { .. } => panic!("expected a reply intent"),
         }
 
         // When a context without reply-to replies.

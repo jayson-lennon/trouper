@@ -1043,6 +1043,16 @@ impl Default for ActorSystem {
 #[cfg(test)]
 mod tests {
     impl ActorSystem {
+        /// Whether the "aud" test actor subscribes to `topic` (tests).
+        pub fn topic_has_subscriber(&self, topic: &crate::types::Topic) -> bool {
+            let kernel = self.kernel.lock().expect("kernel lock");
+            kernel
+                .topic_logs
+                .get(topic)
+                .map(|log| log.subscribers().contains(&Path::new("aud")))
+                .unwrap_or(false)
+        }
+
         /// The number of journalled entries for `path` (tests).
         pub fn journal_len(&self, path: &Path) -> usize {
             let kernel = self.kernel.lock().expect("kernel lock");
@@ -1232,6 +1242,50 @@ mod tests {
         }
         let state = system.es_state(&path).await.expect("live");
         assert_eq!(state["total"], 0);
+    }
+
+    fn topic_of_join() -> crate::types::Topic {
+        crate::types::Topic::new("auditor.join")
+    }
+
+    #[tokio::test]
+    async fn service_actor_subscribes_during_message_handling() {
+        // Given an Auditor service actor.
+        let (system, _clock) = ActorSystem::test();
+        let (idx, sink) = open_sink();
+        bind_sink(&Path::new("aud"), sink);
+        system.spawn_service::<Auditor, _>(
+            Path::new("aud"),
+            &json!({ "sink": idx }),
+            SpawnOpts::default(),
+            || {
+                vec![
+                    Arc::new(TypedServiceAdapter::<Auditor, Add>::new::<Add>()),
+                    Arc::new(TypedServiceAdapter::<Auditor, Added>::new::<Added>()),
+                ]
+            },
+        );
+
+        // When the actor handles a join command (n=0) that calls
+        // ctx.subscribe mid-handler.
+        system
+            .send(system.envelope(Add::schema_id(), Path::new("aud"), json!({ "n": 0 })))
+            .await
+            .expect("join sent");
+        wait_for(|| async { system.topic_has_subscriber(&topic_of_join()) }).await;
+
+        // Then a publish AFTER the subscription lands in the actor's inbox.
+        system
+            .send(system.envelope_to_topic(
+                crate::envelope::Event {
+                    schema: Added::schema_id(),
+                    payload: json!({ "n": 7 }),
+                },
+                topic_of_join(),
+            ))
+            .await
+            .expect("published");
+        wait_for(|| async { sink_read(&Path::new("aud")).contains(&"Added:7".to_string()) }).await;
     }
 
     #[tokio::test]
@@ -2041,7 +2095,13 @@ mod tests {
     }
 
     impl MsgHandler<Add> for Auditor {
-        async fn handle(&mut self, msg: Add, _ctx: &mut crate::context::MsgCtx<'_>) {
+        async fn handle(&mut self, msg: Add, ctx: &mut crate::context::MsgCtx<'_>) {
+            if msg.n == 0 {
+                // The join command: subscribe DURING message handling
+                // (the deferred-intent syscall under test).
+                ctx.subscribe(crate::types::Topic::new("auditor.join"));
+                return;
+            }
             self.sink
                 .lock()
                 .expect("sink lock")
