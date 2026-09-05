@@ -384,3 +384,18 @@ Planned verbatim entries (verify against actual implementation before writing; i
 - ADD: "Message schemas are runtime data: Rust types and external JSON descriptors register into the same schema table; payloads cross the runtime boundary as JSON."
 - ADD: "Event-sourced journals are in-memory, seq-anchored lists of `Event` and `Snapshot` entries; restart restores from the latest snapshot plus the tail, and command redelivery is independent of snapshots; journal persistence is deliberately out of scope."
 - ADD: "External-process ports are planned as ordinary actors reusing the same schema/manifest tables (not yet implemented)."
+
+---
+
+## Implementation Annotations (post-implementation; spec text above is unmodified)
+
+Divergences accepted during implementation and reviewed in the post-implementation gap analysis. Each is a deliberate simplification or naming choice, not a behavior change.
+
+- **`spawn_es`/`spawn_service` entries closure.** The plan's `spawn_es::<A>(path, args, opts)` implied command entries derive from the manifest. The actual signature takes a final `entries: FnOnce() -> Vec<Arc<dyn CommandEntry>>` (typed adapters are declared explicitly at spawn). Accepted: explicit registration is clearer about the erased-dispatch cost; automatic manifest derivation can layer on later.
+- **`Payload::Typed` reserved.** The variant exists per Key Code Context but is constructed only by a unit test; production crosses the waist as JSON only. Kept as a documented reserved path (in-proc zero-copy future), not removed.
+- **Absent planned type names.** `TapHandle`, `TapError`, `TopicError`, `SupervisionError` were not created: tap subscription is infallible (ring snapshot), topic pumps report through facts, supervision outcomes flow as facts/control envelopes. Errors are colocated where they arise (`AskError`, `JournalError`, `SchemaError`, `RegistryError`, `DispatchError`, `InboxError`) per the project conventions.
+- **`CtxCore::reply` semantics (implemented as specified, verified during gap fixes).** `reply` emits `Intent::Reply`; the kernel resolves `Slot(id)` → lease oneshot (mechanism) vs `Path(p)` → routed envelope (durable name). (Mid-implementation fix, matches the spec's ReplyTo contract.)
+- **Typed fact fields (post-gap-fix).** `FactKind` now carries `Address`, `StopReason`, `DeadLetterReason`, and `Spawned { kind, .. }` exactly as Key Code Context specified — this gap was found in review and closed (was `String` in the first implementation pass).
+- **DLQ as a real topic (post-gap-fix).** `system.deadletters` is a retained `TopicLog`; dead letters are appended to it and pumped to subscribers (kernel `Vec<DeadLetter>` kept as an inspection mirror). The first pass only accumulated the Vec — closed in review.
+- **`SystemConfig` (post-gap-fix).** `ActorSystem::new(SystemConfig { clock, tap_capacity, default_mailbox })` implemented; `test()` installs a small tap ring via config; tests no longer mutate `kernel.tap` directly — closed in review.
+- **`MsgCtx::subscribe` (post-gap-fix).** Implemented as a deferred `Intent::Subscribe` performed by the kernel post-ack (a crash before ack never half-applies a subscription) — closed in review.
