@@ -64,10 +64,100 @@ pub struct ActorSystem {
     child_shutdowns: std::sync::Mutex<Vec<tokio::sync::watch::Sender<bool>>>,
 }
 
+
+/// One actor's row in a system export.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct ActorExport {
+    /// The actor's path (its identity).
+    pub path: Path,
+    /// The contract kind (EventSourced | Service).
+    pub kind: crate::types::ActorKind,
+    /// The actor's declared edges.
+    pub manifest: crate::schema::ActorManifest,
+    /// Live ES state via `capture` (ES actors only).
+    pub state: Option<JsonValue>,
+    /// The actor's inbox ack cursor (ES progress).
+    pub cursor: Option<u64>,
+}
+
+/// One declared edge: actor → schema it handles/emits (from manifests).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct DeclaredEdge {
+    /// The actor declaring the edge.
+    pub actor: Path,
+    /// The schema on the edge.
+    pub schema: SchemaId,
+    /// The direction: Handles (inbound) or Emits (outbound).
+    pub direction: EdgeDirection,
+    /// The topic, when the edge is a topic edge.
+    pub topic: Option<crate::types::Topic>,
+}
+
+/// The direction of a declared edge.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum EdgeDirection {
+    /// The actor accepts this schema.
+    Handles,
+    /// The actor produces this schema.
+    Emits,
+    /// The actor subscribes to this topic.
+    Subscribes,
+}
+
+/// One observed edge: aggregated send traffic from the tap.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ObservedEdge {
+    /// The sending path (absent for system-entry sends).
+    pub from: Option<String>,
+    /// The destination ("path:<p>" or "topic:<t>").
+    pub to: String,
+    /// The schema that flowed.
+    pub schema: SchemaId,
+    /// The number of observed sends.
+    pub count: u64,
+}
+
+/// The whole-system export: the artifact a future canvas consumes.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct SystemExport {
+    /// Every registered schema definition (all versions).
+    pub schemas: Vec<crate::schema::SchemaDef>,
+    /// Every live actor with its manifest and (for ES) live state.
+    pub actors: Vec<ActorExport>,
+    /// Declared edges (from manifests).
+    pub declared_edges: Vec<DeclaredEdge>,
+    /// Observed edges (aggregated from the tap).
+    pub observed_edges: Vec<ObservedEdge>,
+}
+
 impl ActorSystem {
     /// The system dead-letter topic, created at boot.
     pub fn deadletter_topic() -> crate::types::Topic {
         crate::types::Topic::new("system.deadletters")
+    }
+
+
+    /// Spawns a foreign (no-Rust-types) event-sourced actor: the schema,
+    /// state fold, and command decision are all runtime JSON data. This is
+    /// the seam the port tier will reuse.
+    pub fn spawn_es_foreign(
+        self: &Arc<Self>,
+        path: Path,
+        schema_id: SchemaId,
+        genesis: JsonValue,
+        decision: crate::actor::ForeignDecision,
+        fold: crate::actor::ForeignFold,
+        opts: SpawnOpts,
+    ) {
+        let state = Box::new(crate::actor::ForeignEsState::new(genesis, fold));
+        let manifest = crate::schema::ActorManifest::new()
+            .handles_id(schema_id.clone())
+            .kind(crate::types::ActorKind::EventSourced);
+        let entries = vec![Arc::new(crate::actor::ForeignCommandEntry::new(
+            schema_id,
+            decision,
+        )) as Arc<dyn crate::actor::CommandEntry>];
+        self.spawn_es_erased(path, manifest, state, entries, opts);
     }
 
     /// Spawns a supervised child: registers its spec (policy, budget,
@@ -153,13 +243,22 @@ impl ActorSystem {
         A: EventSourced,
         F: FnOnce() -> Vec<Arc<dyn CommandEntry>>,
     {
-        let (tx, rx) = tokio::sync::mpsc::channel::<Envelope>(opts.mailbox_capacity.max(1) * 2);
-
-        // Genesis state (replay lands with the atomic-step task).
         let state = Box::new(TypedEsState::<A>::new(A::restore(args)));
+        let manifest = A::manifest();
+        self.spawn_es_erased(path, manifest, state, entries(), opts);
+    }
 
+    /// The erased ES spawn shared by typed and foreign actors.
+    fn spawn_es_erased(
+        self: &Arc<Self>,
+        path: Path,
+        manifest: crate::schema::ActorManifest,
+        state: Box<dyn crate::actor::DynEsActor>,
+        entries: Vec<Arc<dyn CommandEntry>>,
+        opts: SpawnOpts,
+    ) {
+        let (tx, rx) = tokio::sync::mpsc::channel::<Envelope>(opts.mailbox_capacity.max(1) * 2);
         {
-            let manifest = A::manifest();
             let mut registry = self.registry.lock().expect("registry lock");
             registry
                 .insert_slot(
@@ -172,7 +271,7 @@ impl ActorSystem {
             // Declared edges become routes: each handled schema is routable
             // to this path (adding a second actor for a schema converts the
             // route to round-robin).
-            for schema in manifest.handles {
+            for schema in manifest.handles.clone() {
                 registry.add_route(schema, path.clone());
             }
         }
@@ -184,7 +283,7 @@ impl ActorSystem {
         kernel.cells.insert(path.clone(), cell.clone());
         kernel.journals.entry(path.clone()).or_default();
         kernel.es_state.insert(path.clone(), Arc::new(tokio::sync::Mutex::new(state)));
-        kernel.entries.insert(path.clone(), entries());
+        kernel.entries.insert(path.clone(), entries);
         kernel
             .snapshot_policy
             .insert(path.clone(), opts.snapshot);
@@ -327,7 +426,20 @@ impl ActorSystem {
         route(&self.registry, &self.kernel, envelope).await
     }
 
-    /// Builds a system-rooted envelope (fresh trace) addressed to a path.
+    /// Builds a topic-addressed envelope (system root as sender).
+    pub fn envelope_to_topic(
+        &self,
+        event: crate::envelope::Event,
+        topic: crate::types::Topic,
+    ) -> Envelope {
+        Envelope::json(
+            event.schema,
+            crate::envelope::Address::Topic(topic),
+            event.payload,
+            TraceCtx::root(),
+        )
+    }
+
     pub fn envelope(&self, schema: SchemaId, dest: Path, payload: JsonValue) -> Envelope {
         Envelope::json(
             schema,
@@ -557,6 +669,142 @@ impl ActorSystem {
                     reason: "graceful".to_owned(),
                 },
             );
+        }
+    }
+
+
+    /// Exports the system: schemas, live actors (ES state included),
+    /// declared vs observed edges. The artifact a future canvas consumes.
+    pub async fn export(&self) -> SystemExport {
+        // Schemas (all versions).
+        let schemas = {
+            let registry = self.registry.lock().expect("registry lock");
+            registry.schemas().all().into_iter().cloned().collect()
+        };
+
+        // Live actors: manifests from slots, state/cursor from kernel.
+        let slot_manifests = {
+            let registry = self.registry.lock().expect("registry lock");
+            registry.slot_manifests()
+        };
+        let mut actors = Vec::new();
+        for (path, manifest) in slot_manifests {
+            let kernel = self.kernel.lock().expect("kernel lock");
+            let state = match kernel.es_state.get(&path) {
+                Some(shell) => {
+                    let state = shell.lock().await;
+                    state.capture_erased().ok()
+                }
+                None => None,
+            };
+            let cursor = kernel.cells.get(&path).and_then(|cell| {
+                cell.inbox
+                    .try_lock()
+                    .ok()
+                    .map(|inbox| inbox.cursor().as_u64())
+            });
+            actors.push(ActorExport {
+                path,
+                kind: manifest
+                    .kind
+                    .unwrap_or(crate::types::ActorKind::Service),
+                manifest,
+                state,
+                cursor,
+            });
+        }
+
+        // Runtime topic subscriptions (subscribe calls) are declared
+        // edges too: read them from the topic logs.
+        let runtime_subscriptions: Vec<(Path, crate::types::Topic)> = {
+            let kernel = self.kernel.lock().expect("kernel lock");
+            kernel
+                .topic_logs
+                .iter()
+                .flat_map(|(topic, log)| {
+                    log.subscribers().into_iter().map(move |p| (p, topic.clone()))
+                })
+                .collect()
+        };
+        let subscription_edges: Vec<DeclaredEdge> = runtime_subscriptions
+            .into_iter()
+            .map(|(actor, topic)| DeclaredEdge {
+                actor,
+                schema: SchemaId::new("Any", 1),
+                direction: EdgeDirection::Subscribes,
+                topic: Some(topic),
+            })
+            .collect();
+
+        // Declared edges straight from the manifests above.
+        let declared_edges: Vec<DeclaredEdge> = actors
+            .iter()
+            .flat_map(|a| {
+                let handles = a.manifest.handles.iter().map(|s| DeclaredEdge {
+                    actor: a.path.clone(),
+                    schema: s.clone(),
+                    direction: EdgeDirection::Handles,
+                    topic: None,
+                });
+                let emits = a.manifest.emits.iter().map(|s| DeclaredEdge {
+                    actor: a.path.clone(),
+                    schema: s.clone(),
+                    direction: EdgeDirection::Emits,
+                    topic: None,
+                });
+                let emits_topics = a.manifest.emits_on_topics.iter().map(|t| DeclaredEdge {
+                    actor: a.path.clone(),
+                    schema: SchemaId::new("Any", 1),
+                    direction: EdgeDirection::Emits,
+                    topic: Some(t.clone()),
+                });
+                let subscribes = a.manifest.subscribes.iter().map(|t| DeclaredEdge {
+                    actor: a.path.clone(),
+                    schema: SchemaId::new("Any", 1),
+                    direction: EdgeDirection::Subscribes,
+                    topic: Some(t.clone()),
+                });
+                handles
+                    .chain(emits)
+                    .chain(emits_topics)
+                    .chain(subscribes)
+                    .collect::<Vec<_>>()
+            })
+            .chain(subscription_edges)
+            .collect();
+
+        // Observed edges: aggregate Sent facts from the tap.
+        let mut counts: std::collections::HashMap<(Option<String>, String, SchemaId), u64> =
+            std::collections::HashMap::new();
+        for fact in self.tap_facts() {
+            if let crate::tap::FactKind::Sent { from, dest, schema, .. } = &fact.kind {
+                let to_str = dest.clone();
+                let from_str = from.as_ref().map(|p| p.to_string());
+                *counts
+                    .entry((from_str, to_str, schema.clone()))
+                    .or_insert(0) += 1;
+            }
+        }
+        let mut observed_edges: Vec<ObservedEdge> = counts
+            .into_iter()
+            .map(|((from, to, schema), count)| ObservedEdge {
+                from,
+                to,
+                schema,
+                count,
+            })
+            .collect();
+        observed_edges.sort_by(|a, b| {
+            let a_key = (a.from.clone(), a.to.clone(), a.schema.to_string());
+            let b_key = (b.from.clone(), b.to.clone(), b.schema.to_string());
+            a_key.cmp(&b_key)
+        });
+
+        SystemExport {
+            schemas,
+            actors,
+            declared_edges,
+            observed_edges,
         }
     }
 
@@ -856,6 +1104,31 @@ mod tests {
             "the poison message stays queued (peeked, never acked)");
         let state = system.es_state(&path).await.expect("live");
         assert_eq!(state["total"], 4, "fold(journal), not doubled");
+    }
+
+
+    /// Reads a Counter actor's folded total via the erased state capture.
+    #[allow(dead_code)] // used by several test cases; some were trimmed
+    async fn count_total(system: &ActorSystem, name: &str) -> Option<i64> {
+        system
+            .es_state(&Path::new(name))
+            .await
+            .and_then(|s| s["total"].as_i64())
+    }
+
+    /// Polls `cond` until true (2s budget) — async test helper.
+    async fn wait_for<F, Fut>(cond: F)
+    where
+        F: Fn() -> Fut,
+        Fut: std::future::Future<Output = bool>,
+    {
+        for _ in 0..1_000 {
+            if cond().await {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+        }
+        panic!("condition never became true");
     }
 
     async fn wait_for_cursor(system: &ActorSystem, path: &Path, expected: u64) {
@@ -1928,6 +2201,212 @@ mod tests {
         // Then both calls return the same id and one schema is stored.
         assert_eq!(first, second);
         assert!(system.schema(&first).is_some());
+    }
+
+
+    /// Reads a foreign actor's live JSON state (test inspection helper).
+    async fn count_total_json(system: &ActorSystem, path: &Path) -> Option<i64> {
+        system
+            .es_state(path)
+            .await
+            .and_then(|s| s["total"].as_i64())
+    }
+
+
+    #[tokio::test]
+    async fn foreign_schema_roundtrip() {
+        // Given a system with a foreign schema registered from a JSON
+        // descriptor and a foreign ES actor whose state is pure JSON.
+        let system = Arc::new(ActorSystem::new());
+        let schema = system
+            .register_schema_json(json!({
+                "name": "tally", "version": 1, "kind": "command",
+                "fields": [
+                    {"name": "delta", "ty": "int"}
+                ]
+            }))
+            .expect("valid");
+        let schema_for_actor = schema.clone();
+        system.spawn_es_foreign(
+            Path::new("tally-actor"),
+            schema.clone(),
+            json!({ "total": 0 }),
+            Arc::new(move |_state, cmd, _ctx| {
+                let delta = cmd["delta"].as_i64().unwrap_or(0);
+                vec![crate::envelope::Event::new(
+                    schema_for_actor.clone(),
+                    json!({ "delta": delta }),
+                )]
+            }),
+            Arc::new(|state: &mut JsonValue, ev: &crate::envelope::Event| {
+                state["total"] = json!(
+                    state["total"].as_i64().unwrap_or(0)
+                        + ev.payload["delta"].as_i64().unwrap_or(0)
+                );
+            }),
+            SpawnOpts::default(),
+        );
+
+        // When a JSON command is sent to the foreign actor and the ack
+        // settles.
+        system
+            .send(system.envelope(
+                schema.clone(),
+                Path::new("tally-actor"),
+                json!({ "delta": 5 }),
+            ))
+            .await
+            .expect("delivered");
+        wait_for(|| async {
+            count_total_json(&system, &Path::new("tally-actor")).await == Some(5)
+        })
+        .await;
+
+        // Then the foreign actor's live JSON state folded the event.
+        let export = system.export().await;
+        let actor = export
+            .actors
+            .iter()
+            .find(|a| a.path == Path::new("tally-actor"))
+            .expect("foreign actor exported");
+        assert_eq!(
+            actor.state.as_ref().expect("state")["total"],
+            json!(5),
+            "foreign fold applied: {actor:?}"
+        );
+        // And the foreign schema appears in the export's schema table.
+        assert!(
+            export.schemas.iter().any(|s| s.id() == schema),
+            "foreign schema exported"
+        );
+    }
+
+    #[tokio::test]
+    async fn subscription_cascade_on_remove() {
+        // Given a publisher and a subscriber bound to a topic.
+        let system = Arc::new(ActorSystem::new());
+        let topic = crate::types::Topic::new("cascade.events");
+        system.spawn_es::<Counter, _>(
+            Path::new("pub"),
+            &json!({}),
+            SpawnOpts::default(),
+            || vec![Arc::new(TypedEsAdapter::<Counter, Add>::new::<Add>())],
+        );
+        let (sub_idx, sub_sink) = open_sink();
+        bind_sink(&Path::new("sub"), sub_sink);
+        system.spawn_service::<Auditor, _>(
+            Path::new("sub"),
+            &json!({ "sink": sub_idx }),
+            SpawnOpts::default(),
+            || vec![Arc::new(TypedServiceAdapter::<Auditor, Added>::new::<Added>())],
+        );
+        system
+            .subscribe(&Path::new("sub"), &topic, None)
+            .expect("subscribe");
+        system
+            .send(system.envelope_to_topic(
+                crate::envelope::Event::new(system.register_schema::<Added>(), json!({ "n": 1 })),
+                topic.clone(),
+            ))
+            .await
+            .expect("published");
+        wait_for(|| async { sink_read(&Path::new("sub")).len() == 1 }).await;
+
+        // When the subscriber is removed.
+        system.stop(&Path::new("sub")).await;
+
+        // And a second event is published.
+        system
+            .send(system.envelope_to_topic(
+                crate::envelope::Event::new(system.register_schema::<Added>(), json!({ "n": 2 })),
+                topic.clone(),
+            ))
+            .await
+            .expect("published");
+
+        // Then the removed subscriber receives nothing further and the
+        // pump no longer tracks it (no cursor leaks).
+        tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+        assert_eq!(sink_read(&Path::new("sub")).len(), 1);
+        let subscribers = {
+            let kernel = system.kernel.lock().expect("lock");
+            kernel
+                .topic_logs
+                .get(&topic)
+                .map(|log| log.subscribers().len())
+        };
+        assert_eq!(subscribers, Some(0), "subscriber removed from the log");
+    }
+
+    #[tokio::test]
+    async fn export_shows_schemas_actors_and_edge_kinds() {
+        // Given a system with an ES actor declaring handles/emits, a
+        // subscriber on a topic, and some send traffic.
+        let system = Arc::new(ActorSystem::new());
+        let schema = system.register_schema::<Add>();
+        let topic = crate::types::Topic::new("export.events");
+        system.spawn_es::<Counter, _>(
+            Path::new("source"),
+            &json!({}),
+            SpawnOpts::default(),
+            || vec![Arc::new(TypedEsAdapter::<Counter, Add>::new::<Add>())],
+        );
+        let added_schema = system.register_schema::<Added>();
+        let (sink_idx, sink_store) = open_sink();
+        bind_sink(&Path::new("sink"), sink_store);
+        system.spawn_service::<Auditor, _>(
+            Path::new("sink"),
+            &json!({ "sink": sink_idx }),
+            SpawnOpts::default(),
+            || vec![Arc::new(TypedServiceAdapter::<Auditor, Added>::new::<Added>())],
+        );
+        system
+            .subscribe(&Path::new("sink"), &topic, None)
+            .expect("subscribe");
+        system
+            .send(system.envelope_to_topic(
+                crate::envelope::Event::new(system.register_schema::<Added>(), json!({ "n": 1 })),
+                topic.clone(),
+            ))
+            .await
+            .expect("published");
+        wait_for(|| async { sink_read(&Path::new("sink")).len() == 1 }).await;
+
+        // When exporting.
+        let export = system.export().await;
+
+        // Then schemas, actors (with kind), and both declared-edge
+        // directions appear; observed edges count the send.
+        assert!(export.schemas.iter().any(|s| s.id() == schema));
+        assert_eq!(export.actors.len(), 2, "both actors live: {export:?}");
+        let source = export
+            .actors
+            .iter()
+            .find(|a| a.path == Path::new("source"))
+            .expect("source exported");
+        assert_eq!(source.kind, crate::types::ActorKind::EventSourced);
+        // And ES actors export their live state.
+        assert_eq!(
+            source.state.as_ref().and_then(|s| s["total"].as_i64()),
+            Some(0),
+            "genesis state captured: {source:?}"
+        );
+        assert!(export
+            .declared_edges
+            .iter()
+            .any(|e| e.actor == Path::new("source")
+                && e.schema == schema
+                && e.direction == crate::system::EdgeDirection::Handles));
+        assert!(export
+            .declared_edges
+            .iter()
+            .any(|e| e.actor == Path::new("sink") && e.topic == Some(topic.clone())));
+        let observed = export
+            .observed_edges
+            .iter()
+            .find(|e| e.to == format!("topic:{topic}") && e.schema == added_schema)
+            .expect("observed topic edge");
+        assert!(observed.count >= 1, "at least the one send: {observed:?}");
     }
 
     #[test]

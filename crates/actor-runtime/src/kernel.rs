@@ -257,8 +257,24 @@ pub async fn route(
             }
             Ok(path.clone())
         }
-        Address::Slot(_) => Err(envelope),  // reply routing: Phase 5
-        Address::Topic(_) => Err(envelope), // topics: Phase 6
+        Address::Slot(_) => Err(envelope), // reply routing: ctx only
+        Address::Topic(ref topic) => {
+            publish_to_topic(kernel, registry, topic.clone(), envelope.clone()).await;
+            {
+                let mut kernel = kernel.lock().expect("kernel lock");
+                kernel.tap.push(
+                    envelope.trace.causality_id.as_millis_ts(),
+                    crate::tap::FactKind::Sent {
+                        from: envelope.from.clone(),
+                        dest: format!("topic:{topic}"),
+                        schema: envelope.schema.clone(),
+                        trace: envelope.trace,
+                    },
+                );
+            }
+            let label = format!("topic:{topic}");
+            Ok(Path::new(label.as_str()))
+        }
     }
 }
 

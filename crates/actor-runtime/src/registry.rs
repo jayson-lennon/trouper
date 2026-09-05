@@ -245,6 +245,14 @@ impl Registry {
     }
 
     /// The shared schema table (for export).
+    /// A snapshot of every live slot for export: (path, manifest).
+    pub fn slot_manifests(&self) -> Vec<(Path, ActorManifest)> {
+        self.slots
+            .iter()
+            .map(|(path, slot)| (path.clone(), slot.manifest.clone()))
+            .collect()
+    }
+
     pub fn schemas(&self) -> &SchemaTable {
         &self.schemas
     }
