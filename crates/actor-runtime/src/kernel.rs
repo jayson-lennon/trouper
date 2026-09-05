@@ -295,6 +295,14 @@ pub fn dead_letter(
         reason: format!("{reason:?}: {detail}"),
         trace: envelope.trace,
     });
+    // The DLQ is a REAL topic: the envelope is appended to the retained
+    // `system.deadletters` log so a DLQ consumer can subscribe /
+    // reset-cursor and re-consume it later.
+    let log = kernel
+        .topic_logs
+        .entry(Registry::dead_letter_topic())
+        .or_insert_with(|| crate::topics::TopicLog::new(256));
+    log.append(envelope.clone());
     kernel.tap.push(
         envelope.trace.causality_id.as_millis_ts(),
         crate::tap::FactKind::DeadLettered {
@@ -304,6 +312,12 @@ pub fn dead_letter(
             trace: envelope.trace,
         },
     );
+}
+
+/// Pumps the DLQ topic once: offers every retained entry past each DLQ
+/// subscriber's cursor. Called by the loops after dead-lettering.
+pub async fn pump_dlq(registry: &Mutex<Registry>, kernel: &Mutex<KernelState>) {
+    pump_topic(kernel, registry, &Registry::dead_letter_topic()).await;
 }
 
 /// Delivers to an endpoint, honoring Block by awaiting capacity.
@@ -438,6 +452,7 @@ async fn step_es(ctx: &EsLoop) -> Step {
             crate::types::DeadLetterReason::UnknownSchema,
             "no entry for this schema",
         );
+        pump_dlq(&ctx.registry, &ctx.kernel).await;
         ctx.cell.inbox.lock().await.ack();
         return Step::Work;
     };
@@ -477,6 +492,7 @@ async fn step_es(ctx: &EsLoop) -> Step {
                 crate::types::DeadLetterReason::Decode,
                 &reason,
             );
+            pump_dlq(&ctx.registry, &ctx.kernel).await;
             ctx.cell.inbox.lock().await.ack();
             return Step::Work;
         }
@@ -711,44 +727,66 @@ async fn publish_to_topic(
 ) {
     // Append + collect subscriber endpoints without holding locks across
     // delivery; pump_once owns per-subscriber cursor/backlog semantics.
-    let targets: Vec<(Path, std::sync::Arc<Endpoint>)> = {
+    let offset = {
         let mut kernel = kernel.lock().expect("kernel lock");
-        let registry = registry.lock().expect("registry lock");
         let log = kernel
             .topic_logs
             .entry(topic.clone())
             .or_insert_with(|| crate::topics::TopicLog::new(256));
-        let offset = log.append(envelope.clone());
-        let mut targets = Vec::new();
-        for path in log.subscribers() {
-            if let Some(endpoint) = registry.resolve(&path) {
-                targets.push((path, endpoint));
-            }
-        }
-        kernel.topic_facts.push(crate::topics::TopicPublishFact {
-            topic: topic.clone(),
-            offset: crate::types::InboxOffset::new(offset),
-            schema: envelope.schema.clone(),
-            from: envelope.from.clone(),
-            trace: envelope.trace,
-        });
-        kernel.tap.push(
-            envelope.trace.causality_id.as_millis_ts(),
-            crate::tap::FactKind::TopicPublished {
-                topic: topic.clone(),
-                schema: envelope.schema.clone(),
-                trace: envelope.trace,
-            },
-        );
-        targets
+        log.append(envelope.clone())
     };
+    record_publish_facts(kernel, &topic, &envelope, offset);
+    pump_topic(kernel, registry, &topic).await;
+}
 
-    // One pump pass: every subscriber is offered every RETAINED entry
-    // past its own cursor (a reset cursor re-consumes here); only
-    // accepted deliveries advance a cursor — a refused one stays behind
-    // (slow-subscriber isolation, never blocking other subscribers).
+/// Records the publish facts (topic log fact + tap fact) for one append.
+fn record_publish_facts(
+    kernel: &Mutex<KernelState>,
+    topic: &crate::types::Topic,
+    envelope: &Envelope,
+    offset: u64,
+) {
     let mut kernel = kernel.lock().expect("kernel lock");
-    let Some(log) = kernel.topic_logs.get_mut(&topic) else {
+    kernel.topic_facts.push(crate::topics::TopicPublishFact {
+        topic: topic.clone(),
+        offset: crate::types::InboxOffset::new(offset),
+        schema: envelope.schema.clone(),
+        from: envelope.from.clone(),
+        trace: envelope.trace,
+    });
+    kernel.tap.push(
+        envelope.trace.causality_id.as_millis_ts(),
+        crate::tap::FactKind::TopicPublished {
+            topic: topic.clone(),
+            schema: envelope.schema.clone(),
+            trace: envelope.trace,
+        },
+    );
+}
+
+/// One pump pass over a topic: every subscriber is offered every RETAINED
+/// entry past its own cursor (a reset cursor re-consumes here); only
+/// accepted deliveries advance a cursor — a refused one stays behind
+/// (slow-subscriber isolation, never blocking other subscribers).
+async fn pump_topic(
+    kernel: &Mutex<KernelState>,
+    registry: &Mutex<Registry>,
+    topic: &crate::types::Topic,
+) {
+    let targets: Vec<(Path, std::sync::Arc<Endpoint>)> = {
+        let kernel = kernel.lock().expect("kernel lock");
+        let registry = registry.lock().expect("registry lock");
+        kernel
+            .topic_logs
+            .get(topic)
+            .map(|log| log.subscribers())
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|path| registry.resolve(&path).map(|endpoint| (path, endpoint)))
+            .collect()
+    };
+    let mut kernel = kernel.lock().expect("kernel lock");
+    let Some(log) = kernel.topic_logs.get_mut(topic) else {
         return;
     };
     let _delivered_skipped = log.pump_once(|path, entry, _policy| {
@@ -954,6 +992,7 @@ async fn step_service(ctx: &ServiceLoop) -> Step {
             crate::types::DeadLetterReason::UnknownSchema,
             "no entry for this schema",
         );
+        pump_dlq(&ctx.es.registry, &ctx.es.kernel).await;
         ctx.es.cell.inbox.lock().await.ack();
         return Step::Work;
     };
@@ -973,6 +1012,7 @@ async fn step_service(ctx: &ServiceLoop) -> Step {
                 crate::types::DeadLetterReason::Decode,
                 &reason,
             );
+            pump_dlq(&ctx.es.registry, &ctx.es.kernel).await;
             ctx.es.cell.inbox.lock().await.ack();
             return Step::Work;
         }

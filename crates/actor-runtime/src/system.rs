@@ -1154,6 +1154,58 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn dlq_topic_is_subscribable_and_reconsumable() {
+        // Given a spawned actor that handles only Add.
+        let (system, _clock) = ActorSystem::test();
+        let path = Path::new("counter");
+        system.spawn_es::<Counter, _>(path.clone(), &json!({}), SpawnOpts::default(), || {
+            vec![Arc::new(TypedEsAdapter::<Counter, Add>::new::<Add>())]
+        });
+
+        // And a DLQ consumer subscribed to the dead-letter topic BEFORE
+        // any dead letters exist, decoding the Boom payload shape.
+        let dlq = Registry::dead_letter_topic();
+        let (sub_idx, sub_sink) = open_sink();
+        bind_sink(&Path::new("dlq-watcher"), sub_sink);
+        system.spawn_service::<DlqWatcher, _>(
+            Path::new("dlq-watcher"),
+            &json!({ "sink": sub_idx }),
+            SpawnOpts::default(),
+            || {
+                vec![Arc::new(TypedServiceAdapter::<DlqWatcher, BoomMsg>::new::<
+                    BoomMsg,
+                >())]
+            },
+        );
+        system
+            .subscribe(&Path::new("dlq-watcher"), &dlq, None)
+            .expect("subscribe to dlq");
+
+        // When a message with an unhandled schema arrives.
+        system
+            .send(system.envelope(Boom::schema_id(), path.clone(), json!({ "why": "x" })))
+            .await
+            .expect("delivered");
+        wait_for_cursor(&system, &path, 1).await;
+
+        // Then the DLQ consumer received the dead-lettered envelope.
+        wait_for(|| async { sink_read(&Path::new("dlq-watcher")).len() == 1 }).await;
+
+        // And the retained DLQ log holds the entry for re-consumption.
+        let (lo, hi) = system.topic_range(&dlq).expect("dlq log exists");
+        assert_eq!((lo, hi), (0, 1));
+
+        // When the cursor is reset to 0, the retained entry's range is
+        // still reported (re-consumption is possible from the log).
+        system
+            .reset_topic_cursor(&Path::new("dlq-watcher"), &dlq, 0)
+            .expect("reset");
+        let (lo, hi) = system.topic_range(&dlq).expect("dlq log exists");
+        assert_eq!((lo, hi), (0, 1));
+        assert!(!sink_read(&Path::new("dlq-watcher")).is_empty());
+    }
+
+    #[tokio::test]
     async fn atomic_step_panics_leave_the_message_queued_for_redelivery() {
         // Given a spawned actor whose Boom handler panics.
         let (system, _clock) = ActorSystem::test();
@@ -1911,6 +1963,51 @@ mod tests {
                 .lock()
                 .expect("sink lock")
                 .push(format!("n={}", msg.n));
+        }
+    }
+
+    /// A message shape mirroring the Boom payload (DLQ consumers must
+    /// decode dead-lettered payloads by their schema).
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    struct BoomMsg {
+        why: String,
+    }
+    impl Schema for BoomMsg {
+        fn schema_def() -> SchemaDef {
+            SchemaDef {
+                name: "Boom".into(),
+                version: 1,
+                kind: SchemaKind::Command,
+                fields: vec![FieldDef::required("why", FieldTy::Str)],
+                description: None,
+            }
+        }
+    }
+
+    /// A service actor that observes dead letters.
+    struct DlqWatcher {
+        sink: Arc<Mutex<Vec<String>>>,
+    }
+    impl ServiceActor for DlqWatcher {
+        fn manifest() -> ActorManifest {
+            ActorManifest::new()
+                .handles::<BoomMsg>()
+                .kind(ActorKind::Service)
+        }
+        async fn start(
+            args: &JsonValue,
+        ) -> Result<Self, error_stack::Report<crate::registry::RegistryError>> {
+            let idx = args["sink"].as_u64().expect("sink index") as usize;
+            let sink = sinks().lock().expect("sinks lock")[idx].clone();
+            Ok(Self { sink })
+        }
+    }
+    impl MsgHandler<BoomMsg> for DlqWatcher {
+        async fn handle(&mut self, msg: BoomMsg, _ctx: &mut crate::context::MsgCtx<'_>) {
+            self.sink
+                .lock()
+                .expect("sink lock")
+                .push(format!("dead letter: {}", msg.why));
         }
     }
 
