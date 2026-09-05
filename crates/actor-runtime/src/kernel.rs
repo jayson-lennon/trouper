@@ -267,6 +267,37 @@ pub async fn route(
             Ok(path.clone())
         }
         Address::Slot(_) => Err(envelope), // reply routing: ctx only
+        Address::Schema(ref schema) => {
+            // Schema-addressed send: the route table picks the handler
+            // (rotating when several actors handle the same schema).
+            let (target, endpoint) = {
+                let mut registry = registry.lock().expect("registry lock");
+                match registry.route(schema) {
+                    Some(target) => {
+                        let endpoint = registry.resolve(&target);
+                        (target, endpoint)
+                    }
+                    None => return Err(envelope),
+                }
+            };
+            let Some(endpoint) = endpoint else {
+                return Err(envelope);
+            };
+            deliver_with_retry(&endpoint, envelope.clone()).await?;
+            {
+                let mut kernel = kernel.lock().expect("kernel lock");
+                kernel.tap.push(
+                    envelope.trace.causality_id.as_millis_ts(),
+                    crate::tap::FactKind::Sent {
+                        from: envelope.from.clone(),
+                        dest: Address::Schema(schema.clone()),
+                        schema: schema.clone(),
+                        trace: envelope.trace,
+                    },
+                );
+            }
+            Ok(target)
+        }
         Address::Topic(ref topic) => {
             publish_to_topic(kernel, registry, topic.clone(), envelope.clone()).await;
             {
@@ -851,6 +882,19 @@ async fn resolve_reply(
                 .expect("kernel lock")
                 .replies
                 .complete(&lease, payload);
+        }
+        Address::Schema(_) => {
+            // A schema-addressed reply is an ordinary routed send (the
+            // route table picks a handler).
+            let envelope = Envelope::json(schema, to, payload, trace);
+            if let Err(undeliverable) = route(registry, kernel, envelope).await {
+                dead_letter(
+                    kernel,
+                    &undeliverable,
+                    crate::types::DeadLetterReason::Unresolvable,
+                    "reply destination unresolved",
+                );
+            }
         }
         Address::Path(path) => {
             // Durable name: an ordinary envelope (any actor may have moved

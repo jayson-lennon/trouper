@@ -19,6 +19,9 @@ pub enum Address {
     Topic(Topic),
     /// A reply slot for an in-flight `ask`; a mechanism, dies with the ask.
     Slot(LeaseId),
+    /// Any handler of the schema: the kernel picks one per send
+    /// (RoundRobin across registered handlers; Single while only one).
+    Schema(SchemaId),
 }
 
 /// Trace metadata carried by every envelope.
@@ -71,6 +74,7 @@ impl std::fmt::Display for Address {
             Address::Path(path) => write!(f, "{path}"),
             Address::Topic(topic) => write!(f, "{topic}"),
             Address::Slot(lease) => write!(f, "slot({lease})"),
+            Address::Schema(schema) => write!(f, "schema({schema})"),
         }
     }
 }

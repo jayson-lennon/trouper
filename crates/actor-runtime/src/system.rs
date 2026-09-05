@@ -437,14 +437,20 @@ impl ActorSystem {
         let (tx, rx) = tokio::sync::mpsc::channel::<Envelope>(opts.mailbox_capacity.max(1) * 2);
         {
             let mut registry = self.registry.lock().expect("registry lock");
+            let manifest = A::manifest();
             registry
                 .insert_slot(
                     path.clone(),
-                    A::manifest(),
+                    manifest.clone(),
                     Endpoint::new(tx),
                     opts.mailbox_policy,
                 )
                 .expect("path free at spawn");
+            // Service actors route by schema too: each handled schema is
+            // routable to this path (second handler → RoundRobin).
+            for schema in manifest.handles.clone() {
+                registry.add_route(schema, path.clone());
+            }
         }
         let mut kernel = self.kernel.lock().expect("kernel lock");
         let cell = Arc::new(ActorCell::new(
@@ -3407,6 +3413,47 @@ mod tests {
             .find(|e| e.to == topic.to_string() && e.schema == added_schema)
             .expect("observed topic edge");
         assert!(observed.count >= 1, "at least the one send: {observed:?}");
+    }
+
+    #[tokio::test]
+    async fn schema_addressed_sends_round_robin_across_two_handlers() {
+        // Given TWO actors handling the same Add schema: the route table
+        // holds both (adding the second converts Single → RoundRobin).
+        let (system, _clock) = ActorSystem::test();
+        system.register_schema::<Add>();
+        system.register_schema::<Added>();
+        for name in ["w1", "w2"] {
+            let path = Path::new(name);
+            let (idx, sink) = open_sink();
+            bind_sink(&path, sink);
+            system.spawn_service::<Auditor, _>(
+                path.clone(),
+                &json!({ "sink": idx }),
+                SpawnOpts::default(),
+                || vec![Arc::new(TypedServiceAdapter::<Auditor, Add>::new::<Add>())],
+            );
+        }
+
+        // When four schema-addressed sends go out.
+        for n in 1..=4_i64 {
+            let envelope = crate::envelope::Envelope::json(
+                Add::schema_id(),
+                Address::Schema(Add::schema_id()),
+                json!({ "n": n }),
+                TraceCtx::root(),
+            );
+            system.send(envelope).await.expect("schema send delivered");
+        }
+        wait_for(|| async {
+            sink_read(&Path::new("w1")).len() + sink_read(&Path::new("w2")).len() == 4
+        })
+        .await;
+
+        // Then the handlers rotated: each saw two messages.
+        let w1 = sink_read(&Path::new("w1")).len();
+        let w2 = sink_read(&Path::new("w2")).len();
+        assert_eq!(w1, 2, "w1 got its share");
+        assert_eq!(w2, 2, "w2 got its share");
     }
 
     #[tokio::test]
