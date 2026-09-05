@@ -117,7 +117,7 @@ pub struct ActorSystem {
 }
 
 /// One actor's row in a system export.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct ActorExport {
     /// The actor's path (its identity).
     pub path: Path,
@@ -169,7 +169,7 @@ pub struct ObservedEdge {
 }
 
 /// The whole-system export: the artifact a future canvas consumes.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct SystemExport {
     /// Every registered schema definition (all versions).
     pub schemas: Vec<crate::schema::SchemaDef>,
@@ -3407,6 +3407,35 @@ mod tests {
             .find(|e| e.to == topic.to_string() && e.schema == added_schema)
             .expect("observed topic edge");
         assert!(observed.count >= 1, "at least the one send: {observed:?}");
+    }
+
+    #[tokio::test]
+    async fn export_roundtrips_through_json_losslessly() {
+        // Given a system export containing schemas, actors (with live ES
+        // state), declared edges, and observed edges.
+        let (system, _clock) = ActorSystem::test();
+        let schema = system.register_schema::<Add>();
+        system.spawn_es::<Counter, _>(
+            Path::new("counter"),
+            &json!({}),
+            SpawnOpts::default(),
+            || vec![Arc::new(TypedEsAdapter::<Counter, Add>::new::<Add>())],
+        );
+        system
+            .send(system.envelope(Add::schema_id(), Path::new("counter"), json!({ "n": 3 })))
+            .await
+            .expect("sent");
+        wait_for_cursor(&system, &Path::new("counter"), 1).await;
+        let export = system.export().await;
+
+        // When it is serialized to JSON and deserialized back.
+        let json = serde_json::to_string(&export).expect("serialize");
+        let parsed: SystemExport = serde_json::from_str(&json).expect("deserialize");
+
+        // Then the round-tripped export is identical (the canvas can
+        // consume the wire format without information loss).
+        assert_eq!(parsed, export, "export survives the JSON round trip");
+        let _ = schema;
     }
 
     #[test]
