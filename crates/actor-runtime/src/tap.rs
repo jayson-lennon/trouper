@@ -79,6 +79,13 @@ pub enum FactKind {
     SnapshotTaken { path: Path, seq: SeqNo },
     /// A restart budget was exhausted; escalation to the parent.
     Escalated { path: Path, reason: String },
+    /// A parent was notified that its linked child stopped/removed.
+    LinkNotified {
+        /// The parent that was (would have been) notified.
+        parent: Path,
+        /// The child whose stop triggered the notification.
+        child: Path,
+    },
     /// An envelope was dead-lettered.
     DeadLettered {
         dest: Address,
@@ -177,6 +184,11 @@ impl Fact {
                 "kind": "escalated",
                 "path": path.to_string(),
                 "reason": reason,
+            }),
+            FactKind::LinkNotified { parent, child } => json!({
+                "kind": "link_notified",
+                "parent": parent.to_string(),
+                "child": child.to_string(),
             }),
             FactKind::DeadLettered {
                 dest,

@@ -770,7 +770,9 @@ impl ActorSystem {
             }
         }
 
-        // 5. SLOT DROP + subscription cascade + Stopped fact.
+        // 5. SLOT DROP + subscription cascade + Stopped fact + parent
+        // link notification (a supervised child stopping notifies its
+        // parent as a tap fact).
         {
             let mut registry = self.registry.lock().expect("registry lock");
             let _ = registry.remove_slot(path);
@@ -781,6 +783,7 @@ impl ActorSystem {
             for log in kernel.topic_logs.values_mut() {
                 log.unsubscribe(path);
             }
+            let notified_parent = kernel.specs.get(path).and_then(|s| s.parent.clone());
             kernel.specs.remove(path);
             kernel.tap.push(
                 self.clock.now(),
@@ -789,6 +792,15 @@ impl ActorSystem {
                     reason: crate::types::StopReason::Normal,
                 },
             );
+            if let Some(parent) = notified_parent {
+                kernel.tap.push(
+                    self.clock.now(),
+                    crate::tap::FactKind::LinkNotified {
+                        parent,
+                        child: path.clone(),
+                    },
+                );
+            }
         }
     }
 
@@ -1857,6 +1869,16 @@ mod tests {
             !kernel.specs.contains_key(&child)
         };
         assert!(child_cascaded, "child spec cascaded with the parent");
+
+        // And the parent received a link-notification fact for the child.
+        let notified = facts.iter().any(|f| {
+            matches!(
+                &f.kind,
+                crate::tap::FactKind::LinkNotified { parent, child }
+                    if parent.as_str() == "parent" && child.as_str() == "child"
+            )
+        });
+        assert!(notified, "parent notified of child stop");
     }
 
     #[tokio::test]
