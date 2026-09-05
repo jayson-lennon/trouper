@@ -55,7 +55,11 @@ impl TraceCtx {
 /// redelivery possible. The typed arm is an `Arc` clone (cheap).
 #[derive(Clone)]
 pub enum Payload {
-    /// In-process typed fast path; erased to JSON at the schema waist.
+    /// RESERVED in-proc fast path, not yet crossed by production code:
+    /// every runtime boundary is JSON today (the "JSON waist" decision),
+    /// so no adapter constructs this arm yet. Kept as the seam for a
+    /// future zero-copy path; downstream code must still handle it (see
+    /// [`Payload::into_json`] treating it as an error).
     Typed(std::sync::Arc<dyn std::any::Any + Send + Sync>),
     /// The waist representation: plain JSON.
     Json(JsonValue),
@@ -137,7 +141,10 @@ impl Envelope {
         }
     }
 
-    /// Assembles a typed envelope for the in-process fast path.
+    /// Assembles a typed envelope for the RESERVED in-proc fast path.
+    /// Production code crosses the schema waist as JSON; this constructor
+    /// exists for that future path and for the erased-payload unit test.
+    #[doc(hidden)]
     pub fn typed<T: Send + Sync + 'static>(
         schema: SchemaId,
         dest: Address,
