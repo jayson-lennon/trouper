@@ -90,6 +90,8 @@ pub enum DeadLetterReason {
     Decode,
     /// The destination inbox refused the envelope (overload/closed).
     InboxRefused,
+    /// The actor was stopped with undelivered inbox entries.
+    StoppedWithMail,
 }
 
 impl Path {

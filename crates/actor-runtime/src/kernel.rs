@@ -55,7 +55,9 @@ pub struct DeadLetter {
     /// Where it was headed.
     pub dest: Address,
     /// Why it died.
-    pub reason: String,
+    pub reason: crate::types::DeadLetterReason,
+    /// A human-readable detail line (context beyond the reason).
+    pub detail: String,
     /// The trace of the hop that failed.
     pub trace: TraceCtx,
 }
@@ -299,7 +301,8 @@ pub fn dead_letter(
     kernel.dead_letters.push(DeadLetter {
         schema: envelope.schema.clone(),
         dest: envelope.dest.clone(),
-        reason: format!("{reason:?}: {detail}"),
+        reason: reason.clone(),
+        detail: detail.to_owned(),
         trace: envelope.trace,
     });
     // The DLQ is a REAL topic: the envelope is appended to the retained

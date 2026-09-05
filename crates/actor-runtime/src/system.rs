@@ -763,7 +763,8 @@ impl ActorSystem {
                 kernel.dead_letters.push(crate::kernel::DeadLetter {
                     schema: envelope.schema,
                     dest: envelope.dest,
-                    reason: "stopped with a non-empty inbox".to_owned(),
+                    reason: crate::types::DeadLetterReason::StoppedWithMail,
+                    detail: "stopped with a non-empty inbox".to_owned(),
                     trace: envelope.trace,
                 });
             }
@@ -957,7 +958,7 @@ impl ActorSystem {
         kernel
             .dead_letters
             .iter()
-            .map(|d| format!("{}: {}", d.reason, d.schema))
+            .map(|d| format!("{:?}: {}", d.reason.clone(), d.schema))
             .collect()
     }
 
@@ -1749,13 +1750,59 @@ mod tests {
 
     #[tokio::test]
     async fn graceful_shutdown_stops_children_before_the_parent() {
-        // Given a parent path with a supervised child spec (no running
-        // cell for either: the cascade itself is the behavior under test).
+        // Given a LIVE parent service actor with a LIVE supervised child
+        // (both cells running), and messages queued at BOTH so the drain
+        // path is exercised (undelivered entries must dead-letter).
         let (system, _clock) = ActorSystem::test();
         let parent = Path::new("parent");
         let child = Path::new("child");
+        let (p_idx, p_sink) = open_sink();
+        bind_sink(&parent, p_sink);
+        let (c_idx, c_sink) = open_sink();
+        bind_sink(&child, c_sink);
+        let registry = system.registry.clone();
+        let kernel = system.kernel.clone();
+        let view = system.view.clone();
+        let clock = system.clock.clone();
+
+        // The supervised child spawns a real service actor via the spec
+        // factory (the same closure the supervision engine would run).
+        let spawn_child = {
+            let system = system.clone();
+            let child = child.clone();
+            move |_sys: &Arc<ActorSystem>, path: &Path, _args: &JsonValue| {
+                let system = system.clone();
+                let path = path.to_owned();
+                let (idx, sink) = open_sink();
+                bind_sink(&path, sink);
+                system.spawn_service::<Auditor, _>(
+                    path.clone(),
+                    &json!({ "sink": idx }),
+                    SpawnOpts::default(),
+                    || {
+                        vec![
+                            Arc::new(TypedServiceAdapter::<Auditor, Add>::new::<Add>()),
+                            Arc::new(TypedServiceAdapter::<Auditor, Added>::new::<Added>()),
+                        ]
+                    },
+                );
+            }
+        };
+        spawn_child(&system, &child, &json!({}));
+        system.spawn_service::<Auditor, _>(
+            parent.clone(),
+            &json!({ "sink": p_idx }),
+            SpawnOpts::default(),
+            || {
+                vec![
+                    Arc::new(TypedServiceAdapter::<Auditor, Add>::new::<Add>()),
+                    Arc::new(TypedServiceAdapter::<Auditor, Added>::new::<Added>()),
+                ]
+            },
+        );
+        // Register the child spec AFTER its cell exists (supervised).
         {
-            let mut kernel = system.kernel.lock().expect("lock");
+            let mut kernel = kernel.lock().expect("lock");
             kernel.specs.insert(
                 child.clone(),
                 crate::supervision::ChildSpec {
@@ -1765,16 +1812,30 @@ mod tests {
                     budget: crate::supervision::RestartBudget::default(),
                     backoff: crate::supervision::Backoff::default(),
                     args: json!({}),
-                    spawn: Arc::new(|_sys: &Arc<ActorSystem>, _path: &Path, _args: &JsonValue| {}),
+                    spawn: Arc::new(spawn_child),
                 },
             );
+        }
+        drop((registry, kernel, view, clock));
+
+        // Queue messages at both (slow-drain by never waiting between):
+        // these are the envelopes that become DLQ entries if undrained.
+        for n in 1..=3 {
+            system
+                .send(system.envelope(Add::schema_id(), child.clone(), json!({ "n": n })))
+                .await
+                .expect("child queued");
+            system
+                .send(system.envelope(Add::schema_id(), parent.clone(), json!({ "n": n })))
+                .await
+                .expect("parent queued");
         }
 
         // When the parent is stopped gracefully.
         system.stop(&parent).await;
 
-        // Then the parent's Stopped fact was recorded, and the child
-        // spec was cascaded away with it.
+        // Then BOTH Stopped facts exist, and the CHILD's was recorded
+        // BEFORE the parent's (children drain first).
         let facts = system.tap_facts();
         let stops: Vec<String> = facts
             .iter()
@@ -1783,10 +1844,17 @@ mod tests {
                 _ => None,
             })
             .collect();
+        let child_pos = stops.iter().position(|p| p == "child").expect("child stop");
+        let parent_pos = stops
+            .iter()
+            .position(|p| p == "parent")
+            .expect("parent stop");
         assert!(
-            stops.iter().any(|p| p == "parent"),
-            "parent stop recorded: {stops:?}"
+            child_pos < parent_pos,
+            "child stopped before parent; stops = {stops:?}"
         );
+
+        // And the child spec cascaded away with the parent.
         let child_cascaded = {
             let kernel = system.kernel.lock().expect("lock");
             !kernel.specs.contains_key(&child)
