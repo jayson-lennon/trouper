@@ -1543,7 +1543,13 @@ mod tests {
             .send(system.envelope(Add::schema_id(), Path::new("a"), json!({ "n": 1 })))
             .await
             .expect("send");
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        wait_for(|| async {
+            system
+                .tap_facts()
+                .iter()
+                .any(|f| matches!(&f.kind, crate::tap::FactKind::Delivered { to, .. } if *to == Path::new("echo")))
+        })
+        .await;
 
         // Then the facts carry a shared trace id across the hops.
         let facts = system.tap_facts();
@@ -1738,6 +1744,8 @@ mod tests {
             let _ = system
                 .send(system.envelope(Add::schema_id(), worker.clone(), json!({ "n": 1 })))
                 .await;
+            // Deliberate pacing: the budget window measures REAL elapsed
+            // time, so the crashes must spread over real milliseconds.
             tokio::time::sleep(std::time::Duration::from_millis(30)).await;
         }
         // Then the engine restarted it within budget, then escalated:
@@ -1977,7 +1985,6 @@ mod tests {
             .await
             .expect("send");
         wait_for_cursor(&system, &path, 3).await;
-        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
 
         // Then the retained events were re-delivered in order.
         let lines = sink_read(&sub);
@@ -2026,14 +2033,13 @@ mod tests {
             .await
             .expect("send");
         wait_for_cursor(&system, &path, 1).await;
-        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         system.subscribe(&late, &topic, None).expect("subscribe");
         system
             .send(system.envelope(Add::schema_id(), path.clone(), json!({ "n": 2 })))
             .await
             .expect("send");
         wait_for_cursor(&system, &path, 2).await;
-        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        wait_for(|| async { sink_read(&early).len() >= 2 }).await;
 
         // Then "early" saw both events and "late" only the second.
         let early_lines = sink_read(&early);
@@ -2256,7 +2262,13 @@ mod tests {
         );
 
         // When an Add message is sent to it.
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        wait_for(|| async {
+            system
+                .tap_facts()
+                .iter()
+                .any(|f| matches!(&f.kind, crate::tap::FactKind::Spawned { path, .. } if *path == Path::new("auditor")))
+        })
+        .await;
         system
             .send(system.envelope(Add::schema_id(), path.clone(), json!({ "n": 7 })))
             .await
@@ -2357,7 +2369,13 @@ mod tests {
             SpawnOpts::default(),
             || vec![Arc::new(TypedServiceAdapter::<Asker, Boom>::new::<Boom>())],
         );
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        wait_for(|| async {
+            system
+                .tap_facts()
+                .iter()
+                .any(|f| matches!(&f.kind, crate::tap::FactKind::Spawned { path, .. } if *path == Path::new("asker")))
+        })
+        .await;
 
         // When the asker asks the echo.
         system
@@ -2455,7 +2473,13 @@ mod tests {
             SpawnOpts::default(),
             || vec![Arc::new(TypedServiceAdapter::<Asker, Boom>::new::<Boom>())],
         );
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        wait_for(|| async {
+            system
+                .tap_facts()
+                .iter()
+                .any(|f| matches!(&f.kind, crate::tap::FactKind::Spawned { path, .. } if *path == Path::new("asker")))
+        })
+        .await;
 
         // When the asker asks the silent callee.
         system
@@ -2576,7 +2600,13 @@ mod tests {
             SpawnOpts::default(),
             || vec![Arc::new(TypedEsAdapter::<Counter, Add>::new::<Add>())],
         );
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        wait_for(|| async {
+            system
+                .tap_facts()
+                .iter()
+                .any(|f| matches!(&f.kind, crate::tap::FactKind::Spawned { path, .. } if *path == Path::new("counter")))
+        })
+        .await;
 
         // When the counter is told to Add with a reply-to PATH pointing at
         // the collector (an ask-shaped message, but reply-by-name).
@@ -2794,7 +2824,8 @@ mod tests {
 
         // Then the removed subscriber receives nothing further and the
         // pump no longer tracks it (no cursor leaks).
-        tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+        wait_for(|| async { !sink_read(&Path::new("sub")).is_empty() }).await;
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         assert_eq!(sink_read(&Path::new("sub")).len(), 1);
         let subscribers = {
             let kernel = system.kernel.lock().expect("lock");
