@@ -15,7 +15,8 @@
 //! `export()` printing declared vs observed edges and live ES state.
 
 use actor_runtime::actor::{
-    CommandHandler, EventSourced, MsgHandler, ServiceActor, TypedEsAdapter, TypedServiceAdapter,
+    CommandHandler, EventSourcedActor, MsgHandler, ServiceActor, TypedEsAdapter,
+    TypedServiceAdapter,
 };
 use actor_runtime::kernel::SnapshotPolicy;
 use actor_runtime::prelude::*;
@@ -167,7 +168,7 @@ struct Inventory {
     reserved: i64,
 }
 
-impl EventSourced for Inventory {
+impl EventSourcedActor for Inventory {
     fn manifest() -> ActorManifest {
         ActorManifest::new()
             .handles::<ReserveStock>()

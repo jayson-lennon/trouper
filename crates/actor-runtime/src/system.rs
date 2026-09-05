@@ -11,7 +11,7 @@ use std::sync::{Arc, Mutex};
 use serde_json::Value as JsonValue;
 
 use crate::actor::{
-    CommandEntry, DynServiceActor, EventSourced, MsgEntry, ServiceActor, TypedEsState,
+    CommandEntry, DynServiceActor, EventSourcedActor, MsgEntry, ServiceActor, TypedEsState,
     TypedServiceState,
 };
 use crate::clock::{ClockService, FakeClock, SystemClock};
@@ -338,7 +338,7 @@ impl ActorSystem {
         opts: SpawnOpts,
         entries: F,
     ) where
-        A: EventSourced,
+        A: EventSourcedActor,
         F: FnOnce() -> Vec<Arc<dyn CommandEntry>>,
     {
         let state = Box::new(TypedEsState::<A>::new(A::restore(args)));
@@ -528,7 +528,7 @@ impl ActorSystem {
         opts: SpawnOpts,
         entries: F,
     ) where
-        A: EventSourced,
+        A: EventSourcedActor,
         F: FnOnce() -> Vec<Arc<dyn CommandEntry>>,
     {
         self.spawn_es::<A, F>(path, args, opts, entries)
@@ -1170,7 +1170,7 @@ mod tests {
         total: i64,
     }
 
-    impl EventSourced for Counter {
+    impl EventSourcedActor for Counter {
         fn manifest() -> ActorManifest {
             ActorManifest::new()
                 .handles::<Add>()
@@ -1645,7 +1645,7 @@ mod tests {
 
         #[derive(Serialize, Deserialize, Default)]
         struct Forwarder;
-        impl EventSourced for Forwarder {
+        impl EventSourcedActor for Forwarder {
             fn manifest() -> ActorManifest {
                 ActorManifest::new()
                     .handles::<Add>()
@@ -1805,7 +1805,7 @@ mod tests {
         struct Phoenix {
             total: i64,
         }
-        impl EventSourced for Phoenix {
+        impl EventSourcedActor for Phoenix {
             fn manifest() -> ActorManifest {
                 ActorManifest::new().kind(ActorKind::EventSourced)
             }
@@ -1899,7 +1899,7 @@ mod tests {
         // with a budget of 2 restarts per 10 seconds, parent "overseer".
         #[derive(Serialize, Deserialize, Default)]
         struct AlwaysBoom;
-        impl EventSourced for AlwaysBoom {
+        impl EventSourcedActor for AlwaysBoom {
             fn manifest() -> ActorManifest {
                 ActorManifest::new()
                     .handles::<Add>()
@@ -2184,7 +2184,7 @@ mod tests {
 
         #[derive(Serialize, Deserialize, Default)]
         struct Fragile;
-        impl EventSourced for Fragile {
+        impl EventSourcedActor for Fragile {
             fn manifest() -> ActorManifest {
                 ActorManifest::new().kind(ActorKind::EventSourced)
             }
@@ -3050,7 +3050,7 @@ mod tests {
         struct Counter {
             total: i64,
         }
-        impl EventSourced for Counter {
+        impl EventSourcedActor for Counter {
             fn manifest() -> ActorManifest {
                 ActorManifest::new()
                     .handles::<Add>()
@@ -3421,7 +3421,7 @@ mod tests {
         // always panics, and an overseer to receive the escalation.
         #[derive(Serialize, Deserialize, Default)]
         struct AlwaysBoom2;
-        impl EventSourced for AlwaysBoom2 {
+        impl EventSourcedActor for AlwaysBoom2 {
             fn manifest() -> ActorManifest {
                 ActorManifest::new()
                     .handles::<Add>()
@@ -3897,7 +3897,7 @@ mod tests {
             #[serde(skip)]
             doubled: i64,
         }
-        impl crate::actor::EventSourced for Cached {
+        impl crate::actor::EventSourcedActor for Cached {
             fn manifest() -> crate::schema::ActorManifest {
                 ActorManifest::new().kind(crate::types::ActorKind::EventSourced)
             }

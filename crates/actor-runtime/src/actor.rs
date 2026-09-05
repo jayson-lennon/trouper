@@ -28,7 +28,7 @@ use crate::types::SchemaId;
 /// Implementors get journal-backed restart for free; snapshots are opt-in
 /// via the spawn policy and go through [`EventSourced::capture`] /
 /// [`EventSourced::restore_from`].
-pub trait EventSourced: Send + Sync + Serialize + DeserializeOwned + 'static {
+pub trait EventSourcedActor: Send + Sync + Serialize + DeserializeOwned + 'static {
     /// Declares edges and the contract kind (always [`ActorKind::EventSourced`]).
     fn manifest() -> ActorManifest;
 
@@ -68,7 +68,7 @@ pub trait EventSourced: Send + Sync + Serialize + DeserializeOwned + 'static {
 
 /// Typed sugar over the erased dispatch table: a pure decision function for
 /// one command type. Registered once per (actor, command) pair at spawn.
-pub trait CommandHandler<C>: EventSourced {
+pub trait CommandHandler<C>: EventSourcedActor {
     /// Decides: given current state and the command, which events happen?
     ///
     /// Sync, `&self` — no I/O, no await, no mutation. Effects are *declared*
@@ -150,18 +150,18 @@ pub trait DynEsActor: Send {
 }
 
 /// Concrete `DynEsActor` for a typed state `A`.
-pub struct TypedEsState<A: EventSourced> {
+pub struct TypedEsState<A: EventSourcedActor> {
     state: A,
 }
 
-impl<A: EventSourced> TypedEsState<A> {
+impl<A: EventSourcedActor> TypedEsState<A> {
     /// Wraps live state.
     pub fn new(state: A) -> Self {
         Self { state }
     }
 }
 
-impl<A: EventSourced> DynEsActor for TypedEsState<A> {
+impl<A: EventSourcedActor> DynEsActor for TypedEsState<A> {
     fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
         self
     }
@@ -225,7 +225,7 @@ pub struct TypedEsAdapter<A, C> {
     _cmd: std::marker::PhantomData<fn(&C)>,
 }
 
-impl<A: EventSourced, C> TypedEsAdapter<A, C> {
+impl<A: EventSourcedActor, C> TypedEsAdapter<A, C> {
     /// Creates the adapter for command schema `S`.
     pub fn new<S: Schema>() -> Self {
         Self {
@@ -238,7 +238,7 @@ impl<A: EventSourced, C> TypedEsAdapter<A, C> {
 
 impl<A, C> CommandEntry for TypedEsAdapter<A, C>
 where
-    A: EventSourced + CommandHandler<C>,
+    A: EventSourcedActor + CommandHandler<C>,
     C: DeserializeOwned + Send + 'static,
 {
     fn schema(&self) -> SchemaId {
@@ -528,7 +528,7 @@ mod tests {
         count: i64,
     }
 
-    impl EventSourced for Counter {
+    impl EventSourcedActor for Counter {
         fn manifest() -> ActorManifest {
             ActorManifest::new()
                 .handles::<ReserveStock>()
