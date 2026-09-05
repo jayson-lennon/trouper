@@ -25,7 +25,7 @@ use arc_swap::ArcSwapOption;
 use serde_json::Value as JsonValue;
 use tokio::sync::{mpsc, watch, Notify};
 
-use crate::actor::{CommandEntry, DispatchError, DynEsActor};
+use crate::actor::{CommandEntry, DynEsActor, DynServiceActor, MsgEntry};
 use crate::context::{CmdCtx, Outbox, RuntimeView};
 use crate::envelope::{Address, Envelope, TraceCtx};
 use crate::inbox::Inbox;
@@ -60,6 +60,29 @@ pub struct DeadLetter {
     pub trace: TraceCtx,
 }
 
+/// An ask lifecycle event (tap facts from Phase 7 read these).
+#[derive(Debug, Clone, PartialEq)]
+pub enum AskOutcome {
+    /// The callee replied in time.
+    Replied,
+    /// The timeout elapsed with no reply.
+    Timeout,
+    /// The ask failed outright (callee dead, slot lost).
+    Failed,
+}
+
+#[derive(Debug, Clone)]
+pub struct AskFact {
+    /// Whether this opened or settled an ask.
+    pub opened: bool,
+    /// The settled outcome (None while open).
+    pub outcome: Option<AskOutcome>,
+    /// The callee's address.
+    pub dest: Address,
+    /// The ask's trace.
+    pub trace: TraceCtx,
+}
+
 /// Actor tables beyond the registry: cells, journals, live ES state,
 /// command entries, snapshot policies, crashes, and dead letters.
 ///
@@ -72,6 +95,16 @@ pub struct KernelState {
     pub es_state: HashMap<Path, Arc<tokio::sync::Mutex<Box<dyn DynEsActor>>>>,
     pub entries: HashMap<Path, Vec<Arc<dyn CommandEntry>>>,
     pub snapshot_policy: HashMap<Path, SnapshotPolicy>,
+    /// Live service instances (service actors are not journaled).
+    pub services: HashMap<Path, Arc<tokio::sync::Mutex<Box<dyn DynServiceActor>>>>,
+    /// Reply-slot leases (the mechanism half of reply addresses).
+    pub replies: crate::reply::ReplyTable,
+    /// Ask lifecycle facts (the tap consumes these in Phase 7).
+    pub ask_facts: Vec<AskFact>,
+    /// Per-actor async message dispatch entries.
+    pub msg_entries: HashMap<Path, Vec<Arc<dyn MsgEntry>>>,
+    /// Spawn args (genesis rebuild needs them at restart time).
+    pub genesis_args: HashMap<Path, JsonValue>,
     /// Paths whose loop died to a handler panic (awaiting supervision).
     pub crashed: HashSet<Path>,
     /// Envelopes that could not be delivered or decoded.
@@ -132,6 +165,8 @@ pub struct EsLoop {
     pub kernel: Arc<Mutex<KernelState>>,
     /// The read-only view handed to handler contexts.
     pub view: Arc<dyn RuntimeView>,
+    /// The injected clock (lease expiries, deterministic tests).
+    pub clock: crate::clock::ClockService,
 }
 
 impl EsLoop {
@@ -391,6 +426,146 @@ async fn flush_outbox(ctx: &EsLoop, mut outbox: Outbox) {
                 let _ = topic;
                 dead_letter(&ctx.kernel, &envelope, "topics pending (Phase 6)");
             }
+            crate::context::Intent::Reply {
+                to,
+                schema,
+                payload,
+                trace,
+            } => {
+                resolve_reply(&ctx.kernel, &ctx.registry, to, schema, payload, trace).await;
+            }
+        }
+    }
+}
+
+/// The kernel's ask port: opens leases, routes request envelopes,
+/// records ask facts. Handed to service contexts at dispatch time.
+#[derive(Clone)]
+pub struct KernelAskPort {
+    /// The shared routing table.
+    pub registry: Arc<Mutex<Registry>>,
+    /// The shared actor tables (reply leases + ask facts live here).
+    pub kernel: Arc<Mutex<KernelState>>,
+    /// The clock for lease expiries.
+    pub clock: crate::clock::ClockService,
+}
+
+impl crate::context::AskPort for KernelAskPort {
+    fn ask_channel(
+        &self,
+        dest: Address,
+        schema: SchemaId,
+        payload: JsonValue,
+        ttl: std::time::Duration,
+    ) -> std::pin::Pin<
+        Box<
+            dyn Future<
+                    Output = Result<
+                        (crate::types::LeaseId, tokio::sync::oneshot::Receiver<JsonValue>),
+                        error_stack::Report<crate::context::AskError>,
+                    >,
+                > + Send,
+        >,
+    > {
+        let registry = self.registry.clone();
+        let kernel = self.kernel.clone();
+        let clock = self.clock.clone();
+        Box::pin(async move {
+            // Resolve the destination FIRST: an unresolvable ask fails fast.
+            let endpoint = {
+                let Address::Path(path) = &dest else {
+                    return Err(error_stack::Report::new(
+                        crate::context::AskError::Unresolved(format!("{dest:?}")),
+                    ));
+                };
+                registry.lock().expect("registry lock").resolve(path)
+            };
+            let Some(endpoint) = endpoint else {
+                return Err(error_stack::Report::new(
+                    crate::context::AskError::Unresolved(format!("{dest:?}")),
+                ));
+            };
+
+            // Open the lease and route the request envelope.
+            let now = clock.now();
+            let (lease, receiver) = {
+                let mut kernel = kernel.lock().expect("kernel lock");
+                let trace = crate::envelope::TraceCtx::root();
+                let (lease, receiver) = kernel.replies.open(ttl, now);
+                kernel.ask_facts.push(AskFact {
+                    opened: true,
+                    outcome: None,
+                    dest: dest.clone(),
+                    trace,
+                });
+                (lease, receiver)
+            };
+            let trace = crate::envelope::TraceCtx::root();
+            let envelope =
+                Envelope::json(schema, dest.clone(), payload, trace).reply_to(Address::Slot(lease));
+            match deliver_with_retry(&endpoint, envelope).await {
+                Ok(()) => Ok((lease, receiver)),
+                Err(_) => Err(error_stack::Report::new(
+                    crate::context::AskError::Unresolved(format!("{dest:?}")),
+                )),
+            }
+        })
+    }
+
+    fn ask_settled(
+        &self,
+        lease: crate::types::LeaseId,
+        dest: Address,
+        outcome: AskOutcome,
+        trace: TraceCtx,
+    ) {
+        let mut kernel = self.kernel.lock().expect("kernel lock");
+        kernel.ask_facts.push(AskFact {
+            opened: false,
+            outcome: Some(outcome),
+            dest,
+            trace,
+        });
+        // Drop the lease: settled (consumed) or timed out (late replies
+        // land nowhere). The reply's `complete` already removed it on the
+        // Replied path; removal here is idempotent.
+        kernel.replies.cancel(&lease);
+    }
+}
+
+/// Resolves one reply: a slot goes straight to the asker's oneshot (the
+/// mechanism); a path routes an ordinary envelope through the registry
+/// (the durable name).
+async fn resolve_reply(
+    kernel: &Mutex<KernelState>,
+    registry: &Mutex<Registry>,
+    to: Address,
+    schema: SchemaId,
+    payload: JsonValue,
+    trace: TraceCtx,
+) {
+    match to {
+        Address::Slot(lease) => {
+            // Mechanism: complete the lease if it is still live; a dead
+            // (expired/pruned) slot just drops the reply — the asker is
+            // gone, and the ask timed out on its side already.
+            kernel
+                .lock()
+                .expect("kernel lock")
+                .replies
+                .complete(&lease, payload);
+        }
+        Address::Path(path) => {
+            // Durable name: an ordinary envelope (any actor may have moved
+            // on; unresolvable replies dead-letter like any send).
+            let envelope = Envelope::json(schema, Address::Path(path.clone()), payload, trace);
+            if let Err(undeliverable) = route(registry, envelope).await {
+                dead_letter(kernel, &undeliverable, "reply destination unresolved");
+            }
+        }
+        Address::Topic(_) => {
+            // Replying onto a topic is not a reply; treat as a send to a
+            // topic address (Phase 6 wires topic delivery).
         }
     }
 }
@@ -435,6 +610,135 @@ async fn drain_inbox_on_stop(ctx: &EsLoop) {
     drop(inbox);
     // Entries stay queued: restart reopens the inbox and redelivery
     // resumes from the cursor. (Graceful stop flushes to the DLQ — Phase 8.)
+}
+
+/// The service actor loop: pop → decode → dispatch (async, impure) →
+/// drop the message. No journal, no cursor — service actors are at-most-once
+/// by design (Phase 8 adds supervision around this loop).
+pub async fn service_actor_loop(loop_ctx: ServiceLoop, mut shutdown: watch::Receiver<bool>) {
+    loop {
+        if *shutdown.borrow_and_update() {
+            break;
+        }
+        match step_service(&loop_ctx).await {
+            Step::Work => continue,
+            Step::Idle => {}
+            Step::Crashed => break,
+        }
+        let notified = loop_ctx.es.cell.work.notified();
+        tokio::select! {
+            _ = shutdown.changed() => {}
+            _ = notified => {}
+            _ = tokio::time::sleep(std::time::Duration::from_millis(20)) => {}
+        }
+    }
+    drain_inbox_on_stop(&loop_ctx.es).await;
+}
+
+/// Everything one running service loop needs.
+#[derive(Clone)]
+pub struct ServiceLoop {
+    /// The ES-shaped plumbing the service loop shares (routing, cell).
+    pub es: EsLoop,
+}
+
+/// One service step: peek → decode (sync) → dispatch (async) → ack.
+///
+/// Service messages are consumed on HANDOFF (ack before dispatch): there is
+/// no journal to replay from, so redelivery after a crash would re-run
+/// side effects — at-most-once semantics are the honest contract here.
+async fn step_service(ctx: &ServiceLoop) -> Step {
+    // 1. PEEK the envelope.
+    let envelope = {
+        let mut inbox = ctx.es.cell.inbox.lock().await;
+        inbox.peek().cloned()
+    };
+    let Some(envelope) = envelope else {
+        return Step::Idle;
+    };
+
+    // 2. FIND the message entry.
+    let entry = {
+        let kernel = ctx.es.kernel.lock().expect("kernel lock");
+        kernel
+            .msg_entries
+            .get(&ctx.es.path)
+            .and_then(|entries| {
+                entries.iter().find(|e| e.schema() == envelope.schema).cloned()
+            })
+    };
+    let Some(entry) = entry else {
+        dead_letter(&ctx.es.kernel, &envelope, "unknown schema");
+        ctx.es.cell.inbox.lock().await.ack();
+        return Step::Work;
+    };
+
+    // 3. DECODE (sync — decode failures dead-letter cleanly).
+    let payload = envelope.as_json().cloned().unwrap_or(serde_json::Value::Null);
+    let decoded = match entry.decode(&payload) {
+        Ok(msg) => msg,
+        Err(report) => {
+            let reason = format!("{report}");
+            dead_letter(&ctx.es.kernel, &envelope, &reason);
+            ctx.es.cell.inbox.lock().await.ack();
+            return Step::Work;
+        }
+    };
+
+    // 4. CONSUME (ack) — at-most-once handoff to the handler.
+    ctx.es.cell.inbox.lock().await.ack();
+
+    // 5. DISPATCH (async, impure) — spawned so handler panics surface as a
+    // JoinHandle error instead of tearing down the loop task itself; the
+    // loop awaits the handle, so one actor still processes one message at
+    // a time (its inbox serializes).
+    let path = ctx.es.path.clone();
+    let service = {
+        let kernel = ctx.es.kernel.lock().expect("kernel lock");
+        kernel
+            .services
+            .get(&path)
+            .cloned()
+            .expect("service present for a running loop")
+    };
+    let view = ctx.es.view.clone();
+    let entry = entry.clone();
+    let ask_port = KernelAskPort {
+        registry: ctx.es.registry.clone(),
+        kernel: ctx.es.kernel.clone(),
+        clock: ctx.es.clock.clone(),
+    };
+    let (outbox_tx, outbox_rx) = tokio::sync::oneshot::channel();
+    let trace = envelope.trace;
+    let reply_to = envelope.reply_to.clone();
+    let handle = tokio::spawn(async move {
+        let mut outbox = Outbox::new();
+        let mut msg_ctx = crate::context::MsgCtx::new(
+            &path,
+            &trace,
+            reply_to.as_ref(),
+            view.as_ref(),
+            &mut outbox,
+            Some(&ask_port),
+        );
+        let mut service = service.lock().await;
+        entry
+            .dispatch(service.as_mut(), decoded, &mut msg_ctx)
+            .await;
+        let _ = outbox_tx.send(outbox);
+    });
+    let outbox = if handle.await.is_err() {
+        // Handler panicked: mark crashed (supervision restarts via `start`).
+        let mut kernel = ctx.es.kernel.lock().expect("kernel lock");
+        kernel.crashed.insert(ctx.es.path.clone());
+        return Step::Crashed;
+    } else {
+        outbox_rx.await.unwrap_or_default()
+    };
+
+    // 6. FLUSH deferred effects from the handler.
+    flush_outbox(&ctx.es, outbox).await;
+    Step::Work
 }
 
 /// Restarts a crashed ES actor (spec algorithm):
@@ -524,5 +828,3 @@ fn capacity_hint() -> usize {
     64
 }
 
-#[allow(dead_code)]
-fn silence_dispatch_error_import(_: &DispatchError) {}

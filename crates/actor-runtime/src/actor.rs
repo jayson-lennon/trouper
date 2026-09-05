@@ -91,13 +91,6 @@ pub trait ServiceActor: Send + 'static {
     ) -> impl Future<Output = Result<Self, error_stack::Report<crate::registry::RegistryError>>> + Send
     where
         Self: Sized;
-
-    /// Handles one erased message (the adapter decodes before calling).
-    fn handle_erased(
-        &mut self,
-        msg: &(dyn std::any::Any + Send),
-        ctx: &mut crate::context::MsgCtx<'_>,
-    ) -> impl Future<Output = ()> + Send;
 }
 
 /// Typed sugar for service actors, mirroring [`CommandHandler`].
@@ -709,5 +702,126 @@ mod tests {
 
         // Then it is an empty decision.
         assert!(events.is_empty());
+    }
+}
+
+/// The object-safe service shell the kernel drives: one erased instance.
+/// NOT journaled — restart constructs a fresh instance via
+/// [`ServiceActor::start`]. Dispatch runs through a [`MsgEntry`] adapter,
+/// which downcasts the shell and the decoded message by type.
+pub trait DynServiceActor: std::any::Any + Send {}
+
+/// Concrete `DynServiceActor` for a typed service `A`.
+pub struct TypedServiceState<A: ServiceActor> {
+    /// The live service instance.
+    pub state: A,
+}
+
+impl<A: ServiceActor> TypedServiceState<A> {
+    /// Wraps a started service instance.
+    pub fn new(state: A) -> Self {
+        Self { state }
+    }
+}
+
+impl<A: ServiceActor> DynServiceActor for TypedServiceState<A> {}
+
+/// The object-safe async message dispatch routed by [`SchemaId`].
+pub trait MsgEntry: Send + Sync {
+    /// The message schema this entry decodes.
+    fn schema(&self) -> SchemaId;
+
+    /// Decodes the JSON payload into a boxed `Any` of the handler's type
+    /// (the DECODE side runs sync so decode failures dead-letter cleanly).
+    ///
+    /// # Errors
+    ///
+    /// [`DispatchError::Decode`] when the payload does not match.
+    fn decode(
+        &self,
+        payload: &JsonValue,
+    ) -> Result<Box<dyn std::any::Any + Send>, error_stack::Report<DispatchError>>;
+
+    /// Runs the typed handler against the boxed message (consumes it).
+    fn dispatch<'a>(
+        &'a self,
+        state: &'a mut dyn DynServiceActor,
+        msg: Box<dyn std::any::Any + Send>,
+        ctx: &'a mut crate::context::MsgCtx<'_>,
+    ) -> std::pin::Pin<Box<dyn Future<Output = ()> + Send + 'a>>;
+}
+
+/// Generic adapter: erases `A`'s handler for message type `M`.
+pub struct TypedServiceAdapter<A, M> {
+    schema: SchemaId,
+    _actor: std::marker::PhantomData<fn(&A)>,
+    _msg: std::marker::PhantomData<fn(&M)>,
+}
+
+impl<A: ServiceActor, M> TypedServiceAdapter<A, M> {
+    /// Creates the adapter for message schema `S`.
+    pub fn new<S: Schema>() -> Self {
+        Self {
+            schema: S::schema_id(),
+            _actor: std::marker::PhantomData,
+            _msg: std::marker::PhantomData,
+        }
+    }
+}
+
+impl<A, M> MsgEntry for TypedServiceAdapter<A, M>
+where
+    A: ServiceActor + MsgHandler<M>,
+    M: DeserializeOwned + Send + 'static,
+{
+    fn schema(&self) -> SchemaId {
+        self.schema.clone()
+    }
+
+    fn decode(
+        &self,
+        payload: &JsonValue,
+    ) -> Result<Box<dyn std::any::Any + Send>, error_stack::Report<DispatchError>> {
+        use error_stack::ResultExt;
+        let msg: M = serde_json::from_value(payload.clone())
+            .change_context(DispatchError::Decode(format!(
+                "message {} did not match its schema",
+                self.schema
+            )))?;
+        Ok(Box::new(msg))
+    }
+
+    fn dispatch<'a>(
+        &'a self,
+        state: &'a mut dyn DynServiceActor,
+        msg: Box<dyn std::any::Any + Send>,
+        ctx: &'a mut crate::context::MsgCtx<'_>,
+    ) -> std::pin::Pin<Box<dyn Future<Output = ()> + Send + 'a>> {
+        Box::pin(async move {
+            let typed = state
+                .as_any_service_mut::<A>()
+                .expect("service adapter/type mismatch — kernel bug");
+            let msg = match msg.downcast::<M>() {
+                Ok(msg) => *msg,
+                Err(_) => panic!("service message type mismatch — kernel bug"),
+            };
+            typed.state.handle(msg, ctx).await;
+        })
+    }
+}
+
+/// Downcast seam for the service shell (generic: the adapter knows `A`).
+pub trait ServiceAny {
+    /// The live instance as `&mut TypedServiceState<A>`, when it is one.
+    fn as_any_service_mut<A: ServiceActor>(
+        &mut self,
+    ) -> Option<&mut TypedServiceState<A>>;
+}
+
+impl ServiceAny for dyn DynServiceActor {
+    fn as_any_service_mut<A: ServiceActor>(
+        &mut self,
+    ) -> Option<&mut TypedServiceState<A>> {
+        (self as &mut dyn std::any::Any).downcast_mut::<TypedServiceState<A>>()
     }
 }

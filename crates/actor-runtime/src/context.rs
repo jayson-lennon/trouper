@@ -11,6 +11,7 @@
 //! handler can never deadlock the kernel.
 
 use crate::envelope::{Address, Envelope, TraceCtx};
+use crate::kernel::AskOutcome;
 use crate::types::{Path, SchemaId, Timestamp, Topic};
 use serde_json::Value as JsonValue;
 
@@ -35,6 +36,17 @@ pub enum Intent {
     Send(Envelope),
     /// A publish onto a topic.
     Publish { topic: Topic, envelope: Envelope },
+    /// A reply to the message being handled (address = its reply_to).
+    Reply {
+        /// The reply address copied from the incoming envelope.
+        to: Address,
+        /// The reply schema (tracing) — may be the request's schema id.
+        schema: SchemaId,
+        /// The reply payload.
+        payload: JsonValue,
+        /// The trace of the message being replied to (causality links).
+        trace: TraceCtx,
+    },
 }
 
 /// Effects recorded by a handler, flushed by the kernel after ack.
@@ -52,6 +64,16 @@ impl Outbox {
     /// Records a send intent.
     pub fn push_send(&mut self, envelope: Envelope) {
         self.intents.push(Intent::Send(envelope));
+    }
+
+    /// Records a reply intent (resolved by the kernel at flush time).
+    pub fn push_reply(&mut self, to: Address, schema: SchemaId, payload: JsonValue, trace: TraceCtx) {
+        self.intents.push(Intent::Reply {
+            to,
+            schema,
+            payload,
+            trace,
+        });
     }
 
     /// Records a publish intent.
@@ -174,11 +196,59 @@ impl CmdCtx<'_> {
     }
 }
 
+/// The impure syscall port a service actor's [`MsgCtx`] carries: opens
+/// reply leases, routes envelopes, reads the clock. The system implements
+/// it; tests swap it (like [`RuntimeView`]).
+pub trait AskPort: Send + Sync {
+    /// Sends an envelope with a freshly opened reply lease; returns the
+    /// lease id and receiver (the asker awaits the receiver under its
+    /// timeout; the id lets the settle path drop the lease).
+    fn ask_channel(
+        &self,
+        dest: Address,
+        schema: SchemaId,
+        payload: JsonValue,
+        ttl: std::time::Duration,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<
+                    Output = Result<
+                        (crate::types::LeaseId, tokio::sync::oneshot::Receiver<JsonValue>),
+                        error_stack::Report<AskError>,
+                    >,
+                > + Send,
+        >,
+    >;
+
+    /// Records an ask-settled outcome and drops the lease (a settled or
+    /// timed-out ask must not leak its slot).
+    fn ask_settled(
+        &self,
+        lease: crate::types::LeaseId,
+        dest: Address,
+        outcome: AskOutcome,
+        trace: TraceCtx,
+    );
+}
+
+/// Errors surfaced by `ctx.ask`.
+#[derive(Debug, wherror::Error)]
+#[error(debug)]
+pub enum AskError {
+    /// The destination did not resolve.
+    Unresolved(String),
+}
+
 /// Context for service-actor handlers: async, impure by design.
 ///
-/// `ask` and `subscribe` are added when the reply-lease table and topic
-/// pumps exist (Phases 5–6); the sync surface matches [`CmdCtx`].
-pub struct MsgCtx<'a>(pub CtxCore<'a>);
+/// The sync surface matches [`CmdCtx`]; `ask` is exclusive to this tier —
+/// an event-sourced decision function cannot await.
+pub struct MsgCtx<'a> {
+    pub core: CtxCore<'a>,
+    /// The impure port (leases + routing); absent only in pure tests that
+    /// never ask.
+    pub port: Option<&'a dyn AskPort>,
+}
 
 impl MsgCtx<'_> {
     /// Assembles the context for one message dispatch.
@@ -188,14 +258,62 @@ impl MsgCtx<'_> {
         reply_to: Option<&'ctx Address>,
         view: &'ctx dyn RuntimeView,
         outbox: &'ctx mut Outbox,
+        port: Option<&'ctx dyn AskPort>,
     ) -> MsgCtx<'ctx> {
-        MsgCtx(CtxCore {
-            self_path,
-            trace,
-            reply_to,
-            view,
-            outbox,
-        })
+        MsgCtx {
+            core: CtxCore {
+                self_path,
+                trace,
+                reply_to,
+                view,
+                outbox,
+            },
+            port,
+        }
+    }
+
+    /// THE ask: send a request and await its reply, with a MANDATORY
+    /// timeout. Exclusive to service actors — an ES decision function is
+    /// sync and cannot await (AC5).
+    ///
+    /// The timeout produces an [`AskOutcome::Timeout`] fact; the reply
+    /// lease dies with it, so a late reply lands nowhere.
+    pub async fn ask(
+        &mut self,
+        dest: Address,
+        schema: SchemaId,
+        payload: JsonValue,
+        timeout: std::time::Duration,
+    ) -> Result<JsonValue, error_stack::Report<AskError>> {
+        use error_stack::ResultExt;
+        let port = self.port.expect("ask requires a port (service tier)");
+        let trace = self.core.trace.clone();
+        let dest_label = format!("{dest:?}");
+        let (lease, mut receiver) = port
+            .ask_channel(dest.clone(), schema, payload, timeout)
+            .await
+            .change_context(AskError::Unresolved(format!("{dest:?}")))?;
+        let outcome = match tokio::time::timeout(timeout, &mut receiver).await {
+            Ok(Ok(reply)) => Some((AskOutcome::Replied, reply)),
+            Ok(Err(_)) => Some((AskOutcome::Failed, JsonValue::Null)),
+            Err(_) => None,
+        };
+        match outcome {
+            Some((AskOutcome::Replied, reply)) => {
+                port.ask_settled(lease, dest, AskOutcome::Replied, trace);
+                Ok(reply)
+            }
+            Some((outcome, _)) => {
+                port.ask_settled(lease, dest, outcome, trace);
+                Err(error_stack::Report::new(AskError::Unresolved(dest_label)))
+            }
+            None => {
+                // Timed out: drop the lease so a late reply lands nowhere.
+                port.ask_settled(lease, dest, AskOutcome::Timeout, trace);
+                drop(receiver);
+                Err(error_stack::Report::new(AskError::Unresolved(dest_label)))
+            }
+        }
     }
 }
 
@@ -285,6 +403,7 @@ mod tests {
                 assert_eq!(envelope.schema.as_str(), "ReserveStock@1");
             }
             Intent::Publish { .. } => panic!("expected a send"),
+            Intent::Reply { .. } => panic!("expected a send"),
         }
     }
 
@@ -309,6 +428,7 @@ mod tests {
                 assert_eq!(envelope.dest, Address::Path(Path::new("client")));
             }
             Intent::Publish { .. } => panic!("expected a send"),
+            Intent::Reply { .. } => panic!("expected a send"),
         }
 
         // When a context without reply-to replies.
@@ -343,7 +463,7 @@ mod tests {
                 assert_eq!(topic.as_str(), "inventory.events");
                 assert_eq!(envelope.trace.trace_id, trace.trace_id);
             }
-            Intent::Send(_) => panic!("expected a publish"),
+            _ => panic!("expected a publish"),
         }
     }
 
@@ -395,10 +515,10 @@ mod tests {
         let trace = TraceCtx::root();
         let mut outbox = Outbox::new();
         let path = Path::new("auditor");
-        let mut ctx = MsgCtx::new(&path, &trace, None, &view, &mut outbox);
+        let mut ctx = MsgCtx::new(&path, &trace, None, &view, &mut outbox, None);
 
         // When it sends.
-        ctx.0.send(Address::Path(Path::new("b")), SchemaId::new("Ping", 1), serde_json::json!({}), None);
+        ctx.core.send(Address::Path(Path::new("b")), SchemaId::new("Ping", 1), serde_json::json!({}), None);
 
         // Then the effect is deferred identically.
         assert_eq!(outbox.len(), 1);

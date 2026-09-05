@@ -15,6 +15,7 @@ pub mod inbox;
 pub mod journal;
 pub mod kernel;
 pub mod registry;
+pub mod reply;
 pub mod schema;
 pub mod supervision;
 pub mod system;

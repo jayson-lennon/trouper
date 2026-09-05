@@ -10,7 +10,10 @@ use std::sync::{Arc, Mutex};
 
 use serde_json::Value as JsonValue;
 
-use crate::actor::{CommandEntry, EventSourced, TypedEsState};
+use crate::actor::{
+    CommandEntry, DynServiceActor, EventSourced, MsgEntry, ServiceActor, TypedEsState,
+    TypedServiceState,
+};
 use crate::clock::{ClockService, SystemClock};
 use crate::context::RuntimeView;
 use crate::envelope::{Address, Envelope, TraceCtx};
@@ -60,6 +63,11 @@ pub struct ActorSystem {
 }
 
 impl ActorSystem {
+    /// The system dead-letter topic, created at boot.
+    pub fn deadletter_topic() -> crate::types::Topic {
+        crate::types::Topic::new("system.deadletters")
+    }
+
     /// Creates a system on the wall clock.
     pub fn new() -> Self {
         Self::with_clock(ClockService::new(Arc::new(SystemClock::new())))
@@ -158,9 +166,84 @@ impl ActorSystem {
             registry: self.registry.clone(),
             kernel: self.kernel.clone(),
             view: self.view.clone(),
+            clock: self.clock.clone(),
         };
         let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
         loop_ctx.start(rx, shutdown_rx);
+    }
+
+    /// Spawns a service (edge) actor at `path`: async handlers, I/O and
+    /// `ask` allowed, NOT journaled (at-most-once message semantics).
+    pub fn spawn_service<A, F>(self: &Arc<Self>, path: Path, args: &JsonValue, opts: SpawnOpts, entries: F)
+    where
+        A: ServiceActor,
+        F: FnOnce() -> Vec<Arc<dyn MsgEntry>>,
+    {
+        // `A::start` is async (I/O allowed); block briefly on a runtime
+        // thread is not done — spawn the start inside the actor task and
+        // register the slot immediately so senders never see a gap.
+        let (tx, rx) = tokio::sync::mpsc::channel::<Envelope>(opts.mailbox_capacity.max(1) * 2);
+        {
+            let mut registry = self.registry.lock().expect("registry lock");
+            registry
+                .insert_slot(path.clone(), A::manifest(), Endpoint::new(tx))
+                .expect("path free at spawn");
+        }
+        let mut kernel = self.kernel.lock().expect("kernel lock");
+        let cell = Arc::new(ActorCell::new(
+            path.clone(),
+            Inbox::new(opts.mailbox_capacity.max(1), opts.mailbox_policy),
+        ));
+        kernel.cells.insert(path.clone(), cell.clone());
+        kernel.genesis_args.insert(path.clone(), args.clone());
+        kernel.msg_entries.insert(path.clone(), entries());
+        drop(kernel);
+
+        let loop_ctx = EsLoop {
+            path: path.clone(),
+            cell: cell.clone(),
+            registry: self.registry.clone(),
+            kernel: self.kernel.clone(),
+            view: self.view.clone(),
+            clock: self.clock.clone(),
+        };
+        let started_path = path.clone();
+        let view = self.view.clone();
+        let registry = self.registry.clone();
+        let kernel_table = self.kernel.clone();
+        let start_args = args.clone();
+        let front_cell = cell.clone();
+        let front_kernel = self.kernel.clone();
+        tokio::spawn(async move {
+            // Start the instance inside the task; a start failure leaves
+            // the slot present (senders get a closed door) and the crash
+            // recorded for supervision.
+            let started = A::start(&start_args).await;
+            match started {
+                Ok(instance) => {
+                    let mut kernel = kernel_table.lock().expect("kernel lock");
+                    kernel.services.insert(
+                        started_path.clone(),
+                        Arc::new(tokio::sync::Mutex::new(Box::new(
+                            TypedServiceState::new(instance),
+                        ) as Box<dyn DynServiceActor>)),
+                    );
+                }
+                Err(report) => {
+                    let mut kernel = kernel_table.lock().expect("kernel lock");
+                    kernel.crashed.insert(started_path.clone());
+                    let _ = report;
+                }
+            }
+            let _ = (&view, &registry);
+            let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+            tokio::spawn(crate::kernel::front_door_loop(front_cell, front_kernel, rx));
+            crate::kernel::service_actor_loop(
+                crate::kernel::ServiceLoop { es: loop_ctx },
+                shutdown_rx,
+            )
+            .await;
+        });
     }
 
     /// Convenience: spawn with typed adapters for each handled command.
@@ -227,6 +310,7 @@ impl ActorSystem {
             registry: self.registry.clone(),
             kernel: self.kernel.clone(),
             view: self.view.clone(),
+            clock: self.clock.clone(),
         };
         crate::kernel::restart_es(&ctx, genesis_args).await
     }
@@ -300,7 +384,7 @@ impl Default for ActorSystem {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::actor::{CommandHandler, TypedEsAdapter};
+    use crate::actor::{CommandHandler, MsgHandler, TypedEsAdapter, TypedServiceAdapter};
     use crate::context::CmdCtx;
     use crate::schema::{ActorManifest, FieldDef, FieldTy, SchemaDef, SchemaKind};
     use crate::types::ActorKind;
@@ -323,7 +407,10 @@ mod tests {
         }
     }
 
-    struct Added;
+    #[derive(serde::Deserialize)]
+    struct Added {
+        n: i64,
+    }
     impl Schema for Added {
         fn schema_def() -> SchemaDef {
             SchemaDef {
@@ -545,6 +632,401 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(2)).await;
         }
         panic!("actor never crashed");
+    }
+
+    /// A service actor appending to a shared sink (impure by design).
+    /// `start` receives JSON args, so the test passes the sink through a
+    /// well-known args key serialized as a slot index into a static table.
+    static SINKS: std::sync::OnceLock<Mutex<Vec<Arc<Mutex<Vec<String>>>>>> =
+        std::sync::OnceLock::new();
+
+    fn sinks() -> &'static Mutex<Vec<Arc<Mutex<Vec<String>>>>> {
+        SINKS.get_or_init(|| Mutex::new(Vec::new()))
+    }
+
+    fn open_sink() -> (usize, Arc<Mutex<Vec<String>>>) {
+        let sink = Arc::new(Mutex::new(Vec::new()));
+        let mut all = sinks().lock().expect("sinks lock");
+        all.push(sink.clone());
+        (all.len() - 1, sink)
+    }
+
+    struct Auditor {
+        sink: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl ServiceActor for Auditor {
+        fn manifest() -> ActorManifest {
+            ActorManifest::new()
+                .handles::<Add>()
+                .kind(ActorKind::Service)
+        }
+
+        async fn start(
+            args: &JsonValue,
+        ) -> Result<Self, error_stack::Report<crate::registry::RegistryError>> {
+            let idx = args["sink"].as_u64().expect("sink index") as usize;
+            let sink = sinks().lock().expect("sinks lock")[idx].clone();
+            Ok(Self { sink })
+        }
+
+    }
+
+    impl MsgHandler<Add> for Auditor {
+        async fn handle(&mut self, msg: Add, _ctx: &mut crate::context::MsgCtx<'_>) {
+            self.sink.lock().expect("sink lock").push(format!("n={}", msg.n));
+        }
+    }
+
+    #[tokio::test]
+    async fn service_actor_receives_typed_messages_impurely() {
+        // Given a system and an Auditor service with a shared test sink.
+        let system = Arc::new(ActorSystem::new());
+        let (sink_idx, sink) = open_sink();
+        let path = Path::new("auditor");
+        system.spawn_service::<Auditor, _>(
+            path.clone(),
+            &json!({ "sink": sink_idx }),
+            SpawnOpts::default(),
+            || vec![Arc::new(TypedServiceAdapter::<Auditor, Add>::new::<Add>())],
+        );
+
+        // When an Add message is sent to it.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        system
+            .send(system.envelope(Add::schema_id(), path.clone(), json!({ "n": 7 })))
+            .await
+            .expect("delivered");
+
+        // Then the handler ran (impure side effect recorded).
+        for _ in 0..2_000 {
+            if sink.lock().expect("sink lock").as_slice() == ["n=7"] {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+        }
+        panic!("service handler never ran");
+    }
+
+    #[tokio::test]
+    async fn ask_settles_replied_when_the_callee_answers_the_slot() {
+        // Given a callee that replies to whatever asks it, and an asker
+        // service that calls ctx.ask on it.
+        let system = Arc::new(ActorSystem::new());
+        system.register_schema::<Add>();
+
+        static RESULTS: std::sync::OnceLock<Mutex<Vec<String>>> = std::sync::OnceLock::new();
+        let results = RESULTS.get_or_init(|| Mutex::new(Vec::new()));
+
+        struct Echo;
+        impl ServiceActor for Echo {
+            fn manifest() -> ActorManifest {
+                ActorManifest::new()
+                    .handles::<Add>()
+                    .kind(ActorKind::Service)
+            }
+            async fn start(
+                _args: &JsonValue,
+            ) -> Result<Self, error_stack::Report<crate::registry::RegistryError>> {
+                Ok(Self)
+            }
+        }
+        impl MsgHandler<Add> for Echo {
+            async fn handle(&mut self, msg: Add, ctx: &mut crate::context::MsgCtx<'_>) {
+                if let Some(reply_to) = ctx.core.reply_to {
+                    ctx.core.outbox.push_reply(
+                        reply_to.clone(),
+                        Add::schema_id(),
+                        json!({ "echo": msg.n }),
+                        ctx.core.trace.clone(),
+                    );
+                }
+            }
+        }
+
+        struct Asker;
+        impl ServiceActor for Asker {
+            fn manifest() -> ActorManifest {
+                ActorManifest::new()
+                    .handles::<Boom>()
+                    .kind(ActorKind::Service)
+            }
+            async fn start(
+                _args: &JsonValue,
+            ) -> Result<Self, error_stack::Report<crate::registry::RegistryError>> {
+                Ok(Self)
+            }
+        }
+        impl MsgHandler<Boom> for Asker {
+            async fn handle(&mut self, _msg: Boom, ctx: &mut crate::context::MsgCtx<'_>) {
+                let reply = ctx
+                    .ask(
+                        Address::Path(Path::new("echo")),
+                        Add::schema_id(),
+                        json!({ "n": 21 }),
+                        std::time::Duration::from_secs(2),
+                    )
+                    .await;
+                let recorded = RESULTS
+                    .get_or_init(|| Mutex::new(Vec::new()));
+                match reply {
+                    Ok(value) => recorded
+                        .lock()
+                        .expect("results lock")
+                        .push(format!("replied:{}", value["echo"])),
+                    Err(_) => recorded.lock().expect("results lock").push("failed".to_owned()),
+                }
+            }
+        }
+
+        system.spawn_service::<Echo, _>(
+            Path::new("echo"),
+            &json!({}),
+            SpawnOpts::default(),
+            || vec![Arc::new(TypedServiceAdapter::<Echo, Add>::new::<Add>())],
+        );
+        system.spawn_service::<Asker, _>(
+            Path::new("asker"),
+            &json!({}),
+            SpawnOpts::default(),
+            || vec![Arc::new(TypedServiceAdapter::<Asker, Boom>::new::<Boom>())],
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        // When the asker asks the echo.
+        system
+            .send(system.envelope(Boom::schema_id(), Path::new("asker"), json!({ "why": "ask" })))
+            .await
+            .expect("delivered");
+
+        // Then the ask settles as Replied with the echo's payload.
+        for _ in 0..2_000 {
+            if results.lock().expect("lock").as_slice() == ["replied:21"] {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+        }
+        panic!("ask never settled as replied: {:?}", results.lock().unwrap());
+    }
+
+    #[tokio::test]
+    async fn ask_settles_timeout_when_the_callee_never_replies() {
+        // Given a silent callee and an asker with a short timeout.
+        let system = Arc::new(ActorSystem::new());
+        system.register_schema::<Add>();
+
+        static RESULTS: std::sync::OnceLock<Mutex<Vec<String>>> = std::sync::OnceLock::new();
+        let results = RESULTS.get_or_init(|| Mutex::new(Vec::new()));
+
+        struct Silent;
+        impl ServiceActor for Silent {
+            fn manifest() -> ActorManifest {
+                ActorManifest::new()
+                    .handles::<Add>()
+                    .kind(ActorKind::Service)
+            }
+            async fn start(
+                _args: &JsonValue,
+            ) -> Result<Self, error_stack::Report<crate::registry::RegistryError>> {
+                Ok(Self)
+            }
+        }
+        impl MsgHandler<Add> for Silent {
+            async fn handle(&mut self, _msg: Add, _ctx: &mut crate::context::MsgCtx<'_>) {}
+        }
+
+        struct Asker;
+        impl ServiceActor for Asker {
+            fn manifest() -> ActorManifest {
+                ActorManifest::new()
+                    .handles::<Boom>()
+                    .kind(ActorKind::Service)
+            }
+            async fn start(
+                _args: &JsonValue,
+            ) -> Result<Self, error_stack::Report<crate::registry::RegistryError>> {
+                Ok(Self)
+            }
+        }
+        impl MsgHandler<Boom> for Asker {
+            async fn handle(&mut self, _msg: Boom, ctx: &mut crate::context::MsgCtx<'_>) {
+                let reply = ctx
+                    .ask(
+                        Address::Path(Path::new("silent")),
+                        Add::schema_id(),
+                        json!({ "n": 1 }),
+                        std::time::Duration::from_millis(50),
+                    )
+                    .await;
+                let recorded = RESULTS.get_or_init(|| Mutex::new(Vec::new()));
+                recorded
+                    .lock()
+                    .expect("lock")
+                    .push(if reply.is_ok() { "replied" } else { "timed-out" }.to_owned());
+            }
+        }
+
+        system.spawn_service::<Silent, _>(
+            Path::new("silent"),
+            &json!({}),
+            SpawnOpts::default(),
+            || vec![Arc::new(TypedServiceAdapter::<Silent, Add>::new::<Add>())],
+        );
+        system.spawn_service::<Asker, _>(
+            Path::new("asker"),
+            &json!({}),
+            SpawnOpts::default(),
+            || vec![Arc::new(TypedServiceAdapter::<Asker, Boom>::new::<Boom>())],
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        // When the asker asks the silent callee.
+        system
+            .send(system.envelope(Boom::schema_id(), Path::new("asker"), json!({ "why": "ask" })))
+            .await
+            .expect("delivered");
+
+        // Then the ask settles as a timeout (and the lease is gone).
+        for _ in 0..2_000 {
+            if results.lock().expect("lock").as_slice() == ["timed-out"] {
+                let kernel = system.kernel.lock().expect("lock");
+                assert!(kernel.replies.is_empty(), "lease leaked after timeout");
+                assert!(!kernel.ask_facts.is_empty(), "no ask facts recorded");
+                assert!(kernel
+                    .ask_facts
+                    .iter()
+                    .any(|f| f.outcome == Some(crate::kernel::AskOutcome::Timeout)));
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+        }
+        panic!("ask never timed out: {:?}", results.lock().unwrap());
+    }
+
+    #[tokio::test]
+    async fn ask_over_a_durable_path_continues_as_an_ordinary_message() {
+        // Given an ES counter whose Add handler REPLIES to a reply-to
+        // PATH (not a slot): the reply continues as a normal envelope.
+        let system = Arc::new(ActorSystem::new());
+        system.register_schema::<Add>();
+        system.register_schema::<Added>();
+
+        static RECEIVED: std::sync::OnceLock<Mutex<Vec<String>>> = std::sync::OnceLock::new();
+        let received = RECEIVED.get_or_init(|| Mutex::new(Vec::new()));
+
+        struct Collector;
+        impl ServiceActor for Collector {
+            fn manifest() -> ActorManifest {
+                ActorManifest::new()
+                    .handles::<Added>()
+                    .kind(ActorKind::Service)
+            }
+            async fn start(
+                _args: &JsonValue,
+            ) -> Result<Self, error_stack::Report<crate::registry::RegistryError>> {
+                Ok(Self)
+            }
+        }
+        impl MsgHandler<Added> for Collector {
+            async fn handle(&mut self, msg: Added, ctx: &mut crate::context::MsgCtx<'_>) {
+                RECEIVED
+                    .get_or_init(|| Mutex::new(Vec::new()))
+                    .lock()
+                    .expect("lock")
+                    .push(format!(
+                        "got n={} from={:?}",
+                        msg.n, ctx.core.trace.causality_id
+                    ));
+            }
+        }
+
+        #[derive(Serialize, Deserialize)]
+        struct Counter {
+            total: i64,
+        }
+        impl EventSourced for Counter {
+            fn manifest() -> ActorManifest {
+                ActorManifest::new()
+                    .handles::<Add>()
+                    .emits::<Added>()
+                    .kind(ActorKind::EventSourced)
+            }
+            fn restore(_args: &JsonValue) -> Self {
+                Self { total: 0 }
+            }
+            fn apply(&mut self, event: &crate::envelope::Event) {
+                if event.schema.as_str() == "Added@1" {
+                    self.total += event.payload["n"].as_i64().unwrap_or(0);
+                }
+            }
+        }
+        impl CommandHandler<Add> for Counter {
+            fn handle(&self, cmd: Add, ctx: &mut CmdCtx<'_>) -> Vec<crate::envelope::Event> {
+                if let Some(reply_to) = ctx.0.reply_to {
+                    ctx.0.send(
+                        reply_to.clone(),
+                        Added::schema_id(),
+                        json!({ "n": cmd.n }),
+                        Some(Address::Path(ctx.0.self_path.clone())),
+                    );
+                }
+                vec![crate::envelope::Event::new(Added::schema_id(), json!({ "n": cmd.n }))]
+            }
+        }
+
+        system.spawn_service::<Collector, _>(
+            Path::new("collector"),
+            &json!({}),
+            SpawnOpts::default(),
+            || vec![Arc::new(TypedServiceAdapter::<Collector, Added>::new::<Added>())],
+        );
+        system.spawn_es::<Counter, _>(
+            Path::new("counter"),
+            &json!({}),
+            SpawnOpts::default(),
+            || vec![Arc::new(TypedEsAdapter::<Counter, Add>::new::<Add>())],
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        // When the counter is told to Add with a reply-to PATH pointing at
+        // the collector (an ask-shaped message, but reply-by-name).
+        let mut envelope = system.envelope(Add::schema_id(), Path::new("counter"), json!({ "n": 5 }));
+        envelope.reply_to = Some(Address::Path(Path::new("collector")));
+        envelope.from = Some(Path::new("collector"));
+        system.send(envelope).await.expect("delivered");
+
+        // Then the collector receives the reply as an ordinary message
+        // (a durable-path continuation — the name survives, no lease).
+        for _ in 0..2_000 {
+            if !received.lock().expect("lock").is_empty() {
+                let got = received.lock().expect("lock")[0].clone();
+                assert!(got.starts_with("got n=5"), "wrong payload: {got}");
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+        }
+        panic!("path continuation never arrived");
+    }
+
+    #[tokio::test]
+    async fn reply_slots_carry_the_mechanism_and_expire_cleanly() {
+        // Given a live reply table with two leases: one short, one long.
+        let system = ActorSystem::new();
+        let kernel = system.kernel.lock().expect("lock");
+        let (short_lease, _short_rx) =
+            kernel.replies.open(std::time::Duration::from_millis(5), system.clock.now());
+        let (long_lease, long_rx) =
+            kernel.replies.open(std::time::Duration::from_secs(60), system.clock.now());
+
+        // When completing the long lease and pruning past the short one.
+        assert!(kernel.replies.complete(&long_lease, json!({ "ok": true })));
+        drop(long_rx);
+        kernel.replies.prune(crate::types::Timestamp::from_millis(system.clock.now().as_millis() + 10));
+
+        // Then the short lease is gone (expired), the long one was
+        // consumed by its reply, and the table is empty — no leaks.
+        assert!(kernel.replies.is_empty(), "lease leaked");
+        assert!(!kernel.replies.complete(&short_lease, json!({})));
     }
 
     #[tokio::test]
