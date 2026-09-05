@@ -2868,6 +2868,142 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn ask_settles_failed_when_the_lease_dies_mid_ask() {
+        // Given a system where a service asker asks a LIVE callee with a
+        // long timeout — but the callee never replies.
+        let (system, _clock) = ActorSystem::test();
+        system.register_schema::<Add>();
+        system.register_schema::<Boom>();
+
+        static RESULTS: std::sync::OnceLock<Mutex<Vec<String>>> = std::sync::OnceLock::new();
+        let results = RESULTS.get_or_init(|| Mutex::new(Vec::new()));
+
+        struct Silent;
+        impl ServiceActor for Silent {
+            fn manifest() -> ActorManifest {
+                ActorManifest::new()
+                    .handles::<Add>()
+                    .kind(ActorKind::Service)
+            }
+            async fn start(
+                _args: &JsonValue,
+            ) -> Result<Self, error_stack::Report<crate::registry::RegistryError>> {
+                Ok(Self)
+            }
+        }
+        impl MsgHandler<Add> for Silent {
+            async fn handle(&mut self, _msg: Add, _ctx: &mut crate::context::MsgCtx<'_>) {}
+        }
+
+        static FAILED_RESULTS: std::sync::OnceLock<Mutex<Vec<String>>> = std::sync::OnceLock::new();
+
+        struct Asker;
+        impl ServiceActor for Asker {
+            fn manifest() -> ActorManifest {
+                ActorManifest::new()
+                    .handles::<Boom>()
+                    .kind(ActorKind::Service)
+            }
+            async fn start(
+                _args: &JsonValue,
+            ) -> Result<Self, error_stack::Report<crate::registry::RegistryError>> {
+                Ok(Self)
+            }
+        }
+        impl MsgHandler<Boom> for Asker {
+            async fn handle(&mut self, _msg: Boom, ctx: &mut crate::context::MsgCtx<'_>) {
+                // Long timeout: the lease is reaped before the asker's own
+                // timeout could fire — isolating the Failed path.
+                let outcome = ctx
+                    .ask(
+                        Address::Path(Path::new("silent")),
+                        Add::schema_id(),
+                        json!({ "n": 1 }),
+                        std::time::Duration::from_secs(30),
+                    )
+                    .await;
+                let settled = match outcome {
+                    Ok(_) => "replied",
+                    Err(_) => "failed",
+                };
+                FAILED_RESULTS
+                    .get_or_init(|| Mutex::new(Vec::new()))
+                    .lock()
+                    .expect("results lock")
+                    .push(settled.to_string());
+            }
+        }
+
+        system.spawn_service::<Silent, _>(
+            Path::new("silent"),
+            &json!({}),
+            SpawnOpts::default(),
+            || vec![Arc::new(TypedServiceAdapter::<Silent, Add>::new::<Add>())],
+        );
+        system.spawn_service::<Asker, _>(
+            Path::new("asker"),
+            &json!({}),
+            SpawnOpts::default(),
+            || vec![Arc::new(TypedServiceAdapter::<Asker, Boom>::new::<Boom>())],
+        );
+        wait_for(|| async {
+            system
+                .tap_facts()
+                .iter()
+                .any(|f| matches!(&f.kind, crate::tap::FactKind::Spawned { path, .. } if *path == Path::new("asker")))
+        })
+        .await;
+        system
+            .send(system.envelope(
+                Boom::schema_id(),
+                Path::new("asker"),
+                json!({ "why": "ask" }),
+            ))
+            .await
+            .expect("delivered");
+
+        // When the asker's lease is reaped by the lease GC sweep (the
+        // same sweep that runs on system maintenance): the slot's sender
+        // drops while the asker still awaits → receiver errs → Failed.
+        wait_for(|| async {
+            let kernel = system.kernel.lock().expect("lock");
+            kernel.replies.len() == 1
+        })
+        .await;
+        // The lease TTL mirrors the ask's 30s timeout: advance the fake
+        // clock past it, then sweep.
+        system
+            .fake_clock()
+            .expect("fake clock")
+            .advance(std::time::Duration::from_secs(31));
+        {
+            let kernel = system.kernel.lock().expect("lock");
+            kernel.replies.prune(crate::types::Timestamp::from_millis(
+                system.clock.now().as_millis(),
+            ));
+        }
+
+        // Then the ask settles as Failed (not Timeout), with an error.
+        let results = FAILED_RESULTS.get_or_init(|| Mutex::new(Vec::new()));
+        for _ in 0..2_000 {
+            if results.lock().expect("lock").as_slice() == ["failed"] {
+                let kernel = system.kernel.lock().expect("lock");
+                assert!(
+                    kernel
+                        .ask_facts
+                        .iter()
+                        .any(|f| f.outcome == Some(crate::kernel::AskOutcome::Failed)),
+                    "Failed fact recorded: {:?}",
+                    kernel.ask_facts
+                );
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+        }
+        panic!("ask never settled as failed: {:?}", results.lock().unwrap());
+    }
+
+    #[tokio::test]
     async fn ask_over_a_durable_path_continues_as_an_ordinary_message() {
         // Given an ES counter whose Add handler REPLIES to a reply-to
         // PATH (not a slot): the reply continues as a normal envelope.
