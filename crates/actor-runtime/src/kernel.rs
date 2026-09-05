@@ -114,6 +114,10 @@ pub struct KernelState {
     pub topic_facts: Vec<crate::topics::TopicPublishFact>,
     /// The global observation ring (drop-oldest).
     pub tap: crate::tap::TapRing,
+    /// Supervised children: path → spec.
+    pub specs: HashMap<Path, crate::supervision::ChildSpec>,
+    /// Sliding-window failure records: path → window.
+    pub failures: HashMap<Path, crate::supervision::FailureWindow>,
 }
 
 impl Default for KernelState {
@@ -134,6 +138,8 @@ impl Default for KernelState {
             topic_logs: HashMap::new(),
             topic_facts: Vec::new(),
             tap: crate::tap::TapRing::new(4096),
+            specs: HashMap::new(),
+            failures: HashMap::new(),
         }
     }
 }
@@ -153,7 +159,7 @@ pub struct ActorHandle {
     /// The kill switch: signaled on graceful stop.
     pub shutdown: watch::Sender<bool>,
     /// The task join handle; aborted on hard remove.
-    pub task: tokio::task::JoinHandle<()>,
+    pub task: Option<tokio::task::JoinHandle<()>>,
 }
 
 /// Everything the runtime owns for one actor across restarts.
@@ -1051,3 +1057,125 @@ fn capacity_hint() -> usize {
     64
 }
 
+
+
+/// The supervision engine: one task per supervised child, awaiting the
+/// child's crash, then applying the spec — policy → budget → backoff →
+/// restart, or stop + escalate.
+pub async fn supervise_child(
+    system: std::sync::Arc<crate::system::ActorSystem>,
+    spec: crate::supervision::ChildSpec,
+    mut shutdown: tokio::sync::watch::Receiver<bool>,
+) {
+    loop {
+        // Wait for this child to crash (or the system to shut down).
+        let mut crashed_seen = false;
+        let watch = async {
+            loop {
+                let crashed = {
+                    let kernel = system.kernel.lock().expect("kernel lock");
+                    kernel.crashed.contains(&spec.path)
+                };
+                if crashed {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        };
+        tokio::select! {
+            _ = watch => { crashed_seen = true; }
+            _ = shutdown.changed() => {
+                if *shutdown.borrow() { return; }
+            }
+        }
+        let _ = crashed_seen;
+
+        // The child crashed. Interpret the spec.
+        let now = system.clock.now().as_millis();
+        let policy = spec.restart;
+        if policy == crate::supervision::RestartPolicy::Never {
+            escalate(&system, &spec, "policy Never (crashed)").await;
+            return;
+        }
+
+        // Budget: record the failure first, then check the window.
+        let budget_exhausted = {
+            let mut kernel = system.kernel.lock().expect("kernel lock");
+            let window = kernel
+                .failures
+                .entry(spec.path.clone())
+                .or_insert_with(crate::supervision::FailureWindow::new);
+            window.record(now);
+            window.prune(now, &spec.budget);
+            window.exhausted(now, &spec.budget)
+        };
+        if budget_exhausted {
+            escalate(&system, &spec, "restart budget exhausted").await;
+            return;
+        }
+
+        // Backoff, then restart through the spec's spawn closure.
+        let consecutive = {
+            let kernel = system.kernel.lock().expect("kernel lock");
+            kernel
+                .failures
+                .get(&spec.path)
+                .map(|w| w.count(now, &spec.budget))
+                .unwrap_or(1) as u32
+        };
+        let delay = spec.backoff.delay(consecutive);
+        tokio::time::sleep(delay).await;
+        // The spawn closure does a FULL spawn (slot insert included);
+        // clear the dead instance's slot first so the path is free.
+        {
+            let mut registry = system.registry.lock().expect("registry lock");
+            let _ = registry.remove_slot(&spec.path);
+        }
+        (spec.spawn)(&system, &spec.path, &spec.args);
+        // The fresh instance is running (the spawn closure re-runs the
+        // loop); clear the stale crash flag so the next wait observes a
+        // NEW crash, not the one we just handled.
+        {
+            let mut kernel = system.kernel.lock().expect("kernel lock");
+            kernel.crashed.remove(&spec.path);
+        }
+    }
+}
+
+/// Stops the child (slot + crash record) and escalates a control message
+/// to the parent (or the system record when parentless). Emits the
+/// Escalated fact.
+async fn escalate(
+    system: &std::sync::Arc<crate::system::ActorSystem>,
+    spec: &crate::supervision::ChildSpec,
+    reason: &str,
+) {
+    {
+        let mut kernel = system.kernel.lock().expect("kernel lock");
+        kernel.crashed.remove(&spec.path);
+        kernel.tap.push(
+            system.clock.now(),
+            crate::tap::FactKind::Escalated {
+                path: spec.path.clone(),
+                reason: reason.to_owned(),
+            },
+        );
+    }
+    // Remove the child's slot (its identity leaves the registry; the
+    // graceful-stop cascade arrives with the stop API in Phase 9).
+    {
+        let mut registry = system.registry.lock().expect("registry lock");
+        let _ = registry.remove_slot(&spec.path);
+    }
+    let message = spec.escalation_message(reason);
+    if let Some(parent) = &spec.parent {
+        system
+            .send(system.envelope(
+                crate::types::SchemaId::new("Escalated", 1),
+                parent.clone(),
+                message,
+            ))
+            .await
+            .ok();
+    }
+}

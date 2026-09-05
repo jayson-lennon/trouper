@@ -54,18 +54,43 @@ impl Default for SpawnOpts {
 /// mutate together.
 pub struct ActorSystem {
     /// Routing table: slots, schemas, routes.
-    registry: Arc<Mutex<Registry>>,
+    pub(crate) registry: Arc<Mutex<Registry>>,
     /// Actor tables: cells, journals, ES state, entries, crashes.
-    kernel: Arc<Mutex<KernelState>>,
-    clock: ClockService,
+    pub(crate) kernel: Arc<Mutex<KernelState>>,
+    pub(crate) clock: ClockService,
     /// The read-only view handed to handler contexts (the system itself).
-    view: Arc<dyn RuntimeView>,
+    pub(crate) view: Arc<dyn RuntimeView>,
+    /// Supervision engine shutdown handles (one per supervised child).
+    child_shutdowns: std::sync::Mutex<Vec<tokio::sync::watch::Sender<bool>>>,
 }
 
 impl ActorSystem {
     /// The system dead-letter topic, created at boot.
     pub fn deadletter_topic() -> crate::types::Topic {
         crate::types::Topic::new("system.deadletters")
+    }
+
+    /// Spawns a supervised child: registers its spec (policy, budget,
+    /// backoff, spawn closure), runs the spawn closure once, and arms the
+    /// supervision engine for crash handling.
+    pub fn spawn_child(self: &Arc<Self>, spec: crate::supervision::ChildSpec) {
+        {
+            let mut kernel = self.kernel.lock().expect("kernel lock");
+            kernel.specs.insert(spec.path.clone(), spec.clone());
+            kernel
+                .failures
+                .insert(spec.path.clone(), crate::supervision::FailureWindow::new());
+        }
+        let engine = self.clone();
+        let engine_spec = spec.clone();
+        let path = spec.path.clone();
+        (spec.spawn)(&engine, &path, &spec.args);
+        let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        self.child_shutdowns
+            .lock()
+            .expect("shutdown lock")
+            .push(_shutdown_tx);
+        tokio::spawn(crate::kernel::supervise_child(engine, engine_spec, shutdown_rx));
     }
 
     /// Creates a system on the wall clock.
@@ -84,6 +109,7 @@ impl ActorSystem {
             kernel: Arc::new(Mutex::new(KernelState::default())),
             clock,
             view,
+            child_shutdowns: std::sync::Mutex::new(Vec::new()),
         }
     }
 
@@ -180,8 +206,17 @@ impl ActorSystem {
             view: self.view.clone(),
             clock: self.clock.clone(),
         };
-        let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
         loop_ctx.start(rx, shutdown_rx);
+        let kernel = self.kernel.lock().expect("kernel lock");
+        if let Some(cell) = kernel.cells.get(&path) {
+            if let Ok(mut handle) = cell.handle.try_lock() {
+                *handle = Some(crate::kernel::ActorHandle {
+                    shutdown: shutdown_tx,
+                    task: None,
+                });
+            }
+        }
     }
 
     /// Spawns a service (edge) actor at `path`: async handlers, I/O and
@@ -406,6 +441,123 @@ impl ActorSystem {
     /// All retained tap facts (inspection/tests).
     pub fn tap_facts(&self) -> Vec<crate::tap::Fact> {
         self.tap_facts_from(0)
+    }
+
+
+    /// Gracefully stops the actor at `path`: children stop first
+    /// (recursive, timeout-bounded), the drain signal lets the current
+    /// message finish, undelivered inbox entries go to the DLQ, and the
+    /// slot + topic subscriptions are removed. Emits a Stopped fact.
+    pub async fn stop(&self, path: &Path) {
+        const STOP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+        self.stop_bounded(path, STOP_TIMEOUT).await;
+    }
+
+    /// The bounded stop; recursion depth bounded by timeout.
+    fn stop_bounded<'a>(
+        &'a self,
+        path: &'a Path,
+        remaining: std::time::Duration,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'a>> {
+        Box::pin(self.stop_bounded_inner(path, remaining))
+    }
+
+    /// The recursive body, boxed by [`Self::stop_bounded`].
+    async fn stop_bounded_inner(&self, path: &Path, remaining: std::time::Duration) {
+        if remaining.is_zero() {
+            return;
+        }
+        // 1. CHILDREN FIRST (recursive): any spec whose parent is this path.
+        let children: Vec<Path> = {
+            let kernel = self.kernel.lock().expect("kernel lock");
+            kernel
+                .specs
+                .values()
+                .filter(|s| s.parent.as_ref() == Some(path))
+                .map(|s| s.path.clone())
+                .collect()
+        };
+        let mut budget = remaining;
+        for child in children {
+            let child_start = std::time::Instant::now();
+            self.stop_bounded(&child, budget).await;
+            budget = budget.saturating_sub(child_start.elapsed());
+            if budget.is_zero() {
+                break;
+            }
+        }
+
+        // 2. DRAIN SIGNAL: stop accepting + let the current message finish.
+        // An edge-only path (no cell — e.g. a supervised spec whose actor
+        // never started) still cascades below.
+        let join_task = {
+            let kernel = self.kernel.lock().expect("kernel lock");
+            let Some(cell) = kernel.cells.get(path) else {
+                // No running instance: drop the spec edge, record the
+                // stop, and finish.
+                drop(kernel);
+                let mut kernel = self.kernel.lock().expect("kernel lock");
+                kernel.specs.remove(path);
+                kernel.tap.push(
+                    self.clock.now(),
+                    crate::tap::FactKind::Stopped {
+                        path: path.clone(),
+                        reason: "graceful".to_owned(),
+                    },
+                );
+                return;
+            };
+            if let Ok(mut handle) = cell.handle.try_lock() {
+                match handle.take() {
+                    Some(h) => {
+                        let _ = h.shutdown.send(true);
+                        h.task
+                    }
+                    None => None,
+                }
+            } else {
+                None
+            }
+        };
+        // 3. AWAIT the loop's exit (current message completes). The loop
+        // drains/flushes on stop.
+        match join_task {
+            Some(task) => {
+                let _ = tokio::time::timeout(remaining, task).await;
+            }
+            None => {}
+        }
+
+        // 4. UNDELIVERED → DLQ; then close the inbox.
+        {
+            let kernel = self.kernel.lock().expect("kernel lock");
+            if let Some(cell) = kernel.cells.get(path) {
+                if let Ok(mut inbox) = cell.inbox.try_lock() {
+                    inbox.close();
+                }
+            }
+        }
+
+        // 5. SLOT DROP + subscription cascade + Stopped fact.
+        {
+            let mut registry = self.registry.lock().expect("registry lock");
+            let _ = registry.remove_slot(path);
+        }
+        {
+            let mut kernel = self.kernel.lock().expect("kernel lock");
+            kernel.cells.remove(path);
+            for log in kernel.topic_logs.values_mut() {
+                log.unsubscribe(path);
+            }
+            kernel.specs.remove(path);
+            kernel.tap.push(
+                self.clock.now(),
+                crate::tap::FactKind::Stopped {
+                    path: path.clone(),
+                    reason: "graceful".to_owned(),
+                },
+            );
+        }
     }
 
     /// The cursor of an actor's inbox (inspection; Phase 10 tests).
@@ -876,6 +1028,240 @@ mod tests {
         assert_eq!(offsets, sorted, "offsets monotonic");
         let last = facts.last().expect("facts").to_json();
         assert!(last["offset"].is_u64());
+    }
+
+
+    #[tokio::test]
+    async fn restart_budget_escalates_to_the_parent() {
+        // Given a supervised counter whose Add handler always panics,
+        // with a budget of 2 restarts per 10 seconds, parent "overseer".
+        #[derive(Serialize, Deserialize, Default)]
+        struct AlwaysBoom;
+        impl EventSourced for AlwaysBoom {
+            fn manifest() -> ActorManifest {
+                ActorManifest::new()
+                    .handles::<Add>()
+                    .kind(ActorKind::EventSourced)
+            }
+            fn restore(_args: &JsonValue) -> Self {
+                Self
+            }
+            fn apply(&mut self, _event: &crate::envelope::Event) {}
+        }
+        impl CommandHandler<Add> for AlwaysBoom {
+            fn handle(&self, _cmd: Add, _ctx: &mut CmdCtx<'_>) -> Vec<crate::envelope::Event> {
+                panic!("always panics");
+            }
+        }
+
+        // The overseer is a service actor whose Escalated control message
+        // lands in its sink via a plain send from the engine.
+        let system = Arc::new(ActorSystem::new());
+        let overseer = Path::new("overseer");
+        bind_sink(&overseer, Arc::new(std::sync::Mutex::new(Vec::new())));
+        struct Overseer;
+        impl ServiceActor for Overseer {
+            fn manifest() -> ActorManifest {
+                ActorManifest::new()
+                    .handles::<Added>()
+                    .kind(ActorKind::Service)
+            }
+            async fn start(_args: &JsonValue) -> Result<Self, error_stack::Report<crate::registry::RegistryError>> {
+                Ok(Self)
+            }
+        }
+        #[derive(serde::Deserialize)]
+        struct EscalatedMsg {
+            escalated: String,
+        }
+        impl Schema for EscalatedMsg {
+            fn schema_def() -> SchemaDef {
+                SchemaDef {
+                    name: "Escalated".into(),
+                    version: 1,
+                    kind: SchemaKind::Command,
+                    fields: vec![FieldDef::required("escalated", FieldTy::Str)],
+                    description: None,
+                }
+            }
+        }
+        impl MsgHandler<EscalatedMsg> for Overseer {
+            async fn handle(&mut self, msg: EscalatedMsg, _ctx: &mut crate::context::MsgCtx<'_>) {
+                SINK_BY_PATH
+                    .get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+                    .lock()
+                    .expect("table")
+                    .get("overseer")
+                    .map(|s| {
+                        s.lock()
+                            .expect("sink lock")
+                            .push(format!("escalated:{}", msg.escalated))
+                    });
+            }
+        }
+        system.spawn_service::<Overseer, _>(
+            overseer.clone(),
+            &json!({}),
+            SpawnOpts::default(),
+            || vec![Arc::new(TypedServiceAdapter::<Overseer, EscalatedMsg>::new::<EscalatedMsg>())],
+        );
+
+        // The child spawns the real counter under a fixed path; the engine
+        // restarts it per the spec.
+        struct ChildSpawner;
+        let worker = Path::new("worker");
+        let spawner = Arc::new(ChildSpawner);
+        let system_for_spec = system.clone();
+        let worker_clone = worker.clone();
+        let spec = crate::supervision::ChildSpec {
+            path: worker.clone(),
+            parent: Some(overseer.clone()),
+            restart: crate::supervision::RestartPolicy::Permanent,
+            budget: crate::supervision::RestartBudget::per(
+                2,
+                std::time::Duration::from_secs(10),
+            ),
+            backoff: crate::supervision::Backoff {
+                base: std::time::Duration::from_millis(5),
+                max: std::time::Duration::from_millis(20),
+                factor: 2.0,
+            },
+            args: json!({}),
+            spawn: Arc::new(move |sys: &Arc<ActorSystem>, path: &Path, args: &JsonValue| {
+                let _ = (&spawner, &system_for_spec);
+                sys.spawn_es::<AlwaysBoom, _>(
+                    path.clone(),
+                    args,
+                    SpawnOpts::default(),
+                    || vec![Arc::new(TypedEsAdapter::<AlwaysBoom, Add>::new::<Add>())],
+                );
+                let _ = &worker_clone;
+            }),
+        };
+        system.spawn_child(spec);
+
+        // When the worker crashes repeatedly inside the window (sends
+        // after escalation failing is EXPECTED — the child is gone).
+        for _ in 0..4 {
+            let _ = system
+                .send(system.envelope(Add::schema_id(), worker.clone(), json!({ "n": 1 })))
+                .await;
+            tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+        }
+        // Then the engine restarted it within budget, then escalated:
+        // poll for the worker's slot removal (the escalation signature).
+        let mut slot_gone = false;
+        for _ in 0..2_000 {
+            slot_gone = {
+                let registry = system.registry.lock().expect("lock");
+                registry.resolve(&worker).is_none()
+            };
+            if slot_gone {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        assert!(slot_gone, "exhausted child's slot was removed");
+        let lines = sink_read(&overseer);
+        assert!(
+            lines.iter().any(|l| l.starts_with("escalated:worker")),
+            "parent received the escalation: {lines:?}"
+        );
+    }
+
+
+    #[tokio::test]
+    async fn graceful_shutdown_stops_children_before_the_parent() {
+        // Given a parent path with a supervised child spec (no running
+        // cell for either: the cascade itself is the behavior under test).
+        let system = Arc::new(ActorSystem::new());
+        let parent = Path::new("parent");
+        let child = Path::new("child");
+        {
+            let mut kernel = system.kernel.lock().expect("lock");
+            kernel.specs.insert(
+                child.clone(),
+                crate::supervision::ChildSpec {
+                    path: child.clone(),
+                    parent: Some(parent.clone()),
+                    restart: crate::supervision::RestartPolicy::Permanent,
+                    budget: crate::supervision::RestartBudget::default(),
+                    backoff: crate::supervision::Backoff::default(),
+                    args: json!({}),
+                    spawn: Arc::new(|_sys: &Arc<ActorSystem>, _path: &Path, _args: &JsonValue| {}),
+                },
+            );
+        }
+
+        // When the parent is stopped gracefully.
+        system.stop(&parent).await;
+
+        // Then the parent's Stopped fact was recorded, and the child
+        // spec was cascaded away with it.
+        let facts = system.tap_facts();
+        let stops: Vec<String> = facts
+            .iter()
+            .filter_map(|f| match &f.kind {
+                crate::tap::FactKind::Stopped { path, .. } => Some(path.to_string()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            stops.iter().any(|p| p == "parent"),
+            "parent stop recorded: {stops:?}"
+        );
+        let child_cascaded = {
+            let kernel = system.kernel.lock().expect("lock");
+            !kernel.specs.contains_key(&child)
+        };
+        assert!(child_cascaded, "child spec cascaded with the parent");
+    }
+
+    #[tokio::test]
+    async fn transient_policy_ignores_normal_exits() {
+        // Given a supervised child spec with Transient restart policy.
+        // The observable: a NORMAL stop must not arm the failure window
+        // (stop() never records failures), so the child stays stopped.
+        let system = Arc::new(ActorSystem::new());
+        let path = Path::new("transient-child");
+        {
+            let mut kernel = system.kernel.lock().expect("lock");
+            kernel.specs.insert(
+                path.clone(),
+                crate::supervision::ChildSpec {
+                    path: path.clone(),
+                    parent: None,
+                    restart: crate::supervision::RestartPolicy::Transient,
+                    budget: crate::supervision::RestartBudget::default(),
+                    backoff: crate::supervision::Backoff::default(),
+                    args: json!({}),
+                    spawn: Arc::new(|_sys: &Arc<ActorSystem>, _path: &Path, _args: &JsonValue| {}),
+                },
+            );
+        }
+
+        // When the child is stopped gracefully (a normal exit).
+        system.stop(&path).await;
+
+        // Then no failure was recorded (the engine arms only on crashes)
+        // and the stop fact says graceful.
+        let stops: Vec<_> = {
+            let kernel = system.kernel.lock().expect("lock");
+            assert!(!kernel.specs.contains_key(&path), "spec removed on stop");
+            kernel
+                .tap
+                .subscribe(0)
+                .1
+                .into_iter()
+                .filter(|f| matches!(&f.kind, crate::tap::FactKind::Stopped { .. }))
+                .collect()
+        };
+        assert_eq!(stops.len(), 1, "exactly one stop fact: {stops:?}");
+        let no_failures = {
+            let kernel = system.kernel.lock().expect("lock");
+            kernel.failures.get(&path).map(|w| w.is_empty()) != Some(false)
+        };
+        assert!(no_failures, "no failure recorded for a normal exit");
     }
 
     #[tokio::test]
