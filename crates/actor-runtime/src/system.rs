@@ -2882,7 +2882,7 @@ mod tests {
         system.register_schema::<Boom>();
 
         static RESULTS: std::sync::OnceLock<Mutex<Vec<String>>> = std::sync::OnceLock::new();
-        let results = RESULTS.get_or_init(|| Mutex::new(Vec::new()));
+        let _results = RESULTS.get_or_init(|| Mutex::new(Vec::new()));
 
         struct Silent;
         impl ServiceActor for Silent {
