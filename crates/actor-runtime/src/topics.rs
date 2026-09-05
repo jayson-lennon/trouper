@@ -206,7 +206,11 @@ mod tests {
         log.append(envelope(0));
 
         // When subscribing with CursorFrom::Latest.
-        let start = log.subscribe(Path::new("watcher"), OverloadPolicy::DropNew, CursorFrom::Latest);
+        let start = log.subscribe(
+            Path::new("watcher"),
+            OverloadPolicy::DropNew,
+            CursorFrom::Latest,
+        );
 
         // Then the cursor starts past the existing entry.
         assert_eq!(start, 1);
@@ -221,7 +225,11 @@ mod tests {
         }
 
         // When subscribing from offset zero (evicted).
-        let start = log.subscribe(Path::new("watcher"), OverloadPolicy::DropNew, CursorFrom::Offset(0));
+        let start = log.subscribe(
+            Path::new("watcher"),
+            OverloadPolicy::DropNew,
+            CursorFrom::Offset(0),
+        );
 
         // Then the cursor clamps to the floor.
         assert_eq!(start, 2);
@@ -234,7 +242,11 @@ mod tests {
         log.append(envelope(0));
         log.append(envelope(1));
         log.append(envelope(2));
-        log.subscribe(Path::new("sub"), OverloadPolicy::DropNew, CursorFrom::Offset(0));
+        log.subscribe(
+            Path::new("sub"),
+            OverloadPolicy::DropNew,
+            CursorFrom::Offset(0),
+        );
 
         // When pumping with a deliver fn that rejects odd payloads.
         let (delivered, skipped) = log.pump_once(|path, envelope, _| {
@@ -260,9 +272,18 @@ mod tests {
         log.append(envelope(0));
         log.append(envelope(1));
         log.append(envelope(2));
-        log.subscribe(Path::new("ahead"), OverloadPolicy::DropNew, CursorFrom::Latest);
-        log.reset_cursor(&Path::new("ahead"), 2).expect("subscribed");
-        log.subscribe(Path::new("behind"), OverloadPolicy::DropNew, CursorFrom::Offset(0));
+        log.subscribe(
+            Path::new("ahead"),
+            OverloadPolicy::DropNew,
+            CursorFrom::Latest,
+        );
+        log.reset_cursor(&Path::new("ahead"), 2)
+            .expect("subscribed");
+        log.subscribe(
+            Path::new("behind"),
+            OverloadPolicy::DropNew,
+            CursorFrom::Offset(0),
+        );
 
         // When pumping with an always-accept deliver.
         let (delivered, _) = log.pump_once(|_, _, _| true);
@@ -278,7 +299,11 @@ mod tests {
         let mut log = TopicLog::new(8);
         log.append(envelope(0));
         log.append(envelope(1));
-        log.subscribe(Path::new("sub"), OverloadPolicy::DropNew, CursorFrom::Offset(0));
+        log.subscribe(
+            Path::new("sub"),
+            OverloadPolicy::DropNew,
+            CursorFrom::Offset(0),
+        );
         log.pump_once(|_, _, _| true);
 
         // When resetting the cursor to offset zero.
@@ -294,9 +319,7 @@ mod tests {
         while log.retained().0 == 0 {
             log.append(envelope(9));
         }
-        let clamped = log
-            .reset_cursor(&Path::new("sub"), 0)
-            .expect("subscribed");
+        let clamped = log.reset_cursor(&Path::new("sub"), 0).expect("subscribed");
         assert_eq!(clamped, log.retained().0);
     }
 
@@ -304,7 +327,11 @@ mod tests {
     fn unsubscribe_removes_the_subscriber() {
         // Given a subscribed path.
         let mut log = TopicLog::new(8);
-        log.subscribe(Path::new("sub"), OverloadPolicy::DropNew, CursorFrom::Latest);
+        log.subscribe(
+            Path::new("sub"),
+            OverloadPolicy::DropNew,
+            CursorFrom::Latest,
+        );
 
         // When unsubscribing.
         let removed = log.unsubscribe(&Path::new("sub"));

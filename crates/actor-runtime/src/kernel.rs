@@ -23,13 +23,13 @@ use std::sync::{Arc, Mutex};
 
 use arc_swap::ArcSwapOption;
 use serde_json::Value as JsonValue;
-use tokio::sync::{mpsc, watch, Notify};
+use tokio::sync::{Notify, mpsc, watch};
 
 use crate::actor::{CommandEntry, DynEsActor, DynServiceActor, MsgEntry};
 use crate::context::{CmdCtx, Outbox, RuntimeView};
+use crate::envelope::Event;
 use crate::envelope::{Address, Envelope, TraceCtx};
 use crate::inbox::Inbox;
-use crate::envelope::Event;
 use crate::journal::{Journal, JournalEntry, JournalError};
 use crate::registry::{Endpoint, Registry};
 use crate::types::{InboxOffset, Path, SchemaId, SeqNo};
@@ -145,13 +145,13 @@ impl Default for KernelState {
 }
 
 /// Emits one fact onto the tap with the given clock's timestamp.
-pub fn emit(tap_clock: &Mutex<KernelState>, clock: &crate::clock::ClockService, kind: crate::tap::FactKind) {
+pub fn emit(
+    tap_clock: &Mutex<KernelState>,
+    clock: &crate::clock::ClockService,
+    kind: crate::tap::FactKind,
+) {
     let ts = clock.now();
-    tap_clock
-        .lock()
-        .expect("kernel lock")
-        .tap
-        .push(ts, kind);
+    tap_clock.lock().expect("kernel lock").tap.push(ts, kind);
 }
 
 /// Kernel-facing handle for one running actor loop.
@@ -303,7 +303,10 @@ async fn deliver_with_retry(endpoint: &Endpoint, envelope: Envelope) -> Result<(
     use tokio::sync::mpsc::error::TrySendError::*;
     match endpoint.try_deliver(envelope.clone()) {
         Ok(()) => Ok(()),
-        Err(Full(envelope)) => endpoint.deliver(envelope).await.map_err(|send_err| send_err.0),
+        Err(Full(envelope)) => endpoint
+            .deliver(envelope)
+            .await
+            .map_err(|send_err| send_err.0),
         Err(Closed(envelope)) => Err(envelope), // the slot's endpoint died mid-restart
     }
 }
@@ -401,12 +404,12 @@ async fn step_es(ctx: &EsLoop) -> Step {
     // 2. FIND the command entry for this schema.
     let entry = {
         let kernel = ctx.kernel.lock().expect("kernel lock");
-        kernel
-            .entries
-            .get(&ctx.path)
-            .and_then(|entries| {
-                entries.iter().find(|e| e.schema() == envelope.schema).cloned()
-            })
+        kernel.entries.get(&ctx.path).and_then(|entries| {
+            entries
+                .iter()
+                .find(|e| e.schema() == envelope.schema)
+                .cloned()
+        })
     };
     let Some(entry) = entry else {
         // Unknown schema: dead-letter and ADVANCE the cursor (the message
@@ -422,7 +425,10 @@ async fn step_es(ctx: &EsLoop) -> Step {
     let dispatch_result = {
         let state = ctx.state().await;
         let mut state = state.lock().await;
-        let payload = envelope.as_json().cloned().unwrap_or(serde_json::Value::Null);
+        let payload = envelope
+            .as_json()
+            .cloned()
+            .unwrap_or(serde_json::Value::Null);
         let mut cmd_ctx = CmdCtx::new(
             &ctx.path,
             &envelope.trace,
@@ -430,10 +436,10 @@ async fn step_es(ctx: &EsLoop) -> Step {
             ctx.view.as_ref(),
             &mut outbox,
         );
-        let r = std::panic::catch_unwind(AssertUnwindSafe(|| {
+
+        std::panic::catch_unwind(AssertUnwindSafe(|| {
             entry.dispatch(state.as_mut(), &payload, &mut cmd_ctx)
-        }));
-        r
+        }))
     };
 
     let events = match dispatch_result {
@@ -470,7 +476,10 @@ async fn step_es(ctx: &EsLoop) -> Step {
     let seqs = {
         let mut kernel = ctx.kernel.lock().expect("kernel lock");
         let journal = kernel.journals.entry(ctx.path.clone()).or_default();
-        let seqs: Vec<_> = events.iter().map(|ev| journal.append_event(ev.clone())).collect();
+        let seqs: Vec<_> = events
+            .iter()
+            .map(|ev| journal.append_event(ev.clone()))
+            .collect();
         (journal.next_seq(), seqs)
     };
 
@@ -569,7 +578,10 @@ impl crate::context::AskPort for KernelAskPort {
         Box<
             dyn Future<
                     Output = Result<
-                        (crate::types::LeaseId, tokio::sync::oneshot::Receiver<JsonValue>),
+                        (
+                            crate::types::LeaseId,
+                            tokio::sync::oneshot::Receiver<JsonValue>,
+                        ),
                         error_stack::Report<crate::context::AskError>,
                     >,
                 > + Send,
@@ -667,12 +679,11 @@ async fn publish_to_topic(
     topic: crate::types::Topic,
     envelope: Envelope,
 ) {
-    // Resolve subscribers once; the pump runs while kernel/registry locks
-    // are NOT held (deliver may await on Block inboxes).
-    let targets: Vec<(Path, std::sync::Arc<Endpoint>, crate::inbox::OverloadPolicy)> = {
+    // Append + collect subscriber endpoints without holding locks across
+    // delivery; pump_once owns per-subscriber cursor/backlog semantics.
+    let targets: Vec<(Path, std::sync::Arc<Endpoint>)> = {
         let mut kernel = kernel.lock().expect("kernel lock");
         let registry = registry.lock().expect("registry lock");
-        // Auto-create the topic log on first publish.
         let log = kernel
             .topic_logs
             .entry(topic.clone())
@@ -681,8 +692,7 @@ async fn publish_to_topic(
         let mut targets = Vec::new();
         for path in log.subscribers() {
             if let Some(endpoint) = registry.resolve(&path) {
-                let policy = registry.inbox_policy(&path);
-                targets.push((path, endpoint, policy));
+                targets.push((path, endpoint));
             }
         }
         kernel.topic_facts.push(crate::topics::TopicPublishFact {
@@ -695,37 +705,28 @@ async fn publish_to_topic(
         kernel.tap.push(
             envelope.trace.causality_id.as_millis_ts(),
             crate::tap::FactKind::TopicPublished {
-                topic,
+                topic: topic.clone(),
                 schema: envelope.schema.clone(),
                 trace: envelope.trace,
             },
         );
         targets
     };
-    for (_path, endpoint, policy) in targets {
-        match deliver_policy(&endpoint, envelope.clone(), policy).await {
-            Ok(()) => {}
-            Err(undeliverable) => dead_letter(kernel, &undeliverable, "subscriber inbox refused"),
-        }
-    }
-}
 
-/// Delivers honoring the subscriber's policy: Block waits for capacity
-/// (a pump MAY wait on one subscriber), DropNew/DropOld refuse fast and
-/// the refusal dead-letters — a slow subscriber never blocks others.
-async fn deliver_policy(
-    endpoint: &Endpoint,
-    envelope: Envelope,
-    policy: crate::inbox::OverloadPolicy,
-) -> Result<(), Envelope> {
-    use tokio::sync::mpsc::error::TrySendError;
-    match (policy, endpoint.try_deliver(envelope)) {
-        (_, Ok(())) => Ok(()),
-        (crate::inbox::OverloadPolicy::Block, Err(TrySendError::Full(env))) => {
-            endpoint.deliver(env).await.map_err(|send_err| send_err.0)
-        }
-        (_, Err(TrySendError::Full(env))) | (_, Err(TrySendError::Closed(env))) => Err(env),
-    }
+    // One pump pass: every subscriber is offered every RETAINED entry
+    // past its own cursor (a reset cursor re-consumes here); only
+    // accepted deliveries advance a cursor — a refused one stays behind
+    // (slow-subscriber isolation, never blocking other subscribers).
+    let mut kernel = kernel.lock().expect("kernel lock");
+    let Some(log) = kernel.topic_logs.get_mut(&topic) else {
+        return;
+    };
+    let _delivered_skipped = log.pump_once(|path, entry, _policy| {
+        let Some((_, endpoint)) = targets.iter().find(|(p, _)| p == path) else {
+            return false;
+        };
+        endpoint.try_deliver(entry.clone()).is_ok()
+    });
 }
 
 /// Resolves one reply: a slot goes straight to the asker's oneshot (the
@@ -795,10 +796,17 @@ async fn fan_out_emits(ctx: &EsLoop, events: &[crate::envelope::Event]) {
 }
 
 /// Takes the between-messages snapshot if the policy asks for one.
-async fn maybe_snapshot(ctx: &EsLoop, (next_seq, seqs): (crate::types::SeqNo, Vec<crate::types::SeqNo>)) {
+async fn maybe_snapshot(
+    ctx: &EsLoop,
+    (next_seq, seqs): (crate::types::SeqNo, Vec<crate::types::SeqNo>),
+) {
     let policy = {
         let kernel = ctx.kernel.lock().expect("kernel lock");
-        kernel.snapshot_policy.get(&ctx.path).copied().unwrap_or_default()
+        kernel
+            .snapshot_policy
+            .get(&ctx.path)
+            .copied()
+            .unwrap_or_default()
     };
     let SnapshotPolicy::EveryN(n) = policy else {
         return;
@@ -897,22 +905,24 @@ async fn step_service(ctx: &ServiceLoop) -> Step {
     // 2. FIND the message entry.
     let entry = {
         let kernel = ctx.es.kernel.lock().expect("kernel lock");
-        kernel
-            .msg_entries
-            .get(&ctx.es.path)
-            .and_then(|entries| {
-                entries.iter().find(|e| e.schema() == envelope.schema).cloned()
-            })
+        kernel.msg_entries.get(&ctx.es.path).and_then(|entries| {
+            entries
+                .iter()
+                .find(|e| e.schema() == envelope.schema)
+                .cloned()
+        })
     };
     let Some(entry) = entry else {
-
         dead_letter(&ctx.es.kernel, &envelope, "unknown schema");
         ctx.es.cell.inbox.lock().await.ack();
         return Step::Work;
     };
 
     // 3. DECODE (sync — decode failures dead-letter cleanly).
-    let payload = envelope.as_json().cloned().unwrap_or(serde_json::Value::Null);
+    let payload = envelope
+        .as_json()
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
     let decoded = match entry.decode(&payload) {
         Ok(msg) => msg,
         Err(report) => {
@@ -992,7 +1002,10 @@ async fn step_service(ctx: &ServiceLoop) -> Step {
 /// # Errors
 ///
 /// Propagates rebuild failures (a corrupt snapshot or undecodable state).
-pub async fn restart_es(ctx: &EsLoop, genesis_args: &JsonValue) -> Result<(), error_stack::Report<JournalError>> {
+pub async fn restart_es(
+    ctx: &EsLoop,
+    genesis_args: &JsonValue,
+) -> Result<(), error_stack::Report<JournalError>> {
     let (snapshot, snap_seq, tail) = {
         let kernel = ctx.kernel.lock().expect("kernel lock");
         let Some(journal) = kernel.journals.get(&ctx.path) else {
@@ -1073,8 +1086,6 @@ fn capacity_hint() -> usize {
     64
 }
 
-
-
 /// The supervision engine: one task per supervised child, awaiting the
 /// child's crash, then applying the spec — policy → budget → backoff →
 /// restart, or stop + escalate.
@@ -1117,10 +1128,7 @@ pub async fn supervise_child(
         // Budget: record the failure first, then check the window.
         let budget_exhausted = {
             let mut kernel = system.kernel.lock().expect("kernel lock");
-            let window = kernel
-                .failures
-                .entry(spec.path.clone())
-                .or_insert_with(crate::supervision::FailureWindow::new);
+            let window = kernel.failures.entry(spec.path.clone()).or_default();
             window.record(now);
             window.prune(now, &spec.budget);
             window.exhausted(now, &spec.budget)

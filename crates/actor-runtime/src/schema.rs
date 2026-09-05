@@ -64,7 +64,10 @@ pub struct Range {
 impl Range {
     /// A range bounded on both ends.
     pub fn between(min: f64, max: f64) -> Self {
-        Self { min: Some(min), max: Some(max) }
+        Self {
+            min: Some(min),
+            max: Some(max),
+        }
     }
 }
 
@@ -141,8 +144,7 @@ impl SchemaDef {
     /// [`SchemaDef`].
     pub fn from_json(json: JsonValue) -> Result<Self, error_stack::Report<SchemaError>> {
         use error_stack::ResultExt;
-        serde_json::from_value(json)
-            .change_context(SchemaError::InvalidDescriptor)
+        serde_json::from_value(json).change_context(SchemaError::InvalidDescriptor)
     }
 
     /// The schema's stable identifier (`name@version`).
@@ -349,7 +351,10 @@ mod tests {
 
         // Then it fails with InvalidDescriptor.
         let report = result.expect_err("must not parse");
-        assert!(matches!(report.current_context(), SchemaError::InvalidDescriptor));
+        assert!(matches!(
+            report.current_context(),
+            SchemaError::InvalidDescriptor
+        ));
     }
 
     #[test]

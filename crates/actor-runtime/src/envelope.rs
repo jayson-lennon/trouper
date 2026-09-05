@@ -253,7 +253,10 @@ mod tests {
 
         // Then the metadata and payload survive intact.
         assert_eq!(envelope.schema.as_str(), "ReserveStock@1");
-        assert_eq!(envelope.from.as_ref().map(|p| p.as_str()), Some("storefront"));
+        assert_eq!(
+            envelope.from.as_ref().map(|p| p.as_str()),
+            Some("storefront")
+        );
         assert_eq!(
             envelope.reply_to,
             Some(Address::Path(Path::new("storefront")))
@@ -264,8 +267,12 @@ mod tests {
     #[test]
     fn typed_envelope_holds_erased_payload() {
         // Given a typed envelope.
-        let envelope =
-            Envelope::typed(SchemaId::new("Tick", 1), Address::Path(Path::new("a")), 42u32, TraceCtx::root());
+        let envelope = Envelope::typed(
+            SchemaId::new("Tick", 1),
+            Address::Path(Path::new("a")),
+            42u32,
+            TraceCtx::root(),
+        );
 
         // When inspecting the payload.
         let rendered = format!("{envelope:?}");
@@ -275,4 +282,3 @@ mod tests {
         assert!(envelope.as_json().is_none());
     }
 }
-

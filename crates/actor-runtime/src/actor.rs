@@ -14,8 +14,8 @@
 
 use std::sync::Arc;
 
-use serde::de::DeserializeOwned;
 use serde::Serialize;
+use serde::de::DeserializeOwned;
 use serde_json::Value as JsonValue;
 
 use crate::context::CmdCtx;
@@ -96,8 +96,11 @@ pub trait ServiceActor: Send + 'static {
 /// Typed sugar for service actors, mirroring [`CommandHandler`].
 pub trait MsgHandler<M>: ServiceActor {
     /// Handles one typed message.
-    fn handle(&mut self, msg: M, ctx: &mut crate::context::MsgCtx<'_>)
-        -> impl Future<Output = ()> + Send;
+    fn handle(
+        &mut self,
+        msg: M,
+        ctx: &mut crate::context::MsgCtx<'_>,
+    ) -> impl Future<Output = ()> + Send;
 }
 
 /// Errors surfaced while dispatching a command.
@@ -249,11 +252,9 @@ where
         ctx: &mut CmdCtx<'_>,
     ) -> Result<Vec<crate::envelope::Event>, error_stack::Report<DispatchError>> {
         use error_stack::ResultExt;
-        let cmd: C = serde_json::from_value(payload.clone())
-            .change_context(DispatchError::Decode(format!(
-                "command {} did not match its schema",
-                self.schema
-            )))?;
+        let cmd: C = serde_json::from_value(payload.clone()).change_context(
+            DispatchError::Decode(format!("command {} did not match its schema", self.schema)),
+        )?;
 
         // Safe: the spawn that registered this adapter built the state as
         // the same `A` — a mismatch is a kernel bug, hence a panic.
@@ -270,8 +271,9 @@ where
 }
 
 /// A foreign actor's decision function: JSON state + JSON command → events.
-pub type ForeignDecision =
-    Arc<dyn Fn(&JsonValue, &JsonValue, &mut CmdCtx<'_>) -> Vec<crate::envelope::Event> + Send + Sync>;
+pub type ForeignDecision = Arc<
+    dyn Fn(&JsonValue, &JsonValue, &mut CmdCtx<'_>) -> Vec<crate::envelope::Event> + Send + Sync,
+>;
 
 /// The erased twin for actors defined entirely outside Rust: state is JSON,
 /// decisions are a [`ForeignDecision`] closure.
@@ -322,10 +324,7 @@ impl DynEsActor for ForeignEsState {
         // over the tail exactly as the live path does (one code path).
         let mut fresh = match snapshot {
             Some(snap) => ForeignEsState::new(snap, self.fold.clone()),
-            None => ForeignEsState::new(
-                serde_json::json!({ "args": args }),
-                self.fold.clone(),
-            ),
+            None => ForeignEsState::new(serde_json::json!({ "args": args }), self.fold.clone()),
         };
         for event in tail {
             fresh.apply_erased(event);
@@ -366,6 +365,121 @@ impl CommandEntry for ForeignCommandEntry {
             .downcast_mut::<ForeignEsState>()
             .expect("foreign entry on non-foreign state — kernel bug");
         Ok((self.decision)(foreign.state(), payload, ctx))
+    }
+}
+
+/// The object-safe service shell the kernel drives: one erased instance.
+/// NOT journaled — restart constructs a fresh instance via
+/// [`ServiceActor::start`]. Dispatch runs through a [`MsgEntry`] adapter,
+/// which downcasts the shell and the decoded message by type.
+pub trait DynServiceActor: std::any::Any + Send {}
+
+/// Concrete `DynServiceActor` for a typed service `A`.
+pub struct TypedServiceState<A: ServiceActor> {
+    /// The live service instance.
+    pub state: A,
+}
+
+impl<A: ServiceActor> TypedServiceState<A> {
+    /// Wraps a started service instance.
+    pub fn new(state: A) -> Self {
+        Self { state }
+    }
+}
+
+impl<A: ServiceActor> DynServiceActor for TypedServiceState<A> {}
+
+/// The object-safe async message dispatch routed by [`SchemaId`].
+pub trait MsgEntry: Send + Sync {
+    /// The message schema this entry decodes.
+    fn schema(&self) -> SchemaId;
+
+    /// Decodes the JSON payload into a boxed `Any` of the handler's type
+    /// (the DECODE side runs sync so decode failures dead-letter cleanly).
+    ///
+    /// # Errors
+    ///
+    /// [`DispatchError::Decode`] when the payload does not match.
+    fn decode(
+        &self,
+        payload: &JsonValue,
+    ) -> Result<Box<dyn std::any::Any + Send>, error_stack::Report<DispatchError>>;
+
+    /// Runs the typed handler against the boxed message (consumes it).
+    fn dispatch<'a>(
+        &'a self,
+        state: &'a mut dyn DynServiceActor,
+        msg: Box<dyn std::any::Any + Send>,
+        ctx: &'a mut crate::context::MsgCtx<'_>,
+    ) -> std::pin::Pin<Box<dyn Future<Output = ()> + Send + 'a>>;
+}
+
+/// Generic adapter: erases `A`'s handler for message type `M`.
+pub struct TypedServiceAdapter<A, M> {
+    schema: SchemaId,
+    _actor: std::marker::PhantomData<fn(&A)>,
+    _msg: std::marker::PhantomData<fn(&M)>,
+}
+
+impl<A: ServiceActor, M> TypedServiceAdapter<A, M> {
+    /// Creates the adapter for message schema `S`.
+    pub fn new<S: Schema>() -> Self {
+        Self {
+            schema: S::schema_id(),
+            _actor: std::marker::PhantomData,
+            _msg: std::marker::PhantomData,
+        }
+    }
+}
+
+impl<A, M> MsgEntry for TypedServiceAdapter<A, M>
+where
+    A: ServiceActor + MsgHandler<M>,
+    M: DeserializeOwned + Send + 'static,
+{
+    fn schema(&self) -> SchemaId {
+        self.schema.clone()
+    }
+
+    fn decode(
+        &self,
+        payload: &JsonValue,
+    ) -> Result<Box<dyn std::any::Any + Send>, error_stack::Report<DispatchError>> {
+        use error_stack::ResultExt;
+        let msg: M = serde_json::from_value(payload.clone()).change_context(
+            DispatchError::Decode(format!("message {} did not match its schema", self.schema)),
+        )?;
+        Ok(Box::new(msg))
+    }
+
+    fn dispatch<'a>(
+        &'a self,
+        state: &'a mut dyn DynServiceActor,
+        msg: Box<dyn std::any::Any + Send>,
+        ctx: &'a mut crate::context::MsgCtx<'_>,
+    ) -> std::pin::Pin<Box<dyn Future<Output = ()> + Send + 'a>> {
+        Box::pin(async move {
+            let typed = state
+                .as_any_service_mut::<A>()
+                .expect("service adapter/type mismatch — kernel bug");
+            let msg = match msg.downcast::<M>() {
+                Ok(msg) => *msg,
+                Err(_) => panic!("service message type mismatch — kernel bug"),
+            };
+            typed.state.handle(msg, ctx).await;
+        })
+    }
+}
+
+/// Downcast seam for the service shell (generic: the adapter knows `A`).
+pub trait ServiceAny {
+    /// The live instance as `&mut TypedServiceState<A>`, when it is one.
+    fn as_any_service_mut<A: ServiceActor>(&mut self) -> Option<&mut TypedServiceState<A>>;
+}
+
+impl ServiceAny for dyn DynServiceActor {
+    fn as_any_service_mut<A: ServiceActor>(&mut self) -> Option<&mut TypedServiceState<A>> {
+        (self as &mut dyn std::any::Any).downcast_mut::<TypedServiceState<A>>()
     }
 }
 
@@ -604,10 +718,7 @@ mod tests {
 
         // Then it is a Decode error and the state is untouched.
         let report = result.expect_err("must not decode");
-        assert!(matches!(
-            report.current_context(),
-            DispatchError::Decode(_)
-        ));
+        assert!(matches!(report.current_context(), DispatchError::Decode(_)));
         assert_eq!(state.capture_erased().expect("capture")["count"], 0);
     }
 
@@ -702,126 +813,5 @@ mod tests {
 
         // Then it is an empty decision.
         assert!(events.is_empty());
-    }
-}
-
-/// The object-safe service shell the kernel drives: one erased instance.
-/// NOT journaled — restart constructs a fresh instance via
-/// [`ServiceActor::start`]. Dispatch runs through a [`MsgEntry`] adapter,
-/// which downcasts the shell and the decoded message by type.
-pub trait DynServiceActor: std::any::Any + Send {}
-
-/// Concrete `DynServiceActor` for a typed service `A`.
-pub struct TypedServiceState<A: ServiceActor> {
-    /// The live service instance.
-    pub state: A,
-}
-
-impl<A: ServiceActor> TypedServiceState<A> {
-    /// Wraps a started service instance.
-    pub fn new(state: A) -> Self {
-        Self { state }
-    }
-}
-
-impl<A: ServiceActor> DynServiceActor for TypedServiceState<A> {}
-
-/// The object-safe async message dispatch routed by [`SchemaId`].
-pub trait MsgEntry: Send + Sync {
-    /// The message schema this entry decodes.
-    fn schema(&self) -> SchemaId;
-
-    /// Decodes the JSON payload into a boxed `Any` of the handler's type
-    /// (the DECODE side runs sync so decode failures dead-letter cleanly).
-    ///
-    /// # Errors
-    ///
-    /// [`DispatchError::Decode`] when the payload does not match.
-    fn decode(
-        &self,
-        payload: &JsonValue,
-    ) -> Result<Box<dyn std::any::Any + Send>, error_stack::Report<DispatchError>>;
-
-    /// Runs the typed handler against the boxed message (consumes it).
-    fn dispatch<'a>(
-        &'a self,
-        state: &'a mut dyn DynServiceActor,
-        msg: Box<dyn std::any::Any + Send>,
-        ctx: &'a mut crate::context::MsgCtx<'_>,
-    ) -> std::pin::Pin<Box<dyn Future<Output = ()> + Send + 'a>>;
-}
-
-/// Generic adapter: erases `A`'s handler for message type `M`.
-pub struct TypedServiceAdapter<A, M> {
-    schema: SchemaId,
-    _actor: std::marker::PhantomData<fn(&A)>,
-    _msg: std::marker::PhantomData<fn(&M)>,
-}
-
-impl<A: ServiceActor, M> TypedServiceAdapter<A, M> {
-    /// Creates the adapter for message schema `S`.
-    pub fn new<S: Schema>() -> Self {
-        Self {
-            schema: S::schema_id(),
-            _actor: std::marker::PhantomData,
-            _msg: std::marker::PhantomData,
-        }
-    }
-}
-
-impl<A, M> MsgEntry for TypedServiceAdapter<A, M>
-where
-    A: ServiceActor + MsgHandler<M>,
-    M: DeserializeOwned + Send + 'static,
-{
-    fn schema(&self) -> SchemaId {
-        self.schema.clone()
-    }
-
-    fn decode(
-        &self,
-        payload: &JsonValue,
-    ) -> Result<Box<dyn std::any::Any + Send>, error_stack::Report<DispatchError>> {
-        use error_stack::ResultExt;
-        let msg: M = serde_json::from_value(payload.clone())
-            .change_context(DispatchError::Decode(format!(
-                "message {} did not match its schema",
-                self.schema
-            )))?;
-        Ok(Box::new(msg))
-    }
-
-    fn dispatch<'a>(
-        &'a self,
-        state: &'a mut dyn DynServiceActor,
-        msg: Box<dyn std::any::Any + Send>,
-        ctx: &'a mut crate::context::MsgCtx<'_>,
-    ) -> std::pin::Pin<Box<dyn Future<Output = ()> + Send + 'a>> {
-        Box::pin(async move {
-            let typed = state
-                .as_any_service_mut::<A>()
-                .expect("service adapter/type mismatch — kernel bug");
-            let msg = match msg.downcast::<M>() {
-                Ok(msg) => *msg,
-                Err(_) => panic!("service message type mismatch — kernel bug"),
-            };
-            typed.state.handle(msg, ctx).await;
-        })
-    }
-}
-
-/// Downcast seam for the service shell (generic: the adapter knows `A`).
-pub trait ServiceAny {
-    /// The live instance as `&mut TypedServiceState<A>`, when it is one.
-    fn as_any_service_mut<A: ServiceActor>(
-        &mut self,
-    ) -> Option<&mut TypedServiceState<A>>;
-}
-
-impl ServiceAny for dyn DynServiceActor {
-    fn as_any_service_mut<A: ServiceActor>(
-        &mut self,
-    ) -> Option<&mut TypedServiceState<A>> {
-        (self as &mut dyn std::any::Any).downcast_mut::<TypedServiceState<A>>()
     }
 }

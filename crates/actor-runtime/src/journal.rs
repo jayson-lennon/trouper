@@ -112,12 +112,9 @@ impl Journal {
     /// first.
     pub fn after(&self, seq: SeqNo) -> impl Iterator<Item = &JournalEntry> {
         let from_beginning = seq.is_before_genesis();
-        self.entries
-            .iter()
-            .filter(move |entry| {
-                entry.as_event().is_some()
-                    && (from_beginning || entry.seq() > seq)
-            })
+        self.entries.iter().filter(move |entry| {
+            entry.as_event().is_some() && (from_beginning || entry.seq() > seq)
+        })
     }
 
     /// Every entry (for inspection and export).
@@ -215,10 +212,7 @@ mod tests {
         let seqs: Vec<_> = (0..3).map(|_| journal.append_event(event(1))).collect();
 
         // Then sequences are 0, 1, 2.
-        assert_eq!(
-            seqs,
-            [SeqNo::new(0), SeqNo::new(1), SeqNo::new(2)]
-        );
+        assert_eq!(seqs, [SeqNo::new(0), SeqNo::new(1), SeqNo::new(2)]);
         assert_eq!(journal.next_seq(), SeqNo::new(3));
     }
 
@@ -277,10 +271,12 @@ mod tests {
         journal.append_event(event(2));
 
         // When asking for events after genesis.
-        let all: Vec<SeqNo> = journal.after(SeqNo::before_genesis()).map(|e| e.seq()).collect();
+        let all: Vec<SeqNo> = journal
+            .after(SeqNo::before_genesis())
+            .map(|e| e.seq())
+            .collect();
 
         // Then both events replay.
         assert_eq!(all, [SeqNo::new(0), SeqNo::new(1)]);
     }
 }
-

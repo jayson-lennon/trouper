@@ -51,9 +51,7 @@ impl Refused {
     /// The refused envelope itself.
     pub fn into_envelope(self) -> Envelope {
         match self {
-            Self::Full(envelope)
-            | Self::Evicted(envelope)
-            | Self::Closed(envelope) => envelope,
+            Self::Full(envelope) | Self::Evicted(envelope) | Self::Closed(envelope) => envelope,
         }
     }
 
@@ -108,6 +106,10 @@ impl Inbox {
     ///
     /// Returns the refused envelope ([`InboxError::Full`]) under Block/
     /// DropNew when full, and [`InboxError::Closed`] once draining.
+    // The refused envelope travels back by value on purpose: the kernel
+    // dead-letters exactly what was refused. Boxing it would allocate on
+    // the hot push path to satisfy a lint.
+    #[allow(clippy::result_large_err)]
     pub fn push(&mut self, envelope: Envelope) -> Result<InboxOffset, Refused> {
         if !self.open {
             return Err(Refused::Closed(envelope));
@@ -142,6 +144,14 @@ impl Inbox {
     /// Closes the inbox: no new deliveries, existing entries stay readable.
     pub fn close(&mut self) {
         self.open = false;
+    }
+
+    /// Drains one queued entry for shutdown-flush purposes (the cursor
+    /// advances: the entry is leaving the system via the DLQ).
+    pub fn pop_discard(&mut self) -> Option<Envelope> {
+        let (_offset, envelope) = self.queue.pop_front()?;
+        self.cursor += 1;
+        Some(envelope)
     }
 
     /// Reopens a closed inbox (restart: redelivery resumes from the
@@ -195,7 +205,9 @@ impl Inbox {
 
     /// Drains every un-acked entry (kernel uses this on shutdown/DLQ flush).
     pub fn drain(&mut self) -> impl Iterator<Item = (InboxOffset, Envelope)> + '_ {
-        self.queue.drain(..).map(|(offset, envelope)| (InboxOffset::new(offset), envelope))
+        self.queue
+            .drain(..)
+            .map(|(offset, envelope)| (InboxOffset::new(offset), envelope))
     }
 
     /// The number of entries waiting between the cursor and the write head.

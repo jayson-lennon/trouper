@@ -19,7 +19,7 @@ use crate::context::RuntimeView;
 use crate::envelope::{Address, Envelope, TraceCtx};
 use crate::inbox::{Inbox, OverloadPolicy};
 pub use crate::kernel::DeadLetter;
-use crate::kernel::{route, EsLoop, ActorCell, KernelState};
+use crate::kernel::{ActorCell, EsLoop, KernelState, route};
 use crate::registry::{Endpoint, EndpointInfo, Registry};
 use crate::schema::Schema;
 use crate::types::{InboxOffset, Path, SchemaId, Timestamp};
@@ -63,7 +63,6 @@ pub struct ActorSystem {
     /// Supervision engine shutdown handles (one per supervised child).
     child_shutdowns: std::sync::Mutex<Vec<tokio::sync::watch::Sender<bool>>>,
 }
-
 
 /// One actor's row in a system export.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -136,7 +135,6 @@ impl ActorSystem {
         crate::types::Topic::new("system.deadletters")
     }
 
-
     /// Spawns a foreign (no-Rust-types) event-sourced actor: the schema,
     /// state fold, and command decision are all runtime JSON data. This is
     /// the seam the port tier will reuse.
@@ -153,10 +151,10 @@ impl ActorSystem {
         let manifest = crate::schema::ActorManifest::new()
             .handles_id(schema_id.clone())
             .kind(crate::types::ActorKind::EventSourced);
-        let entries = vec![Arc::new(crate::actor::ForeignCommandEntry::new(
-            schema_id,
-            decision,
-        )) as Arc<dyn crate::actor::CommandEntry>];
+        let entries = vec![
+            Arc::new(crate::actor::ForeignCommandEntry::new(schema_id, decision))
+                as Arc<dyn crate::actor::CommandEntry>,
+        ];
         self.spawn_es_erased(path, manifest, state, entries, opts);
     }
 
@@ -180,7 +178,11 @@ impl ActorSystem {
             .lock()
             .expect("shutdown lock")
             .push(_shutdown_tx);
-        tokio::spawn(crate::kernel::supervise_child(engine, engine_spec, shutdown_rx));
+        tokio::spawn(crate::kernel::supervise_child(
+            engine,
+            engine_spec,
+            shutdown_rx,
+        ));
     }
 
     /// Creates a system on the wall clock.
@@ -238,8 +240,13 @@ impl ActorSystem {
     /// `handles` schema (via the `spawn_es` closure), builds the journal +
     /// inbox, rebuilds state (snapshot fast-path or genesis), and starts
     /// the ES loop. Redelivery resumes from the inbox cursor.
-    pub fn spawn_es<A, F>(self: &Arc<Self>, path: Path, args: &JsonValue, opts: SpawnOpts, entries: F)
-    where
+    pub fn spawn_es<A, F>(
+        self: &Arc<Self>,
+        path: Path,
+        args: &JsonValue,
+        opts: SpawnOpts,
+        entries: F,
+    ) where
         A: EventSourced,
         F: FnOnce() -> Vec<Arc<dyn CommandEntry>>,
     {
@@ -282,11 +289,11 @@ impl ActorSystem {
         ));
         kernel.cells.insert(path.clone(), cell.clone());
         kernel.journals.entry(path.clone()).or_default();
-        kernel.es_state.insert(path.clone(), Arc::new(tokio::sync::Mutex::new(state)));
-        kernel.entries.insert(path.clone(), entries);
         kernel
-            .snapshot_policy
-            .insert(path.clone(), opts.snapshot);
+            .es_state
+            .insert(path.clone(), Arc::new(tokio::sync::Mutex::new(state)));
+        kernel.entries.insert(path.clone(), entries);
+        kernel.snapshot_policy.insert(path.clone(), opts.snapshot);
         kernel.tap.push(
             self.clock.now(),
             crate::tap::FactKind::Spawned {
@@ -308,20 +315,25 @@ impl ActorSystem {
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
         loop_ctx.start(rx, shutdown_rx);
         let kernel = self.kernel.lock().expect("kernel lock");
-        if let Some(cell) = kernel.cells.get(&path) {
-            if let Ok(mut handle) = cell.handle.try_lock() {
-                *handle = Some(crate::kernel::ActorHandle {
-                    shutdown: shutdown_tx,
-                    task: None,
-                });
-            }
+        if let Some(cell) = kernel.cells.get(&path)
+            && let Ok(mut handle) = cell.handle.try_lock()
+        {
+            *handle = Some(crate::kernel::ActorHandle {
+                shutdown: shutdown_tx,
+                task: None,
+            });
         }
     }
 
     /// Spawns a service (edge) actor at `path`: async handlers, I/O and
     /// `ask` allowed, NOT journaled (at-most-once message semantics).
-    pub fn spawn_service<A, F>(self: &Arc<Self>, path: Path, args: &JsonValue, opts: SpawnOpts, entries: F)
-    where
+    pub fn spawn_service<A, F>(
+        self: &Arc<Self>,
+        path: Path,
+        args: &JsonValue,
+        opts: SpawnOpts,
+        entries: F,
+    ) where
         A: ServiceActor,
         F: FnOnce() -> Vec<Arc<dyn MsgEntry>>,
     {
@@ -382,9 +394,9 @@ impl ActorSystem {
                     let mut kernel = kernel_table.lock().expect("kernel lock");
                     kernel.services.insert(
                         started_path.clone(),
-                        Arc::new(tokio::sync::Mutex::new(Box::new(
-                            TypedServiceState::new(instance),
-                        ) as Box<dyn DynServiceActor>)),
+                        Arc::new(tokio::sync::Mutex::new(
+                            Box::new(TypedServiceState::new(instance)) as Box<dyn DynServiceActor>,
+                        )),
                     );
                 }
                 Err(report) => {
@@ -408,8 +420,13 @@ impl ActorSystem {
     ///
     /// `entries()` builds the CommandEntry list (usually
     /// `vec![Arc::new(TypedEsAdapter::<A, C1>::new::<C1>()), ...]`).
-    pub fn spawn_es_typed<A, F>(self: &Arc<Self>, path: Path, args: &JsonValue, opts: SpawnOpts, entries: F)
-    where
+    pub fn spawn_es_typed<A, F>(
+        self: &Arc<Self>,
+        path: Path,
+        args: &JsonValue,
+        opts: SpawnOpts,
+        entries: F,
+    ) where
         A: EventSourced,
         F: FnOnce() -> Vec<Arc<dyn CommandEntry>>,
     {
@@ -441,12 +458,7 @@ impl ActorSystem {
     }
 
     pub fn envelope(&self, schema: SchemaId, dest: Path, payload: JsonValue) -> Envelope {
-        Envelope::json(
-            schema,
-            Address::Path(dest),
-            payload,
-            TraceCtx::root(),
-        )
+        Envelope::json(schema, Address::Path(dest), payload, TraceCtx::root())
     }
 
     /// The system's clock (tests use this to reach the [`crate::clock::FakeClock`]).
@@ -555,7 +567,6 @@ impl ActorSystem {
         self.tap_facts_from(0)
     }
 
-
     /// Gracefully stops the actor at `path`: children stop first
     /// (recursive, timeout-bounded), the drain signal lets the current
     /// message finish, undelivered inbox entries go to the DLQ, and the
@@ -633,20 +644,33 @@ impl ActorSystem {
         };
         // 3. AWAIT the loop's exit (current message completes). The loop
         // drains/flushes on stop.
-        match join_task {
-            Some(task) => {
-                let _ = tokio::time::timeout(remaining, task).await;
-            }
-            None => {}
+        if let Some(task) = join_task {
+            let _ = tokio::time::timeout(remaining, task).await;
         }
 
         // 4. UNDELIVERED → DLQ; then close the inbox.
-        {
+        let undelivered: Vec<Envelope> = {
             let kernel = self.kernel.lock().expect("kernel lock");
-            if let Some(cell) = kernel.cells.get(path) {
-                if let Ok(mut inbox) = cell.inbox.try_lock() {
-                    inbox.close();
+            let mut drained = Vec::new();
+            if let Some(cell) = kernel.cells.get(path)
+                && let Ok(mut inbox) = cell.inbox.try_lock()
+            {
+                inbox.close();
+                while let Some(envelope) = inbox.pop_discard() {
+                    drained.push(envelope);
                 }
+            }
+            drained
+        };
+        {
+            let mut kernel = self.kernel.lock().expect("kernel lock");
+            for envelope in undelivered {
+                kernel.dead_letters.push(crate::kernel::DeadLetter {
+                    schema: envelope.schema,
+                    dest: envelope.dest,
+                    reason: "stopped with a non-empty inbox".to_owned(),
+                    trace: envelope.trace,
+                });
             }
         }
 
@@ -672,7 +696,6 @@ impl ActorSystem {
         }
     }
 
-
     /// Exports the system: schemas, live actors (ES state included),
     /// declared vs observed edges. The artifact a future canvas consumes.
     pub async fn export(&self) -> SystemExport {
@@ -689,25 +712,38 @@ impl ActorSystem {
         };
         let mut actors = Vec::new();
         for (path, manifest) in slot_manifests {
-            let kernel = self.kernel.lock().expect("kernel lock");
-            let state = match kernel.es_state.get(&path) {
-                Some(shell) => {
-                    let state = shell.lock().await;
-                    state.capture_erased().ok()
+            // Scope the kernel guard: drop it before awaiting the state
+            // shell (a std Mutex must never span an await point).
+            let (state, cursor) = {
+                let kernel = self.kernel.lock().expect("kernel lock");
+                let cursor = kernel.cells.get(&path).and_then(|cell| {
+                    cell.inbox
+                        .try_lock()
+                        .ok()
+                        .map(|inbox| inbox.cursor().as_u64())
+                });
+                let has_state = kernel.es_state.contains_key(&path);
+                (has_state.then_some(()), cursor)
+            };
+            let state = match state {
+                Some(()) => {
+                    let shell = {
+                        let kernel = self.kernel.lock().expect("kernel lock");
+                        kernel.es_state.get(&path).cloned()
+                    };
+                    match shell {
+                        Some(shell) => {
+                            let shell = shell.lock().await;
+                            shell.capture_erased().ok()
+                        }
+                        None => None,
+                    }
                 }
                 None => None,
             };
-            let cursor = kernel.cells.get(&path).and_then(|cell| {
-                cell.inbox
-                    .try_lock()
-                    .ok()
-                    .map(|inbox| inbox.cursor().as_u64())
-            });
             actors.push(ActorExport {
                 path,
-                kind: manifest
-                    .kind
-                    .unwrap_or(crate::types::ActorKind::Service),
+                kind: manifest.kind.unwrap_or(crate::types::ActorKind::Service),
                 manifest,
                 state,
                 cursor,
@@ -722,7 +758,9 @@ impl ActorSystem {
                 .topic_logs
                 .iter()
                 .flat_map(|(topic, log)| {
-                    log.subscribers().into_iter().map(move |p| (p, topic.clone()))
+                    log.subscribers()
+                        .into_iter()
+                        .map(move |p| (p, topic.clone()))
                 })
                 .collect()
         };
@@ -777,7 +815,10 @@ impl ActorSystem {
         let mut counts: std::collections::HashMap<(Option<String>, String, SchemaId), u64> =
             std::collections::HashMap::new();
         for fact in self.tap_facts() {
-            if let crate::tap::FactKind::Sent { from, dest, schema, .. } = &fact.kind {
+            if let crate::tap::FactKind::Sent {
+                from, dest, schema, ..
+            } = &fact.kind
+            {
                 let to_str = dest.clone();
                 let from_str = from.as_ref().map(|p| p.to_string());
                 *counts
@@ -809,6 +850,36 @@ impl ActorSystem {
     }
 
     /// The cursor of an actor's inbox (inspection; Phase 10 tests).
+    /// How many envelopes the runtime could not deliver (inspection).
+    pub async fn dead_letter_count(&self) -> usize {
+        let kernel = self.kernel.lock().expect("kernel lock");
+        kernel.dead_letters.len()
+    }
+
+    /// Why envelopes died (inspection/tests/demo debugging).
+    pub async fn dead_letter_reasons(&self) -> Vec<String> {
+        let kernel = self.kernel.lock().expect("kernel lock");
+        kernel
+            .dead_letters
+            .iter()
+            .map(|d| format!("{}: {}", d.reason, d.schema))
+            .collect()
+    }
+
+    /// How many envelopes are queued at `path` (inspection/tests).
+    pub async fn inbox_debug_len(&self, path: &Path) -> usize {
+        // Clone the Arc out of the kernel guard, then await the inbox
+        // lock without holding the kernel's std Mutex.
+        let cell = {
+            let kernel = self.kernel.lock().expect("kernel lock");
+            kernel.cells.get(path).cloned()
+        };
+        match cell {
+            Some(cell) => cell.inbox.lock().await.len(),
+            None => 0,
+        }
+    }
+
     pub fn inbox_cursor(&self, path: &Path) -> Option<InboxOffset> {
         let kernel = self.kernel.lock().expect("kernel lock");
         kernel.cells.get(path).map(|cell| {
@@ -877,13 +948,13 @@ impl Default for ActorSystem {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::HashMap;
     use crate::actor::{CommandHandler, MsgHandler, TypedEsAdapter, TypedServiceAdapter};
     use crate::context::CmdCtx;
     use crate::schema::{ActorManifest, FieldDef, FieldTy, SchemaDef, SchemaKind};
     use crate::types::ActorKind;
     use serde::{Deserialize, Serialize};
     use serde_json::json;
+    use std::collections::HashMap;
 
     #[derive(Deserialize)]
     struct Add {
@@ -941,7 +1012,10 @@ mod tests {
     }
     impl CommandHandler<Add> for Counter {
         fn handle(&self, cmd: Add, _ctx: &mut CmdCtx<'_>) -> Vec<crate::envelope::Event> {
-            vec![crate::envelope::Event::new(Added::schema_id(), json!({ "n": cmd.n }))]
+            vec![crate::envelope::Event::new(
+                Added::schema_id(),
+                json!({ "n": cmd.n }),
+            )]
         }
     }
 
@@ -974,12 +1048,9 @@ mod tests {
         // Given a spawned counter actor.
         let system = Arc::new(ActorSystem::new());
         let path = Path::new("counter");
-        system.spawn_es::<Counter, _>(
-            path.clone(),
-            &json!({}),
-            SpawnOpts::default(),
-            || vec![Arc::new(TypedEsAdapter::<Counter, Add>::new::<Add>())],
-        );
+        system.spawn_es::<Counter, _>(path.clone(), &json!({}), SpawnOpts::default(), || {
+            vec![Arc::new(TypedEsAdapter::<Counter, Add>::new::<Add>())]
+        });
 
         // When one Add command is sent and the loop commits it.
         system
@@ -1004,12 +1075,9 @@ mod tests {
         // Given a spawned actor that handles only Add.
         let system = Arc::new(ActorSystem::new());
         let path = Path::new("counter");
-        system.spawn_es::<Counter, _>(
-            path.clone(),
-            &json!({}),
-            SpawnOpts::default(),
-            || vec![Arc::new(TypedEsAdapter::<Counter, Add>::new::<Add>())],
-        );
+        system.spawn_es::<Counter, _>(path.clone(), &json!({}), SpawnOpts::default(), || {
+            vec![Arc::new(TypedEsAdapter::<Counter, Add>::new::<Add>())]
+        });
 
         // When a message with an unhandled schema arrives.
         system
@@ -1019,11 +1087,12 @@ mod tests {
         wait_for_cursor(&system, &path, 1).await;
 
         // Then it is dead-lettered, nothing is journalled, nothing applied.
-        let kernel = system.kernel.lock().expect("lock");
-        assert_eq!(kernel.dead_letters.len(), 1);
-        assert_eq!(kernel.dead_letters[0].schema, Boom::schema_id());
-        assert_eq!(kernel.journals[&path].len(), 0);
-        drop(kernel);
+        {
+            let kernel = system.kernel.lock().expect("lock");
+            assert_eq!(kernel.dead_letters.len(), 1);
+            assert_eq!(kernel.dead_letters[0].schema, Boom::schema_id());
+            assert_eq!(kernel.journals[&path].len(), 0);
+        }
         let state = system.es_state(&path).await.expect("live");
         assert_eq!(state["total"], 0);
     }
@@ -1033,12 +1102,9 @@ mod tests {
         // Given a spawned actor whose Boom handler panics.
         let system = Arc::new(ActorSystem::new());
         let path = Path::new("counter");
-        system.spawn_es::<Counter, _>(
-            path.clone(),
-            &json!({}),
-            SpawnOpts::default(),
-            || vec![Arc::new(TypedEsAdapter::<Counter, Boom>::new::<Boom>())],
-        );
+        system.spawn_es::<Counter, _>(path.clone(), &json!({}), SpawnOpts::default(), || {
+            vec![Arc::new(TypedEsAdapter::<Counter, Boom>::new::<Boom>())]
+        });
 
         // When a Boom command arrives (the handler panics mid-decision).
         system
@@ -1049,11 +1115,12 @@ mod tests {
 
         // Then NOTHING was appended, NOTHING acked, and the crash was
         // recorded: the message stays queued for redelivery after restart.
-        let kernel = system.kernel.lock().expect("lock");
-        assert!(kernel.crashed.contains(&path));
-        assert_eq!(kernel.journals.get(&path).map(|j| j.len()), Some(0));
-        assert!(kernel.dead_letters.is_empty());
-        drop(kernel);
+        {
+            let kernel = system.kernel.lock().expect("lock");
+            assert!(kernel.crashed.contains(&path));
+            assert_eq!(kernel.journals.get(&path).map(|j| j.len()), Some(0));
+            assert!(kernel.dead_letters.is_empty());
+        }
         assert_eq!(system.inbox_cursor(&path).map(|c| c.as_u64()), Some(0));
         let state = system.es_state(&path).await.expect("shell present");
         assert_eq!(state["total"], 0);
@@ -1065,17 +1132,12 @@ mod tests {
         let system = Arc::new(ActorSystem::new());
         let path = Path::new("counter");
         let boom = Path::new("counter");
-        system.spawn_es::<Counter, _>(
-            path.clone(),
-            &json!({}),
-            SpawnOpts::default(),
-            || {
-                vec![
-                    Arc::new(TypedEsAdapter::<Counter, Add>::new::<Add>()),
-                    Arc::new(TypedEsAdapter::<Counter, Boom>::new::<Boom>()),
-                ]
-            },
-        );
+        system.spawn_es::<Counter, _>(path.clone(), &json!({}), SpawnOpts::default(), || {
+            vec![
+                Arc::new(TypedEsAdapter::<Counter, Add>::new::<Add>()),
+                Arc::new(TypedEsAdapter::<Counter, Boom>::new::<Boom>()),
+            ]
+        });
         system
             .send(system.envelope(Add::schema_id(), boom.clone(), json!({ "n": 4 })))
             .await
@@ -1096,16 +1158,19 @@ mod tests {
         // Then redelivery attempted the Boom exactly once (no duplicate
         // events, no double-apply), the pre-crash Add stayed committed, and
         // state equals the journal fold.
-        let kernel = system.kernel.lock().expect("lock");
-        assert_eq!(kernel.journals[&path].len(), 1, "no duplicate events");
-        assert!(kernel.dead_letters.is_empty(), "panic never dead-letters");
-        drop(kernel);
-        assert_eq!(system.inbox_cursor(&path).map(|c| c.as_u64()), Some(1),
-            "the poison message stays queued (peeked, never acked)");
+        {
+            let kernel = system.kernel.lock().expect("lock");
+            assert_eq!(kernel.journals[&path].len(), 1, "no duplicate events");
+            assert!(kernel.dead_letters.is_empty(), "panic never dead-letters");
+        }
+        assert_eq!(
+            system.inbox_cursor(&path).map(|c| c.as_u64()),
+            Some(1),
+            "the poison message stays queued (peeked, never acked)"
+        );
         let state = system.es_state(&path).await.expect("live");
         assert_eq!(state["total"], 4, "fold(journal), not doubled");
     }
-
 
     /// Reads a Counter actor's folded total via the erased state capture.
     #[allow(dead_code)] // used by several test cases; some were trimmed
@@ -1140,9 +1205,6 @@ mod tests {
         }
         panic!("cursor never reached {expected}");
     }
-
-
-
 
     #[tokio::test]
     async fn tap_causality_chain_links_hops_with_a_shared_trace() {
@@ -1198,7 +1260,9 @@ mod tests {
                     .handles::<Ping>()
                     .kind(ActorKind::Service)
             }
-            async fn start(_args: &JsonValue) -> Result<Self, error_stack::Report<crate::registry::RegistryError>> {
+            async fn start(
+                _args: &JsonValue,
+            ) -> Result<Self, error_stack::Report<crate::registry::RegistryError>> {
                 Ok(Self)
             }
         }
@@ -1207,12 +1271,9 @@ mod tests {
         }
 
         let system = Arc::new(ActorSystem::new());
-        system.spawn_es::<Forwarder, _>(
-            Path::new("a"),
-            &json!({}),
-            SpawnOpts::default(),
-            || vec![Arc::new(TypedEsAdapter::<Forwarder, Add>::new::<Add>())],
-        );
+        system.spawn_es::<Forwarder, _>(Path::new("a"), &json!({}), SpawnOpts::default(), || {
+            vec![Arc::new(TypedEsAdapter::<Forwarder, Add>::new::<Add>())]
+        });
         system.spawn_service::<Echo, _>(
             Path::new("echo"),
             &json!({}),
@@ -1252,7 +1313,8 @@ mod tests {
         assert!(!b_facts.is_empty(), "echo never received the forward");
         for f in &b_facts {
             assert_eq!(
-                trace_of(f).trace_id, a_trace.trace_id,
+                trace_of(f).trace_id,
+                a_trace.trace_id,
                 "hops share one trace"
             );
         }
@@ -1267,12 +1329,9 @@ mod tests {
             kernel.tap = crate::tap::TapRing::new(4);
         }
         let path = Path::new("counter");
-        system.spawn_es::<Counter, _>(
-            path.clone(),
-            &json!({}),
-            SpawnOpts::default(),
-            || vec![Arc::new(TypedEsAdapter::<Counter, Add>::new::<Add>())],
-        );
+        system.spawn_es::<Counter, _>(path.clone(), &json!({}), SpawnOpts::default(), || {
+            vec![Arc::new(TypedEsAdapter::<Counter, Add>::new::<Add>())]
+        });
 
         // When far more messages flow than the ring can hold.
         for n in 0..50 {
@@ -1302,7 +1361,6 @@ mod tests {
         let last = facts.last().expect("facts").to_json();
         assert!(last["offset"].is_u64());
     }
-
 
     #[tokio::test]
     async fn restart_budget_escalates_to_the_parent() {
@@ -1339,7 +1397,9 @@ mod tests {
                     .handles::<Added>()
                     .kind(ActorKind::Service)
             }
-            async fn start(_args: &JsonValue) -> Result<Self, error_stack::Report<crate::registry::RegistryError>> {
+            async fn start(
+                _args: &JsonValue,
+            ) -> Result<Self, error_stack::Report<crate::registry::RegistryError>> {
                 Ok(Self)
             }
         }
@@ -1360,23 +1420,27 @@ mod tests {
         }
         impl MsgHandler<EscalatedMsg> for Overseer {
             async fn handle(&mut self, msg: EscalatedMsg, _ctx: &mut crate::context::MsgCtx<'_>) {
-                SINK_BY_PATH
+                if let Some(s) = SINK_BY_PATH
                     .get_or_init(|| std::sync::Mutex::new(HashMap::new()))
                     .lock()
                     .expect("table")
                     .get("overseer")
-                    .map(|s| {
-                        s.lock()
-                            .expect("sink lock")
-                            .push(format!("escalated:{}", msg.escalated))
-                    });
+                {
+                    s.lock()
+                        .expect("sink lock")
+                        .push(format!("escalated:{}", msg.escalated))
+                }
             }
         }
         system.spawn_service::<Overseer, _>(
             overseer.clone(),
             &json!({}),
             SpawnOpts::default(),
-            || vec![Arc::new(TypedServiceAdapter::<Overseer, EscalatedMsg>::new::<EscalatedMsg>())],
+            || {
+                vec![Arc::new(
+                    TypedServiceAdapter::<Overseer, EscalatedMsg>::new::<EscalatedMsg>(),
+                )]
+            },
         );
 
         // The child spawns the real counter under a fixed path; the engine
@@ -1390,26 +1454,22 @@ mod tests {
             path: worker.clone(),
             parent: Some(overseer.clone()),
             restart: crate::supervision::RestartPolicy::Permanent,
-            budget: crate::supervision::RestartBudget::per(
-                2,
-                std::time::Duration::from_secs(10),
-            ),
+            budget: crate::supervision::RestartBudget::per(2, std::time::Duration::from_secs(10)),
             backoff: crate::supervision::Backoff {
                 base: std::time::Duration::from_millis(5),
                 max: std::time::Duration::from_millis(20),
                 factor: 2.0,
             },
             args: json!({}),
-            spawn: Arc::new(move |sys: &Arc<ActorSystem>, path: &Path, args: &JsonValue| {
-                let _ = (&spawner, &system_for_spec);
-                sys.spawn_es::<AlwaysBoom, _>(
-                    path.clone(),
-                    args,
-                    SpawnOpts::default(),
-                    || vec![Arc::new(TypedEsAdapter::<AlwaysBoom, Add>::new::<Add>())],
-                );
-                let _ = &worker_clone;
-            }),
+            spawn: Arc::new(
+                move |sys: &Arc<ActorSystem>, path: &Path, args: &JsonValue| {
+                    let _ = (&spawner, &system_for_spec);
+                    sys.spawn_es::<AlwaysBoom, _>(path.clone(), args, SpawnOpts::default(), || {
+                        vec![Arc::new(TypedEsAdapter::<AlwaysBoom, Add>::new::<Add>())]
+                    });
+                    let _ = &worker_clone;
+                },
+            ),
         };
         system.spawn_child(spec);
 
@@ -1441,7 +1501,6 @@ mod tests {
             "parent received the escalation: {lines:?}"
         );
     }
-
 
     #[tokio::test]
     async fn graceful_shutdown_stops_children_before_the_parent() {
@@ -1543,12 +1602,9 @@ mod tests {
         let system = Arc::new(ActorSystem::new());
         let path = Path::new("counter");
         let sub = Path::new("watcher");
-        system.spawn_es::<Counter, _>(
-            path.clone(),
-            &json!({}),
-            SpawnOpts::default(),
-            || vec![Arc::new(TypedEsAdapter::<Counter, Add>::new::<Add>())],
-        );
+        system.spawn_es::<Counter, _>(path.clone(), &json!({}), SpawnOpts::default(), || {
+            vec![Arc::new(TypedEsAdapter::<Counter, Add>::new::<Add>())]
+        });
         let (sub_idx, sub_sink) = open_sink();
         bind_sink(&sub, sub_sink);
         system.spawn_service::<Auditor, _>(
@@ -1610,12 +1666,9 @@ mod tests {
         let path = Path::new("counter");
         let early = Path::new("early");
         let late = Path::new("late");
-        system.spawn_es::<Counter, _>(
-            path.clone(),
-            &json!({}),
-            SpawnOpts::default(),
-            || vec![Arc::new(TypedEsAdapter::<Counter, Add>::new::<Add>())],
-        );
+        system.spawn_es::<Counter, _>(path.clone(), &json!({}), SpawnOpts::default(), || {
+            vec![Arc::new(TypedEsAdapter::<Counter, Add>::new::<Add>())]
+        });
         for p in [&early, &late] {
             let (idx, sink) = open_sink();
             bind_sink(p, sink);
@@ -1652,8 +1705,16 @@ mod tests {
         // Then "early" saw both events and "late" only the second.
         let early_lines = sink_read(&early);
         let late_lines = sink_read(&late);
-        assert_eq!(early_lines.len(), 2, "early saw everything: {early_lines:?}");
-        assert_eq!(late_lines.len(), 1, "late only saw its own era: {late_lines:?}");
+        assert_eq!(
+            early_lines.len(),
+            2,
+            "early saw everything: {early_lines:?}"
+        );
+        assert_eq!(
+            late_lines.len(),
+            1,
+            "late only saw its own era: {late_lines:?}"
+        );
     }
 
     #[tokio::test]
@@ -1662,15 +1723,14 @@ mod tests {
         let system = Arc::new(ActorSystem::new());
         let path = Path::new("counter");
         let slow = Path::new("slow");
-        system.spawn_es::<Counter, _>(
-            path.clone(),
-            &json!({}),
-            SpawnOpts::default(),
-            || vec![Arc::new(TypedEsAdapter::<Counter, Add>::new::<Add>())],
-        );
+        system.spawn_es::<Counter, _>(path.clone(), &json!({}), SpawnOpts::default(), || {
+            vec![Arc::new(TypedEsAdapter::<Counter, Add>::new::<Add>())]
+        });
+        let (slow_idx, _slow_sink) = open_sink();
+        bind_sink(&slow, sinks().lock().expect("sinks lock")[slow_idx].clone());
         system.spawn_service::<Auditor, _>(
             slow.clone(),
-            &json!({}),
+            &json!({ "sink": slow_idx }),
             SpawnOpts {
                 mailbox_capacity: 1,
                 mailbox_policy: crate::inbox::OverloadPolicy::DropNew,
@@ -1699,9 +1759,7 @@ mod tests {
         // And some deliveries were refused (dead-lettered), not blocked.
         let dead = system.kernel.lock().expect("lock").dead_letters.len();
         assert!(
-            dead > 0 || {
-                !sink_read(&slow).is_empty()
-            },
+            dead > 0 || { !sink_read(&slow).is_empty() },
             "slow subscriber either dropped or received; never stalled the publisher"
         );
     }
@@ -1722,16 +1780,16 @@ mod tests {
     /// A service actor appending to a shared sink (impure by design).
     /// `start` receives JSON args, so the test passes the sink through a
     /// well-known args key serialized as a slot index into a static table.
-    static SINKS: std::sync::OnceLock<Mutex<Vec<Arc<Mutex<Vec<String>>>>>> =
-        std::sync::OnceLock::new();
+    type SinkList = Vec<Arc<Mutex<Vec<String>>>>;
+    static SINKS: std::sync::OnceLock<Mutex<SinkList>> = std::sync::OnceLock::new();
 
     fn sinks() -> &'static Mutex<Vec<Arc<Mutex<Vec<String>>>>> {
         SINKS.get_or_init(|| Mutex::new(Vec::new()))
     }
 
     /// Path→sink table (tests inspect a subscriber's sink by its path).
-    static SINK_BY_PATH: std::sync::OnceLock<Mutex<HashMap<String, Arc<Mutex<Vec<String>>>>>> =
-        std::sync::OnceLock::new();
+    type SinkTable = HashMap<String, Arc<Mutex<Vec<String>>>>;
+    static SINK_BY_PATH: std::sync::OnceLock<Mutex<SinkTable>> = std::sync::OnceLock::new();
 
     fn sink_table() -> &'static Mutex<HashMap<String, Arc<Mutex<Vec<String>>>>> {
         SINK_BY_PATH.get_or_init(|| Mutex::new(HashMap::new()))
@@ -1779,7 +1837,6 @@ mod tests {
             let sink = sinks().lock().expect("sinks lock")[idx].clone();
             Ok(Self { sink })
         }
-
     }
 
     impl MsgHandler<Added> for Auditor {
@@ -1794,7 +1851,10 @@ mod tests {
 
     impl MsgHandler<Add> for Auditor {
         async fn handle(&mut self, msg: Add, _ctx: &mut crate::context::MsgCtx<'_>) {
-            self.sink.lock().expect("sink lock").push(format!("n={}", msg.n));
+            self.sink
+                .lock()
+                .expect("sink lock")
+                .push(format!("n={}", msg.n));
         }
     }
 
@@ -1858,7 +1918,7 @@ mod tests {
                         reply_to.clone(),
                         Add::schema_id(),
                         json!({ "echo": msg.n }),
-                        ctx.core.trace.clone(),
+                        *ctx.core.trace,
                     );
                 }
             }
@@ -1887,14 +1947,16 @@ mod tests {
                         std::time::Duration::from_secs(2),
                     )
                     .await;
-                let recorded = RESULTS
-                    .get_or_init(|| Mutex::new(Vec::new()));
+                let recorded = RESULTS.get_or_init(|| Mutex::new(Vec::new()));
                 match reply {
                     Ok(value) => recorded
                         .lock()
                         .expect("results lock")
                         .push(format!("replied:{}", value["echo"])),
-                    Err(_) => recorded.lock().expect("results lock").push("failed".to_owned()),
+                    Err(_) => recorded
+                        .lock()
+                        .expect("results lock")
+                        .push("failed".to_owned()),
                 }
             }
         }
@@ -1915,7 +1977,11 @@ mod tests {
 
         // When the asker asks the echo.
         system
-            .send(system.envelope(Boom::schema_id(), Path::new("asker"), json!({ "why": "ask" })))
+            .send(system.envelope(
+                Boom::schema_id(),
+                Path::new("asker"),
+                json!({ "why": "ask" }),
+            ))
             .await
             .expect("delivered");
 
@@ -1926,7 +1992,10 @@ mod tests {
             }
             tokio::time::sleep(std::time::Duration::from_millis(2)).await;
         }
-        panic!("ask never settled as replied: {:?}", results.lock().unwrap());
+        panic!(
+            "ask never settled as replied: {:?}",
+            results.lock().unwrap()
+        );
     }
 
     #[tokio::test]
@@ -1979,10 +2048,14 @@ mod tests {
                     )
                     .await;
                 let recorded = RESULTS.get_or_init(|| Mutex::new(Vec::new()));
-                recorded
-                    .lock()
-                    .expect("lock")
-                    .push(if reply.is_ok() { "replied" } else { "timed-out" }.to_owned());
+                recorded.lock().expect("lock").push(
+                    if reply.is_ok() {
+                        "replied"
+                    } else {
+                        "timed-out"
+                    }
+                    .to_owned(),
+                );
             }
         }
 
@@ -2002,7 +2075,11 @@ mod tests {
 
         // When the asker asks the silent callee.
         system
-            .send(system.envelope(Boom::schema_id(), Path::new("asker"), json!({ "why": "ask" })))
+            .send(system.envelope(
+                Boom::schema_id(),
+                Path::new("asker"),
+                json!({ "why": "ask" }),
+            ))
             .await
             .expect("delivered");
 
@@ -2012,10 +2089,12 @@ mod tests {
                 let kernel = system.kernel.lock().expect("lock");
                 assert!(kernel.replies.is_empty(), "lease leaked after timeout");
                 assert!(!kernel.ask_facts.is_empty(), "no ask facts recorded");
-                assert!(kernel
-                    .ask_facts
-                    .iter()
-                    .any(|f| f.outcome == Some(crate::kernel::AskOutcome::Timeout)));
+                assert!(
+                    kernel
+                        .ask_facts
+                        .iter()
+                        .any(|f| f.outcome == Some(crate::kernel::AskOutcome::Timeout))
+                );
                 return;
             }
             tokio::time::sleep(std::time::Duration::from_millis(2)).await;
@@ -2090,7 +2169,10 @@ mod tests {
                         Some(Address::Path(ctx.0.self_path.clone())),
                     );
                 }
-                vec![crate::envelope::Event::new(Added::schema_id(), json!({ "n": cmd.n }))]
+                vec![crate::envelope::Event::new(
+                    Added::schema_id(),
+                    json!({ "n": cmd.n }),
+                )]
             }
         }
 
@@ -2098,7 +2180,11 @@ mod tests {
             Path::new("collector"),
             &json!({}),
             SpawnOpts::default(),
-            || vec![Arc::new(TypedServiceAdapter::<Collector, Added>::new::<Added>())],
+            || {
+                vec![Arc::new(TypedServiceAdapter::<Collector, Added>::new::<
+                    Added,
+                >())]
+            },
         );
         system.spawn_es::<Counter, _>(
             Path::new("counter"),
@@ -2110,7 +2196,8 @@ mod tests {
 
         // When the counter is told to Add with a reply-to PATH pointing at
         // the collector (an ask-shaped message, but reply-by-name).
-        let mut envelope = system.envelope(Add::schema_id(), Path::new("counter"), json!({ "n": 5 }));
+        let mut envelope =
+            system.envelope(Add::schema_id(), Path::new("counter"), json!({ "n": 5 }));
         envelope.reply_to = Some(Address::Path(Path::new("collector")));
         envelope.from = Some(Path::new("collector"));
         system.send(envelope).await.expect("delivered");
@@ -2133,15 +2220,19 @@ mod tests {
         // Given a live reply table with two leases: one short, one long.
         let system = ActorSystem::new();
         let kernel = system.kernel.lock().expect("lock");
-        let (short_lease, _short_rx) =
-            kernel.replies.open(std::time::Duration::from_millis(5), system.clock.now());
-        let (long_lease, long_rx) =
-            kernel.replies.open(std::time::Duration::from_secs(60), system.clock.now());
+        let (short_lease, _short_rx) = kernel
+            .replies
+            .open(std::time::Duration::from_millis(5), system.clock.now());
+        let (long_lease, long_rx) = kernel
+            .replies
+            .open(std::time::Duration::from_secs(60), system.clock.now());
 
         // When completing the long lease and pruning past the short one.
         assert!(kernel.replies.complete(&long_lease, json!({ "ok": true })));
         drop(long_rx);
-        kernel.replies.prune(crate::types::Timestamp::from_millis(system.clock.now().as_millis() + 10));
+        kernel.replies.prune(crate::types::Timestamp::from_millis(
+            system.clock.now().as_millis() + 10,
+        ));
 
         // Then the short lease is gone (expired), the long one was
         // consumed by its reply, and the table is empty — no leaks.
@@ -2158,12 +2249,9 @@ mod tests {
 
         // When spawning an ES actor.
         let path = Path::new("counter");
-        system.spawn_es::<Counter, _>(
-            path.clone(),
-            &json!({}),
-            SpawnOpts::default(),
-            || vec![Arc::new(TypedEsAdapter::<Counter, Add>::new::<Add>())],
-        );
+        system.spawn_es::<Counter, _>(path.clone(), &json!({}), SpawnOpts::default(), || {
+            vec![Arc::new(TypedEsAdapter::<Counter, Add>::new::<Add>())]
+        });
 
         // Then the slot resolves and who_handles finds the path.
         let handlers = RuntimeView::who_handles(system.as_ref(), &Add::schema_id());
@@ -2175,12 +2263,9 @@ mod tests {
         // Given a system with a spawned counter.
         let system = Arc::new(ActorSystem::new());
         let path = Path::new("counter");
-        system.spawn_es::<Counter, _>(
-            path.clone(),
-            &json!({}),
-            SpawnOpts::default(),
-            || vec![Arc::new(TypedEsAdapter::<Counter, Add>::new::<Add>())],
-        );
+        system.spawn_es::<Counter, _>(path.clone(), &json!({}), SpawnOpts::default(), || {
+            vec![Arc::new(TypedEsAdapter::<Counter, Add>::new::<Add>())]
+        });
 
         // When capturing the state.
         let state = system.es_state(&path).await.expect("live");
@@ -2203,7 +2288,6 @@ mod tests {
         assert!(system.schema(&first).is_some());
     }
 
-
     /// Reads a foreign actor's live JSON state (test inspection helper).
     async fn count_total_json(system: &ActorSystem, path: &Path) -> Option<i64> {
         system
@@ -2211,7 +2295,6 @@ mod tests {
             .await
             .and_then(|s| s["total"].as_i64())
     }
-
 
     #[tokio::test]
     async fn foreign_schema_roundtrip() {
@@ -2286,19 +2369,20 @@ mod tests {
         // Given a publisher and a subscriber bound to a topic.
         let system = Arc::new(ActorSystem::new());
         let topic = crate::types::Topic::new("cascade.events");
-        system.spawn_es::<Counter, _>(
-            Path::new("pub"),
-            &json!({}),
-            SpawnOpts::default(),
-            || vec![Arc::new(TypedEsAdapter::<Counter, Add>::new::<Add>())],
-        );
+        system.spawn_es::<Counter, _>(Path::new("pub"), &json!({}), SpawnOpts::default(), || {
+            vec![Arc::new(TypedEsAdapter::<Counter, Add>::new::<Add>())]
+        });
         let (sub_idx, sub_sink) = open_sink();
         bind_sink(&Path::new("sub"), sub_sink);
         system.spawn_service::<Auditor, _>(
             Path::new("sub"),
             &json!({ "sink": sub_idx }),
             SpawnOpts::default(),
-            || vec![Arc::new(TypedServiceAdapter::<Auditor, Added>::new::<Added>())],
+            || {
+                vec![Arc::new(
+                    TypedServiceAdapter::<Auditor, Added>::new::<Added>(),
+                )]
+            },
         );
         system
             .subscribe(&Path::new("sub"), &topic, None)
@@ -2358,7 +2442,11 @@ mod tests {
             Path::new("sink"),
             &json!({ "sink": sink_idx }),
             SpawnOpts::default(),
-            || vec![Arc::new(TypedServiceAdapter::<Auditor, Added>::new::<Added>())],
+            || {
+                vec![Arc::new(
+                    TypedServiceAdapter::<Auditor, Added>::new::<Added>(),
+                )]
+            },
         );
         system
             .subscribe(&Path::new("sink"), &topic, None)
@@ -2391,16 +2479,20 @@ mod tests {
             Some(0),
             "genesis state captured: {source:?}"
         );
-        assert!(export
-            .declared_edges
-            .iter()
-            .any(|e| e.actor == Path::new("source")
-                && e.schema == schema
-                && e.direction == crate::system::EdgeDirection::Handles));
-        assert!(export
-            .declared_edges
-            .iter()
-            .any(|e| e.actor == Path::new("sink") && e.topic == Some(topic.clone())));
+        assert!(
+            export
+                .declared_edges
+                .iter()
+                .any(|e| e.actor == Path::new("source")
+                    && e.schema == schema
+                    && e.direction == crate::system::EdgeDirection::Handles)
+        );
+        assert!(
+            export
+                .declared_edges
+                .iter()
+                .any(|e| e.actor == Path::new("sink") && e.topic == Some(topic.clone()))
+        );
         let observed = export
             .observed_edges
             .iter()
@@ -2438,7 +2530,7 @@ mod tests {
             path.clone(),
             &json!({}),
             SpawnOpts::default(),
-            || vec![],
+            std::vec::Vec::new,
         );
 
         // When sending an envelope from the system root.

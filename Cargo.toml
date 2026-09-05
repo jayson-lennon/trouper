@@ -20,6 +20,18 @@ derive_more = { version = "2.1", features = ["debug"] }
 rstest = "0.26"
 futures = "0.3"
 
+[package]
+name = "actor-canvas"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+actor-runtime.workspace = true
+error-stack.workspace = true
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+
 [profile.release]
 lto = true
 codegen-units = 1

@@ -434,8 +434,8 @@ mod tests {
 
         // When comparing and round-tripping through JSON.
         let ordered = earlier < later;
-        let round: SeqNo = serde_json::from_str(&serde_json::to_string(&later).expect("ser"))
-            .expect("de");
+        let round: SeqNo =
+            serde_json::from_str(&serde_json::to_string(&later).expect("ser")).expect("de");
 
         // Then ordering follows the numeric value and the value survives.
         assert!(ordered);
@@ -480,4 +480,3 @@ mod tests {
         assert_eq!(round, reason);
     }
 }
-

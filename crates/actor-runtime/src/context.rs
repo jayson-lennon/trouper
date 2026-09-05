@@ -67,7 +67,13 @@ impl Outbox {
     }
 
     /// Records a reply intent (resolved by the kernel at flush time).
-    pub fn push_reply(&mut self, to: Address, schema: SchemaId, payload: JsonValue, trace: TraceCtx) {
+    pub fn push_reply(
+        &mut self,
+        to: Address,
+        schema: SchemaId,
+        payload: JsonValue,
+        trace: TraceCtx,
+    ) {
         self.intents.push(Intent::Reply {
             to,
             schema,
@@ -96,6 +102,21 @@ impl Outbox {
         self.intents.len()
     }
 }
+
+/// The boxed future a [`AskPort::ask_channel`] resolves to.
+pub type AskChannelFuture = std::pin::Pin<
+    Box<
+        dyn std::future::Future<
+                Output = Result<
+                    (
+                        crate::types::LeaseId,
+                        tokio::sync::oneshot::Receiver<JsonValue>,
+                    ),
+                    error_stack::Report<AskError>,
+                >,
+            > + Send,
+    >,
+>;
 
 /// The fields every context shares.
 pub struct CtxCore<'a> {
@@ -129,8 +150,8 @@ impl CtxCore<'_> {
         payload: JsonValue,
         reply_to: Option<Address>,
     ) {
-        let mut envelope = Envelope::json(schema, dest, payload, self.child_trace())
-            .from(self.self_path.clone());
+        let mut envelope =
+            Envelope::json(schema, dest, payload, self.child_trace()).from(self.self_path.clone());
         if let Some(reply_to) = reply_to {
             envelope = envelope.reply_to(reply_to);
         }
@@ -139,9 +160,13 @@ impl CtxCore<'_> {
 
     /// Records a publish onto `topic`.
     pub fn publish(&mut self, topic: Topic, schema: SchemaId, payload: JsonValue) {
-        let envelope =
-            Envelope::json(schema, Address::Topic(topic.clone()), payload, self.child_trace())
-                .from(self.self_path.clone());
+        let envelope = Envelope::json(
+            schema,
+            Address::Topic(topic.clone()),
+            payload,
+            self.child_trace(),
+        )
+        .from(self.self_path.clone());
         self.outbox.push_publish(topic, envelope);
     }
 
@@ -151,7 +176,8 @@ impl CtxCore<'_> {
     /// so the fact is unobservable by definition.
     pub fn reply(&mut self, schema: SchemaId, payload: JsonValue) {
         if let Some(reply_to) = self.reply_to {
-            self.send(reply_to.clone(), schema, payload, None);
+            self.outbox
+                .push_reply(reply_to.clone(), schema, payload, self.child_trace());
         }
     }
 
@@ -209,16 +235,7 @@ pub trait AskPort: Send + Sync {
         schema: SchemaId,
         payload: JsonValue,
         ttl: std::time::Duration,
-    ) -> std::pin::Pin<
-        Box<
-            dyn std::future::Future<
-                    Output = Result<
-                        (crate::types::LeaseId, tokio::sync::oneshot::Receiver<JsonValue>),
-                        error_stack::Report<AskError>,
-                    >,
-                > + Send,
-        >,
-    >;
+    ) -> AskChannelFuture;
 
     /// Records an ask-settled outcome and drops the lease (a settled or
     /// timed-out ask must not leak its slot).
@@ -287,7 +304,7 @@ impl MsgCtx<'_> {
     ) -> Result<JsonValue, error_stack::Report<AskError>> {
         use error_stack::ResultExt;
         let port = self.port.expect("ask requires a port (service tier)");
-        let trace = self.core.trace.clone();
+        let trace = *self.core.trace;
         let dest_label = format!("{dest:?}");
         let (lease, mut receiver) = port
             .ask_channel(dest.clone(), schema, payload, timeout)
@@ -339,7 +356,10 @@ mod tests {
                     (Path::new("inventory.west"), ActorKind::EventSourced),
                     (Path::new("auditor"), ActorKind::Service),
                 ],
-                handlers: vec![(SchemaId::new("ReserveStock", 1), Path::new("inventory.west"))],
+                handlers: vec![(
+                    SchemaId::new("ReserveStock", 1),
+                    Path::new("inventory.west"),
+                )],
                 now: Timestamp::from_millis(millis),
             }
         }
@@ -347,11 +367,14 @@ mod tests {
 
     impl RuntimeView for FakeView {
         fn lookup(&self, path: &Path) -> Option<EndpointInfo> {
-            self.paths.iter().find(|(p, _)| p == path).map(|(p, kind)| EndpointInfo {
-                path: p.clone(),
-                kind: *kind,
-                manifest: ActorManifest::new().kind(*kind),
-            })
+            self.paths
+                .iter()
+                .find(|(p, _)| p == path)
+                .map(|(p, kind)| EndpointInfo {
+                    path: p.clone(),
+                    kind: *kind,
+                    manifest: ActorManifest::new().kind(*kind),
+                })
         }
 
         fn who_handles(&self, schema: &SchemaId) -> Vec<Path> {
@@ -374,13 +397,7 @@ mod tests {
         let parent = TraceCtx::root();
         let mut outbox = Outbox::new();
         let path = Path::new("storefront");
-        let mut ctx = CmdCtx::new(
-            &path,
-            &parent,
-            None,
-            &view,
-            &mut outbox,
-        );
+        let mut ctx = CmdCtx::new(&path, &parent, None, &view, &mut outbox);
 
         // When sending a command.
         let json = serde_json::json!({ "qty": 2 });
@@ -397,7 +414,10 @@ mod tests {
         let drained: Vec<_> = outbox.drain().collect();
         match &drained[0] {
             Intent::Send(envelope) => {
-                assert_eq!(envelope.from.as_ref().map(|p| p.as_str()), Some("storefront"));
+                assert_eq!(
+                    envelope.from.as_ref().map(|p| p.as_str()),
+                    Some("storefront")
+                );
                 assert_eq!(envelope.trace.trace_id, parent.trace_id);
                 assert_ne!(envelope.trace.causality_id, parent.causality_id);
                 assert_eq!(envelope.schema.as_str(), "ReserveStock@1");
@@ -419,22 +439,27 @@ mod tests {
         let mut ctx = CmdCtx::new(&path, &trace, Some(&reply_to), view, &mut outbox);
 
         // When replying.
-        ctx.0.reply(SchemaId::new("Reserved", 1), serde_json::json!({ "ok": true }));
+        ctx.0.reply(
+            SchemaId::new("Reserved", 1),
+            serde_json::json!({ "ok": true }),
+        );
 
-        // Then one send intent targets the client.
+        // Then one reply intent targets the client.
         let drained: Vec<_> = outbox.drain().collect();
         match &drained[0] {
-            Intent::Send(envelope) => {
-                assert_eq!(envelope.dest, Address::Path(Path::new("client")));
+            Intent::Send(_) => panic!("expected a reply intent"),
+            Intent::Publish { .. } => panic!("expected a reply intent"),
+            Intent::Reply { to, .. } => {
+                assert_eq!(*to, Address::Path(Path::new("client")));
             }
-            Intent::Publish { .. } => panic!("expected a send"),
-            Intent::Reply { .. } => panic!("expected a send"),
         }
 
         // When a context without reply-to replies.
         let mut silent_outbox = Outbox::new();
         let mut silent = CmdCtx::new(&path, &trace, None, view, &mut silent_outbox);
-        silent.0.reply(SchemaId::new("Reserved", 1), serde_json::json!({}));
+        silent
+            .0
+            .reply(SchemaId::new("Reserved", 1), serde_json::json!({}));
 
         // Then nothing is recorded.
         assert!(silent_outbox.is_empty());
@@ -497,8 +522,18 @@ mod tests {
         let mut outbox = Outbox::new();
         let path = Path::new("a");
         let mut ctx = CmdCtx::new(&path, &trace, None, &view, &mut outbox);
-        ctx.0.send(Address::Path(Path::new("b")), SchemaId::new("Ping", 1), serde_json::json!({}), None);
-        ctx.0.send(Address::Path(Path::new("c")), SchemaId::new("Pong", 1), serde_json::json!({}), None);
+        ctx.0.send(
+            Address::Path(Path::new("b")),
+            SchemaId::new("Ping", 1),
+            serde_json::json!({}),
+            None,
+        );
+        ctx.0.send(
+            Address::Path(Path::new("c")),
+            SchemaId::new("Pong", 1),
+            serde_json::json!({}),
+            None,
+        );
 
         // When draining.
         let count = outbox.drain().count();
@@ -518,7 +553,12 @@ mod tests {
         let mut ctx = MsgCtx::new(&path, &trace, None, &view, &mut outbox, None);
 
         // When it sends.
-        ctx.core.send(Address::Path(Path::new("b")), SchemaId::new("Ping", 1), serde_json::json!({}), None);
+        ctx.core.send(
+            Address::Path(Path::new("b")),
+            SchemaId::new("Ping", 1),
+            serde_json::json!({}),
+            None,
+        );
 
         // Then the effect is deferred identically.
         assert_eq!(outbox.len(), 1);

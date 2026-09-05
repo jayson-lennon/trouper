@@ -54,10 +54,7 @@ pub enum FactKind {
         trace: TraceCtx,
     },
     /// An ask settled.
-    AskSettled {
-        outcome: String,
-        trace: TraceCtx,
-    },
+    AskSettled { outcome: String, trace: TraceCtx },
     /// An actor was spawned (fresh or restarted).
     Spawned { path: Path, restart: bool },
     /// An actor stopped gracefully.

@@ -95,11 +95,8 @@ pub struct ChildSpec {
     /// Ok(()) after the child runs again; the kernel drives restarts.
     #[allow(clippy::type_complexity)]
     pub spawn: std::sync::Arc<
-        dyn Fn(
-                &std::sync::Arc<crate::system::ActorSystem>,
-                &crate::types::Path,
-                &serde_json::Value,
-            ) + Send
+        dyn Fn(&std::sync::Arc<crate::system::ActorSystem>, &crate::types::Path, &serde_json::Value)
+            + Send
             + Sync,
     >,
 }

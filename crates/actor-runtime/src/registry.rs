@@ -42,7 +42,13 @@ impl Endpoint {
     ///
     /// Fails when the front door is full (`try_send`) or the endpoint is
     /// gone (receiver dropped mid-restart).
-    pub fn try_deliver(&self, envelope: Envelope) -> Result<(), mpsc::error::TrySendError<Envelope>> {
+    // Large Err is deliberate: the caller recovers the undeliverable
+    // envelope for dead-lettering (same rationale as `Inbox::push`).
+    #[allow(clippy::result_large_err)]
+    pub fn try_deliver(
+        &self,
+        envelope: Envelope,
+    ) -> Result<(), mpsc::error::TrySendError<Envelope>> {
         self.tx.try_send(envelope)
     }
 
@@ -51,7 +57,10 @@ impl Endpoint {
     /// # Errors
     ///
     /// Fails when the endpoint is gone (receiver dropped mid-restart).
-    pub async fn deliver(&self, envelope: Envelope) -> Result<(), mpsc::error::SendError<Envelope>> {
+    pub async fn deliver(
+        &self,
+        envelope: Envelope,
+    ) -> Result<(), mpsc::error::SendError<Envelope>> {
         self.tx.send(envelope).await
     }
 }
@@ -329,10 +338,7 @@ impl Registry {
 
     /// Resolves a path to a deliverable endpoint, if the actor is running.
     pub fn resolve(&self, path: &Path) -> Option<std::sync::Arc<Endpoint>> {
-        self.slots
-            .get(path)?
-            .endpoint
-            .load_full()
+        self.slots.get(path)?.endpoint.load_full()
     }
 
     /// The inbox policy a path spawned with (topic pump delivery).
@@ -547,10 +553,10 @@ mod tests {
             .expect("insert");
 
         // When resolving the path and delivering an envelope.
-        let delivered = registry
-            .resolve(&path)
-            .map(|ep| ep.try_deliver(envelope(1)))
-            .is_some();
+        let delivered = match registry.resolve(&path) {
+            Some(ep) => ep.try_deliver(envelope(1)).is_ok(),
+            None => false,
+        };
 
         // Then delivery succeeds.
         assert!(delivered);
@@ -666,7 +672,10 @@ mod tests {
 
         // Then kind and topic edges are visible.
         assert_eq!(info.kind, ActorKind::EventSourced);
-        assert_eq!(info.manifest.emits_on_topics, [Topic::new("inventory.events")]);
+        assert_eq!(
+            info.manifest.emits_on_topics,
+            [Topic::new("inventory.events")]
+        );
     }
 
     #[test]
