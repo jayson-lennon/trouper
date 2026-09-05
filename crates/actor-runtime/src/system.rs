@@ -162,6 +162,13 @@ impl ActorSystem {
         kernel
             .snapshot_policy
             .insert(path.clone(), opts.snapshot);
+        kernel.tap.push(
+            self.clock.now(),
+            crate::tap::FactKind::Spawned {
+                path: path.clone(),
+                restart: false,
+            },
+        );
         drop(kernel);
 
         // Front door + ES loop, sharing the kernel tables.
@@ -207,6 +214,13 @@ impl ActorSystem {
         kernel.cells.insert(path.clone(), cell.clone());
         kernel.genesis_args.insert(path.clone(), args.clone());
         kernel.msg_entries.insert(path.clone(), entries());
+        kernel.tap.push(
+            self.clock.now(),
+            crate::tap::FactKind::Spawned {
+                path: path.clone(),
+                restart: false,
+            },
+        );
         drop(kernel);
 
         let loop_ctx = EsLoop {
@@ -275,7 +289,7 @@ impl ActorSystem {
     /// Returns the envelope back when its destination does not resolve
     /// (callers dead-letter or retry).
     pub async fn send(&self, envelope: Envelope) -> Result<Path, Envelope> {
-        route(&self.registry, envelope).await
+        route(&self.registry, &self.kernel, envelope).await
     }
 
     /// Builds a system-rooted envelope (fresh trace) addressed to a path.
@@ -381,6 +395,17 @@ impl ActorSystem {
     pub fn topic_range(&self, topic: &crate::types::Topic) -> Option<(u64, u64)> {
         let kernel = self.kernel.lock().expect("kernel lock");
         kernel.topic_logs.get(topic).map(|log| log.retained())
+    }
+
+    /// A snapshot of tap facts from an offset (inspection/tests).
+    pub fn tap_facts_from(&self, from: u64) -> Vec<crate::tap::Fact> {
+        let kernel = self.kernel.lock().expect("kernel lock");
+        kernel.tap.subscribe(from).1
+    }
+
+    /// All retained tap facts (inspection/tests).
+    pub fn tap_facts(&self) -> Vec<crate::tap::Fact> {
+        self.tap_facts_from(0)
     }
 
     /// The cursor of an actor's inbox (inspection; Phase 10 tests).
@@ -692,6 +717,166 @@ mod tests {
     }
 
 
+
+
+    #[tokio::test]
+    async fn tap_causality_chain_links_hops_with_a_shared_trace() {
+        // Given A→B→C: a counter whose Add handler forwards to an Echo
+        // service, and an Echo service that handles Ping.
+        #[derive(serde::Deserialize)]
+        struct Ping {
+            #[serde(default)]
+            #[allow(dead_code)] // payload shape; the handler ignores it
+            n: i64,
+        }
+        impl Schema for Ping {
+            fn schema_def() -> SchemaDef {
+                SchemaDef {
+                    name: "Ping".into(),
+                    version: 1,
+                    kind: SchemaKind::Command,
+                    fields: vec![FieldDef::required("n", FieldTy::Int)],
+                    description: None,
+                }
+            }
+        }
+
+        #[derive(Serialize, Deserialize, Default)]
+        struct Forwarder;
+        impl EventSourced for Forwarder {
+            fn manifest() -> ActorManifest {
+                ActorManifest::new()
+                    .handles::<Add>()
+                    .kind(ActorKind::EventSourced)
+            }
+            fn restore(_args: &JsonValue) -> Self {
+                Self
+            }
+            fn apply(&mut self, _event: &crate::envelope::Event) {}
+        }
+        impl CommandHandler<Add> for Forwarder {
+            fn handle(&self, _cmd: Add, ctx: &mut CmdCtx<'_>) -> Vec<crate::envelope::Event> {
+                ctx.0.send(
+                    Address::Path(Path::new("echo")),
+                    Ping::schema_id(),
+                    json!({ "n": 0 }),
+                    None,
+                );
+                Vec::new()
+            }
+        }
+
+        struct Echo;
+        impl ServiceActor for Echo {
+            fn manifest() -> ActorManifest {
+                ActorManifest::new()
+                    .handles::<Ping>()
+                    .kind(ActorKind::Service)
+            }
+            async fn start(_args: &JsonValue) -> Result<Self, error_stack::Report<crate::registry::RegistryError>> {
+                Ok(Self)
+            }
+        }
+        impl MsgHandler<Ping> for Echo {
+            async fn handle(&mut self, _msg: Ping, _ctx: &mut crate::context::MsgCtx<'_>) {}
+        }
+
+        let system = Arc::new(ActorSystem::new());
+        system.spawn_es::<Forwarder, _>(
+            Path::new("a"),
+            &json!({}),
+            SpawnOpts::default(),
+            || vec![Arc::new(TypedEsAdapter::<Forwarder, Add>::new::<Add>())],
+        );
+        system.spawn_service::<Echo, _>(
+            Path::new("echo"),
+            &json!({}),
+            SpawnOpts::default(),
+            || vec![Arc::new(TypedServiceAdapter::<Echo, Ping>::new::<Ping>())],
+        );
+
+        // When the conversation starts at A and both hops settle.
+        system
+            .send(system.envelope(Add::schema_id(), Path::new("a"), json!({ "n": 1 })))
+            .await
+            .expect("send");
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        // Then the facts carry a shared trace id across the hops.
+        let facts = system.tap_facts();
+        let a_hop = facts
+            .iter()
+            .find(|f| matches!(&f.kind, crate::tap::FactKind::Delivered { to, .. } if *to == Path::new("a")))
+            .expect("hop a delivered");
+        let trace_of = |f: &crate::tap::Fact| match &f.kind {
+            crate::tap::FactKind::Delivered { trace, .. }
+            | crate::tap::FactKind::Acked { trace, .. }
+            | crate::tap::FactKind::Sent { trace, .. } => *trace,
+            _ => panic!("unexpected fact kind"),
+        };
+        let a_trace = trace_of(a_hop);
+        let b_facts: Vec<_> = facts
+            .iter()
+            .filter(|f| {
+                matches!(
+                    &f.kind,
+                    crate::tap::FactKind::Delivered { to, .. } if *to == Path::new("echo")
+                )
+            })
+            .collect();
+        assert!(!b_facts.is_empty(), "echo never received the forward");
+        for f in &b_facts {
+            assert_eq!(
+                trace_of(f).trace_id, a_trace.trace_id,
+                "hops share one trace"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn tap_drop_oldest_under_pressure_keeps_delivery_working() {
+        // Given a system whose tap ring is tiny (test-visible capacity).
+        let system = Arc::new(ActorSystem::new());
+        {
+            let mut kernel = system.kernel.lock().expect("lock");
+            kernel.tap = crate::tap::TapRing::new(4);
+        }
+        let path = Path::new("counter");
+        system.spawn_es::<Counter, _>(
+            path.clone(),
+            &json!({}),
+            SpawnOpts::default(),
+            || vec![Arc::new(TypedEsAdapter::<Counter, Add>::new::<Add>())],
+        );
+
+        // When far more messages flow than the ring can hold.
+        for n in 0..50 {
+            system
+                .send(system.envelope(Add::schema_id(), path.clone(), json!({ "n": n })))
+                .await
+                .expect("send");
+        }
+        wait_for_cursor(&system, &path, 50).await;
+
+        // Then delivery was unaffected: all 50 committed (journal count).
+        let journal_len = {
+            let kernel = system.kernel.lock().expect("lock");
+            kernel.journals[&path].len()
+        };
+        assert_eq!(journal_len, 50);
+
+        // And the ring retained only its newest facts with monotonic
+        // offsets and a JSON projection that still works.
+        let facts = system.tap_facts();
+        assert!(facts.len() <= 4, "ring dropped oldest: {}", facts.len());
+        let offsets: Vec<u64> = facts.iter().map(|f| f.offset).collect();
+        let sorted = offsets.clone();
+        let mut sorted = sorted;
+        sorted.sort_unstable();
+        assert_eq!(offsets, sorted, "offsets monotonic");
+        let last = facts.last().expect("facts").to_json();
+        assert!(last["offset"].is_u64());
+    }
 
     #[tokio::test]
     async fn topic_cursor_reset_redelivers_in_order() {

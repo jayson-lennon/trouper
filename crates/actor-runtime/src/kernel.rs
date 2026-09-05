@@ -88,7 +88,6 @@ pub struct AskFact {
 ///
 /// Guarded by one lock — these mutate together (spawn inserts into every
 /// table; restart swaps state + endpoint as one observation).
-#[derive(Default)]
 pub struct KernelState {
     pub cells: HashMap<Path, Arc<ActorCell>>,
     pub journals: HashMap<Path, Journal>,
@@ -113,6 +112,40 @@ pub struct KernelState {
     pub topic_logs: HashMap<crate::types::Topic, crate::topics::TopicLog>,
     /// Topic publish facts (tap consumes in Phase 7).
     pub topic_facts: Vec<crate::topics::TopicPublishFact>,
+    /// The global observation ring (drop-oldest).
+    pub tap: crate::tap::TapRing,
+}
+
+impl Default for KernelState {
+    fn default() -> Self {
+        Self {
+            cells: HashMap::new(),
+            journals: HashMap::new(),
+            es_state: HashMap::new(),
+            entries: HashMap::new(),
+            snapshot_policy: HashMap::new(),
+            services: HashMap::new(),
+            replies: crate::reply::ReplyTable::default(),
+            ask_facts: Vec::new(),
+            msg_entries: HashMap::new(),
+            genesis_args: HashMap::new(),
+            crashed: HashSet::new(),
+            dead_letters: Vec::new(),
+            topic_logs: HashMap::new(),
+            topic_facts: Vec::new(),
+            tap: crate::tap::TapRing::new(4096),
+        }
+    }
+}
+
+/// Emits one fact onto the tap with the given clock's timestamp.
+pub fn emit(tap_clock: &Mutex<KernelState>, clock: &crate::clock::ClockService, kind: crate::tap::FactKind) {
+    let ts = clock.now();
+    tap_clock
+        .lock()
+        .expect("kernel lock")
+        .tap
+        .push(ts, kind);
 }
 
 /// Kernel-facing handle for one running actor loop.
@@ -190,6 +223,7 @@ impl EsLoop {
 /// Phases 5–6).
 pub async fn route(
     registry: &Mutex<Registry>,
+    kernel: &Mutex<KernelState>,
     envelope: Envelope,
 ) -> Result<Path, Envelope> {
     let dest = envelope.dest.clone();
@@ -200,8 +234,20 @@ pub async fn route(
                 registry.resolve(path)
             };
             match endpoint {
-                Some(endpoint) => deliver_with_retry(&endpoint, envelope).await?,
+                Some(endpoint) => deliver_with_retry(&endpoint, envelope.clone()).await?,
                 None => return Err(envelope),
+            }
+            {
+                let mut kernel = kernel.lock().expect("kernel lock");
+                kernel.tap.push(
+                    envelope.trace.causality_id.as_millis_ts(),
+                    crate::tap::FactKind::Sent {
+                        from: envelope.from.clone(),
+                        dest: path.to_string(),
+                        schema: envelope.schema.clone(),
+                        trace: envelope.trace,
+                    },
+                );
             }
             Ok(path.clone())
         }
@@ -219,6 +265,15 @@ pub fn dead_letter(kernel: &Mutex<KernelState>, envelope: &Envelope, reason: &st
         reason: reason.to_owned(),
         trace: envelope.trace,
     });
+    kernel.tap.push(
+        envelope.trace.causality_id.as_millis_ts(),
+        crate::tap::FactKind::DeadLettered {
+            dest: envelope.dest.to_string(),
+            schema: envelope.schema.clone(),
+            reason: reason.to_owned(),
+            trace: envelope.trace,
+        },
+    );
 }
 
 /// Delivers to an endpoint, honoring Block by awaiting capacity.
@@ -309,6 +364,17 @@ async fn step_es(ctx: &EsLoop) -> Step {
     let Some(envelope) = envelope else {
         return Step::Idle;
     };
+    {
+        let mut kernel = ctx.kernel.lock().expect("kernel lock");
+        kernel.tap.push(
+            envelope.trace.causality_id.as_millis_ts(),
+            crate::tap::FactKind::Delivered {
+                to: ctx.path.clone(),
+                schema: envelope.schema.clone(),
+                trace: envelope.trace,
+            },
+        );
+    }
 
     // 2. FIND the command entry for this schema.
     let entry = {
@@ -362,9 +428,17 @@ async fn step_es(ctx: &EsLoop) -> Step {
             // PANIC: nothing appended, nothing acked, outbox discarded.
             // The state may be poisoned — mark crashed and stop; the
             // supervisor rebuilds from the journal (never reuses `state`).
-            let mut kernel = ctx.kernel.lock().expect("kernel lock");
-            kernel.crashed.insert(ctx.path.clone());
-            drop(kernel);
+            {
+                let mut kernel = ctx.kernel.lock().expect("kernel lock");
+                kernel.crashed.insert(ctx.path.clone());
+                kernel.tap.push(
+                    envelope.trace.causality_id.as_millis_ts(),
+                    crate::tap::FactKind::Failed {
+                        path: ctx.path.clone(),
+                        error: "handler panic".to_owned(),
+                    },
+                );
+            }
             let _ = poison;
             return Step::Crashed;
         }
@@ -380,6 +454,17 @@ async fn step_es(ctx: &EsLoop) -> Step {
 
     // 6. ACK (the commit point: this message will never redeliver).
     ctx.cell.inbox.lock().await.ack();
+    {
+        let mut kernel = ctx.kernel.lock().expect("kernel lock");
+        kernel.tap.push(
+            envelope.trace.causality_id.as_millis_ts(),
+            crate::tap::FactKind::Acked {
+                to: ctx.path.clone(),
+                schema: envelope.schema.clone(),
+                trace: envelope.trace,
+            },
+        );
+    }
 
     // 7. APPLY (the same fold replay uses; state may now lag the journal
     // only if the process dies before this line — rebuild covers that).
@@ -420,7 +505,7 @@ async fn flush_outbox(ctx: &EsLoop, mut outbox: Outbox) {
     for intent in outbox.drain() {
         match intent {
             crate::context::Intent::Send(envelope) => {
-                if let Err(undeliverable) = route(&ctx.registry, envelope).await {
+                if let Err(undeliverable) = route(&ctx.registry, &ctx.kernel, envelope).await {
                     dead_letter(&ctx.kernel, &undeliverable, "destination unresolved");
                 }
             }
@@ -499,6 +584,14 @@ impl crate::context::AskPort for KernelAskPort {
                     dest: dest.clone(),
                     trace,
                 });
+                kernel.tap.push(
+                    now,
+                    crate::tap::FactKind::AskOpened {
+                        from: Path::new("anonymous"),
+                        dest: dest.to_string(),
+                        trace,
+                    },
+                );
                 (lease, receiver)
             };
             let trace = crate::envelope::TraceCtx::root();
@@ -523,10 +616,18 @@ impl crate::context::AskPort for KernelAskPort {
         let mut kernel = self.kernel.lock().expect("kernel lock");
         kernel.ask_facts.push(AskFact {
             opened: false,
-            outcome: Some(outcome),
-            dest,
+            outcome: Some(outcome.clone()),
+            dest: dest.clone(),
             trace,
         });
+        kernel.tap.push(
+            trace.causality_id.as_millis_ts(),
+            crate::tap::FactKind::AskSettled {
+                outcome: format!("{outcome:?}"),
+                trace,
+            },
+        );
+        let _ = dest;
         // Drop the lease: settled (consumed) or timed out (late replies
         // land nowhere). The reply's `complete` already removed it on the
         // Replied path; removal here is idempotent.
@@ -569,6 +670,14 @@ async fn publish_to_topic(
             from: envelope.from.clone(),
             trace: envelope.trace,
         });
+        kernel.tap.push(
+            envelope.trace.causality_id.as_millis_ts(),
+            crate::tap::FactKind::TopicPublished {
+                topic,
+                schema: envelope.schema.clone(),
+                trace: envelope.trace,
+            },
+        );
         targets
     };
     for (_path, endpoint, policy) in targets {
@@ -623,7 +732,7 @@ async fn resolve_reply(
             // Durable name: an ordinary envelope (any actor may have moved
             // on; unresolvable replies dead-letter like any send).
             let envelope = Envelope::json(schema, Address::Path(path.clone()), payload, trace);
-            if let Err(undeliverable) = route(registry, envelope).await {
+            if let Err(undeliverable) = route(registry, kernel, envelope).await {
                 dead_letter(kernel, &undeliverable, "reply destination unresolved");
             }
         }
@@ -686,6 +795,13 @@ async fn maybe_snapshot(ctx: &EsLoop, (next_seq, seqs): (crate::types::SeqNo, Ve
         let mut kernel = ctx.kernel.lock().expect("kernel lock");
         let journal = kernel.journals.entry(ctx.path.clone()).or_default();
         journal.append_snapshot(last, blob);
+        kernel.tap.push(
+            ctx.clock.now(),
+            crate::tap::FactKind::SnapshotTaken {
+                path: ctx.path.clone(),
+                seq: last,
+            },
+        );
     }
     let _ = next_seq;
 }
@@ -743,6 +859,18 @@ async fn step_service(ctx: &ServiceLoop) -> Step {
     let Some(envelope) = envelope else {
         return Step::Idle;
     };
+
+    {
+        let mut kernel = ctx.es.kernel.lock().expect("kernel lock");
+        kernel.tap.push(
+            envelope.trace.causality_id.as_millis_ts(),
+            crate::tap::FactKind::Delivered {
+                to: ctx.es.path.clone(),
+                schema: envelope.schema.clone(),
+                trace: envelope.trace,
+            },
+        );
+    }
 
     // 2. FIND the message entry.
     let entry = {
@@ -885,6 +1013,13 @@ pub async fn restart_es(ctx: &EsLoop, genesis_args: &JsonValue) -> Result<(), er
             .es_state
             .insert(ctx.path.clone(), Arc::new(tokio::sync::Mutex::new(fresh)));
         kernel.crashed.remove(&ctx.path);
+        kernel.tap.push(
+            ctx.clock.now(),
+            crate::tap::FactKind::Spawned {
+                path: ctx.path.clone(),
+                restart: true,
+            },
+        );
     }
 
     // Fresh endpoint behind the SAME path: senders holding pre-crash

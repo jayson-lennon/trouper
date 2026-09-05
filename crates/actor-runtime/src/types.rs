@@ -140,6 +140,12 @@ impl TraceId {
     }
 }
 
+impl std::fmt::Display for TraceId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
 impl Default for TraceId {
     fn default() -> Self {
         Self::new()
@@ -150,6 +156,24 @@ impl CausalityId {
     /// Generates a fresh, time-ordered (v7) causality id.
     pub fn new() -> Self {
         Self(Uuid::now_v7())
+    }
+}
+
+impl std::fmt::Display for CausalityId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+impl CausalityId {
+    /// The millisecond timestamp embedded in the v7 uuid (fact ts fallback).
+    pub fn as_millis_ts(self) -> crate::types::Timestamp {
+        let ms = self
+            .0
+            .get_timestamp()
+            .map(|t| t.to_unix().0 * 1_000 + u64::from(t.to_unix().1) / 1_000_000)
+            .unwrap_or(0);
+        Timestamp::from_millis(ms)
     }
 }
 

@@ -61,6 +61,16 @@ pub enum Payload {
     Json(JsonValue),
 }
 
+impl std::fmt::Display for Address {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Address::Path(path) => write!(f, "{path}"),
+            Address::Topic(topic) => write!(f, "{topic}"),
+            Address::Slot(lease) => write!(f, "slot({lease})"),
+        }
+    }
+}
+
 impl std::fmt::Debug for Payload {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
