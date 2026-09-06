@@ -352,10 +352,12 @@ mod tests {
             .iter_mut()
             .find(|actor| actor.path.as_str() == "state/reporter")
             .expect("reporter in fixture");
-        if let Some(state) = reporter.state.as_mut() {
-            if let Some(object) = state.as_object_mut() {
-                object.insert("seq".into(), serde_json::json!(seq));
-            }
+        if let Some(object) = reporter
+            .state
+            .as_mut()
+            .and_then(|state| state.as_object_mut())
+        {
+            object.insert("seq".into(), serde_json::json!(seq));
         }
         export
     }
@@ -402,7 +404,7 @@ mod tests {
         // Given a world that already applied one export (seq = 0) and
         // a second, fresher export waiting in the channel (seq = 7).
         let mut world = World::default();
-        let (_command_tx, command_rx) = std::sync::mpsc::channel::<FetchCommand>();
+        let (command_tx, _command_rx) = std::sync::mpsc::channel::<FetchCommand>();
         let (result_tx, result_rx) = std::sync::mpsc::channel();
         result_tx
             .send(ExportMsg {
