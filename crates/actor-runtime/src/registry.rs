@@ -278,6 +278,60 @@ impl Registry {
             .collect()
     }
 
+    /// The declared pool/partition/rule topology (for export). Entities
+    /// are the live slots derived from each set's public path.
+    pub fn topology(
+        &self,
+    ) -> (
+        Vec<crate::system::PoolExport>,
+        Vec<crate::system::PartitionExport>,
+        Vec<crate::system::RuleExport>,
+    ) {
+        let pools = self
+            .pools
+            .iter()
+            .map(|(path, pool)| crate::system::PoolExport {
+                path: path.clone(),
+                algo: pool.algo.name().to_owned(),
+                workers: pool.workers.clone(),
+                spec_parent: pool.spec_parent.clone(),
+            })
+            .collect();
+        let partitions = self
+            .partitions
+            .iter()
+            .map(|(path, spec)| crate::system::PartitionExport {
+                path: path.clone(),
+                key_field: spec.key_field.clone(),
+                entities: self
+                    .slots
+                    .keys()
+                    .filter(|slot| slot.as_str().starts_with(&format!("{}/", path.as_str())))
+                    .cloned()
+                    .collect(),
+            })
+            .collect();
+        let rules = self
+            .rules
+            .iter()
+            .map(|rule| crate::system::RuleExport {
+                source: rule.source.clone(),
+                schema: rule.schema.clone(),
+                dest: rule.dest.clone(),
+                action: match rule.action {
+                    crate::pool::RuleAction::Tee(_) => "tee".to_owned(),
+                    crate::pool::RuleAction::Inline(_) => "inline".to_owned(),
+                },
+                observer: match &rule.action {
+                    crate::pool::RuleAction::Tee(o) | crate::pool::RuleAction::Inline(o) => {
+                        o.clone()
+                    }
+                },
+            })
+            .collect();
+        (pools, partitions, rules)
+    }
+
     pub fn schemas(&self) -> &SchemaTable {
         &self.schemas
     }

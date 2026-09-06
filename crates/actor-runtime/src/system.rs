@@ -187,6 +187,47 @@ pub struct ObservedEdge {
     pub count: u64,
 }
 
+/// One declared pool: the public path, its algo, and its workers (the
+/// canvas draws `source → public → workers` from this row).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct PoolExport {
+    /// The public path senders address.
+    pub path: ActorPath,
+    /// The worker-selection algorithm ("round-robin" | "random").
+    pub algo: String,
+    /// The worker paths (the only deliverable destinations).
+    pub workers: Vec<ActorPath>,
+    /// The parent workers escalate to, if any.
+    pub spec_parent: Option<ActorPath>,
+}
+
+/// One declared partition set: the public path, the shard-key field, and
+/// the entities activated so far.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct PartitionExport {
+    /// The public path senders address.
+    pub path: ActorPath,
+    /// The command field carrying the shard key.
+    pub key_field: String,
+    /// Every entity path derived so far (activated entities).
+    pub entities: Vec<ActorPath>,
+}
+
+/// One declared router rule (declaration/priority order).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct RuleExport {
+    /// Matches the original sender path, if declared.
+    pub source: Option<ActorPath>,
+    /// Matches the envelope's schema, if declared.
+    pub schema: Option<SchemaId>,
+    /// Matches the envelope's destination path, if declared.
+    pub dest: Option<ActorPath>,
+    /// "tee" or "inline".
+    pub action: String,
+    /// The observer the action targets.
+    pub observer: ActorPath,
+}
+
 /// The whole-system export: the artifact a future canvas consumes.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct SystemExport {
@@ -198,6 +239,12 @@ pub struct SystemExport {
     pub declared_edges: Vec<DeclaredEdge>,
     /// Observed edges (aggregated from the tap).
     pub observed_edges: Vec<ObservedEdge>,
+    /// Declared stateless pools (public path → workers).
+    pub pools: Vec<PoolExport>,
+    /// Declared partition sets (public path → entities).
+    pub partitions: Vec<PartitionExport>,
+    /// Declared router rules (declaration order).
+    pub rules: Vec<RuleExport>,
 }
 
 impl ActorSystem {
@@ -1188,11 +1235,21 @@ impl ActorSystem {
             a_key.cmp(&b_key)
         });
 
+        // Declared pool/partition/rule topology (the canvas's structural
+        // view; the observed router signature lives in the tap facts).
+        let (pools, partitions, rules) = {
+            let registry = self.registry.lock().expect("registry lock");
+            registry.topology()
+        };
+
         SystemExport {
             schemas,
             actors,
             declared_edges,
             observed_edges,
+            pools,
+            partitions,
+            rules,
         }
     }
 
@@ -3681,6 +3738,94 @@ mod tests {
             .find(|e| e.to == topic.to_string() && e.schema == added_schema)
             .expect("observed topic edge");
         assert!(observed.count >= 1, "at least the one send: {observed:?}");
+    }
+
+    #[tokio::test]
+    async fn export_shows_pool_partition_and_rule_topology() {
+        // Given a pool over "api" (2 workers), a partition set over
+        // "accounts", and a tee rule on Add@1.
+        let (system, _clock) = ActorSystem::test();
+        system.register_schema::<Add>();
+        install_key_partition(&system, "accounts").expect("partition install");
+        system
+            .install_pool(crate::pool::PoolSpec {
+                public: ActorPath::new("api"),
+                workers: 2,
+                algo: crate::pool::PoolAlgo::RoundRobin,
+                factory: std::sync::Arc::new(|system, path, args| {
+                    crate::builder::spawn_es_builder::<BareCounter>(system)
+                        .at(path.clone())
+                        .args(args.clone())
+                        .handles::<Add>()
+                        .emits::<Added>()
+                        .start();
+                }),
+                args: Some(json!({ "total": 0 })),
+                parent: Some(ActorPath::new("pool-parent")),
+                seed: 7,
+            })
+            .await
+            .expect("pool install");
+        {
+            let mut registry = system.registry.lock().expect("registry lock");
+            registry.add_rule(crate::pool::Rule {
+                source: None,
+                schema: Some(Add::schema_id()),
+                dest: Some(ActorPath::new("api")),
+                action: crate::pool::RuleAction::Tee(ActorPath::new("watcher")),
+            });
+        }
+        // Activate one entity so the export has something to list.
+        let e = system.envelope(
+            KeyedAdd::schema_id(),
+            ActorPath::new("accounts"),
+            json!({ "n": 1, "account": "acme" }),
+        );
+        let _ = system.send(e).await;
+        wait_for(|| async {
+            system
+                .export()
+                .await
+                .partitions
+                .iter()
+                .any(|p| !p.entities.is_empty())
+        })
+        .await;
+
+        // When exporting.
+        let export = system.export().await;
+
+        // Then the declared topology rows are present: the pool with its
+        // workers + parent, the partition with its activated entity, and
+        // the rule with its action/observer.
+        let pool = export
+            .pools
+            .iter()
+            .find(|p| p.path == ActorPath::new("api"))
+            .expect("pool exported");
+        assert_eq!(pool.algo, "round-robin");
+        assert_eq!(pool.workers.len(), 2, "both workers listed: {pool:?}");
+        assert_eq!(pool.spec_parent, Some(ActorPath::new("pool-parent")));
+        let partition = export
+            .partitions
+            .iter()
+            .find(|p| p.path == ActorPath::new("accounts"))
+            .expect("partition exported");
+        assert_eq!(partition.key_field, "account");
+        assert!(
+            partition
+                .entities
+                .contains(&ActorPath::new("accounts/acme")),
+            "activated entity listed: {partition:?}"
+        );
+        let rule = export
+            .rules
+            .iter()
+            .find(|r| r.schema == Some(Add::schema_id()))
+            .expect("rule exported");
+        assert_eq!(rule.action, "tee");
+        assert_eq!(rule.observer, ActorPath::new("watcher"));
+        assert_eq!(rule.dest, Some(ActorPath::new("api")));
     }
 
     #[tokio::test]
