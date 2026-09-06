@@ -1,0 +1,16 @@
+[package]
+name = "canvas-gui"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+actor-runtime.workspace = true
+state-report.workspace = true
+bevy.workspace = true
+bevy_egui.workspace = true
+tokio.workspace = true
+serde_json.workspace = true
+wherror.workspace = true
+
+[dev-dependencies]
+rstest.workspace = true
