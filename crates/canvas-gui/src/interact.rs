@@ -12,6 +12,8 @@ use bevy::input::keyboard::KeyCode;
 use bevy::input::mouse::AccumulatedMouseMotion;
 use bevy::input::mouse::AccumulatedMouseScroll;
 use bevy::input::mouse::MouseButton;
+use bevy::window::CursorGrabMode;
+use bevy::window::CursorOptions;
 use bevy::window::PrimaryWindow;
 use bevy::window::Window;
 use bevy_egui::EguiContexts;
@@ -72,6 +74,12 @@ fn frame_camera_once(
 
 /// Pan (drag), zoom (wheel, cursor-anchored), click selection, and
 /// refresh (R key here; button in the legend window).
+///
+/// While dragging, the cursor is confined to the window and hidden:
+/// winit only delivers motion while the cursor is inside the surface,
+/// so a fast flick that exits the window would silently lose the rest
+/// of the gesture. `Confined` (not `Locked`) is the portable mode —
+/// X11 and Wayland support it natively; macOS degrades to no grab.
 #[allow(clippy::too_many_arguments)]
 fn handle_input(
     mouse_buttons: Res<ButtonInput<MouseButton>>,
@@ -79,6 +87,7 @@ fn handle_input(
     motion: Res<AccumulatedMouseMotion>,
     scroll: Res<AccumulatedMouseScroll>,
     windows: Query<&Window, With<PrimaryWindow>>,
+    mut cursor_options: Query<&mut CursorOptions, With<PrimaryWindow>>,
     mut drag: ResMut<DragState>,
     mut view: ResMut<ViewTransform>,
     mut selection: ResMut<Selection>,
@@ -111,6 +120,15 @@ fn handle_input(
     if mouse_buttons.just_pressed(MouseButton::Left) && cursor.is_some() && !egui_wants_pointer {
         drag.held = true;
         drag.traveled = 0.0;
+    }
+    // Grab on drag start, release when the drag ends.
+    if let Ok(mut options) = cursor_options.single_mut() {
+        options.grab_mode = if drag.held {
+            CursorGrabMode::Confined
+        } else {
+            CursorGrabMode::None
+        };
+        options.visible = !drag.held;
     }
     if drag.held && !egui_wants_pointer {
         drag.traveled += motion.delta.length();
