@@ -49,6 +49,12 @@ impl Vec2 {
         Self::new(self.x.max(other.x), self.y.max(other.y))
     }
 
+    /// Euclidean length.
+    #[must_use]
+    pub fn length(self) -> f32 {
+        (self.x * self.x + self.y * self.y).sqrt()
+    }
+
     /// True when both components are within `eps`.
     #[must_use]
     pub fn approx_eq(self, other: Self, eps: f32) -> bool {
@@ -91,7 +97,7 @@ pub const MAX_ZOOM: f32 = 20.0;
 
 /// The camera's 2D transform: world point at the viewport center
 /// (`pan`) and world-units-per-pixel (`zoom`).
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, bevy::ecs::resource::Resource)]
 pub struct ViewTransform {
     /// World coordinates at the viewport center.
     pub pan: Vec2,

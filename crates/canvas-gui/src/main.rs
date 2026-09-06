@@ -11,10 +11,12 @@ use bevy_egui::EguiContexts;
 use bevy_egui::EguiPlugin;
 use bevy_egui::EguiPrimaryContextPass;
 
+mod fetch;
 #[cfg(test)]
 mod fixture;
 mod layout;
 mod model;
+mod render;
 mod view;
 
 fn spawn_camera(mut commands: Commands) {
@@ -33,21 +35,38 @@ fn egui_shell(mut contexts: EguiContexts) {
 }
 
 fn main() {
-    App::new()
-        .add_plugins((
-            DefaultPlugins
-                .set(WindowPlugin {
-                    primary_window: Some(Window {
-                        title: "actor canvas".into(),
-                        ..Default::default()
-                    }),
+    // Given the GUI shell.
+    // When the fetch thread is started and the render plugin wired.
+    // Then an initial refresh is requested so the first export
+    // arrives as soon as zenoh answers.
+    let (command_tx, command_rx) = std::sync::mpsc::channel();
+    let (result_tx, result_rx) = std::sync::mpsc::channel();
+    let fetcher = fetch::spawn_fetch_thread(command_rx, result_tx);
+    command_tx
+        .send(fetch::FetchCommand::Refresh)
+        .expect("fetch thread alive");
+
+    let mut app = App::new();
+    app.add_plugins((
+        DefaultPlugins
+            .set(WindowPlugin {
+                primary_window: Some(Window {
+                    title: "actor canvas".into(),
                     ..Default::default()
-                })
-                .set(RenderPlugin::default())
-                .set(WinitPlugin::default()),
-            EguiPlugin::default(),
-        ))
-        .add_systems(Startup, spawn_camera)
-        .add_systems(EguiPrimaryContextPass, egui_shell)
-        .run();
+                }),
+                ..Default::default()
+            })
+            .set(RenderPlugin::default())
+            .set(WinitPlugin::default()),
+        EguiPlugin::default(),
+    ))
+    .insert_resource(render::FetchChannels {
+        commands: command_tx,
+        results: std::sync::Mutex::new(result_rx),
+    })
+    .add_systems(Startup, spawn_camera);
+    render::plugin(&mut app);
+    app.add_systems(EguiPrimaryContextPass, egui_shell);
+    app.run();
+    let _ = fetcher.join();
 }

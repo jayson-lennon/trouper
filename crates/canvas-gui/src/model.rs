@@ -25,6 +25,18 @@ pub enum NodeKind {
     Topic,
 }
 
+impl NodeKind {
+    /// The short display name ("ES", "Service", "topic").
+    #[must_use]
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::EventSourced => "ES",
+            Self::Service => "Service",
+            Self::Topic => "topic",
+        }
+    }
+}
+
 /// The contract lines shown inside a node box and in its popup.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct ManifestInfo {
