@@ -8,3 +8,8 @@
 - ADD: "External-process ports are planned as ordinary actors reusing the same schema/manifest tables (not yet implemented)."
 - ADD: "The tap is a global bounded drop-oldest ring of facts that may drop under pressure; it is observation only — delivery never flows through it, and JSON projection happens only at the tap boundary."
 - ADD: "Service-actor asks are lease-backed: every ask carries a mandatory timeout, the reply slot is a runtime lease that dies with the ask (never a durable name), and outcomes (Replied/Timeout/Failed) are tap facts."
+- ADD: "Actor spawning is builder-based: typed actors declare `handles`/`emits` inline; foreign actors supply JSON schema plus handle/apply closures; positional spawn functions remain only as deprecated wrappers."
+- ADD: "Event emission is declaration-filtered: the kernel drops events whose schema the actor has not declared, before journal append, with a dead-letter fact and a tracing error; journals therefore contain only declared schemas."
+- ADD: "Pools and partition sets are declarative specs resolved by the kernel at route time, never forwarding actors: senders keep addressing the public path; partition sets derive per-entity paths from a schema-declared shard key and activate entities on demand; idle-entity passivation and live resharding are deliberately out of scope."
+- ADD: "`tracing` is the developer-diagnostic channel (errors, warnings, low-level detail); the tap remains the product fact stream; product observability is a later, separate surface."
+- ADD: "Runtime facts are consumable in-actor via the `system.facts` topic with per-subscriber cursors and gap detection; teed command copies (when introduced) are at-most-once and are not an audit mechanism."
