@@ -8,6 +8,7 @@ actor-runtime.workspace = true
 state-report.workspace = true
 bevy.workspace = true
 bevy_egui.workspace = true
+egui_json_tree.workspace = true
 tokio.workspace = true
 serde_json.workspace = true
 wherror.workspace = true

@@ -18,6 +18,8 @@ use bevy::window::PrimaryWindow;
 use bevy::window::Window;
 use bevy_egui::EguiContexts;
 use bevy_egui::egui;
+use egui_json_tree::DefaultExpand;
+use egui_json_tree::JsonTree;
 
 use crate::fetch::FetchCommand;
 use crate::model::NodeKind;
@@ -231,13 +233,12 @@ fn ui_popups(mut contexts: EguiContexts, selection: Res<Selection>, state: Res<S
                         if let Some(cursor) = node.cursor {
                             ui.label(format!("inbox cursor: {cursor}"));
                         }
-                        if let Some(pretty) = node
-                            .state
-                            .as_ref()
-                            .and_then(|value| serde_json::to_string_pretty(value).ok())
-                        {
+                        if let Some(state) = node.state.as_ref() {
                             ui.separator();
-                            ui.monospace(pretty);
+                            ui.strong("state");
+                            JsonTree::new(ui.id().with("state"), state)
+                                .default_expand(DefaultExpand::ToLevel(1))
+                                .show(ui);
                         }
                     });
             });

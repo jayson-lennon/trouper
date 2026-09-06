@@ -2202,6 +2202,7 @@ dependencies = [
  "actor-runtime",
  "bevy",
  "bevy_egui",
+ "egui_json_tree",
  "rstest",
  "serde_json",
  "state-report",
@@ -2910,6 +2911,16 @@ dependencies = [
  "profiling",
  "smallvec",
  "unicode-segmentation",
+]
+
+[[package]]
+name = "egui_json_tree"
+version = "0.16.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "95767add193316dea7aa54fc36b59ca66a79c46a87d8942d91a531538e4f0114"
+dependencies = [
+ "egui",
+ "serde_json",
 ]
 
 [[package]]

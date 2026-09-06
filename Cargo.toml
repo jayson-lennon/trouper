@@ -22,6 +22,7 @@ derive_more = { version = "2.1", features = ["debug"] }
 tracing = "0.1"
 bevy = "0.19"
 bevy_egui = "0.41"
+egui_json_tree = "0.16"
 # dev
 rstest = "0.26"
 futures = "0.3"
