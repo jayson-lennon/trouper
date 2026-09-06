@@ -414,7 +414,7 @@ mod tests {
             .expect("send");
         world.insert_resource(SceneState::default());
         world.insert_resource(FetchChannels {
-            commands: _command_tx,
+            commands: command_tx,
             results: std::sync::Mutex::new(result_rx),
         });
         world.run_system_once(drain_fetch).expect("system runs");
