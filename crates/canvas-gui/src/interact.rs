@@ -35,13 +35,20 @@ const CLICK_THRESHOLD_PX: f32 = 4.0;
 /// Zoom multiplier per wheel line.
 const ZOOM_STEP: f32 = 1.1;
 
-/// What the user is doing with the left button this frame.
+/// The lifecycle of one left-button gesture. Classification is by
+/// cursor displacement between press and current position (not
+/// accumulated deltas), so it is stable even when individual frames
+/// are missed.
 #[derive(Resource, Default)]
 struct DragState {
     /// Whether the left button is currently held.
     held: bool,
-    /// Total accumulated motion (px) since the press.
-    traveled: f32,
+    /// Whether the gesture has been classified as a pan.
+    panning: bool,
+    /// Cursor position at press time (px).
+    press_px: Option<view::Vec2>,
+    /// Current cursor position (px).
+    cursor_px: Option<view::Vec2>,
 }
 
 /// Frames the camera onto the scene bounds once the first export
@@ -113,25 +120,41 @@ fn handle_input(
         let _ = channels.commands.send(FetchCommand::Refresh);
     }
 
-    // The drag state machine runs unconditionally: pan applies the
+    // The gesture state machine runs unconditionally: pan applies the
     // frame's whole accumulated delta even when the cursor read fails
     // (window edge, drag out of bounds) — dropping frames here made
     // fast flicks lose distance.
-    if mouse_buttons.just_pressed(MouseButton::Left) && cursor.is_some() && !egui_wants_pointer {
-        drag.held = true;
-        drag.traveled = 0.0;
+    if mouse_buttons.just_pressed(MouseButton::Left) {
+        if let (Some(cursor), false) = (cursor, egui_wants_pointer) {
+            drag.held = true;
+            drag.panning = false;
+            drag.press_px = Some(cursor);
+            drag.cursor_px = Some(cursor);
+        }
+    } else if drag.held {
+        drag.cursor_px = cursor;
     }
-    // Grab on drag start, release when the drag ends.
+
+    // Classify the gesture: only a real pan (past the click threshold)
+    // confines and hides the cursor — a pure click must not perturb the
+    // pointer, or the release-frame hit test becomes unreliable.
+    let moved_px = match (drag.press_px, drag.cursor_px) {
+        (Some(press), Some(now)) => (now - press).length(),
+        _ => 0.0,
+    };
+    if drag.held && !drag.panning && moved_px > CLICK_THRESHOLD_PX {
+        drag.panning = true;
+    }
     if let Ok(mut options) = cursor_options.single_mut() {
-        options.grab_mode = if drag.held {
+        options.grab_mode = if drag.panning {
             CursorGrabMode::Confined
         } else {
             CursorGrabMode::None
         };
-        options.visible = !drag.held;
+        options.visible = !drag.panning;
     }
-    if drag.held && !egui_wants_pointer {
-        drag.traveled += motion.delta.length();
+
+    if drag.held && drag.panning && !egui_wants_pointer {
         // Screen-pixel delta (y-down) → world pan delta (y-up): flip
         // the sign of y, and divide by zoom so content tracks the
         // cursor 1:1 at any zoom level.
@@ -139,18 +162,18 @@ fn handle_input(
         view.pan = view.pan - delta;
     }
     if mouse_buttons.just_released(MouseButton::Left) {
-        let was_drag = drag.held;
+        let was_click = drag.held && !drag.panning;
         drag.held = false;
-        if was_drag && !egui_wants_pointer {
-            drag.traveled += motion.delta.length();
-            if let (false, Some(cursor)) = (drag.traveled < CLICK_THRESHOLD_PX, cursor) {
-                let world = view.screen_to_world(cursor, window_size(window));
-                selection.node = state.layout.hit_node(&state.hit_order, world).cloned();
-                if selection.node.is_some() {
-                    selection.cursor_px = Some(cursor);
-                } else {
-                    selection.cursor_px = None;
-                }
+        drag.panning = false;
+        drag.press_px = None;
+        drag.cursor_px = None;
+        if was_click && let (false, Some(cursor)) = (egui_wants_pointer, cursor) {
+            let world = view.screen_to_world(cursor, window_size(window));
+            selection.node = state.layout.hit_node(&state.hit_order, world).cloned();
+            if selection.node.is_some() {
+                selection.cursor_px = Some(cursor);
+            } else {
+                selection.cursor_px = None;
             }
         }
     }
