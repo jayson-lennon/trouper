@@ -2081,7 +2081,7 @@ mod tests {
         }
         impl CommandHandler<Add> for Forwarder {
             fn handle(&self, _cmd: Add, ctx: &mut CmdCtx<'_>) -> Vec<crate::envelope::Event> {
-                ctx.0.send(
+                ctx.send(
                     Address::Path(ActorPath::new("echo")),
                     Ping::schema_id(),
                     json!({ "n": 0 }),
@@ -3105,14 +3105,7 @@ mod tests {
         }
         impl MsgHandler<Add> for Echo {
             async fn handle(&mut self, msg: Add, ctx: &mut crate::context::MsgCtx<'_>) {
-                if let Some(reply_to) = ctx.core.reply_to {
-                    ctx.core.outbox.push_reply(
-                        reply_to.clone(),
-                        Add::schema_id(),
-                        json!({ "echo": msg.n }),
-                        *ctx.core.trace,
-                    );
-                }
+                ctx.reply(Add::schema_id(), json!({ "echo": msg.n }));
             }
         }
 
@@ -3467,15 +3460,12 @@ mod tests {
             }
         }
         impl MsgHandler<Added> for Collector {
-            async fn handle(&mut self, msg: Added, ctx: &mut crate::context::MsgCtx<'_>) {
+            async fn handle(&mut self, msg: Added, _ctx: &mut crate::context::MsgCtx<'_>) {
                 RECEIVED
                     .get_or_init(|| Mutex::new(Vec::new()))
                     .lock()
                     .expect("lock")
-                    .push(format!(
-                        "got n={} from={:?}",
-                        msg.n, ctx.core.trace.causality_id
-                    ));
+                    .push(format!("got n={}", msg.n));
             }
         }
 
@@ -3501,14 +3491,15 @@ mod tests {
         }
         impl CommandHandler<Add> for Counter {
             fn handle(&self, cmd: Add, ctx: &mut CmdCtx<'_>) -> Vec<crate::envelope::Event> {
-                if let Some(reply_to) = ctx.0.reply_to {
-                    ctx.0.send(
-                        reply_to.clone(),
-                        Added::schema_id(),
-                        json!({ "n": cmd.n }),
-                        Some(Address::Path(ctx.0.self_path.clone())),
-                    );
-                }
+                let dest: crate::envelope::Address = ctx
+                    .reply_dest()
+                    .unwrap_or_else(|| crate::envelope::Address::Path(ctx.self_path().clone()));
+                ctx.send(
+                    dest,
+                    Added::schema_id(),
+                    json!({ "n": cmd.n }),
+                    Some(crate::envelope::Address::Path(ctx.self_path().clone())),
+                );
                 vec![crate::envelope::Event::new(
                     Added::schema_id(),
                     json!({ "n": cmd.n }),
@@ -5363,7 +5354,7 @@ mod tests {
         }
         impl MsgHandler<Add> for Echo {
             async fn handle(&mut self, msg: Add, ctx: &mut crate::context::MsgCtx<'_>) {
-                ctx.core.reply(Add::schema_id(), json!({ "echo": msg.n }));
+                ctx.reply(Add::schema_id(), json!({ "echo": msg.n }));
             }
         }
 
@@ -5705,7 +5696,7 @@ mod tests {
                 .lock()
                 .expect("sink lock")
                 .push(format!("seen={}", msg.n));
-            ctx.core.send(
+            ctx.send(
                 Address::Path(self.forward_to.clone()),
                 Add::schema_id(),
                 json!({ "n": msg.n }),

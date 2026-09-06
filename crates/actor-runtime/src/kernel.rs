@@ -21,7 +21,6 @@ use std::collections::{HashMap, HashSet};
 use std::panic::AssertUnwindSafe;
 use std::sync::{Arc, Mutex};
 
-use arc_swap::ArcSwapOption;
 use serde_json::Value as JsonValue;
 use tokio::sync::{Notify, mpsc, watch};
 
@@ -32,7 +31,7 @@ use crate::envelope::{Address, Envelope, TraceCtx};
 use crate::inbox::Inbox;
 use crate::journal::{Journal, JournalEntry, JournalError};
 use crate::registry::{Endpoint, Registry};
-use crate::types::{ActorPath, InboxOffset, SchemaId, SeqNo};
+use crate::types::{ActorPath, SchemaId, SeqNo};
 
 /// An envelope the runtime could not deliver or decode.
 ///
@@ -64,15 +63,19 @@ pub enum AskOutcome {
 }
 
 #[derive(Debug, Clone)]
-pub struct AskFact {
+pub(crate) struct AskFact {
     /// Whether this opened or settled an ask.
-    pub opened: bool,
+    #[allow(dead_code)] // ledger completeness; only `outcome` is asserted
+    pub(crate) opened: bool,
     /// The settled outcome (None while open).
-    pub outcome: Option<AskOutcome>,
+    #[allow(dead_code)] // asserted by tests, projected via FactKind in prod
+    pub(crate) outcome: Option<AskOutcome>,
     /// The callee's address.
-    pub dest: Address,
+    #[allow(dead_code)] // ledger completeness
+    pub(crate) dest: Address,
     /// The ask's trace.
-    pub trace: TraceCtx,
+    #[allow(dead_code)] // ledger completeness
+    pub(crate) trace: TraceCtx,
 }
 
 /// Actor tables beyond the registry: cells, journals, live ES state,
@@ -80,40 +83,40 @@ pub struct AskFact {
 ///
 /// Guarded by one lock — these mutate together (spawn inserts into every
 /// table; restart swaps state + endpoint as one observation).
-pub struct KernelState {
-    pub cells: HashMap<ActorPath, Arc<ActorCell>>,
-    pub journals: HashMap<ActorPath, Journal>,
-    pub es_state: HashMap<ActorPath, Arc<tokio::sync::Mutex<Box<dyn DynEsActor>>>>,
-    pub entries: HashMap<ActorPath, Vec<Arc<dyn CommandEntry>>>,
-    pub snapshot_policy: HashMap<ActorPath, crate::types::SnapshotCadence>,
+pub(crate) struct KernelState {
+    pub(crate) cells: HashMap<ActorPath, Arc<ActorCell>>,
+    pub(crate) journals: HashMap<ActorPath, Journal>,
+    pub(crate) es_state: HashMap<ActorPath, Arc<tokio::sync::Mutex<Box<dyn DynEsActor>>>>,
+    pub(crate) entries: HashMap<ActorPath, Vec<Arc<dyn CommandEntry>>>,
+    pub(crate) snapshot_policy: HashMap<ActorPath, crate::types::SnapshotCadence>,
     /// Live service instances (service actors are not journaled).
-    pub services: HashMap<ActorPath, Arc<tokio::sync::Mutex<Box<dyn DynServiceActor>>>>,
+    pub(crate) services: HashMap<ActorPath, Arc<tokio::sync::Mutex<Box<dyn DynServiceActor>>>>,
     /// Reply-slot leases (the mechanism half of reply addresses).
-    pub replies: crate::reply::ReplyTable,
+    pub(crate) replies: crate::reply::ReplyTable,
     /// Ask lifecycle facts (the tap consumes these in Phase 7).
-    pub ask_facts: Vec<AskFact>,
+    pub(crate) ask_facts: Vec<AskFact>,
     /// Per-actor async message dispatch entries.
-    pub msg_entries: HashMap<ActorPath, Vec<Arc<dyn MsgEntry>>>,
+    pub(crate) msg_entries: HashMap<ActorPath, Vec<Arc<dyn MsgEntry>>>,
     /// Spawn args (genesis rebuild needs them at restart time).
-    pub genesis_args: HashMap<ActorPath, JsonValue>,
+    pub(crate) genesis_args: HashMap<ActorPath, JsonValue>,
     /// Paths whose loop died to a handler panic (awaiting supervision).
-    pub crashed: HashSet<ActorPath>,
+    pub(crate) crashed: HashSet<ActorPath>,
     /// Envelopes that could not be delivered or decoded.
-    pub dead_letters: Vec<DeadLetter>,
+    pub(crate) dead_letters: Vec<DeadLetter>,
     /// Topic logs: bounded rings with per-subscriber cursors.
-    pub topic_logs: HashMap<crate::types::Topic, crate::topics::TopicLog>,
+    pub(crate) topic_logs: HashMap<crate::types::Topic, crate::topics::TopicLog>,
     /// Topic publish facts (tap consumes in Phase 7).
-    pub topic_facts: Vec<crate::topics::TopicPublishFact>,
+    pub(crate) topic_facts: Vec<crate::topics::TopicPublishFact>,
     /// The global observation ring (drop-oldest).
-    pub tap: crate::tap::TapRing,
+    pub(crate) tap: crate::tap::TapRing,
     /// Supervised children: path → spec.
-    pub specs: HashMap<ActorPath, crate::supervision::ChildSpec>,
+    pub(crate) specs: HashMap<ActorPath, crate::supervision::ChildSpec>,
     /// Sliding-window failure records: path → window.
-    pub failures: HashMap<ActorPath, crate::supervision::FailureWindow>,
+    pub(crate) failures: HashMap<ActorPath, crate::supervision::FailureWindow>,
     /// Per-actor backpressure watermarks: path → (high watermark, fired).
     /// `fired` latches the up-crossing (down-crossings re-arm it), so a
     /// sustained overload produces ONE fact, not one per message.
-    pub watermarks: HashMap<ActorPath, (u64, bool)>,
+    pub(crate) watermarks: HashMap<ActorPath, (u64, bool)>,
 }
 
 impl Default for KernelState {
@@ -184,41 +187,29 @@ async fn pump_facts(kernel: &Mutex<KernelState>, registry: &Mutex<Registry>) {
 
 /// Public facts pump for non-route fact sources (e.g. the stop path):
 /// pushes facts already recorded by those paths to live subscribers.
-pub async fn pump_facts_now(kernel: &Mutex<KernelState>, registry: &Mutex<Registry>) {
+pub(crate) async fn pump_facts_now(kernel: &Mutex<KernelState>, registry: &Mutex<Registry>) {
     pump_facts(kernel, registry).await;
 }
 
-/// Emits one fact onto the tap with the given clock's timestamp.
-pub fn emit(
-    tap_clock: &Mutex<KernelState>,
-    clock: &crate::clock::ClockService,
-    kind: crate::tap::FactKind,
-) {
-    let ts = clock.now();
-    tap_clock.lock().expect("kernel lock").record_fact(ts, kind);
-}
-
 /// Kernel-facing handle for one running actor loop.
-pub struct ActorHandle {
+pub(crate) struct ActorHandle {
     /// The kill switch: signaled on graceful stop.
-    pub shutdown: watch::Sender<bool>,
+    pub(crate) shutdown: watch::Sender<bool>,
     /// The task join handle; aborted on hard remove.
-    pub task: Option<tokio::task::JoinHandle<()>>,
+    pub(crate) task: Option<tokio::task::JoinHandle<()>>,
 }
 
 /// Everything the runtime owns for one actor across restarts.
-pub struct ActorCell {
+pub(crate) struct ActorCell {
     /// The actor's path (its identity).
-    pub path: ActorPath,
+    pub(crate) path: ActorPath,
     /// The runtime-owned inbox (survives endpoint swaps).
-    pub inbox: tokio::sync::Mutex<Inbox>,
-    /// The mailbox front door registered in the registry slot.
-    pub endpoint: ArcSwapOption<Endpoint>,
+    pub(crate) inbox: tokio::sync::Mutex<Inbox>,
     /// The running loop's handle, when a task is live.
-    pub handle: tokio::sync::Mutex<Option<ActorHandle>>,
+    pub(crate) handle: tokio::sync::Mutex<Option<ActorHandle>>,
     /// Wakes the actor loop when work arrives (latency optimization; the
     /// loop's poll backstop is the correctness guarantee).
-    pub work: Arc<Notify>,
+    pub(crate) work: Arc<Notify>,
 }
 
 impl ActorCell {
@@ -227,33 +218,27 @@ impl ActorCell {
         Self {
             path,
             inbox: tokio::sync::Mutex::new(inbox),
-            endpoint: ArcSwapOption::empty(),
             handle: tokio::sync::Mutex::new(None),
             work: Arc::new(Notify::new()),
         }
-    }
-
-    /// The cursor of the runtime-owned inbox (never resets).
-    pub async fn cursor(&self) -> InboxOffset {
-        self.inbox.lock().await.cursor()
     }
 }
 
 /// Everything one running ES loop needs; cloned per spawn/restart.
 #[derive(Clone)]
-pub struct EsLoop {
+pub(crate) struct EsLoop {
     /// The actor's path.
-    pub path: ActorPath,
+    pub(crate) path: ActorPath,
     /// The actor's cell (inbox + front door).
-    pub cell: Arc<ActorCell>,
+    pub(crate) cell: Arc<ActorCell>,
     /// The shared routing table.
-    pub registry: Arc<Mutex<Registry>>,
+    pub(crate) registry: Arc<Mutex<Registry>>,
     /// The shared actor tables.
-    pub kernel: Arc<Mutex<KernelState>>,
+    pub(crate) kernel: Arc<Mutex<KernelState>>,
     /// The read-only view handed to handler contexts.
-    pub view: Arc<dyn RuntimeView>,
+    pub(crate) view: Arc<dyn RuntimeView>,
     /// The injected clock (lease expiries, deterministic tests).
-    pub clock: crate::clock::ClockService,
+    pub(crate) clock: crate::clock::ClockService,
 }
 
 impl EsLoop {
@@ -271,7 +256,7 @@ impl EsLoop {
 /// Returns the delivered path, or the envelope back for dead-lettering
 /// when the destination does not resolve (slot/topic routing lands in
 /// Phases 5–6).
-pub async fn route(
+pub(crate) async fn route(
     registry: &Mutex<Registry>,
     kernel: &Mutex<KernelState>,
     envelope: Envelope,
@@ -566,7 +551,7 @@ fn apply_rules(
 ///
 /// `detail` is the human-readable elaboration (e.g. the decode error);
 /// `reason` is the typed category.
-pub fn dead_letter(
+pub(crate) fn dead_letter(
     kernel: &Mutex<KernelState>,
     envelope: &Envelope,
     reason: crate::types::DeadLetterReason,
@@ -601,7 +586,7 @@ pub fn dead_letter(
 
 /// Pumps the DLQ topic once: offers every retained entry past each DLQ
 /// subscriber's cursor. Called by the loops after dead-lettering.
-pub async fn pump_dlq(registry: &Mutex<Registry>, kernel: &Mutex<KernelState>) {
+pub(crate) async fn pump_dlq(registry: &Mutex<Registry>, kernel: &Mutex<KernelState>) {
     pump_topic(kernel, registry, &Registry::dead_letter_topic()).await;
 }
 
@@ -622,7 +607,7 @@ async fn deliver_with_retry(endpoint: &Endpoint, envelope: Envelope) -> Result<(
 ///
 /// Only DropOld/DropNew refusals land here (the mpsc already backpressures
 /// Block); refused/evicted messages are dead-lettered — never lost silently.
-pub async fn front_door_loop(
+pub(crate) async fn front_door_loop(
     cell: Arc<ActorCell>,
     kernel: Arc<Mutex<KernelState>>,
     mut rx: mpsc::Receiver<Envelope>,
@@ -682,7 +667,7 @@ pub async fn front_door_loop(
 ///
 /// Idles with a notify + short poll backstop; the poll is deliberate — it
 /// bounds wakeup latency without lost-wakeup races.
-pub async fn es_actor_loop(loop_ctx: EsLoop, mut shutdown: watch::Receiver<bool>) {
+pub(crate) async fn es_actor_loop(loop_ctx: EsLoop, mut shutdown: watch::Receiver<bool>) {
     loop {
         if *shutdown.borrow_and_update() {
             break;
@@ -992,13 +977,13 @@ fn apply_subscribe(
 /// The kernel's ask port: opens leases, routes request envelopes,
 /// records ask facts. Handed to service contexts at dispatch time.
 #[derive(Clone)]
-pub struct KernelAskPort {
+pub(crate) struct KernelAskPort {
     /// The shared routing table.
-    pub registry: Arc<Mutex<Registry>>,
+    pub(crate) registry: Arc<Mutex<Registry>>,
     /// The shared actor tables (reply leases + ask facts live here).
-    pub kernel: Arc<Mutex<KernelState>>,
+    pub(crate) kernel: Arc<Mutex<KernelState>>,
     /// The clock for lease expiries.
-    pub clock: crate::clock::ClockService,
+    pub(crate) clock: crate::clock::ClockService,
 }
 
 impl crate::context::AskPort for KernelAskPort {
@@ -1365,7 +1350,7 @@ async fn drain_inbox_on_stop(ctx: &EsLoop) {
 /// The service actor loop: pop → decode → dispatch (async, impure) →
 /// drop the message. No journal, no cursor — service actors are at-most-once
 /// by design (Phase 8 adds supervision around this loop).
-pub async fn service_actor_loop(loop_ctx: ServiceLoop, mut shutdown: watch::Receiver<bool>) {
+pub(crate) async fn service_actor_loop(loop_ctx: ServiceLoop, mut shutdown: watch::Receiver<bool>) {
     loop {
         if *shutdown.borrow_and_update() {
             break;
@@ -1387,9 +1372,9 @@ pub async fn service_actor_loop(loop_ctx: ServiceLoop, mut shutdown: watch::Rece
 
 /// Everything one running service loop needs.
 #[derive(Clone)]
-pub struct ServiceLoop {
+pub(crate) struct ServiceLoop {
     /// The ES-shaped plumbing the service loop shares (routing, cell).
-    pub es: EsLoop,
+    pub(crate) es: EsLoop,
 }
 
 /// One service step: peek → decode (sync) → dispatch (async) → ack.
@@ -1534,7 +1519,7 @@ async fn step_service(ctx: &ServiceLoop) -> Step {
 /// # Errors
 ///
 /// Propagates rebuild failures (a corrupt snapshot or undecodable state).
-pub async fn restart_es(
+pub(crate) async fn restart_es(
     ctx: &EsLoop,
     genesis_args: &JsonValue,
 ) -> Result<(), error_stack::Report<JournalError>> {

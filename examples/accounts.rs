@@ -255,7 +255,7 @@ impl ServiceActor for StoryObserver {
 
 impl MsgHandler<FactMsg> for StoryObserver {
     async fn handle(&mut self, fact: FactMsg, ctx: &mut MsgCtx<'_>) {
-        if ctx.core.self_path.as_str() == "story2" {
+        if ctx.self_path().as_str() == "story2" {
             tell(format!(
                 "spawn fact seen (offset {}) — initial spawn or supervised restart",
                 fact.offset

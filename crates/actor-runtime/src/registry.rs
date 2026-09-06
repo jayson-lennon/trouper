@@ -68,14 +68,14 @@ impl Endpoint {
 
 /// A registered actor identity: its manifest plus a swappable endpoint.
 #[derive(Debug)]
-pub struct Slot {
+pub(crate) struct Slot {
     /// The actor's declared edges and contract kind.
-    pub manifest: ActorManifest,
+    pub(crate) manifest: ActorManifest,
     /// The running endpoint; `None` while stopped (between restarts).
-    pub endpoint: arc_swap::ArcSwapOption<Endpoint>,
+    pub(crate) endpoint: arc_swap::ArcSwapOption<Endpoint>,
     /// The inbox overload policy this actor spawned with (topic pumps
     /// consult it when delivering published envelopes).
-    pub inbox_policy: crate::inbox::OverloadPolicy,
+    pub(crate) inbox_policy: crate::inbox::OverloadPolicy,
 }
 
 impl Slot {
@@ -223,12 +223,12 @@ pub struct Registry {
     routes: HashMap<SchemaId, RoutePolicy>,
     route_cursor: usize,
     /// Stateless pools by PUBLIC path (workers own the real slots).
-    pub pools: HashMap<ActorPath, crate::pool::PoolEntry>,
+    pub(crate) pools: HashMap<ActorPath, crate::pool::PoolEntry>,
     /// Partition sets by PUBLIC path (entities own the real slots, derived
     /// from the set's path on demand).
-    pub partitions: HashMap<ActorPath, crate::pool::PartitionSpec>,
+    pub(crate) partitions: HashMap<ActorPath, crate::pool::PartitionSpec>,
     /// Router rules in declaration (priority) order.
-    pub rules: Vec<crate::pool::Rule>,
+    pub(crate) rules: Vec<crate::pool::Rule>,
 }
 
 impl Registry {

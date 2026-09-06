@@ -51,6 +51,8 @@ Entries are added or amended **only with human approval**.
 - (runtime) `system.export()` returns a JSON-serializable `SystemExport` of the live system: schemas, actors (with ES state and inbox cursor), declared edges, observed edges, pools, partitions, and router rules; `SystemExport` round-trips through JSON losslessly.
 - (runtime) A ReportState command makes a StateReporter actor emit a journaled StateReported event whose payload is the JSON SystemExport document.
 - (runtime) Domain outcomes are events journaled like any other event; technical failures are handler panics, which supervision converts into restarts and `Failed`/`Escalated` tap facts.
+- (runtime) Replies are point-to-point: a reply with no reply_to is dropped silently, never broadcast; failures that must reach non-asking observers travel as published events on topics.
+- (runtime) Handler contexts (CmdCtx/MsgCtx) expose only tier-curated methods; the outbox, trace, and ask port are crate-private plumbing.
 - (canvas) System state is served and consumed as zenoh messages on the actor-runtime/state key (Config::default()); the canvas CLI queries it and prints the export.
 - (canvas) The canvas GUI consumes the same zenoh state key as the CLI and renders the export as an interactive graph with pan, zoom, and cursor-anchored popups; the runtime serves it no differently than the CLI.
 - (canvas) The canvas GUI lives in its own repo next to the SDK (../actor-canvas) and consumes actor-runtime and state-report by path dependency; this SDK carries no bevy anymore.

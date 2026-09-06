@@ -18,7 +18,7 @@ use serde_json::Value as JsonValue;
 /// Read-only runtime view for handlers: registry lookups plus the clock.
 ///
 /// Implemented by the system facade; the kernel hands contexts a reference.
-pub trait RuntimeView: Send + Sync {
+pub(crate) trait RuntimeView: Send + Sync {
     /// Snapshot info about a path, if registered.
     fn lookup(&self, path: &ActorPath) -> Option<crate::registry::EndpointInfo>;
 
@@ -31,7 +31,7 @@ pub trait RuntimeView: Send + Sync {
 
 /// One deferred effect, fully stamped; the kernel executes these post-ack.
 #[derive(Debug)]
-pub enum Intent {
+pub(crate) enum Intent {
     /// A point-to-point send to an address.
     Send(Envelope),
     /// A publish onto a topic.
@@ -54,7 +54,7 @@ pub enum Intent {
 
 /// Effects recorded by a handler, flushed by the kernel after ack.
 #[derive(Debug, Default)]
-pub struct Outbox {
+pub(crate) struct Outbox {
     intents: Vec<Intent>,
 }
 
@@ -101,18 +101,20 @@ impl Outbox {
     }
 
     /// Whether any effects are pending.
-    pub fn is_empty(&self) -> bool {
+    #[cfg(test)]
+    pub(crate) fn is_empty(&self) -> bool {
         self.intents.is_empty()
     }
 
     /// The number of pending effects.
-    pub fn len(&self) -> usize {
+    #[cfg(test)]
+    pub(crate) fn len(&self) -> usize {
         self.intents.len()
     }
 }
 
 /// The boxed future a [`AskPort::ask_channel`] resolves to.
-pub type AskChannelFuture = std::pin::Pin<
+pub(crate) type AskChannelFuture = std::pin::Pin<
     Box<
         dyn std::future::Future<
                 Output = Result<
@@ -127,17 +129,21 @@ pub type AskChannelFuture = std::pin::Pin<
 >;
 
 /// The fields every context shares.
-pub struct CtxCore<'a> {
+///
+/// Crate-private plumbing: the two tier contexts ([`CmdCtx`], [`MsgCtx`])
+/// are the public surface, and their fields are opaque to handlers. The
+/// outbox, trace, and view are never in user hands directly.
+pub(crate) struct CtxCore<'a> {
     /// The processing actor's registered path.
-    pub self_path: &'a ActorPath,
+    self_path: &'a ActorPath,
     /// Trace metadata of the message being processed.
-    pub trace: &'a TraceCtx,
+    trace: &'a TraceCtx,
     /// Where a reply should go, if the sender asked for one.
-    pub reply_to: Option<&'a Address>,
+    reply_to: Option<&'a Address>,
     /// Read-only runtime view (lookups + clock).
-    pub view: &'a dyn RuntimeView,
+    view: &'a dyn RuntimeView,
     /// The outbox the kernel flushes after ack.
-    pub outbox: &'a mut Outbox,
+    outbox: &'a mut Outbox,
 }
 
 impl CtxCore<'_> {
@@ -203,37 +209,102 @@ impl CtxCore<'_> {
     pub fn recv_ts(&self) -> Timestamp {
         self.view.now()
     }
+
+    /// The incoming message's reply address, if the sender asked for a
+    /// reply. Handlers usually want [`CtxCore::reply`] instead; this is for
+    /// routing continuations to a durable path.
+    pub fn reply_dest(&self) -> Option<Address> {
+        self.reply_to.cloned()
+    }
 }
 
 /// Context for event-sourced handlers: sync, pure, deferred effects only.
 ///
 /// There is deliberately no `ask` here: the handler is sync and cannot
 /// await, and no I/O sneaks into a decision function.
-pub struct CmdCtx<'a>(pub CtxCore<'a>);
+///
+/// The constructor is crate-private: only the kernel assembles contexts.
+pub struct CmdCtx<'a> {
+    core: CtxCore<'a>,
+}
 
-impl CmdCtx<'_> {
+impl<'a> CmdCtx<'a> {
     /// Assembles the context for one command dispatch.
-    pub fn new<'ctx>(
-        self_path: &'ctx ActorPath,
-        trace: &'ctx TraceCtx,
-        reply_to: Option<&'ctx Address>,
-        view: &'ctx dyn RuntimeView,
-        outbox: &'ctx mut Outbox,
-    ) -> CmdCtx<'ctx> {
-        CmdCtx(CtxCore {
-            self_path,
-            trace,
-            reply_to,
-            view,
-            outbox,
-        })
+    pub(crate) fn new(
+        self_path: &'a ActorPath,
+        trace: &'a TraceCtx,
+        reply_to: Option<&'a Address>,
+        view: &'a dyn RuntimeView,
+        outbox: &'a mut Outbox,
+    ) -> CmdCtx<'a> {
+        CmdCtx {
+            core: CtxCore {
+                self_path,
+                trace,
+                reply_to,
+                view,
+                outbox,
+            },
+        }
+    }
+
+    /// Records a send to `dest` (deferred; the kernel flushes post-ack).
+    pub fn send(
+        &mut self,
+        dest: Address,
+        schema: SchemaId,
+        payload: JsonValue,
+        reply_to: Option<Address>,
+    ) {
+        self.core.send(dest, schema, payload, reply_to);
+    }
+
+    /// Records a publish onto `topic` (deferred; flushed post-ack).
+    pub fn publish(&mut self, topic: Topic, schema: SchemaId, payload: JsonValue) {
+        self.core.publish(topic, schema, payload);
+    }
+
+    /// Records a reply to the message's `reply_to`, if the sender asked.
+    ///
+    /// A reply without a `reply_to` is dropped silently: the asker is gone,
+    /// so the fact is unobservable by definition. It is NEVER a broadcast —
+    /// use [`CmdCtx::publish`] for topics.
+    pub fn reply(&mut self, schema: SchemaId, payload: JsonValue) {
+        self.core.reply(schema, payload);
+    }
+
+    /// Snapshot info about a path.
+    pub fn lookup(&self, path: &ActorPath) -> Option<crate::registry::EndpointInfo> {
+        self.core.lookup(path)
+    }
+
+    /// Every path registered as a handler for a schema.
+    pub fn who_handles(&self, schema: &SchemaId) -> Vec<ActorPath> {
+        self.core.who_handles(schema)
+    }
+
+    /// The time the message was received (injected clock = deterministic).
+    pub fn recv_ts(&self) -> Timestamp {
+        self.core.recv_ts()
+    }
+
+    /// The processing actor's registered path.
+    pub fn self_path(&self) -> &ActorPath {
+        self.core.self_path
+    }
+
+    /// The incoming message's reply address, if the sender asked for a
+    /// reply. Handlers usually want `reply` instead; this is for routing
+    /// continuations to a durable path.
+    pub fn reply_dest(&self) -> Option<Address> {
+        self.core.reply_dest()
     }
 }
 
 /// The impure syscall port a service actor's [`MsgCtx`] carries: opens
 /// reply leases, routes envelopes, reads the clock. The system implements
 /// it; tests swap it (like [`RuntimeView`]).
-pub trait AskPort: Send + Sync {
+pub(crate) trait AskPort: Send + Sync {
     /// Sends an envelope with a freshly opened reply lease; returns the
     /// lease id and receiver (the asker awaits the receiver under its
     /// timeout; the id lets the settle path drop the lease).
@@ -312,23 +383,25 @@ pub(crate) async fn ask_via_port(
 ///
 /// The sync surface matches [`CmdCtx`]; `ask` is exclusive to this tier —
 /// an event-sourced decision function cannot await.
+///
+/// The constructor is crate-private: only the kernel assembles contexts.
 pub struct MsgCtx<'a> {
-    pub core: CtxCore<'a>,
+    core: CtxCore<'a>,
     /// The impure port (leases + routing); absent only in pure tests that
     /// never ask.
-    pub port: Option<&'a dyn AskPort>,
+    port: Option<&'a dyn AskPort>,
 }
 
-impl MsgCtx<'_> {
+impl<'a> MsgCtx<'a> {
     /// Assembles the context for one message dispatch.
-    pub fn new<'ctx>(
-        self_path: &'ctx ActorPath,
-        trace: &'ctx TraceCtx,
-        reply_to: Option<&'ctx Address>,
-        view: &'ctx dyn RuntimeView,
-        outbox: &'ctx mut Outbox,
-        port: Option<&'ctx dyn AskPort>,
-    ) -> MsgCtx<'ctx> {
+    pub(crate) fn new(
+        self_path: &'a ActorPath,
+        trace: &'a TraceCtx,
+        reply_to: Option<&'a Address>,
+        view: &'a dyn RuntimeView,
+        outbox: &'a mut Outbox,
+        port: Option<&'a dyn AskPort>,
+    ) -> MsgCtx<'a> {
         MsgCtx {
             core: CtxCore {
                 self_path,
@@ -365,6 +438,58 @@ impl MsgCtx<'_> {
     ) -> Result<JsonValue, error_stack::Report<AskError>> {
         let port = self.port.expect("ask requires a port (service tier)");
         ask_via_port(port, dest, schema, payload, timeout, *self.core.trace).await
+    }
+
+    /// Records a send to `dest` (deferred; the kernel flushes post-ack).
+    pub fn send(
+        &mut self,
+        dest: Address,
+        schema: SchemaId,
+        payload: JsonValue,
+        reply_to: Option<Address>,
+    ) {
+        self.core.send(dest, schema, payload, reply_to);
+    }
+
+    /// Records a publish onto `topic` (deferred; flushed post-ack).
+    pub fn publish(&mut self, topic: Topic, schema: SchemaId, payload: JsonValue) {
+        self.core.publish(topic, schema, payload);
+    }
+
+    /// Records a reply to the message's `reply_to`, if the sender asked.
+    ///
+    /// A reply without a `reply_to` is dropped silently: the asker is gone,
+    /// so the fact is unobservable by definition. It is NEVER a broadcast —
+    /// use [`MsgCtx::publish`] for topics.
+    pub fn reply(&mut self, schema: SchemaId, payload: JsonValue) {
+        self.core.reply(schema, payload);
+    }
+
+    /// Snapshot info about a path.
+    pub fn lookup(&self, path: &ActorPath) -> Option<crate::registry::EndpointInfo> {
+        self.core.lookup(path)
+    }
+
+    /// Every path registered as a handler for a schema.
+    pub fn who_handles(&self, schema: &SchemaId) -> Vec<ActorPath> {
+        self.core.who_handles(schema)
+    }
+
+    /// The time the message was received (injected clock = deterministic).
+    pub fn recv_ts(&self) -> Timestamp {
+        self.core.recv_ts()
+    }
+
+    /// The processing actor's registered path.
+    pub fn self_path(&self) -> &ActorPath {
+        self.core.self_path
+    }
+
+    /// The incoming message's reply address, if the sender asked for a
+    /// reply. Handlers usually want `reply` instead; this is for routing
+    /// continuations to a durable path.
+    pub fn reply_dest(&self) -> Option<Address> {
+        self.core.reply_dest()
     }
 }
 
@@ -435,7 +560,7 @@ mod tests {
 
         // When sending a command.
         let json = serde_json::json!({ "qty": 2 });
-        ctx.0.send(
+        ctx.send(
             Address::Path(ActorPath::new("inventory.west")),
             SchemaId::new("ReserveStock", 1),
             json,
@@ -474,7 +599,7 @@ mod tests {
         let mut ctx = CmdCtx::new(&path, &trace, Some(&reply_to), view, &mut outbox);
 
         // When replying.
-        ctx.0.reply(
+        ctx.reply(
             SchemaId::new("Reserved", 1),
             serde_json::json!({ "ok": true }),
         );
@@ -493,9 +618,7 @@ mod tests {
         // When a context without reply-to replies.
         let mut silent_outbox = Outbox::new();
         let mut silent = CmdCtx::new(&path, &trace, None, view, &mut silent_outbox);
-        silent
-            .0
-            .reply(SchemaId::new("Reserved", 1), serde_json::json!({}));
+        silent.reply(SchemaId::new("Reserved", 1), serde_json::json!({}));
 
         // Then nothing is recorded.
         assert!(silent_outbox.is_empty());
@@ -511,7 +634,7 @@ mod tests {
         let mut ctx = CmdCtx::new(&path, &trace, None, &view, &mut outbox);
 
         // When publishing an event onto a topic.
-        ctx.0.publish(
+        ctx.publish(
             Topic::new("inventory.events"),
             SchemaId::new("StockReserved", 1),
             serde_json::json!({ "qty": 2 }),
@@ -538,10 +661,10 @@ mod tests {
         let ctx = CmdCtx::new(&path, &trace, None, &view, &mut outbox);
 
         // When querying lookups, who_handles, and the receive timestamp.
-        let info = ctx.0.lookup(&ActorPath::new("auditor"));
-        let missing = ctx.0.lookup(&ActorPath::new("ghost"));
-        let handlers = ctx.0.who_handles(&SchemaId::new("ReserveStock", 1));
-        let ts = ctx.0.recv_ts();
+        let info = ctx.lookup(&ActorPath::new("auditor"));
+        let missing = ctx.lookup(&ActorPath::new("ghost"));
+        let handlers = ctx.who_handles(&SchemaId::new("ReserveStock", 1));
+        let ts = ctx.recv_ts();
 
         // Then the view's answers come through, including the clock's.
         assert_eq!(info.map(|i| i.kind), Some(ActorKind::Service));
@@ -558,13 +681,13 @@ mod tests {
         let mut outbox = Outbox::new();
         let path = ActorPath::new("a");
         let mut ctx = CmdCtx::new(&path, &trace, None, &view, &mut outbox);
-        ctx.0.send(
+        ctx.send(
             Address::Path(ActorPath::new("b")),
             SchemaId::new("Ping", 1),
             serde_json::json!({}),
             None,
         );
-        ctx.0.send(
+        ctx.send(
             Address::Path(ActorPath::new("c")),
             SchemaId::new("Pong", 1),
             serde_json::json!({}),
@@ -589,7 +712,7 @@ mod tests {
         let mut ctx = MsgCtx::new(&path, &trace, None, &view, &mut outbox, None);
 
         // When it sends.
-        ctx.core.send(
+        ctx.send(
             Address::Path(ActorPath::new("b")),
             SchemaId::new("Ping", 1),
             serde_json::json!({}),
@@ -599,5 +722,42 @@ mod tests {
         // Then the effect is deferred identically.
         assert_eq!(outbox.len(), 1);
         assert!(matches!(SchemaKind::Command, SchemaKind::Command));
+    }
+
+    /// The silent-drop contract: a reply with no reply_to records nothing.
+    /// It is NEVER a broadcast — the fact is unobservable by definition.
+    #[test]
+    fn reply_without_reply_to_is_dropped_silently() {
+        // Given a message context with no reply_to (a tell delivery).
+        let view = FakeView::at_millis(0);
+        let trace = TraceCtx::root();
+        let mut outbox = Outbox::new();
+        let path = ActorPath::new("auditor");
+        let mut ctx = MsgCtx::new(&path, &trace, None, &view, &mut outbox, None);
+
+        // When the handler replies.
+        ctx.reply(SchemaId::new("Pong", 1), serde_json::json!({}));
+
+        // Then the outbox stays empty — nothing is recorded anywhere.
+        assert_eq!(outbox.len(), 0);
+    }
+
+    /// The counterpart: WITH a reply_to, the same call records a Reply
+    /// intent (point-to-point to the asker).
+    #[test]
+    fn reply_with_reply_to_records_a_reply_intent() {
+        // Given a message context whose message carried a reply_to.
+        let view = FakeView::at_millis(0);
+        let trace = TraceCtx::root();
+        let reply_to = Address::Path(ActorPath::new("asker"));
+        let mut outbox = Outbox::new();
+        let path = ActorPath::new("auditor");
+        let mut ctx = MsgCtx::new(&path, &trace, Some(&reply_to), &view, &mut outbox, None);
+
+        // When the handler replies.
+        ctx.reply(SchemaId::new("Pong", 1), serde_json::json!({ "ok": 1 }));
+
+        // Then exactly one Reply intent is recorded, addressed to the asker.
+        assert_eq!(outbox.len(), 1);
     }
 }

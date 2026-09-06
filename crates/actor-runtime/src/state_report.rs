@@ -107,7 +107,7 @@ impl CommandHandler<ReportState> for StateReporter {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::context::{CtxCore, Outbox, RuntimeView};
+    use crate::context::{CmdCtx, Outbox, RuntimeView};
     use crate::envelope::TraceCtx;
     use crate::types::{ActorPath, SchemaId};
     use serde_json::json;
@@ -134,13 +134,7 @@ mod tests {
         let path: &'static ActorPath = Box::leak(Box::new(ActorPath::new("reporter")));
         let outbox: &'static mut Outbox = Box::leak(Box::new(Outbox::new()));
         let view: &'static NullView = Box::leak(Box::new(NullView));
-        CmdCtx(CtxCore {
-            self_path: path,
-            trace,
-            reply_to: None,
-            view,
-            outbox,
-        })
+        CmdCtx::new(path, trace, None, view, outbox)
     }
 
     #[test]

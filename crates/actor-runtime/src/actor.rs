@@ -653,7 +653,7 @@ mod tests {
         let mut state = TypedEsState::new(Counter::restore(&json!({})));
 
         // The adapter needs a CmdCtx; build a minimal one over a null view.
-        use crate::context::{CtxCore, Outbox, RuntimeView};
+        use crate::context::{CmdCtx, Outbox, RuntimeView};
         struct NullView;
         impl RuntimeView for NullView {
             fn lookup(&self, _path: &ActorPath) -> Option<crate::registry::EndpointInfo> {
@@ -669,13 +669,7 @@ mod tests {
         let trace = crate::envelope::TraceCtx::root();
         let path = ActorPath::new("counter");
         let mut outbox = Outbox::new();
-        let mut ctx = CmdCtx(CtxCore {
-            self_path: &path,
-            trace: &trace,
-            reply_to: None,
-            view: &NullView,
-            outbox: &mut outbox,
-        });
+        let mut ctx = CmdCtx::new(&path, &trace, None, &NullView, &mut outbox);
 
         // When dispatching a well-formed command.
         let events = adapter
@@ -705,7 +699,7 @@ mod tests {
         let adapter = TypedEsAdapter::<Counter, ReserveStock>::new::<ReserveStock>();
         let mut state = TypedEsState::new(Counter::restore(&json!({})));
 
-        use crate::context::{CtxCore, Outbox, RuntimeView};
+        use crate::context::{CmdCtx, Outbox, RuntimeView};
         struct NullView;
         impl RuntimeView for NullView {
             fn lookup(&self, _path: &ActorPath) -> Option<crate::registry::EndpointInfo> {
@@ -721,13 +715,7 @@ mod tests {
         let trace = crate::envelope::TraceCtx::root();
         let path = ActorPath::new("counter");
         let mut outbox = Outbox::new();
-        let mut ctx = CmdCtx(CtxCore {
-            self_path: &path,
-            trace: &trace,
-            reply_to: None,
-            view: &NullView,
-            outbox: &mut outbox,
-        });
+        let mut ctx = CmdCtx::new(&path, &trace, None, &NullView, &mut outbox);
 
         // When dispatching a malformed payload.
         let result = adapter.dispatch(&mut state, &json!({ "nope": true }), &mut ctx);
@@ -755,7 +743,7 @@ mod tests {
         let entry = ForeignCommandEntry::new(schema, decision);
         let mut state = ForeignEsState::new(json!({ "count": 0 }), fold);
 
-        use crate::context::{CtxCore, Outbox, RuntimeView};
+        use crate::context::{CmdCtx, Outbox, RuntimeView};
         struct NullView;
         impl RuntimeView for NullView {
             fn lookup(&self, _path: &ActorPath) -> Option<crate::registry::EndpointInfo> {
@@ -771,13 +759,7 @@ mod tests {
         let trace = crate::envelope::TraceCtx::root();
         let path = ActorPath::new("foreign");
         let mut outbox = Outbox::new();
-        let mut ctx = CmdCtx(CtxCore {
-            self_path: &path,
-            trace: &trace,
-            reply_to: None,
-            view: &NullView,
-            outbox: &mut outbox,
-        });
+        let mut ctx = CmdCtx::new(&path, &trace, None, &NullView, &mut outbox);
 
         // When dispatching a JSON command (no Rust type involved).
         let events = entry
