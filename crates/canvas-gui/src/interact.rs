@@ -89,17 +89,12 @@ fn handle_input(
     let Ok(window) = windows.single() else {
         return;
     };
-    let Some(cursor_px) = window.cursor_position() else {
-        return;
-    };
-    let cursor = view::Vec2::new(cursor_px.x, cursor_px.y);
+    let cursor_px = window.cursor_position();
+    let cursor = cursor_px.map(|px| view::Vec2::new(px.x, px.y));
     let egui_wants_pointer = contexts
         .ctx_mut()
         .map(|ctx| ctx.egui_wants_pointer_input())
         .unwrap_or(false);
-    if egui_wants_pointer {
-        return;
-    }
 
     if keys.just_pressed(KeyCode::Escape) {
         selection.node = None;
@@ -109,11 +104,15 @@ fn handle_input(
         let _ = channels.commands.send(FetchCommand::Refresh);
     }
 
-    if mouse_buttons.just_pressed(MouseButton::Left) {
+    // The drag state machine runs unconditionally: pan applies the
+    // frame's whole accumulated delta even when the cursor read fails
+    // (window edge, drag out of bounds) — dropping frames here made
+    // fast flicks lose distance.
+    if mouse_buttons.just_pressed(MouseButton::Left) && cursor.is_some() && !egui_wants_pointer {
         drag.held = true;
         drag.traveled = 0.0;
     }
-    if drag.held {
+    if drag.held && !egui_wants_pointer {
         drag.traveled += motion.delta.length();
         // Screen-pixel delta (y-down) → world pan delta (y-up): flip
         // the sign of y, and divide by zoom so content tracks the
@@ -122,19 +121,25 @@ fn handle_input(
         view.pan = view.pan - delta;
     }
     if mouse_buttons.just_released(MouseButton::Left) {
+        let was_drag = drag.held;
         drag.held = false;
-        if drag.traveled < CLICK_THRESHOLD_PX {
-            let world = view.screen_to_world(cursor, window_size(window));
-            selection.node = state.layout.hit_node(&state.hit_order, world).cloned();
-            if selection.node.is_some() {
-                selection.cursor_px = Some(cursor);
-            } else {
-                selection.cursor_px = None;
+        if was_drag && !egui_wants_pointer {
+            drag.traveled += motion.delta.length();
+            if let (false, Some(cursor)) = (drag.traveled < CLICK_THRESHOLD_PX, cursor) {
+                let world = view.screen_to_world(cursor, window_size(window));
+                selection.node = state.layout.hit_node(&state.hit_order, world).cloned();
+                if selection.node.is_some() {
+                    selection.cursor_px = Some(cursor);
+                } else {
+                    selection.cursor_px = None;
+                }
             }
         }
     }
 
-    if scroll.delta.y != 0.0 {
+    if scroll.delta.y != 0.0
+        && let (false, Some(cursor)) = (egui_wants_pointer, cursor)
+    {
         let factor = ZOOM_STEP.powf(scroll.delta.y);
         *view = view.zoom_at(cursor, window_size(window), factor);
     }
