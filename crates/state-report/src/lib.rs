@@ -1,10 +1,16 @@
 //! Serves and consumes system state as zenoh messages.
 //!
-//! One key — [`STATE_KEY`] — carries the whole story: [`install`] declares
-//! a queryable that answers every query with a *fresh* export document
-//! (captured, journaled through a `StateReporter` actor, then replied),
-//! and [`fetch`] queries that key and decodes the export. Both sides are
-//! zenoh peers on `Config::default()` — no addresses, no ports.
+//! One key family — [`STATE_KEY`] — carries the whole story: [`install`]
+//! declares a queryable that answers every query with a *fresh* export
+//! document (captured, journaled through a `StateReporter` actor, then
+//! replied), and [`fetch`] queries that key and decodes the export. Both
+//! sides are zenoh peers on `Config::default()` — no addresses, no ports.
+//!
+//! Test isolation: zenoh's default peer discovery puts every session on
+//! the machine (and network) into one mesh, so concurrent tests must not
+//! share the production key. [`StateKey::scoped`] derives per-test island
+//! keys (`actor-runtime/state/<scope>`); a query on one island only ever
+//! reaches queryables declared on that same island.
 //!
 //! Freshness contract: a reply is only sent after the reporter's journaled
 //! `seq` has advanced past its pre-query value, so what `fetch` decodes is
@@ -17,8 +23,42 @@ use std::borrow::Cow;
 use std::time::Duration;
 use tokio::time::Instant;
 
+/// Re-exported so consumers of [`install_on`]/[`fetch_on`] can name
+/// session types (e.g. to close a bridge session) without adding their
+/// own zenoh dependency.
+pub use zenoh;
+
 /// The zenoh key every state query travels on.
 pub const STATE_KEY: &str = "actor-runtime/state";
+
+/// The zenoh key a bridge serves and clients query.
+///
+/// Production uses [`StateKey::production`]; tests derive per-test
+/// islands with [`StateKey::scoped`] so concurrent test processes sharing
+/// one zenoh mesh never answer each other's queries.
+#[derive(Debug, Clone)]
+pub struct StateKey(String);
+
+impl StateKey {
+    /// The production key, [`STATE_KEY`].
+    pub fn production() -> Self {
+        Self(STATE_KEY.to_string())
+    }
+
+    /// A namespaced island key, `actor-runtime/state/<scope>`.
+    ///
+    /// Keys are matched exactly (no wildcards here), so queries on one
+    /// scope only reach queryables on the same scope — even though the
+    /// underlying zenoh sessions all discover each other.
+    pub fn scoped(scope: &str) -> Self {
+        Self(format!("{STATE_KEY}/{scope}"))
+    }
+
+    /// The key expression as zenoh sees it.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
 
 /// How long the bridge waits for the reporter's `seq` to advance after
 /// injecting a `ReportState` command.
@@ -66,6 +106,20 @@ pub async fn install(
     system: std::sync::Arc<ActorSystem>,
     reporter: ActorPath,
 ) -> Result<zenoh::Session, StateBridgeError> {
+    install_on(StateKey::production(), system, reporter).await
+}
+
+/// [`install`] on an explicit [`StateKey`] — the test seam for per-test
+/// island keys.
+///
+/// # Errors
+///
+/// As [`install`].
+pub async fn install_on(
+    key: StateKey,
+    system: std::sync::Arc<ActorSystem>,
+    reporter: ActorPath,
+) -> Result<zenoh::Session, StateBridgeError> {
     // Given the system already contains the reporter actor.
     if system.inbox_cursor(&reporter).is_none() {
         return Err(StateBridgeError::NoReporter(reporter));
@@ -74,7 +128,7 @@ pub async fn install(
     // When the zenoh session and queryable are declared.
     let session = zenoh::open(zenoh::Config::default()).await.map_err(zoh)?;
     let queryable = session
-        .declare_queryable(STATE_KEY)
+        .declare_queryable(key.as_str())
         .complete(true)
         .await
         .map_err(zoh)?;
@@ -82,19 +136,26 @@ pub async fn install(
     // Then queries are served for as long as this task lives (it owns the
     // queryable, and its session clone keeps the transport alive even if
     // the caller lets their handle go).
-    tokio::spawn(serve_loop(session.clone(), queryable, system, reporter));
+    tokio::spawn(serve_loop(
+        session.clone(),
+        key,
+        queryable,
+        system,
+        reporter,
+    ));
     Ok(session)
 }
 
 /// Serves state queries one at a time until the queryable's channel closes.
 async fn serve_loop(
     session: zenoh::Session,
+    key: StateKey,
     queryable: zenoh::query::Queryable<zenoh::handlers::FifoChannelHandler<zenoh::query::Query>>,
     system: std::sync::Arc<ActorSystem>,
     reporter: ActorPath,
 ) {
     while let Ok(query) = queryable.recv_async().await {
-        serve_query(&session, &system, &reporter, query).await;
+        serve_query(&session, &key, &system, &reporter, query).await;
     }
 }
 
@@ -102,6 +163,7 @@ async fn serve_loop(
 /// cannot be produced and journaled.
 async fn serve_query(
     _session: &zenoh::Session,
+    key: &StateKey,
     system: &std::sync::Arc<ActorSystem>,
     reporter: &ActorPath,
     query: zenoh::query::Query,
@@ -143,7 +205,7 @@ async fn serve_query(
             return;
         }
     };
-    if let Err(error) = query.reply(STATE_KEY, body).await {
+    if let Err(error) = query.reply(key.as_str(), body).await {
         tracing::error!("zenoh reply failed: {error}");
         return;
     }
@@ -181,10 +243,34 @@ async fn wait_for_seq(system: &ActorSystem, reporter: &ActorPath, before: u64) -
 /// [`FETCH_BUDGET`], [`StateBridgeError::Zenoh`] for transport failures, or
 /// [`StateBridgeError::Payload`] when a reply does not decode.
 pub async fn fetch() -> Result<SystemExport, StateBridgeError> {
+    fetch_on(StateKey::production()).await
+}
+
+/// [`fetch`] from an explicit [`StateKey`] — the test seam for per-test
+/// island keys.
+///
+/// # Errors
+///
+/// As [`fetch`].
+pub async fn fetch_on(key: StateKey) -> Result<SystemExport, StateBridgeError> {
     let session = zenoh::open(zenoh::Config::default()).await.map_err(zoh)?;
+    // Whatever happens, leave the mesh gracefully — an abruptly vanished
+    // peer can poison routing state in every other session on the network.
+    let result = fetch_all(&session, &key).await;
+    if let Err(error) = session.close().await {
+        tracing::warn!("fetch session close failed: {error}");
+    }
+    result
+}
+
+/// The retry loop of [`fetch_on`] against an open session.
+async fn fetch_all(
+    session: &zenoh::Session,
+    key: &StateKey,
+) -> Result<SystemExport, StateBridgeError> {
     let deadline = Instant::now() + FETCH_BUDGET;
     while Instant::now() < deadline {
-        match first_export(&session, deadline).await {
+        match first_export(session, key, deadline).await {
             Ok(export) => return Ok(export),
             Err(FetchMiss::Retry) => continue,
             Err(FetchMiss::Fatal(error)) => return Err(error),
@@ -205,10 +291,11 @@ enum FetchMiss {
 /// One query attempt: sends the query and decodes the first usable reply.
 async fn first_export(
     session: &zenoh::Session,
+    key: &StateKey,
     deadline: Instant,
 ) -> Result<SystemExport, FetchMiss> {
     let replies = session
-        .get(STATE_KEY)
+        .get(key.as_str())
         .timeout(GET_TIMEOUT)
         .await
         .map_err(zoh)

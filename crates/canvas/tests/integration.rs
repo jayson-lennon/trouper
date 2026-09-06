@@ -1,21 +1,21 @@
 //! Integration tests: the projection over the real query path —
 //! `fetch_export` against a system with an installed bridge, the summary
 //! derived from the fetched export, and the no-bridge timeout.
+//!
+//! Every zenoh test runs on its own [`state_report::StateKey::scoped`]
+//! island key: default peer discovery puts all sessions in one mesh, so
+//! tests that shared the production key answered each other's queries
+//! under a parallel test runner. Island keys make the locks unnecessary.
 
 use actor_runtime::actor::{CommandHandler, EventSourcedActor};
 use actor_runtime::prelude::*;
 use actor_runtime::schema::{FieldDef, FieldTy, Schema, SchemaDef, SchemaKind};
 use actor_runtime::state_report::{ReportState, StateReported, StateReporter};
-use canvas::{SnapshotSummary, StateError, fetch_export};
+use canvas::{SnapshotSummary, StateError, fetch_export_on};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::sync::Arc;
 use std::time::Duration;
-
-/// Zenoh discovery is machine-wide, so concurrent tests (including ones
-/// from the state-report suite) could answer each other's queries —
-/// serialize everything that touches the shared state key.
-static ZENOH_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 #[derive(Deserialize)]
 struct Work {
@@ -80,8 +80,11 @@ impl CommandHandler<Work> for Worker {
 }
 
 /// Builds a live system: one journaled worker that has done `total` units
-/// of work, plus the state reporter with the bridge installed.
-async fn serving_system(total: i64) -> Arc<ActorSystem> {
+/// of work, plus the state reporter with the bridge installed on `key`.
+async fn serving_system(
+    key: state_report::StateKey,
+    total: i64,
+) -> (Arc<ActorSystem>, state_report::zenoh::Session) {
     let system = Arc::new(ActorSystem::new(SystemConfig::production()));
     system.register_schema::<Work>();
     system.register_schema::<WorkDone>();
@@ -119,10 +122,10 @@ async fn serving_system(total: i64) -> Arc<ActorSystem> {
     })
     .await;
 
-    state_report::install(system.clone(), ActorPath::new("state/reporter"))
+    let session = state_report::install_on(key, system.clone(), ActorPath::new("state/reporter"))
         .await
         .expect("bridge installed");
-    system
+    (system, session)
 }
 
 /// Polls `cond` until true (5s budget).
@@ -142,14 +145,14 @@ where
 
 #[tokio::test(flavor = "multi_thread")]
 async fn fetched_export_projects_to_a_summary() {
-    let _zenoh = ZENOH_LOCK.lock().await;
     // Given a serving system: one ES worker with 4 units done, the
     // reporter, and both ReportState schemas — plus the runtime's own
     // Fact@1, auto-registered on first spawn (5 schemas, 2 actors, 2 ES).
-    let _system = serving_system(4).await;
+    let key = state_report::StateKey::scoped("canvas-summary");
+    let (_system, session) = serving_system(key.clone(), 4).await;
 
     // When fetching through the projection seam and summarizing.
-    let export = fetch_export().await.expect("fetch");
+    let export = fetch_export_on(key).await.expect("fetch");
     let summary = SnapshotSummary::of(&export);
 
     // Then the summary counts the live topology.
@@ -159,15 +162,18 @@ async fn fetched_export_projects_to_a_summary() {
     assert_eq!(summary.service, 0);
     assert_eq!(summary.partitions, 0);
     assert_eq!(summary.rules, 0);
+
+    // Teardown: leave the mesh gracefully.
+    session.close().await.expect("bridge session closed");
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn fetch_without_any_bridge_times_out() {
-    let _zenoh = ZENOH_LOCK.lock().await;
-    // Given NO system on this network has a bridge installed.
+    // Given a fresh island no bridge serves.
+    let key = state_report::StateKey::scoped("canvas-timeout");
 
     // When fetching.
-    let result = fetch_export().await;
+    let result = fetch_export_on(key).await;
 
     // Then the projection reports the timeout as "nothing answered".
     match result {

@@ -1,6 +1,11 @@
 //! Integration tests: the bridge serves real queries over real zenoh
 //! sessions (`Config::default()`), `fetch` decodes a fresh export, and
 //! `install` refuses to start without a reporter.
+//!
+//! Every zenoh test runs on its own [`StateKey::scoped`] island key:
+//! default peer discovery puts all sessions in one mesh, so tests that
+//! shared the production key answered each other's queries under a
+//! parallel test runner. Island keys make the locks unnecessary.
 
 use actor_runtime::actor::{CommandHandler, EventSourcedActor};
 use actor_runtime::prelude::*;
@@ -9,14 +14,9 @@ use actor_runtime::state_report::{ReportState, StateReported, StateReporter};
 use actor_runtime::system::SystemExport;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use state_report::{STATE_KEY, StateBridgeError, fetch, install};
+use state_report::{StateBridgeError, StateKey, fetch_on, install, install_on};
 use std::sync::Arc;
 use std::time::Duration;
-
-/// Zenoh discovery is machine-wide, so concurrent tests in this binary
-/// could answer each other's queries — serialize everything that touches
-/// the shared state key.
-static ZENOH_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 #[derive(Deserialize)]
 struct Work {
@@ -150,52 +150,70 @@ fn worker_total(export: &SystemExport) -> i64 {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn installed_bridge_answers_a_second_sessions_query() {
-    let _zenoh = ZENOH_LOCK.lock().await;
-    // Given a reporting system whose bridge is installed.
+    // Given a reporting system whose bridge is installed on its own
+    // island key.
+    let key = StateKey::scoped("bridge-answers-second-session");
     let system = reporting_system(3).await;
-    let _session = install(system.clone(), ActorPath::new("state/reporter"))
-        .await
-        .expect("bridge installed");
+    let _session = install_on(
+        key.clone(),
+        system.clone(),
+        ActorPath::new("state/reporter"),
+    )
+    .await
+    .expect("bridge installed");
 
-    // When a SECOND zenoh session queries the state key (retrying through
-    // peer-discovery warm-up).
+    // When a SECOND zenoh session queries the island key. Zenoh closes a
+    // query immediately when no queryable is discovered yet, so the retry
+    // loop needs real backoff between attempts to ride out peer discovery
+    // (~20 tries × 250ms ≈ 5s worst case).
     let client = zenoh::open(zenoh::Config::default())
         .await
         .expect("session");
     let mut payload = None;
-    for _ in 0..6 {
-        let replies = client.get(STATE_KEY).timeout(Duration::from_secs(1)).await;
-        let Ok(replies) = replies else { continue };
-        while let Ok(reply) = replies.recv_async().await {
-            let Ok(sample) = reply.result() else { continue };
-            let Ok(text) = sample.payload().try_to_string() else {
-                continue;
-            };
+    for _ in 0..20 {
+        if let Ok(replies) = client
+            .get(key.as_str())
+            .timeout(Duration::from_secs(1))
+            .await
+            && let Ok(reply) = replies.recv_async().await
+            && let Ok(sample) = reply.result()
+            && let Ok(text) = sample.payload().try_to_string()
+        {
             payload = Some(text.to_string());
-            break;
         }
         if payload.is_some() {
             break;
         }
+        tokio::time::sleep(Duration::from_millis(250)).await;
     }
     let payload = payload.expect("a second session received a reply");
 
     // Then the payload decodes into the system's export with fresh content.
     let export: SystemExport = serde_json::from_str(&payload).expect("decodable export");
     assert_eq!(worker_total(&export), 6);
+
+    // Teardown: both sessions close gracefully so peers see clean leaves,
+    // not vanished transports.
+    client.close().await.expect("client session closed");
+    _session.close().await.expect("bridge session closed");
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn fetch_returns_a_decodable_export() {
-    let _zenoh = ZENOH_LOCK.lock().await;
-    // Given a reporting system whose bridge is installed.
+    // Given a reporting system whose bridge is installed on its own
+    // island key.
+    let key = StateKey::scoped("fetch-decodes");
     let system = reporting_system(5).await;
-    let _session = install(system.clone(), ActorPath::new("state/reporter"))
-        .await
-        .expect("bridge installed");
+    let _session = install_on(
+        key.clone(),
+        system.clone(),
+        ActorPath::new("state/reporter"),
+    )
+    .await
+    .expect("bridge installed");
 
     // When fetching (the retry budget absorbs discovery warm-up).
-    let export = fetch().await.expect("fetch");
+    let export = fetch_on(key).await.expect("fetch");
 
     // Then the export reflects the live system.
     assert_eq!(worker_total(&export), 15);
@@ -205,17 +223,25 @@ async fn fetch_returns_a_decodable_export() {
             .iter()
             .any(|a| a.path.as_str() == "state/reporter")
     );
+
+    // Teardown: leave the mesh gracefully.
+    _session.close().await.expect("bridge session closed");
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn successive_fetches_observe_advancing_state() {
-    let _zenoh = ZENOH_LOCK.lock().await;
-    // Given a reporting system whose bridge is installed, fetched once.
+    // Given a reporting system whose bridge is installed on its own
+    // island key, fetched once.
+    let key = StateKey::scoped("fetch-advances");
     let system = reporting_system(1).await;
-    let _session = install(system.clone(), ActorPath::new("state/reporter"))
-        .await
-        .expect("bridge installed");
-    let first = fetch().await.expect("first fetch");
+    let _session = install_on(
+        key.clone(),
+        system.clone(),
+        ActorPath::new("state/reporter"),
+    )
+    .await
+    .expect("bridge installed");
+    let first = fetch_on(key.clone()).await.expect("first fetch");
     assert_eq!(worker_total(&first), 1);
 
     // When more work happens and the state is fetched again.
@@ -234,15 +260,17 @@ async fn successive_fetches_observe_advancing_state() {
             == Some(2)
     })
     .await;
-    let second = fetch().await.expect("second fetch");
+    let second = fetch_on(key).await.expect("second fetch");
 
     // Then the second reply carries the NEW state, not the first fetch's.
     assert_eq!(worker_total(&second), 10);
+
+    // Teardown: leave the mesh gracefully.
+    _session.close().await.expect("bridge session closed");
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn install_rejects_unknown_reporter_path() {
-    let _zenoh = ZENOH_LOCK.lock().await;
     // Given a live system with NO actor at the reporter path.
     let system = reporting_system(0).await;
 

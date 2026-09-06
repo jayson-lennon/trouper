@@ -10,19 +10,24 @@
 mod demo;
 
 use actor_runtime::prelude::*;
-use state_report::{fetch, install};
+use state_report::{StateKey, fetch_on, install_on};
 
 #[tokio::test(flavor = "multi_thread")]
 async fn demo_system_answers_queries_with_its_full_topology_over_zenoh() {
     // Given the demo system with its bridge installed (the same flow
     // `run_demo_system` performs, minus the ctrl-c wait).
     let system = demo::build_demo_system().await;
-    let _session = install(system.clone(), ActorPath::new("state/reporter"))
-        .await
-        .expect("bridge installed");
+    let key = StateKey::scoped("e2e-demo-topology");
+    let session = install_on(
+        key.clone(),
+        system.clone(),
+        ActorPath::new("state/reporter"),
+    )
+    .await
+    .expect("bridge installed");
 
-    // When a client fetches the state over real zenoh.
-    let export = fetch().await.expect("fetch");
+    // When a client fetches the state over real zenoh, on that island.
+    let export = fetch_on(key).await.expect("fetch");
     let actors = &export.actors;
 
     // Then every demo topology section is present and populated.
@@ -116,4 +121,7 @@ async fn demo_system_answers_queries_with_its_full_topology_over_zenoh() {
         actor(&direct, reporter)["state"]["export"].is_object(),
         "the journaled report carries the captured export"
     );
+
+    // Teardown: leave the mesh gracefully.
+    session.close().await.expect("bridge session closed");
 }

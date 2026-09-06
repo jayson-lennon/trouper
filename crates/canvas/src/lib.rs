@@ -48,7 +48,17 @@ impl From<StateBridgeError> for StateError {
 /// - [`StateError::Timeout`] when nothing answers within the budget.
 /// - [`StateError::Payload`] when a reply fails to decode.
 pub async fn fetch_export() -> Result<SystemExport, StateError> {
-    Ok(state_report::fetch().await?)
+    fetch_export_on(state_report::StateKey::production()).await
+}
+
+/// [`fetch_export`] on an explicit key — the test seam for per-test
+/// zenoh island keys (see [`state_report::StateKey`]).
+///
+/// # Errors
+///
+/// As [`fetch_export`].
+pub async fn fetch_export_on(key: state_report::StateKey) -> Result<SystemExport, StateError> {
+    Ok(state_report::fetch_on(key).await?)
 }
 
 /// The one-glance digest of an export: counts per export section, with
