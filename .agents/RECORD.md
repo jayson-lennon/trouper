@@ -47,3 +47,6 @@ Entries are added or amended **only with human approval**.
 - (runtime) `tracing` is the developer-diagnostic channel; the tap is the product fact stream.
 - (runtime) `system.export()` returns a JSON-serializable `SystemExport` of the live system: schemas, actors (with ES state and inbox cursor), declared edges, observed edges, pools, partitions, and router rules; `SystemExport` round-trips through JSON losslessly.
 - (runtime) Domain outcomes are events journaled like any other event; technical failures are handler panics, which supervision converts into restarts and `Failed`/`Escalated` tap facts.
+- (server) The canvas-server crate exposes a running ActorSystem over loopback TCP as NDJSON: a versioned request/response protocol whose snapshot request returns a JSON SystemExport document.
+- (server) The canvas protocol is stateless request/response: malformed or unknown-version requests receive a versioned error reply and the connection stays open.
+- (canvas) The canvas binary connects to a provided address (bare invocation uses a documented default loopback address) and aborts with a non-zero exit before any GUI startup when connecting or snapshotting fails.
