@@ -11,6 +11,10 @@ use bevy_egui::EguiContexts;
 use bevy_egui::EguiPlugin;
 use bevy_egui::EguiPrimaryContextPass;
 
+#[cfg(test)]
+mod fixture;
+mod model;
+
 fn spawn_camera(mut commands: Commands) {
     // Given the scaffold camera shell.
     // When the window opens.
