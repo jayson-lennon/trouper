@@ -34,10 +34,16 @@ use tracing::Level;
 // ---------- the minimal actor ---------------------------------------------
 
 /// The command: save these contents to this path.
+///
+/// Rich domain types on both fields. `PathBuf` serializes as a JSON
+/// string; `Vec<u8>` has no native JSON form, so serde picks its array-of-
+/// numbers representation — which is what [`FieldTy::Json`] exists for
+/// ("arbitrary JSON; the escape hatch for payloads the canvas need not
+/// inspect deeply").
 #[derive(Serialize, Deserialize)]
 struct SaveFile {
-    path: String,
-    contents: String,
+    path: std::path::PathBuf,
+    contents: Vec<u8>,
 }
 
 impl Schema for SaveFile {
@@ -48,7 +54,7 @@ impl Schema for SaveFile {
             kind: SchemaKind::Command,
             fields: vec![
                 FieldDef::required("path", FieldTy::Str),
-                FieldDef::required("contents", FieldTy::Str),
+                FieldDef::required("contents", FieldTy::Json),
             ],
             description: None,
         }
@@ -158,8 +164,8 @@ async fn run_demo() -> Result<(), state_report::StateBridgeError> {
         .tell(
             saver.clone(),
             SaveFile {
-                path: tell_path.display().to_string(),
-                contents: "saved via tell (fire-and-forget)".to_owned(),
+                path: tell_path.clone(),
+                contents: b"saved via tell (fire-and-forget)".to_vec(),
             },
         )
         .await
@@ -173,8 +179,8 @@ async fn run_demo() -> Result<(), state_report::StateBridgeError> {
         .ask(
             saver.clone(),
             SaveFile {
-                path: ask_path.display().to_string(),
-                contents: "saved via ask (save & confirm)".to_owned(),
+                path: ask_path.clone(),
+                contents: b"saved via ask (save & confirm)".to_vec(),
             },
             Duration::from_secs(5),
         )
@@ -191,8 +197,8 @@ async fn run_demo() -> Result<(), state_report::StateBridgeError> {
         .ask(
             ActorPath::new("fs.ghost"),
             SaveFile {
-                path: String::new(),
-                contents: String::new(),
+                path: std::path::PathBuf::new(),
+                contents: Vec::new(),
             },
             Duration::from_millis(500),
         )
