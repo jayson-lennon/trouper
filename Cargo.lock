@@ -7,6 +7,8 @@ name = "actor-canvas"
 version = "0.1.0"
 dependencies = [
  "actor-runtime",
+ "canvas",
+ "canvas-server",
  "error-stack",
  "serde",
  "serde_json",
@@ -74,11 +76,14 @@ version = "0.1.0"
 dependencies = [
  "actor-runtime",
  "canvas-server",
+ "error-stack",
  "futures",
  "rstest",
  "serde",
  "serde_json",
  "tokio",
+ "tracing",
+ "tracing-subscriber",
  "wherror",
 ]
 

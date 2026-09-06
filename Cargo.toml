@@ -9,6 +9,7 @@ edition = "2024"
 [workspace.dependencies]
 actor-runtime = { path = "crates/actor-runtime" }
 canvas-server = { path = "crates/canvas-server" }
+canvas = { path = "crates/canvas" }
 tokio = { version = "1.53", features = ["rt-multi-thread", "sync", "time", "macros", "net", "io-util"] }
 serde = { version = "1.0", features = ["derive", "rc"] }
 serde_json = "1.0"
@@ -30,6 +31,8 @@ edition.workspace = true
 
 [dependencies]
 actor-runtime.workspace = true
+canvas-server.workspace = true
+canvas.workspace = true
 error-stack.workspace = true
 tokio.workspace = true
 serde.workspace = true
