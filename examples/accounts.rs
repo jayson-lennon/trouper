@@ -23,7 +23,6 @@ use actor_runtime::actor::{CommandHandler, EventSourcedActor, MsgHandler, Servic
 use actor_runtime::prelude::*;
 use actor_runtime::registry::RegistryError;
 use actor_runtime::tap::FactKind;
-use actor_runtime::types::ActorKind;
 use error_stack::Report;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -157,17 +156,6 @@ struct Account {
 }
 
 impl EventSourcedActor for Account {
-    fn manifest() -> ActorManifest {
-        ActorManifest::new()
-            .handles::<Deposit>()
-            .handles::<Withdraw>()
-            .handles::<Poison>()
-            .emits::<Deposited>()
-            .emits::<Withdrawn>()
-            .emits::<WithdrawFailed>()
-            .kind(ActorKind::EventSourced)
-    }
-
     fn restore(_args: &serde_json::Value) -> Self {
         Self::default()
     }
@@ -260,12 +248,6 @@ impl Schema for FactMsg {
 struct StoryObserver;
 
 impl ServiceActor for StoryObserver {
-    fn manifest() -> ActorManifest {
-        ActorManifest::new()
-            .handles::<FactMsg>()
-            .kind(ActorKind::Service)
-    }
-
     async fn start(_args: &serde_json::Value) -> Result<Self, Report<RegistryError>> {
         Ok(Self)
     }
@@ -293,12 +275,6 @@ async fn main() {
         .with_max_level(Level::ERROR)
         .init();
     let system = Arc::new(ActorSystem::new(SystemConfig::production()));
-    system.register_schema::<Deposit>();
-    system.register_schema::<Withdraw>();
-    system.register_schema::<Poison>();
-    system.register_schema::<Deposited>();
-    system.register_schema::<Withdrawn>();
-    system.register_schema::<WithdrawFailed>();
 
     // The story observer: one subscription, filtered to failed/spawned.
     actor_runtime::builder::spawn_service_builder::<StoryObserver>(&system)

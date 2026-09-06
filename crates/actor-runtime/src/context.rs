@@ -264,6 +264,50 @@ pub enum AskError {
     Unresolved(String),
 }
 
+/// The ask machinery shared by [`MsgCtx::ask`] (in-actor asks) and
+/// [`crate::system::ActorSystem::ask`] (system-level asks): open a reply
+/// lease over the port, await the reply under the MANDATORY timeout, and
+/// settle the lease with a Replied/Timeout/Failed fact so nothing leaks.
+///
+/// The timeout produces an [`AskOutcome::Timeout`] fact; a late reply lands
+/// nowhere (the lease is dropped before the receiver is).
+pub(crate) async fn ask_via_port(
+    port: &dyn AskPort,
+    dest: Address,
+    schema: SchemaId,
+    payload: JsonValue,
+    timeout: std::time::Duration,
+    trace: TraceCtx,
+) -> Result<JsonValue, error_stack::Report<AskError>> {
+    use error_stack::ResultExt;
+    let dest_label = format!("{dest:?}");
+    let (lease, mut receiver) = port
+        .ask_channel(dest.clone(), schema, payload, timeout)
+        .await
+        .change_context(AskError::Unresolved(format!("{dest:?}")))?;
+    let outcome = match tokio::time::timeout(timeout, &mut receiver).await {
+        Ok(Ok(reply)) => Some((AskOutcome::Replied, reply)),
+        Ok(Err(_)) => Some((AskOutcome::Failed, JsonValue::Null)),
+        Err(_) => None,
+    };
+    match outcome {
+        Some((AskOutcome::Replied, reply)) => {
+            port.ask_settled(lease, dest, AskOutcome::Replied, trace);
+            Ok(reply)
+        }
+        Some((outcome, _)) => {
+            port.ask_settled(lease, dest, outcome, trace);
+            Err(error_stack::Report::new(AskError::Unresolved(dest_label)))
+        }
+        None => {
+            // Timed out: drop the lease so a late reply lands nowhere.
+            port.ask_settled(lease, dest, AskOutcome::Timeout, trace);
+            drop(receiver);
+            Err(error_stack::Report::new(AskError::Unresolved(dest_label)))
+        }
+    }
+}
+
 /// Context for service-actor handlers: async, impure by design.
 ///
 /// The sync surface matches [`CmdCtx`]; `ask` is exclusive to this tier —
@@ -319,35 +363,8 @@ impl MsgCtx<'_> {
         payload: JsonValue,
         timeout: std::time::Duration,
     ) -> Result<JsonValue, error_stack::Report<AskError>> {
-        use error_stack::ResultExt;
         let port = self.port.expect("ask requires a port (service tier)");
-        let trace = *self.core.trace;
-        let dest_label = format!("{dest:?}");
-        let (lease, mut receiver) = port
-            .ask_channel(dest.clone(), schema, payload, timeout)
-            .await
-            .change_context(AskError::Unresolved(format!("{dest:?}")))?;
-        let outcome = match tokio::time::timeout(timeout, &mut receiver).await {
-            Ok(Ok(reply)) => Some((AskOutcome::Replied, reply)),
-            Ok(Err(_)) => Some((AskOutcome::Failed, JsonValue::Null)),
-            Err(_) => None,
-        };
-        match outcome {
-            Some((AskOutcome::Replied, reply)) => {
-                port.ask_settled(lease, dest, AskOutcome::Replied, trace);
-                Ok(reply)
-            }
-            Some((outcome, _)) => {
-                port.ask_settled(lease, dest, outcome, trace);
-                Err(error_stack::Report::new(AskError::Unresolved(dest_label)))
-            }
-            None => {
-                // Timed out: drop the lease so a late reply lands nowhere.
-                port.ask_settled(lease, dest, AskOutcome::Timeout, trace);
-                drop(receiver);
-                Err(error_stack::Report::new(AskError::Unresolved(dest_label)))
-            }
-        }
+        ask_via_port(port, dest, schema, payload, timeout, *self.core.trace).await
     }
 }
 

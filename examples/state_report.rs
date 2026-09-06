@@ -69,13 +69,6 @@ struct Worker {
 }
 
 impl EventSourcedActor for Worker {
-    fn manifest() -> ActorManifest {
-        ActorManifest::new()
-            .handles::<Work>()
-            .emits::<WorkDone>()
-            .kind(ActorKind::EventSourced)
-    }
-
     fn restore(_args: &serde_json::Value) -> Self {
         Self::default()
     }
@@ -140,13 +133,6 @@ struct Account {
 }
 
 impl EventSourcedActor for Account {
-    fn manifest() -> ActorManifest {
-        ActorManifest::new()
-            .handles::<KeyedAdd>()
-            .emits::<Added>()
-            .kind(ActorKind::EventSourced)
-    }
-
     fn restore(_args: &serde_json::Value) -> Self {
         Self::default()
     }
@@ -199,12 +185,6 @@ struct FactCounter {
 }
 
 impl ServiceActor for FactCounter {
-    fn manifest() -> ActorManifest {
-        ActorManifest::new()
-            .handles::<FactMsg>()
-            .kind(ActorKind::Service)
-    }
-
     async fn start(_args: &serde_json::Value) -> Result<Self, Report<RegistryError>> {
         Ok(Self { consumed: 0 })
     }
@@ -232,14 +212,11 @@ impl MsgHandler<FactMsg> for FactCounter {
 pub async fn build_demo_system() -> Arc<ActorSystem> {
     let system = Arc::new(ActorSystem::new(SystemConfig::production()));
 
-    // Schemas for everything the demo sends (and the facts topic mirror).
-    system.register_schema::<Work>();
-    system.register_schema::<WorkDone>();
+    // The partition spec below validates against the schema table AT
+    // INSTALL TIME — but the Account builder registers KeyedAdd only when
+    // its factory spawns the first entity (after traffic arrives). The
+    // shard-key def must therefore be an agreed fact up front.
     system.register_schema::<KeyedAdd>();
-    system.register_schema::<Added>();
-    system.register_schema::<FactMsg>();
-    system.register_schema::<ReportState>();
-    system.register_schema::<StateReported>();
 
     // 1. The topic subscriber: a service actor on `system.facts`.
     actor_runtime::builder::spawn_service_builder::<FactCounter>(&system)

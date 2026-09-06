@@ -30,7 +30,15 @@ use crate::types::SchemaId;
 /// [`EventSourced::restore_from`].
 pub trait EventSourcedActor: Send + Sync + Serialize + DeserializeOwned + 'static {
     /// Declares edges and the contract kind (always [`ActorKind::EventSourced`]).
-    fn manifest() -> ActorManifest;
+    ///
+    /// Defaults to an EMPTY manifest: the typed spawn builder stamps the
+    /// contract kind and merges its declared edges, making the builder the
+    /// single source of an actor's declared surface. Override only when
+    /// spawning through the positional entry points, which take edges from
+    /// here.
+    fn manifest() -> ActorManifest {
+        ActorManifest::new()
+    }
 
     /// Genesis state — a fresh instance (no snapshot exists).
     ///
@@ -79,7 +87,15 @@ pub trait CommandHandler<C>: EventSourcedActor {
 /// Edge/service actor: async, I/O and `ask` allowed; NOT journaled.
 pub trait ServiceActor: Send + 'static {
     /// Declares edges and the contract kind (always [`ActorKind::Service`]).
-    fn manifest() -> ActorManifest;
+    ///
+    /// Defaults to an EMPTY manifest: the typed spawn builder stamps the
+    /// contract kind and merges its declared edges, making the builder the
+    /// single source of an actor's declared surface. Override only when
+    /// spawning through the positional entry points, which take edges from
+    /// here.
+    fn manifest() -> ActorManifest {
+        ActorManifest::new()
+    }
 
     /// Constructs the actor instance. I/O allowed.
     ///

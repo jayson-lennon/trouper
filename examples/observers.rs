@@ -64,12 +64,6 @@ struct Observer {
 }
 
 impl ServiceActor for Observer {
-    fn manifest() -> ActorManifest {
-        ActorManifest::new()
-            .handles::<FactMsg>()
-            .kind(ActorKind::Service)
-    }
-
     async fn start(_args: &serde_json::Value) -> Result<Self, Report<RegistryError>> {
         Ok(Self { last: None })
     }
@@ -149,12 +143,6 @@ impl Schema for StrictOk {
 struct TickBouncer;
 
 impl EventSourcedActor for TickBouncer {
-    fn manifest() -> ActorManifest {
-        ActorManifest::new()
-            .handles::<StrictCmd>()
-            .emits::<StrictOk>()
-            .kind(ActorKind::EventSourced)
-    }
     fn restore(_args: &serde_json::Value) -> Self {
         Self
     }
@@ -170,12 +158,6 @@ impl CommandHandler<StrictCmd> for TickBouncer {
 struct Ticker;
 
 impl ServiceActor for Ticker {
-    fn manifest() -> ActorManifest {
-        ActorManifest::new()
-            .handles::<Tick>()
-            .kind(ActorKind::Service)
-    }
-
     async fn start(_args: &serde_json::Value) -> Result<Self, Report<RegistryError>> {
         Ok(Self)
     }
@@ -208,7 +190,6 @@ async fn main() {
         )
         .expect("subscribe");
 
-    system.register_schema::<Tick>();
     // The traffic source: a plain actor the demo sends commands to.
     actor_runtime::builder::spawn_service_builder::<Ticker>(&system)
         .at(ActorPath::new("ticker"))

@@ -59,6 +59,7 @@ pub fn spawn_service_builder<A: ServiceActor>(
         path: None,
         args: JsonValue::Null,
         entries: Vec::new(),
+        emits: Vec::new(),
         opts: SpawnOpts::default(),
         _actor: std::marker::PhantomData,
     }
@@ -108,11 +109,16 @@ impl<A: crate::actor::EventSourcedActor> SpawnBuilder<A> {
     /// Declares a handled command `C`: registers the schema edge, the
     /// route, and — internally — the erased command adapter. `C` is
     /// written exactly once.
+    ///
+    /// `C`'s schema descriptor is registered into the schema table here,
+    /// at the declaration site — spawning through the builder is all a
+    /// caller needs for `system.export()` to carry the full contract.
     pub fn handles<C>(mut self) -> Self
     where
         A: crate::actor::CommandHandler<C>,
         C: Schema + serde::de::DeserializeOwned + Send + 'static,
     {
+        self.system.register_schema::<C>();
         self.entries
             .push(Arc::new(TypedEsAdapter::<A, C>::new::<C>()));
         self
@@ -120,7 +126,12 @@ impl<A: crate::actor::EventSourcedActor> SpawnBuilder<A> {
 
     /// Declares an emitted event schema — an ENFORCED edge: the kernel
     /// drops undeclared emits before journal append.
+    ///
+    /// `E`'s schema descriptor is registered into the schema table here,
+    /// at the declaration site (idempotent — see
+    /// [`crate::registry::SchemaTable::register`]).
     pub fn emits<E: Schema>(mut self) -> Self {
+        self.system.register_schema::<E>();
         let id = E::schema_id();
         if !self.emits.contains(&id) {
             self.emits.push(id);
@@ -197,6 +208,7 @@ pub struct ServiceBuilder<A: ServiceActor> {
     path: Option<ActorPath>,
     args: JsonValue,
     entries: Vec<Arc<dyn MsgEntry>>,
+    emits: Vec<SchemaId>,
     opts: SpawnOpts,
     _actor: std::marker::PhantomData<fn(&A)>,
 }
@@ -215,13 +227,33 @@ impl<A: ServiceActor> ServiceBuilder<A> {
     }
 
     /// Declares a handled message `M` (schema edge + route + adapter).
+    ///
+    /// `M`'s schema descriptor is registered into the schema table here,
+    /// at the declaration site — mirroring the typed ES builder and the
+    /// foreign builder (which registers at `start`).
     pub fn handles<M>(mut self) -> Self
     where
         A: crate::actor::MsgHandler<M>,
         M: Schema + serde::de::DeserializeOwned + Send + 'static,
     {
+        self.system.register_schema::<M>();
         self.entries
             .push(Arc::new(TypedServiceAdapter::<A, M>::new::<M>()));
+        self
+    }
+
+    /// Declares an emitted message schema for a service actor — a
+    /// DECLARED edge (advisory: the service tier is not emit-enforced,
+    /// unlike [`SpawnBuilder::emits`]), published in the manifest so the
+    /// export/GUI shows the actor's outputs.
+    ///
+    /// `E`'s schema descriptor is registered into the schema table here,
+    /// at the declaration site.
+    pub fn emits<E: Schema>(mut self) -> Self {
+        self.system.register_schema::<E>();
+        if !self.emits.contains(&E::schema_id()) {
+            self.emits.push(E::schema_id());
+        }
         self
     }
 
@@ -250,6 +282,11 @@ impl<A: ServiceActor> ServiceBuilder<A> {
             let schema = entry.schema();
             if !manifest.handles.contains(&schema) {
                 manifest.handles.push(schema);
+            }
+        }
+        for schema in self.emits {
+            if !manifest.emits.contains(&schema) {
+                manifest.emits.push(schema);
             }
         }
         manifest = manifest.kind(ActorKind::Service);

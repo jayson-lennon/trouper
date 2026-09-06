@@ -691,6 +691,72 @@ impl ActorSystem {
         route(&self.registry, &self.kernel, envelope).await
     }
 
+    /// Typed fire-and-forget: serializes `value` under `C`'s schema and
+    /// routes it as a system-root send. Sugar over [`ActorSystem::send`]
+    /// + [`ActorSystem::envelope`] with the payload built by serde.
+    ///
+    /// # Errors
+    ///
+    /// Returns the original envelope back when `dest` does not resolve
+    /// (callers dead-letter or retry).
+    ///
+    /// # Panics
+    ///
+    /// Panics when `C` cannot serialize — a programmer error (serde only
+    /// fails on pathological map keys), not a domain outcome.
+    pub async fn tell<C>(&self, dest: ActorPath, value: C) -> Result<ActorPath, Envelope>
+    where
+        C: Schema + serde::Serialize,
+    {
+        let payload = serde_json::to_value(value).expect("schema payload serializes");
+        self.send(self.envelope(C::schema_id(), dest, payload))
+            .await
+    }
+
+    /// Typed ask from outside the system: serializes `value` under `C`'s
+    /// schema, opens a reply lease, and awaits the reply under the
+    /// MANDATORY `timeout`. The lease settles with the same
+    /// Replied/Timeout/Failed facts an in-actor ask produces (see
+    /// [`crate::kernel::KernelAskPort`]); a timed-out ask's late reply
+    /// lands nowhere.
+    ///
+    /// Trace root is the entry point, matching [`ActorSystem::send`].
+    ///
+    /// # Errors
+    ///
+    /// [`crate::context::AskError::Unresolved`] when `dest` does not
+    /// resolve, the ask times out, or the lease dies before the reply.
+    ///
+    /// # Panics
+    ///
+    /// Panics when `C` cannot serialize — a programmer error (serde only
+    /// fails on pathological map keys), not a domain outcome.
+    pub async fn ask<C>(
+        &self,
+        dest: ActorPath,
+        value: C,
+        timeout: std::time::Duration,
+    ) -> Result<JsonValue, error_stack::Report<crate::context::AskError>>
+    where
+        C: Schema + serde::Serialize,
+    {
+        let payload = serde_json::to_value(value).expect("schema payload serializes");
+        let port = crate::kernel::KernelAskPort {
+            registry: self.registry.clone(),
+            kernel: self.kernel.clone(),
+            clock: self.clock.clone(),
+        };
+        crate::context::ask_via_port(
+            &port,
+            Address::Path(dest),
+            C::schema_id(),
+            payload,
+            timeout,
+            TraceCtx::root(),
+        )
+        .await
+    }
+
     /// Installs the DLQ re-driver: re-sends every dead letter currently
     /// retained in the `system.deadletters` topic to its recorded dest
     /// (as a normal sender — `Sent` facts appear; an undeliverable redrive
@@ -1469,7 +1535,7 @@ mod tests {
     use serde_json::json;
     use std::collections::HashMap;
 
-    #[derive(Deserialize)]
+    #[derive(Serialize, Deserialize)]
     struct Add {
         n: i64,
     }
@@ -5054,6 +5120,451 @@ mod tests {
         // was enforced — the journal holds the event).
         assert_eq!(system.journal_len(&ActorPath::new("t-built")), 1);
         assert_eq!(system.journal_len(&ActorPath::new("t-pos")), 1);
+    }
+
+    /// Same name+version as Add but a different def body (first-wins
+    /// fixture: the schema table must keep the FIRST registration).
+    #[derive(Deserialize)]
+    struct AddFirstWins {
+        #[allow(dead_code)] // payload shape; never decoded in the test
+        n: i64,
+    }
+    impl Schema for AddFirstWins {
+        fn schema_def() -> SchemaDef {
+            SchemaDef {
+                name: "Add".into(),
+                version: 1,
+                kind: SchemaKind::Command,
+                fields: vec![FieldDef::required("n", FieldTy::Int)],
+                description: Some("hand-first".into()),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn builder_spawns_register_handled_and_emitted_schemas() {
+        // Given a fresh system whose schema table starts empty.
+        let (system, _clock) = ActorSystem::test();
+
+        // When spawning through the typed ES builder (handles + emits)
+        // and the typed service builder (handles) with NO hand
+        // registration.
+        crate::builder::spawn_es_builder::<BareCounter>(&system)
+            .at(ActorPath::new("reg-es"))
+            .handles::<Add>()
+            .emits::<Added>()
+            .start();
+        let (svc_idx, _svc_sink) = open_sink();
+        crate::builder::spawn_service_builder::<Auditor>(&system)
+            .at(ActorPath::new("reg-svc"))
+            .args(json!({ "sink": svc_idx }))
+            .handles::<Added>()
+            .start();
+
+        // Then the export's schema table carries every declared def.
+        let export = system.export().await;
+        assert!(
+            export.schemas.iter().any(|s| s.id() == Add::schema_id()),
+            "handled command schema exported"
+        );
+        assert!(
+            export.schemas.iter().any(|s| s.id() == Added::schema_id()),
+            "emitted event schema exported"
+        );
+    }
+
+    #[tokio::test]
+    async fn builder_registration_keeps_the_first_registered_def() {
+        // Given a def under the Add name+version hand-registered FIRST,
+        // with a body that differs from `Add::schema_def()`.
+        let (system, _clock) = ActorSystem::test();
+        system.register_schema::<AddFirstWins>();
+
+        // When a builder spawn declares the same schema id afterwards.
+        crate::builder::spawn_es_builder::<BareCounter>(&system)
+            .at(ActorPath::new("first-wins"))
+            .handles::<Add>()
+            .start();
+
+        // Then the export holds exactly ONE def for the id, and it is
+        // the FIRST one (schemas are agreed facts, not config).
+        let export = system.export().await;
+        let defs: Vec<&SchemaDef> = export
+            .schemas
+            .iter()
+            .filter(|s| s.id() == Add::schema_id())
+            .collect();
+        assert_eq!(defs.len(), 1, "no duplicate def for one id");
+        assert_eq!(
+            defs[0].description.as_deref(),
+            Some("hand-first"),
+            "the first registration won"
+        );
+    }
+
+    #[tokio::test]
+    async fn foreign_builder_registers_its_schema_at_start() {
+        // Given a foreign builder spawn with a JSON schema descriptor and
+        // NO hand registration (regression guard: the foreign builder has
+        // always registered at `start`; it must keep doing so).
+        let (system, _clock) = ActorSystem::test();
+        let decision: crate::actor::ForeignDecision = Arc::new(|_state, _cmd, _ctx| vec![]);
+        let fold: crate::actor::ForeignFold =
+            Arc::new(|_state: &mut JsonValue, _ev: &crate::envelope::Event| {});
+        crate::builder::spawn_foreign(&system)
+            .at(ActorPath::new("f-reg"))
+            .schema(json!({
+                "name": "fbuildcmd", "version": 1, "kind": "command",
+                "fields": [{ "name": "delta", "ty": "int" }]
+            }))
+            .args(json!({ "total": 0 }))
+            .handle(decision)
+            .apply(fold)
+            .start()
+            .expect("foreign builder starts");
+
+        // Then the schema table — and thus the export — carries the def.
+        let export = system.export().await;
+        assert!(
+            export
+                .schemas
+                .iter()
+                .any(|s| s.id() == SchemaId::new("fbuildcmd", 1)),
+            "foreign builder schema exported"
+        );
+    }
+
+    /// A counter that relies on the trait's DEFAULT manifest (no
+    /// override): every declared edge must come from the builder.
+    #[derive(Serialize, Deserialize, Default)]
+    struct DefaultManifestCounter {
+        total: i64,
+    }
+    impl EventSourcedActor for DefaultManifestCounter {
+        fn restore(_args: &JsonValue) -> Self {
+            Self::default()
+        }
+        fn apply(&mut self, event: &crate::envelope::Event) {
+            self.total += event.payload["n"].as_i64().unwrap_or(0);
+        }
+    }
+    impl CommandHandler<Add> for DefaultManifestCounter {
+        fn handle(&self, cmd: Add, _ctx: &mut CmdCtx<'_>) -> Vec<crate::envelope::Event> {
+            vec![crate::envelope::Event::new(
+                Added::schema_id(),
+                json!({ "n": cmd.n }),
+            )]
+        }
+    }
+
+    #[tokio::test]
+    async fn default_manifest_actor_gets_edges_and_kind_from_the_builder() {
+        // Given an actor that does NOT override manifest() (the trait
+        // default returns an empty manifest), spawned via the builder.
+        let (system, _clock) = ActorSystem::test();
+        let path = ActorPath::new("default-manifest");
+        crate::builder::spawn_es_builder::<DefaultManifestCounter>(&system)
+            .at(path.clone())
+            .handles::<Add>()
+            .emits::<Added>()
+            .start();
+        wait_for(|| async { system.inbox_cursor(&path).is_some() }).await;
+
+        // Then the export stamps the contract kind and carries exactly the
+        // builder-declared edges.
+        let export = system.export().await;
+        let actor = export
+            .actors
+            .iter()
+            .find(|a| a.path == path)
+            .expect("actor exported");
+        assert_eq!(
+            actor.kind,
+            ActorKind::EventSourced,
+            "kind stamped: {actor:?}"
+        );
+        assert_eq!(
+            actor.manifest.handles,
+            vec![Add::schema_id()],
+            "builder handle edge: {actor:?}"
+        );
+        assert_eq!(
+            actor.manifest.emits,
+            vec![Added::schema_id()],
+            "builder emit edge: {actor:?}"
+        );
+    }
+
+    /// A counter whose OWN manifest declares an edge the builder does not
+    /// (union fixture: explicit manifest and builder edges must merge).
+    #[derive(Serialize, Deserialize, Default)]
+    struct RichCounter {
+        total: i64,
+    }
+    impl EventSourcedActor for RichCounter {
+        fn manifest() -> ActorManifest {
+            ActorManifest::new().handles_id(Boom::schema_id())
+        }
+        fn restore(_args: &JsonValue) -> Self {
+            Self::default()
+        }
+        fn apply(&mut self, event: &crate::envelope::Event) {
+            self.total += event.payload["n"].as_i64().unwrap_or(0);
+        }
+    }
+    impl CommandHandler<Add> for RichCounter {
+        fn handle(&self, cmd: Add, _ctx: &mut CmdCtx<'_>) -> Vec<crate::envelope::Event> {
+            vec![crate::envelope::Event::new(
+                Added::schema_id(),
+                json!({ "n": cmd.n }),
+            )]
+        }
+    }
+
+    #[tokio::test]
+    async fn explicit_manifest_edges_merge_with_builder_edges() {
+        // Given an actor whose explicit manifest declares Boom (the builder
+        // does not), spawned with the builder declaring Add.
+        let (system, _clock) = ActorSystem::test();
+        let path = ActorPath::new("rich-manifest");
+        crate::builder::spawn_es_builder::<RichCounter>(&system)
+            .at(path.clone())
+            .handles::<Add>()
+            .start();
+        wait_for(|| async { system.inbox_cursor(&path).is_some() }).await;
+
+        // Then the registered manifest is the UNION of both sources.
+        let manifest = registered_manifest(&system, &path).expect("slot");
+        assert_eq!(
+            manifest.handles.len(),
+            2,
+            "union, not overwrite: {manifest:?}"
+        );
+        assert!(manifest.handles.contains(&Add::schema_id()));
+        assert!(manifest.handles.contains(&Boom::schema_id()));
+        // And the kind is still stamped by the builder.
+        assert_eq!(manifest.kind, Some(ActorKind::EventSourced));
+    }
+
+    // ---- typed system surface: tell / ask ----
+
+    #[tokio::test]
+    async fn system_ask_settles_replied_with_an_ask_settled_fact() {
+        // Given a replying callee (builder-spawned, no hand registration).
+        let (system, _clock) = ActorSystem::test();
+
+        struct Echo;
+        impl ServiceActor for Echo {
+            async fn start(
+                _args: &JsonValue,
+            ) -> Result<Self, error_stack::Report<crate::registry::RegistryError>> {
+                Ok(Self)
+            }
+        }
+        impl MsgHandler<Add> for Echo {
+            async fn handle(&mut self, msg: Add, ctx: &mut crate::context::MsgCtx<'_>) {
+                ctx.core.reply(Add::schema_id(), json!({ "echo": msg.n }));
+            }
+        }
+
+        crate::builder::spawn_service_builder::<Echo>(&system)
+            .at(ActorPath::new("sys-echo"))
+            .handles::<Add>()
+            .start();
+        wait_for(|| async { system.inbox_cursor(&ActorPath::new("sys-echo")).is_some() }).await;
+
+        // When the system asks it a typed Add.
+        let reply = system
+            .ask(
+                ActorPath::new("sys-echo"),
+                Add { n: 21 },
+                std::time::Duration::from_secs(2),
+            )
+            .await
+            .expect("replied");
+
+        // Then the reply decodes as the handler's payload.
+        assert_eq!(reply["echo"], 21);
+        // And the ask settled as Replied with its own fact.
+        let kernel = system.kernel.lock().expect("lock");
+        assert!(
+            kernel
+                .ask_facts
+                .iter()
+                .any(|f| f.outcome == Some(crate::kernel::AskOutcome::Replied)),
+            "Replied fact recorded: {:?}",
+            kernel.ask_facts
+        );
+    }
+
+    #[tokio::test]
+    async fn system_ask_timeout_kills_the_lease_for_late_replies() {
+        // Given a silent callee.
+        let (system, _clock) = ActorSystem::test();
+
+        struct Silent;
+        impl ServiceActor for Silent {
+            async fn start(
+                _args: &JsonValue,
+            ) -> Result<Self, error_stack::Report<crate::registry::RegistryError>> {
+                Ok(Self)
+            }
+        }
+        impl MsgHandler<Add> for Silent {
+            async fn handle(&mut self, _msg: Add, _ctx: &mut crate::context::MsgCtx<'_>) {}
+        }
+
+        crate::builder::spawn_service_builder::<Silent>(&system)
+            .at(ActorPath::new("sys-silent"))
+            .handles::<Add>()
+            .start();
+        wait_for(|| async { system.inbox_cursor(&ActorPath::new("sys-silent")).is_some() }).await;
+
+        // When the ask times out and then the callee tries to reply LATE.
+        let outcome = system
+            .ask(
+                ActorPath::new("sys-silent"),
+                Add { n: 1 },
+                std::time::Duration::from_millis(50),
+            )
+            .await;
+        assert!(outcome.is_err(), "must time out");
+        // (kernel-internal detail for the late-reply probe: the settled
+        // ask's lease slot is gone, so `complete` finds nothing.)
+        let late_lease = {
+            let kernel = system.kernel.lock().expect("lock");
+            assert!(
+                kernel
+                    .ask_facts
+                    .iter()
+                    .any(|f| f.outcome == Some(crate::kernel::AskOutcome::Timeout)),
+                "Timeout fact recorded: {:?}",
+                kernel.ask_facts
+            );
+            assert!(kernel.replies.is_empty(), "lease leaked after timeout");
+            crate::types::LeaseId::new()
+        };
+
+        // Then the late reply lands nowhere: no lease knows its id.
+        {
+            let kernel = system.kernel.lock().expect("lock");
+            assert!(
+                !kernel.replies.complete(&late_lease, json!({ "echo": 1 })),
+                "a dead lease must not accept a late reply"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn system_ask_settles_failed_when_the_lease_dies_mid_ask() {
+        // Given a silent LIVE callee and a long system-level timeout (the
+        // lease must be reaped by the GC sweep before the asker times out,
+        // isolating the Failed path).
+        let (system, _clock) = ActorSystem::test();
+
+        struct Silent;
+        impl ServiceActor for Silent {
+            async fn start(
+                _args: &JsonValue,
+            ) -> Result<Self, error_stack::Report<crate::registry::RegistryError>> {
+                Ok(Self)
+            }
+        }
+        impl MsgHandler<Add> for Silent {
+            async fn handle(&mut self, _msg: Add, _ctx: &mut crate::context::MsgCtx<'_>) {}
+        }
+
+        crate::builder::spawn_service_builder::<Silent>(&system)
+            .at(ActorPath::new("sys-silent2"))
+            .handles::<Add>()
+            .start();
+        wait_for(|| async {
+            system
+                .inbox_cursor(&ActorPath::new("sys-silent2"))
+                .is_some()
+        })
+        .await;
+
+        // When the ask is launched and its lease is reaped by the sweep.
+        let asker = system.clone();
+        let ask_task = tokio::spawn(async move {
+            asker
+                .ask(
+                    ActorPath::new("sys-silent2"),
+                    Add { n: 1 },
+                    std::time::Duration::from_secs(30),
+                )
+                .await
+        });
+        wait_for(|| async { system.kernel.lock().expect("lock").replies.len() == 1 }).await;
+        // The lease TTL mirrors the ask's 30s timeout: advance the fake
+        // clock past it, then prune.
+        system
+            .fake_clock()
+            .expect("fake clock")
+            .advance(std::time::Duration::from_secs(31));
+        {
+            let kernel = system.kernel.lock().expect("lock");
+            kernel.replies.prune(crate::types::Timestamp::from_millis(
+                system.clock.now().as_millis(),
+            ));
+        }
+
+        // Then the ask settles as Failed (not Timeout), with its fact.
+        let outcome = ask_task.await.expect("ask task");
+        assert!(outcome.is_err(), "lease death must surface as an error");
+        let kernel = system.kernel.lock().expect("lock");
+        assert!(
+            kernel
+                .ask_facts
+                .iter()
+                .any(|f| f.outcome == Some(crate::kernel::AskOutcome::Failed)),
+            "Failed fact recorded: {:?}",
+            kernel.ask_facts
+        );
+    }
+
+    #[tokio::test]
+    async fn tell_delivers_a_typed_message_to_a_builder_spawned_actor() {
+        // Given an Auditor spawned through the service builder with NO
+        // hand registration (the builder declares the Add schema).
+        let (system, _clock) = ActorSystem::test();
+        let path = ActorPath::new("tell-aud");
+        let (idx, sink) = open_sink();
+        bind_sink(&path, sink);
+        crate::builder::spawn_service_builder::<Auditor>(&system)
+            .at(path.clone())
+            .args(json!({ "sink": idx }))
+            .handles::<Add>()
+            .start();
+        wait_for(|| async { system.inbox_cursor(&path).is_some() }).await;
+
+        // When telling it a typed Add (no json!{} hand-serialization).
+        system
+            .tell(path.clone(), Add { n: 9 })
+            .await
+            .expect("delivered");
+
+        // Then the handler decoded the typed payload and ran.
+        wait_for(|| async { sink_read(&path).contains(&"n=9".to_string()) }).await;
+    }
+
+    #[tokio::test]
+    async fn tell_to_an_unknown_path_returns_the_envelope_back() {
+        // Given a system where no actor exists at the destination.
+        let (system, _clock) = ActorSystem::test();
+
+        // When telling the ghost path.
+        let result = system.tell(ActorPath::new("ghost"), Add { n: 1 }).await;
+
+        // Then the original envelope comes back (schema + payload intact).
+        let envelope = result.expect_err("unresolved destination");
+        assert_eq!(envelope.schema, Add::schema_id());
+        assert_eq!(
+            envelope.as_json(),
+            Some(&json!({ "n": 1 })),
+            "the original payload is returned to the caller"
+        );
     }
 
     #[tokio::test]

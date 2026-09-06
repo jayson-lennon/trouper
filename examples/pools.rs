@@ -55,13 +55,6 @@ struct Worker {
 }
 
 impl EventSourcedActor for Worker {
-    fn manifest() -> ActorManifest {
-        ActorManifest::new()
-            .handles::<Work>()
-            .emits::<WorkDone>()
-            .kind(ActorKind::EventSourced)
-    }
-
     fn restore(_args: &serde_json::Value) -> Self {
         Self::default()
     }
@@ -117,12 +110,6 @@ impl Schema for CopyDone {
 struct Watcher;
 
 impl EventSourcedActor for Watcher {
-    fn manifest() -> ActorManifest {
-        ActorManifest::new()
-            .handles::<WorkCopy>()
-            .emits::<CopyDone>()
-            .kind(ActorKind::EventSourced)
-    }
     fn restore(_args: &serde_json::Value) -> Self {
         Self
     }
@@ -141,8 +128,6 @@ async fn main() {
         .with_max_level(Level::ERROR)
         .init();
     let system = Arc::new(ActorSystem::new(SystemConfig::production()));
-    system.register_schema::<Work>();
-    system.register_schema::<WorkDone>();
 
     // -- 1. Takeover: a plain actor holds "api"; the pool claims it --------
     println!("== 1. takeover ==");
@@ -218,7 +203,6 @@ async fn main() {
 
     // -- 3. Tee rule: a watcher observes the pool flow ----------------------
     println!("== 3. tee rule ==");
-    system.register_schema::<WorkCopy>();
     actor_runtime::builder::spawn_es_builder::<Watcher>(&system)
         .at(ActorPath::new("watcher"))
         .args(json!({}))

@@ -62,13 +62,6 @@ struct Account {
 }
 
 impl EventSourcedActor for Account {
-    fn manifest() -> ActorManifest {
-        ActorManifest::new()
-            .handles::<KeyedAdd>()
-            .emits::<Added>()
-            .kind(ActorKind::EventSourced)
-    }
-
     fn restore(_args: &serde_json::Value) -> Self {
         Self::default()
     }
@@ -90,8 +83,12 @@ async fn main() {
         .with_max_level(Level::ERROR)
         .init();
     let system = Arc::new(ActorSystem::new(SystemConfig::production()));
+
+    // The partition spec below validates against the schema table AT
+    // INSTALL TIME — but the Account builder registers KeyedAdd only when
+    // its factory spawns the first entity (after traffic arrives). The
+    // shard-key def must therefore be an agreed fact up front.
     system.register_schema::<KeyedAdd>();
-    system.register_schema::<Added>();
 
     system
         .install_partition_set(actor_runtime::pool::PartitionSpec {
