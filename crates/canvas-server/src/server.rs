@@ -49,8 +49,9 @@ pub async fn bind_server(bind: SocketAddr) -> io::Result<TcpListener> {
 }
 
 /// Accept loop: spawn one task per connection; keep accepting no matter
-/// what any single connection does.
-async fn accept_loop(system: Arc<ActorSystem>, listener: TcpListener) -> io::Result<()> {
+/// what any single connection does. Exposed for hosts and tests that
+/// bind themselves (via [`bind_server`]) to learn the port first.
+pub async fn accept_loop(system: Arc<ActorSystem>, listener: TcpListener) -> io::Result<()> {
     loop {
         let (stream, _peer) = listener.accept().await?;
         let system = system.clone();

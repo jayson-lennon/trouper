@@ -1,0 +1,16 @@
+[package]
+name = "canvas"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+actor-runtime.workspace = true
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+wherror.workspace = true
+
+[dev-dependencies]
+rstest.workspace = true
+futures.workspace = true
+canvas-server.workspace = true
