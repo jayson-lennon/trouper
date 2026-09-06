@@ -333,3 +333,106 @@ pub fn plugin(app: &mut bevy::app::App) {
             (drain_fetch, build_scene, apply_view).chain(),
         );
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::fixture::fixture;
+    use bevy::ecs::system::RunSystemOnce;
+    use bevy::ecs::world::World;
+
+    use crate::fetch::FetchCommand;
+
+    /// The demo export with the reporter's `seq` field set, mimicking
+    /// what a later fetch returns as the reporter journals reports.
+    fn demo_export_with_seq(seq: i64) -> actor_runtime::system::SystemExport {
+        let mut export = fixture();
+        let reporter = export
+            .actors
+            .iter_mut()
+            .find(|actor| actor.path.as_str() == "state/reporter")
+            .expect("reporter in fixture");
+        if let Some(state) = reporter.state.as_mut() {
+            if let Some(object) = state.as_object_mut() {
+                object.insert("seq".into(), serde_json::json!(seq));
+            }
+        }
+        export
+    }
+
+    #[test]
+    fn drain_fetch_applies_export_into_scene_state() {
+        // Given a world with the fetch channels holding one canned
+        // export (seq = 3).
+        let mut world = World::default();
+        let (command_tx, command_rx) = std::sync::mpsc::channel();
+        let (result_tx, result_rx) = std::sync::mpsc::channel();
+        result_tx
+            .send(ExportMsg {
+                export: Ok(demo_export_with_seq(3)),
+                at: std::time::Instant::now(),
+            })
+            .expect("send");
+        world.insert_resource(SceneState::default());
+        world.insert_resource(FetchChannels {
+            commands: command_tx,
+            results: std::sync::Mutex::new(result_rx),
+        });
+        let _ = command_rx; // receiver dropped by the fetch thread in prod
+
+        // When draining the fetch results.
+        world.run_system_once(drain_fetch).expect("system runs");
+
+        // Then the scene state holds the mapped graph with the seq
+        // visible in the reporter's stored state, and the version
+        // advanced.
+        let state = world.resource::<SceneState>();
+        assert_eq!(state.version, 1);
+        assert_eq!(state.graph.nodes.len(), 7);
+        let reporter = state
+            .graph
+            .node(&NodeId("state/reporter".into()))
+            .expect("reporter node");
+        assert_eq!(reporter.state.as_ref().expect("state")["seq"], 3);
+        assert!(state.fetched_at.is_some());
+    }
+
+    #[test]
+    fn drain_fetch_bumps_version_on_refresh() {
+        // Given a world that already applied one export (seq = 0) and
+        // a second, fresher export waiting in the channel (seq = 7).
+        let mut world = World::default();
+        let (_command_tx, command_rx) = std::sync::mpsc::channel::<FetchCommand>();
+        let (result_tx, result_rx) = std::sync::mpsc::channel();
+        result_tx
+            .send(ExportMsg {
+                export: Ok(demo_export_with_seq(0)),
+                at: std::time::Instant::now(),
+            })
+            .expect("send");
+        world.insert_resource(SceneState::default());
+        world.insert_resource(FetchChannels {
+            commands: _command_tx,
+            results: std::sync::Mutex::new(result_rx),
+        });
+        world.run_system_once(drain_fetch).expect("system runs");
+
+        // When the refresh result arrives and drains again.
+        result_tx
+            .send(ExportMsg {
+                export: Ok(demo_export_with_seq(7)),
+                at: std::time::Instant::now(),
+            })
+            .expect("send");
+        world.run_system_once(drain_fetch).expect("system runs");
+
+        // Then the version bumped and the reporter's seq advanced.
+        let state = world.resource::<SceneState>();
+        assert_eq!(state.version, 2);
+        let reporter = state
+            .graph
+            .node(&NodeId("state/reporter".into()))
+            .expect("reporter");
+        assert_eq!(reporter.state.as_ref().expect("state")["seq"], 7);
+    }
+}
