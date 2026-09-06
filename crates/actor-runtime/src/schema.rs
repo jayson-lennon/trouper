@@ -85,9 +85,24 @@ pub struct FieldDef {
     /// Accepted numeric bounds, if any.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub range: Option<Range>,
+    /// The field's structural role, when it carries one (e.g.
+    /// [`FieldRole::ShardKey`] names the partition key a router reads).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub role: Option<FieldRole>,
     /// Human-facing description.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
+}
+
+/// A structural role a field can play beyond its data type.
+///
+/// The runtime reads roles to make routing decisions; the canvas renders
+/// them so the declared routing is visible.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum FieldRole {
+    /// The partition key: partition-set routers extract this field from a
+    /// command payload to derive the entity path.
+    ShardKey,
 }
 
 impl FieldDef {
@@ -98,6 +113,7 @@ impl FieldDef {
             ty,
             unit: None,
             range: None,
+            role: None,
             description: None,
         }
     }
@@ -111,6 +127,18 @@ impl FieldDef {
     /// Attaches a numeric range.
     pub fn with_range(mut self, range: Range) -> Self {
         self.range = Some(range);
+        self
+    }
+
+    /// Attaches a structural role.
+    pub fn with_role(mut self, role: FieldRole) -> Self {
+        self.role = Some(role);
+        self
+    }
+
+    /// Marks this field as the partition's shard key.
+    pub fn as_shard_key(mut self) -> Self {
+        self.role = Some(FieldRole::ShardKey);
         self
     }
 }
@@ -155,6 +183,14 @@ impl SchemaDef {
     /// Serializes the descriptor to JSON — the export/canvas projection.
     pub fn to_json(&self) -> JsonValue {
         serde_json::to_value(self).unwrap_or(JsonValue::Null)
+    }
+
+    /// The name of the field carrying `role`, if any.
+    pub fn field_with_role(&self, role: FieldRole) -> Option<&str> {
+        self.fields
+            .iter()
+            .find(|f| f.role == Some(role))
+            .map(|f| f.name.as_str())
     }
 }
 
@@ -457,5 +493,32 @@ mod tests {
                 description: None,
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod field_role_tests {
+    use super::{FieldDef, FieldRole, FieldTy};
+    #[test]
+    fn old_descriptor_json_without_role_deserializes() {
+        // Given a descriptor JSON from before FieldRole existed.
+        let raw = serde_json::json!({ "name": "n", "ty": "int" });
+        // When deserialized.
+        let f: FieldDef = serde_json::from_value(raw).expect("old shape");
+        // Then role defaults to None.
+        assert_eq!(f.role, None);
+    }
+    #[test]
+    fn shard_key_role_round_trips() {
+        // Given a field marked as the shard key.
+        let f = FieldDef::required("sku", FieldTy::Str).as_shard_key();
+        // When serialized and deserialized.
+        let v = serde_json::to_value(&f).expect("serialize");
+        let back: FieldDef = serde_json::from_value(v).expect("deserialize");
+        // Then the role survives.
+        assert_eq!(back.role, Some(FieldRole::ShardKey));
+        // And the role is absent from JSON when None (clean descriptors).
+        let plain = serde_json::to_value(FieldDef::required("n", FieldTy::Int)).expect("serialize");
+        assert!(plain.get("role").is_none());
     }
 }

@@ -293,14 +293,29 @@ pub async fn route(
                 }
                 None => path.clone(),
             };
+            // PARTITION SETS: a public set path resolves to ONE entity,
+            // derived from the payload's shard key (activated on demand).
+            let path = match resolve_partition(registry, &envelope, path.clone()).await {
+                Ok(Some(entity)) => entity,
+                Ok(None) => path,
+                Err(missing_key_envelope) => {
+                    // Key absent/unextractable: dead-letter, no activation.
+                    dead_letter(
+                        kernel,
+                        &missing_key_envelope,
+                        crate::types::DeadLetterReason::ShardKeyMissing,
+                        "partition command without its shard key",
+                    );
+                    pump_dlq(registry, kernel).await;
+                    return Ok(path);
+                }
+            };
             // POOLS: a public pool path resolves to ONE worker (algo pick).
             let path = {
                 let reg = registry.lock().expect("registry lock");
                 match reg.pools.get(&path) {
                     Some(pool) => {
-                        let idx = pool
-                            .algo
-                            .pick(pool.workers.len(), &pool.next);
+                        let idx = pool.algo.pick(pool.workers.len(), &pool.next);
                         pool.workers[idx].clone()
                     }
                     None => path,
@@ -380,6 +395,63 @@ pub async fn route(
     }
 }
 
+/// Resolves a partition-set destination to its entity path.
+///
+/// `Ok(None)` = the dest is not a partition set (fall through). `Ok(Some)`
+/// = the entity path (activated on demand if absent). `Err(envelope)` =
+/// the command lacked its shard key — dead-lettered, NEVER activated.
+///
+/// Determinism is structural: the entity path is `public/key`, so the same
+/// key always reaches the same entity and journal. Activation is
+/// check-then-insert under the registry lock: the loser of a concurrent
+/// same-key race delivers to the winner's entity.
+async fn resolve_partition(
+    registry: &Mutex<Registry>,
+    envelope: &Envelope,
+    dest: ActorPath,
+) -> Result<Option<ActorPath>, Envelope> {
+    let spec = {
+        let reg = registry.lock().expect("registry lock");
+        let Some(spec) = reg.partitions.get(&dest) else {
+            return Ok(None);
+        };
+        spec.clone()
+    };
+    // Schema-aware key extraction from the payload (schema lock scoped).
+    let key = {
+        let reg = registry.lock().expect("registry lock");
+        let payload = envelope.as_json().cloned().unwrap_or(JsonValue::Null);
+        match reg.schema(&envelope.schema) {
+            Some(def) => crate::pool::extract_shard_key(def, &spec.key_field, &payload),
+            None => payload
+                .get(&spec.key_field)
+                .and_then(|v| v.as_str().map(str::to_owned)),
+        }
+    };
+    let Some(key) = key else {
+        // The schema declares the key required; arriving here is a
+        // contract break (or an unregistered foreign sender).
+        return Err(envelope.clone());
+    };
+    // Determinism is structural: same key → same derived path.
+    let entity_path = ActorPath::new(format!("{}/{}", dest, key).as_str());
+    // Fast path: the entity is already live.
+    if registry
+        .lock()
+        .expect("registry lock")
+        .lookup(&entity_path)
+        .is_some()
+    {
+        return Ok(Some(entity_path));
+    }
+    // ACTIVATE: spawn the entity from the shared factory. The factory's
+    // spawn registers the entity's slot; a concurrent same-key send is
+    // serialized by the registry lock inside the spawn, and the loser of
+    // a race delivers to the winner's entity (same derived path).
+    (spec.factory)(&spec.system, &entity_path, &spec.entity_args(&key));
+    Ok(Some(entity_path))
+}
+
 /// Applies the first matching router rule to a path-addressed envelope.
 ///
 /// Returns `(tee, inline_dest)`:
@@ -406,10 +478,14 @@ fn apply_rules(
         {
             continue;
         }
-        if let Some(schema) = &rule.schema && envelope.schema != *schema {
+        if let Some(schema) = &rule.schema
+            && envelope.schema != *schema
+        {
             continue;
         }
-        if let Some(rule_dest) = &rule.dest && *rule_dest != dest {
+        if let Some(rule_dest) = &rule.dest
+            && *rule_dest != dest
+        {
             continue;
         }
         match &rule.action {

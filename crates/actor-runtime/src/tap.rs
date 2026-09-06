@@ -96,10 +96,7 @@ pub enum FactKind {
     /// An actor's inbox depth crossed its configured high watermark.
     /// Fires once per crossing (down-crossings re-arm it), never per
     /// message — sustained overload stays observable without flooding.
-    Backpressured {
-        path: ActorPath,
-        depth: u64,
-    },
+    Backpressured { path: ActorPath, depth: u64 },
 }
 
 impl Fact {

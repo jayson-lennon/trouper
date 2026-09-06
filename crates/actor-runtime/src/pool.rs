@@ -117,11 +117,8 @@ pub struct PoolSpec {
     /// Spawns one worker at the given path (slot included).
     #[allow(clippy::type_complexity)]
     pub factory: std::sync::Arc<
-        dyn Fn(
-            &std::sync::Arc<crate::system::ActorSystem>,
-            &ActorPath,
-            &serde_json::Value,
-        ) + Send
+        dyn Fn(&std::sync::Arc<crate::system::ActorSystem>, &ActorPath, &serde_json::Value)
+            + Send
             + Sync,
     >,
     /// Genesis args handed to the factory (the workers' shared config).
@@ -142,6 +139,97 @@ impl std::fmt::Debug for PoolSpec {
             .field("algo", &self.algo)
             .field("parent", &self.parent)
             .finish_non_exhaustive()
+    }
+}
+
+/// A partition-set spec: per-entity actors derived from a schema-declared
+/// shard key, activated on demand from ONE shared factory.
+///
+/// Senders address the public path forever; the kernel extracts the key,
+/// derives `public/key`, and spawns the entity there on first sight.
+#[derive(Clone)]
+pub struct PartitionSpec {
+    /// The public path senders address (the set's identity).
+    pub public: ActorPath,
+    /// The system handle the factory spawns entities through (captured at
+    /// install so the router can activate without extra plumbing).
+    pub system: std::sync::Arc<crate::system::ActorSystem>,
+    /// Spawns ONE entity at the given path (an ES spawn — the entity owns
+    /// its journal). The factory owns the actor type; the kernel owns the
+    /// naming and the activation moment.
+    #[allow(clippy::type_complexity)]
+    pub factory: std::sync::Arc<
+        dyn Fn(&std::sync::Arc<crate::system::ActorSystem>, &ActorPath, &serde_json::Value)
+            + Send
+            + Sync,
+    >,
+    /// The command field carrying the shard key (extracted per envelope).
+    /// Must be marked [`crate::schema::FieldRole::ShardKey`] in at least one
+    /// handled command schema — validated at install (refuse-to-lie).
+    pub key_field: String,
+    /// Genesis args template: the derived key is merged in as `"key"`.
+    pub args_template: Option<serde_json::Value>,
+    /// Spawn opts for activated entities (snapshot cadence, mailbox).
+    pub opts: crate::system::SpawnOpts,
+}
+
+impl PartitionSpec {
+    /// The genesis args for one entity: the template with the extracted
+    /// shard key merged in as `"key"` (so `restore` seeds per-entity state).
+    pub fn entity_args(&self, key: &str) -> serde_json::Value {
+        let mut merged = match &self.args_template {
+            Some(serde_json::Value::Object(map)) => map.clone(),
+            _ => serde_json::Map::new(),
+        };
+        merged.insert("key".into(), serde_json::Value::String(key.to_owned()));
+        serde_json::Value::Object(merged)
+    }
+}
+
+impl std::fmt::Debug for PartitionSpec {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PartitionSpec")
+            .field("public", &self.public)
+            .field("key_field", &self.key_field)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Extracts the shard-key string from a payload per the schema def.
+///
+/// Schema-aware, not stringly: the key field's declared type decides how
+/// the JSON value renders into the entity path (ints vs strings).
+pub fn extract_shard_key(
+    schema: &crate::schema::SchemaDef,
+    key_field: &str,
+    payload: &serde_json::Value,
+) -> Option<String> {
+    let field_ty = schema
+        .fields
+        .iter()
+        .find(|f| f.name == key_field)
+        .map(|f| f.ty.clone());
+    let value = payload.get(key_field)?;
+    use crate::schema::FieldTy;
+    let rendered = match field_ty {
+        // Declared-int keys render bare (no quotes in the path).
+        Some(FieldTy::Int) => {
+            let n = value.as_i64()?;
+            n.to_string()
+        }
+        Some(FieldTy::Float) => value.as_f64()?.to_string(),
+        Some(FieldTy::Bool) => value.as_bool()?.to_string(),
+        // Undeclared or string-typed keys render as strings.
+        _ => {
+            let s = value.as_str()?;
+            s.to_owned()
+        }
+    };
+    // A path segment must never be empty.
+    if rendered.is_empty() {
+        None
+    } else {
+        Some(rendered)
     }
 }
 
@@ -174,8 +262,18 @@ mod tests {
     #[test]
     fn random_is_deterministic_for_a_seed() {
         // Given two identically-seeded pools.
-        let e1 = pool_entry(PoolAlgo::Random, vec![ActorPath::new("a"); 4], 0xDEADBEEF, None);
-        let e2 = pool_entry(PoolAlgo::Random, vec![ActorPath::new("a"); 4], 0xDEADBEEF, None);
+        let e1 = pool_entry(
+            PoolAlgo::Random,
+            vec![ActorPath::new("a"); 4],
+            0xDEADBEEF,
+            None,
+        );
+        let e2 = pool_entry(
+            PoolAlgo::Random,
+            vec![ActorPath::new("a"); 4],
+            0xDEADBEEF,
+            None,
+        );
 
         // When several picks run on each.
         let p1: Vec<usize> = (0..8).map(|_| e1.algo.pick(4, &e1.next)).collect();

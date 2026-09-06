@@ -184,9 +184,7 @@ impl<A: crate::actor::EventSourcedActor> SpawnBuilder<A> {
             }
         }
         manifest = manifest.kind(ActorKind::EventSourced);
-        let state = Box::new(crate::actor::TypedEsState::<A>::new(A::restore(
-            &self.args,
-        )));
+        let state = Box::new(crate::actor::TypedEsState::<A>::new(A::restore(&self.args)));
         self.system
             .spawn_es_erased(path.clone(), manifest, state, self.entries, self.opts);
         path
@@ -257,12 +255,10 @@ impl<A: ServiceActor> ServiceBuilder<A> {
         manifest = manifest.kind(ActorKind::Service);
         let start_args = self.args.clone();
         let start: crate::system::ServiceStart = Box::pin(async move {
-            A::start(&start_args)
-                .await
-                .map(|instance| {
-                    Box::new(crate::actor::TypedServiceState::new(instance))
-                        as Box<dyn crate::actor::DynServiceActor>
-                })
+            A::start(&start_args).await.map(|instance| {
+                Box::new(crate::actor::TypedServiceState::new(instance))
+                    as Box<dyn crate::actor::DynServiceActor>
+            })
         });
         self.system.spawn_service_erased(
             path.clone(),
@@ -310,10 +306,7 @@ impl ForeignBuilder {
     }
 
     /// The decision closure: (state, command, ctx) → events. Pure.
-    pub fn handle(
-        mut self,
-        f: crate::actor::ForeignDecision,
-    ) -> Self {
+    pub fn handle(mut self, f: crate::actor::ForeignDecision) -> Self {
         self.decision = Some(f);
         self
     }
@@ -352,9 +345,7 @@ impl ForeignBuilder {
     /// [`crate::schema::SchemaError::InvalidDescriptor`] when `.at()`,
     /// `.schema()`, `.handle()`, or `.apply()` was never called, or the
     /// schema descriptor fails to parse.
-    pub fn start(
-        self,
-    ) -> Result<ActorPath, error_stack::Report<crate::schema::SchemaError>> {
+    pub fn start(self) -> Result<ActorPath, error_stack::Report<crate::schema::SchemaError>> {
         use error_stack::{IntoReport, ResultExt};
         let invalid = || crate::schema::SchemaError::InvalidDescriptor.into_report();
         let path = self.path.ok_or_else(invalid)?;

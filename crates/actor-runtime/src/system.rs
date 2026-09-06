@@ -479,11 +479,9 @@ impl ActorSystem {
         let manifest = A::manifest();
         let start_args = args.clone();
         let start = Box::pin(async move {
-            A::start(&start_args)
-                .await
-                .map(|instance| {
-                    Box::new(TypedServiceState::new(instance)) as Box<dyn DynServiceActor>
-                })
+            A::start(&start_args).await.map(|instance| {
+                Box::new(TypedServiceState::new(instance)) as Box<dyn DynServiceActor>
+            })
         });
         self.spawn_service_erased(path, manifest, args, entries(), opts, start);
     }
@@ -780,7 +778,10 @@ impl ActorSystem {
                         parent: Some(parent.clone()),
                         args,
                         restart: crate::supervision::RestartPolicy::Permanent,
-                        budget: crate::supervision::RestartBudget::per(5, std::time::Duration::from_secs(10)),
+                        budget: crate::supervision::RestartBudget::per(
+                            5,
+                            std::time::Duration::from_secs(10),
+                        ),
                         backoff: crate::supervision::Backoff::default(),
                         spawn: Arc::new(move |system, path, args| {
                             factory(system, path, args);
@@ -795,14 +796,31 @@ impl ActorSystem {
         }
         // 3. INSTALL: one registry transaction — the pool entry claims the
         // public name (workers own the deliverable slots).
-        let entry = crate::pool::pool_entry(
-            spec.algo,
-            workers,
-            spec.seed,
-            spec.parent.clone(),
-        );
+        let entry = crate::pool::pool_entry(spec.algo, workers, spec.seed, spec.parent.clone());
         let mut registry = self.registry.lock().expect("registry lock");
         registry.install_pool(spec.public, entry)
+    }
+
+    /// Installs a partition set over `public`: commands aimed at the
+    /// public path are routed to per-entity actors derived from the
+    /// payload's declared shard key (`public/key`), activated on demand
+    /// from the spec's shared factory.
+    ///
+    /// Senders keep addressing the public path forever; entity paths and
+    /// journals are per key. Entities live until stopped — passivation is
+    /// a declared anti-goal.
+    ///
+    /// # Errors
+    ///
+    /// [`crate::registry::RegistryError::InvalidSpec`] when no command
+    /// schema declares the spec's key field as the ShardKey (refuse-to-lie:
+    /// the set would dead-letter every command).
+    pub fn install_partition_set(
+        self: &Arc<Self>,
+        spec: crate::pool::PartitionSpec,
+    ) -> Result<(), error_stack::Report<crate::registry::RegistryError>> {
+        let mut registry = self.registry.lock().expect("registry lock");
+        registry.install_partition_set(spec)
     }
 
     /// The bounded stop; recursion depth bounded by timeout.
@@ -3409,10 +3427,7 @@ mod tests {
         {
             let mut registry = system.registry.lock().expect("registry lock");
             registry
-                .declare_emits(
-                    &ActorPath::new("tally-actor"),
-                    schema.clone(),
-                )
+                .declare_emits(&ActorPath::new("tally-actor"), schema.clone())
                 .expect("live slot");
         }
 
@@ -4694,11 +4709,13 @@ mod tests {
                 )]
             })
         };
-        let fold: crate::actor::ForeignFold = Arc::new(|state: &mut JsonValue, ev: &crate::envelope::Event| {
-            state["total"] = json!(
-                state["total"].as_i64().unwrap_or(0) + ev.payload["delta"].as_i64().unwrap_or(0)
-            );
-        });
+        let fold: crate::actor::ForeignFold =
+            Arc::new(|state: &mut JsonValue, ev: &crate::envelope::Event| {
+                state["total"] = json!(
+                    state["total"].as_i64().unwrap_or(0)
+                        + ev.payload["delta"].as_i64().unwrap_or(0)
+                );
+            });
         system.spawn_es_foreign(
             ActorPath::new("t-pos"),
             schema.clone(),
@@ -4745,11 +4762,7 @@ mod tests {
         .await;
         for path in [ActorPath::new("t-pos"), ActorPath::new("t-built")] {
             system
-                .send(system.envelope(
-                    SchemaId::new("tally2", 1),
-                    path,
-                    json!({ "delta": 9 }),
-                ))
+                .send(system.envelope(SchemaId::new("tally2", 1), path, json!({ "delta": 9 })))
                 .await
                 .expect("delivered");
         }
@@ -4944,6 +4957,286 @@ mod tests {
         }
     }
 
+    /// A key-keyed counter for partition tests: state seeded from the
+    /// `key` genesis arg, increments isolated per entity.
+    #[derive(Serialize, Deserialize, Default)]
+    struct KeyCounter {
+        key: String,
+        total: i64,
+    }
+    impl EventSourcedActor for KeyCounter {
+        fn manifest() -> ActorManifest {
+            ActorManifest::new()
+                .handles::<KeyedAdd>()
+                .emits::<Added>()
+                .kind(ActorKind::EventSourced)
+        }
+        fn restore(args: &JsonValue) -> Self {
+            Self {
+                key: args["key"].as_str().unwrap_or_default().to_owned(),
+                total: 0,
+            }
+        }
+        fn apply(&mut self, event: &crate::envelope::Event) {
+            self.total += event.payload["n"].as_i64().unwrap_or(0);
+        }
+    }
+    impl CommandHandler<KeyedAdd> for KeyCounter {
+        fn handle(&self, cmd: KeyedAdd, _ctx: &mut CmdCtx<'_>) -> Vec<crate::envelope::Event> {
+            vec![crate::envelope::Event::new(
+                Added::schema_id(),
+                json!({ "n": cmd.n }),
+            )]
+        }
+    }
+
+    /// Registers the partition test command (a str shard key field) and
+    /// installs a KeyCounter partition set over `public`.
+    fn install_key_partition(
+        system: &Arc<ActorSystem>,
+        public: &str,
+    ) -> Result<(), error_stack::Report<crate::registry::RegistryError>> {
+        system.register_schema::<KeyedAdd>();
+        let spec = crate::pool::PartitionSpec {
+            public: ActorPath::new(public),
+            system: system.clone(),
+            factory: Arc::new(|system, path, args| {
+                crate::builder::spawn_es_builder::<KeyCounter>(system)
+                    .at(path.clone())
+                    .args(args.clone())
+                    .handles::<KeyedAdd>()
+                    .emits::<Added>()
+                    .start();
+            }),
+            key_field: "account".to_owned(),
+            args_template: None,
+            opts: SpawnOpts::default(),
+        };
+        system.install_partition_set(spec)
+    }
+
+    /// The partition test command: an int-typed `n` plus a STRING-TYPED
+    /// `account` field marked ShardKey (typed key extraction).
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    struct KeyedAdd {
+        n: i64,
+        account: String,
+    }
+    impl Schema for KeyedAdd {
+        fn schema_def() -> SchemaDef {
+            SchemaDef {
+                name: "KeyedAdd".into(),
+                version: 1,
+                kind: SchemaKind::Command,
+                fields: vec![
+                    FieldDef::required("n", FieldTy::Int),
+                    FieldDef::required("account", FieldTy::Str).as_shard_key(),
+                ],
+                description: None,
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn partition_keys_activate_distinct_entities_with_separate_journals() {
+        // Given a partition set over "accounts" (str shard key `account`).
+        let (system, _clock) = ActorSystem::test();
+        install_key_partition(&system, "accounts").expect("install");
+
+        // When commands for two DIFFERENT keys are sent to the public path.
+        let e1 = system.envelope(
+            KeyedAdd::schema_id(),
+            ActorPath::new("accounts"),
+            json!({ "n": 3, "account": "a" }),
+        );
+        system.send(e1).await.expect("delivered");
+        let e2 = system.envelope(
+            KeyedAdd::schema_id(),
+            ActorPath::new("accounts"),
+            json!({ "n": 7, "account": "b" }),
+        );
+        system.send(e2).await.expect("delivered");
+        wait_for(|| async {
+            system.journal_len(&ActorPath::new("accounts/a")) == 1
+                && system.journal_len(&ActorPath::new("accounts/b")) == 1
+        })
+        .await;
+
+        // Then two distinct entities were activated with per-key state.
+        assert_eq!(
+            system
+                .es_state(&ActorPath::new("accounts/a"))
+                .await
+                .and_then(|s| s["total"].as_i64()),
+            Some(3),
+            "entity a holds only key-a totals"
+        );
+        assert_eq!(
+            system
+                .es_state(&ActorPath::new("accounts/b"))
+                .await
+                .and_then(|s| s["total"].as_i64()),
+            Some(7),
+            "entity b holds only key-b totals"
+        );
+        // And each entity has its OWN journal.
+        assert_eq!(system.journal_len(&ActorPath::new("accounts/a")), 1);
+        assert_eq!(system.journal_len(&ActorPath::new("accounts/b")), 1);
+    }
+
+    #[tokio::test]
+    async fn partition_same_key_always_same_entity() {
+        // Given a partition set over "accounts".
+        let (system, _clock) = ActorSystem::test();
+        install_key_partition(&system, "accounts").expect("install");
+
+        // When the SAME key is sent repeatedly.
+        for n in 1..=3 {
+            let e = system.envelope(
+                KeyedAdd::schema_id(),
+                ActorPath::new("accounts"),
+                json!({ "n": n, "account": "a" }),
+            );
+            system.send(e).await.expect("delivered");
+        }
+        wait_for(|| async {
+            system
+                .es_state(&ActorPath::new("accounts/a"))
+                .await
+                .and_then(|s| s["total"].as_i64())
+                == Some(6)
+        })
+        .await;
+
+        // Then all three commands landed on ONE entity (deterministic
+        // derived path), and only one Spawned fact exists for it.
+        assert_eq!(
+            system
+                .es_state(&ActorPath::new("accounts/a"))
+                .await
+                .and_then(|s| s["total"].as_i64()),
+            Some(6)
+        );
+        let spawns = system
+            .tap_facts()
+            .iter()
+            .filter(|f| matches!(
+                &f.kind,
+                crate::tap::FactKind::Spawned { path, .. } if *path == ActorPath::new("accounts/a")
+            ))
+            .count();
+        assert_eq!(spawns, 1, "same key activated the entity exactly once");
+    }
+
+    #[tokio::test]
+    async fn partition_rejects_command_without_shard_key() {
+        // Given a partition set over "accounts".
+        let (system, _clock) = ActorSystem::test();
+        install_key_partition(&system, "accounts").expect("install");
+
+        // When a payload WITHOUT the key is sent (schema-registered, but
+        // the sender violates the payload contract).
+        let e = system.envelope(
+            KeyedAdd::schema_id(),
+            ActorPath::new("accounts"),
+            json!({ "n": 9 }),
+        );
+        let result = system.send(e).await;
+
+        // Then the send RESOLVES (the set exists) but the command is
+        // dead-lettered ShardKeyMissing — and no entity was activated.
+        assert!(result.is_ok(), "the partition set resolved the dest");
+        wait_for(|| async { !system.dead_letter_schemas().is_empty() }).await;
+        assert!(
+            system
+                .dead_letter_reasons()
+                .await
+                .iter()
+                .any(|r| r.starts_with("ShardKeyMissing")),
+            "missing key dead-lettered: {:?}",
+            system.dead_letter_reasons().await
+        );
+        assert!(
+            system
+                .es_state(&ActorPath::new("accounts/9"))
+                .await
+                .is_none(),
+            "no entity activated for a keyless command"
+        );
+    }
+
+    #[tokio::test]
+    async fn partition_spec_without_key_field_rejected() {
+        // Given a system whose command schema has NO shard-key field.
+        let (system, _clock) = ActorSystem::test();
+        system.register_schema::<Add>();
+
+        // When a partition spec names a key field no command declares.
+        let spec = crate::pool::PartitionSpec {
+            public: ActorPath::new("accounts"),
+            system: system.clone(),
+            factory: Arc::new(|_system, _path, _args| {}),
+            key_field: "account".to_owned(),
+            args_template: None,
+            opts: SpawnOpts::default(),
+        };
+        let result = system.install_partition_set(spec);
+
+        // Then the install is REFUSED (refuse-to-lie discipline).
+        assert!(
+            result.is_err(),
+            "spec without a declared shard key rejected"
+        );
+    }
+
+    #[tokio::test]
+    async fn concurrent_same_key_activation_yields_one_entity() {
+        // Given a partition set over "accounts".
+        let (system, _clock) = ActorSystem::test();
+        install_key_partition(&system, "accounts").expect("install");
+
+        // When several commands for the same FRESH key are sent in quick
+        // succession (the first may still be activating).
+        let sends: Vec<_> = (0..5)
+            .map(|n| {
+                let e = system.envelope(
+                    KeyedAdd::schema_id(),
+                    ActorPath::new("accounts"),
+                    json!({ "n": n, "account": "race" }),
+                );
+                system.send(e)
+            })
+            .collect();
+        for s in sends {
+            s.await.expect("delivered");
+        }
+        wait_for(|| async {
+            system
+                .es_state(&ActorPath::new("accounts/race"))
+                .await
+                .and_then(|s| s["total"].as_i64())
+                == Some(10)
+        })
+        .await;
+
+        // Then exactly one entity holds the full total (5×2 from the
+        // handler's emit shape), spawned once.
+        let total = system
+            .es_state(&ActorPath::new("accounts/race"))
+            .await
+            .and_then(|s| s["total"].as_i64());
+        assert_eq!(total, Some(10), "all five commands hit ONE entity");
+        let spawns = system
+            .tap_facts()
+            .iter()
+            .filter(|f| matches!(
+                &f.kind,
+                crate::tap::FactKind::Spawned { path, .. } if *path == ActorPath::new("accounts/race")
+            ))
+            .count();
+        assert_eq!(spawns, 1, "the race yielded a single activation");
+    }
+
     #[tokio::test]
     async fn pool_takeover_is_invisible_to_senders() {
         // Given a pool installed over "public" (fresh; no prior actor) with
@@ -4966,7 +5259,8 @@ mod tests {
         // When the sender addresses the PUBLIC path six times.
         wait_for(|| async {
             (0..3).all(|i| {
-                system.inbox_cursor(&ActorPath::new(format!("public/worker-{i}").as_str()))
+                system
+                    .inbox_cursor(&ActorPath::new(format!("public/worker-{i}").as_str()))
                     .is_some()
             })
         })
@@ -4986,14 +5280,17 @@ mod tests {
         // Then every message landed in a worker through the public name
         // (the sender never saw a worker path), and the tap shows the
         // router signature: Sent{dest: public} → Delivered{to: worker}.
-        assert_eq!(*sink.lock().expect("sink lock"), vec![
-            "n=1", "n=2", "n=3", "n=4", "n=5", "n=6"
-        ]);
-        let to_workers = system.tap_facts().iter().any(|f| matches!(
-            &f.kind,
-            crate::tap::FactKind::Delivered { to, .. }
-                if *to == ActorPath::new("public/worker-0")
-        ));
+        assert_eq!(
+            *sink.lock().expect("sink lock"),
+            vec!["n=1", "n=2", "n=3", "n=4", "n=5", "n=6"]
+        );
+        let to_workers = system.tap_facts().iter().any(|f| {
+            matches!(
+                &f.kind,
+                crate::tap::FactKind::Delivered { to, .. }
+                    if *to == ActorPath::new("public/worker-0")
+            )
+        });
         assert!(to_workers, "deliveries landed on worker paths");
     }
 
@@ -5004,12 +5301,9 @@ mod tests {
         system.register_schema::<Add>();
         system.register_schema::<Added>();
         let public = ActorPath::new("pub");
-        system.spawn_es::<BareCounter, _>(
-            public.clone(),
-            &json!({}),
-            SpawnOpts::default(),
-            || vec![Arc::new(TypedEsAdapter::<BareCounter, Add>::new::<Add>())],
-        );
+        system.spawn_es::<BareCounter, _>(public.clone(), &json!({}), SpawnOpts::default(), || {
+            vec![Arc::new(TypedEsAdapter::<BareCounter, Add>::new::<Add>())]
+        });
         wait_for(|| async { system.inbox_cursor(&public).is_some() }).await;
 
         // When the pool takes the public path over (stop-drain first).
@@ -5066,17 +5360,17 @@ mod tests {
 
         // When four commands go to the public path.
         wait_for(|| async {
-            system.inbox_cursor(&ActorPath::new("rnd/worker-0")).is_some()
-                && system.inbox_cursor(&ActorPath::new("rnd/worker-1")).is_some()
+            system
+                .inbox_cursor(&ActorPath::new("rnd/worker-0"))
+                .is_some()
+                && system
+                    .inbox_cursor(&ActorPath::new("rnd/worker-1"))
+                    .is_some()
         })
         .await;
         for n in 1..=4 {
             system
-                .send(system.envelope(
-                    Add::schema_id(),
-                    ActorPath::new("rnd"),
-                    json!({ "n": n }),
-                ))
+                .send(system.envelope(Add::schema_id(), ActorPath::new("rnd"), json!({ "n": n })))
                 .await
                 .expect("delivered");
         }
@@ -5122,8 +5416,6 @@ mod tests {
         assert_eq!(spec_parent, Some(parent));
     }
 
-
-
     #[tokio::test]
     async fn tee_rule_copies_without_touching_delivery() {
         // Given a primary ES counter and a Tee observer, with a Tee rule:
@@ -5137,7 +5429,11 @@ mod tests {
             ActorPath::new("watcher"),
             &json!({ "sink": sink_idx }),
             SpawnOpts::default(),
-            || vec![Arc::new(TypedServiceAdapter::<Auditor, Added>::new::<Added>())],
+            || {
+                vec![Arc::new(
+                    TypedServiceAdapter::<Auditor, Added>::new::<Added>(),
+                )]
+            },
         );
         let counter = ActorPath::new("counter");
         system.spawn_es::<BareCounter, _>(
@@ -5168,10 +5464,7 @@ mod tests {
         envelope.trace = crate::envelope::TraceCtx::root();
         let original_causality = envelope.trace.causality_id;
         system.send(envelope).await.expect("delivered");
-        wait_for(|| async {
-            count_total(&system, "counter").await == Some(5)
-        })
-        .await;
+        wait_for(|| async { count_total(&system, "counter").await == Some(5) }).await;
 
         // Then the PRIMARY still processed the original untouched (the tee
         // never disturbed the main flow), and the copy did not poison it.
@@ -5183,10 +5476,12 @@ mod tests {
         let facts = system.tap_facts();
         let tee_delivered = facts
             .iter()
-            .find(|f| matches!(
-                &f.kind,
-                crate::tap::FactKind::Delivered { to, .. } if *to == ActorPath::new("watcher")
-            ))
+            .find(|f| {
+                matches!(
+                    &f.kind,
+                    crate::tap::FactKind::Delivered { to, .. } if *to == ActorPath::new("watcher")
+                )
+            })
             .expect("tee copy delivered");
         if let crate::tap::FactKind::Delivered { trace, .. } = &tee_delivered.kind {
             assert_ne!(
@@ -5194,13 +5489,12 @@ mod tests {
                 "copy has a NEW causality"
             );
             assert_ne!(
-                trace.trace_id, crate::envelope::TraceCtx::root().trace_id,
+                trace.trace_id,
+                crate::envelope::TraceCtx::root().trace_id,
                 "sanity: trace ids are unique per root"
             );
         }
     }
-
-
 
     #[tokio::test]
     async fn inline_rule_interposes() {
@@ -5224,7 +5518,11 @@ mod tests {
             ActorPath::new("final"),
             &json!({ "sink": final_idx }),
             SpawnOpts::default(),
-            || vec![Arc::new(TypedServiceAdapter::<PoolWorker, Add>::new::<Add>())],
+            || {
+                vec![Arc::new(
+                    TypedServiceAdapter::<PoolWorker, Add>::new::<Add>(),
+                )]
+            },
         );
         {
             let mut registry = system.registry.lock().expect("registry lock");
@@ -5316,7 +5614,11 @@ mod tests {
             plain.clone(),
             &json!({ "sink": sink_idx }),
             opts,
-            || vec![Arc::new(TypedServiceAdapter::<GatedWorker, Add>::new::<Add>())],
+            || {
+                vec![Arc::new(
+                    TypedServiceAdapter::<GatedWorker, Add>::new::<Add>(),
+                )]
+            },
         );
         wait_for(|| async { system.inbox_cursor(&plain).is_some() }).await;
 

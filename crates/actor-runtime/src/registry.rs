@@ -223,6 +223,9 @@ pub struct Registry {
     route_cursor: usize,
     /// Stateless pools by PUBLIC path (workers own the real slots).
     pub pools: HashMap<ActorPath, crate::pool::PoolEntry>,
+    /// Partition sets by PUBLIC path (entities own the real slots, derived
+    /// from the set's path on demand).
+    pub partitions: HashMap<ActorPath, crate::pool::PartitionSpec>,
     /// Router rules in declaration (priority) order.
     pub rules: Vec<crate::pool::Rule>,
 }
@@ -400,6 +403,45 @@ impl Registry {
     /// Appends a router rule (declaration order is priority order).
     pub fn add_rule(&mut self, rule: crate::pool::Rule) {
         self.rules.push(rule);
+    }
+
+    /// Installs a partition set: validates the spec against the schema
+    /// table (refuse-to-lie), then records it. Entities are NOT spawned
+    /// here — activation happens on demand in the router.
+    ///
+    /// # Errors
+    ///
+    /// [`RegistryError::InvalidSpec`] when no command schema reachable
+    /// from the spec declares the shard-key field the spec names: a
+    /// partition set whose key can never be extracted would silently
+    /// dead-letter every command, so it is rejected at install.
+    pub fn install_partition_set(
+        &mut self,
+        spec: crate::pool::PartitionSpec,
+    ) -> Result<(), error_stack::Report<RegistryError>> {
+        use error_stack::IntoReport;
+        // The key field must be declared (with the ShardKey role) on at
+        // least one COMMAND schema whose route could reach this set. The
+        // schema table is keyed by `name@version`; scan all command
+        // schemas for a field with the declared name + role.
+        let key_declared = self
+            .schemas
+            .all()
+            .into_iter()
+            .filter(|def| def.kind == crate::schema::SchemaKind::Command)
+            .any(|def| {
+                def.fields.iter().any(|f| {
+                    f.name == spec.key_field && f.role == Some(crate::schema::FieldRole::ShardKey)
+                })
+            });
+        if !key_declared {
+            return Err(RegistryError::InvalidSpec.into_report().attach(format!(
+                "partition set {}: no command schema declares field `{}` as ShardKey",
+                spec.public, spec.key_field
+            )));
+        }
+        self.partitions.insert(spec.public.clone(), spec);
+        Ok(())
     }
 
     /// Destination set for a schema's route (tests/canvas introspection).

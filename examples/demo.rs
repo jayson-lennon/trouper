@@ -18,9 +18,9 @@ use actor_runtime::actor::{
     CommandHandler, EventSourcedActor, MsgHandler, ServiceActor, TypedEsAdapter,
     TypedServiceAdapter,
 };
-use actor_runtime::system::SnapshotCadence;
 use actor_runtime::prelude::*;
 use actor_runtime::registry::RegistryError;
+use actor_runtime::system::SnapshotCadence;
 use error_stack::Report;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
