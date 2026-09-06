@@ -65,7 +65,10 @@ pub struct PoolEntry {
 #[derive(Debug, Clone)]
 pub enum RuleAction {
     /// Deliver a COPY to the observer; the primary delivery is untouched.
-    /// At-most-once — a teed copy is not an audit mechanism.
+    /// The copy carries a NEW causality id under the original's trace id
+    /// (two deliveries of one message must not look like a chain of two
+    /// hops). At-most-once: the copy is dropped if the observer's inbox
+    /// is full — a teed copy is NOT an audit mechanism.
     Tee(ActorPath),
     /// Interpose the observer: it receives the envelope in the primary's
     /// place and is responsible for forwarding it.
