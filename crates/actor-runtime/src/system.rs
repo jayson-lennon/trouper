@@ -1343,6 +1343,22 @@ impl ActorSystem {
         let state = state.lock().await;
         state.capture_erased().ok()
     }
+
+    /// The event schemas currently journaled for `path`, in order
+    /// (inspection: snapshots are skipped — they are not decisions).
+    pub fn journal_schemas(&self, path: &ActorPath) -> Vec<SchemaId> {
+        let kernel = self.kernel.lock().expect("kernel lock");
+        kernel
+            .journals
+            .get(path)
+            .map(|j| {
+                j.entries()
+                    .iter()
+                    .filter_map(|e| e.as_event().map(|ev| ev.schema.clone()))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
 }
 
 /// A read-only snapshot view over the kernel: handler contexts resolve
