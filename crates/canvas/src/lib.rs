@@ -1,176 +1,57 @@
-//! canvas: connects to a running system's canvas server and consumes a
-//! whole-system snapshot.
+//! canvas: queries a running system's state over zenoh and consumes the
+//! export document.
 //!
-//! The library seam is [`connect_snapshot`]: one address, one timeout,
-//! one `SystemExport` back (or a [`CanvasError`] naming what failed).
-//! The `canvas` binary wraps it: connect-or-abort — on any failure it
+//! The library seam is [`fetch_export`]: one call, one fresh
+//! `SystemExport` back (or a [`StateError`] naming what failed). All
+//! transport lives in `state-report` — this crate is a pure projection.
+//! The `canvas` binary wraps it: query-or-abort — on any failure it
 //! prints a legible stderr message and exits non-zero before any GUI
 //! startup path (no GUI exists yet, and none may be stubbed here).
-//!
-//! Wire protocol: versioned NDJSON envelopes, strict v1 (see
-//! [`wire`]). The wire is untyped JSON; this crate deserializes the
-//! snapshot into `actor_runtime`'s `SystemExport`.
 
-pub mod wire;
-
-use crate::wire::ReplyKind;
 use actor_runtime::system::SystemExport;
-use actor_runtime::types::ActorKind;
-use std::net::SocketAddr;
-use std::time::Duration;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::net::TcpStream;
+use state_report::StateBridgeError;
 
-/// Everything that can go wrong between "connect" and "snapshot in
-/// hand". Every message names the address involved — the binary prints
-/// these verbatim to stderr before aborting.
+/// Everything that can go wrong between "query" and "export in hand".
+/// The binary prints these verbatim to stderr before aborting.
 #[derive(Debug, wherror::Error)]
-pub enum CanvasError {
-    /// The TCP connection itself failed (refused, unroutable, ...).
-    #[error("could not connect to {addr}: {source}")]
-    Connect {
-        /// The address that refused the connection.
-        addr: SocketAddr,
-        /// The underlying OS error.
-        #[source]
-        source: std::io::Error,
-    },
-    /// The deadline passed before the exchange completed.
-    #[error("timed out after {timeout:?} talking to {addr}")]
-    Timeout {
-        /// The address that went quiet.
-        addr: SocketAddr,
-        /// The budget that elapsed.
-        timeout: Duration,
-    },
-    /// The server hung up before sending a reply line.
-    #[error("connection to {addr} closed before a reply arrived")]
-    Closed {
-        /// The address that closed the connection.
-        addr: SocketAddr,
-    },
-    /// The server answered with an error envelope (or an envelope this
-    /// client cannot interpret — including a different protocol version).
-    #[error("{addr} replied with an error ({code}): {detail}")]
-    Protocol {
-        /// The address that produced the reply.
-        addr: SocketAddr,
-        /// The envelope's error code (or a client-side discriminator).
-        code: String,
-        /// The envelope's human-readable detail.
-        detail: String,
-    },
-    /// The snapshot document did not decode into a `SystemExport`.
-    #[error("snapshot from {addr} was not a decodable SystemExport: {source}")]
-    Payload {
-        /// The address that sent the payload.
-        addr: SocketAddr,
-        /// The deserialization error.
-        #[source]
-        source: serde_json::Error,
-    },
+pub enum StateError {
+    /// A zenoh operation failed.
+    #[error("zenoh query failed: {0}")]
+    Zenoh(String),
+    /// No bridge answered within the fetch budget.
+    #[error("no system answered the state query; is one running with a bridge installed?")]
+    Timeout,
+    /// A reply did not decode into a `SystemExport`.
+    #[error("reply was not a decodable SystemExport: {0}")]
+    Payload(String),
 }
 
-/// An open, ready connection: the request has been written. The write
-/// half is kept only so the connection (and its request) stays alive
-/// while the reply is read.
-struct Connected {
-    #[allow(dead_code)]
-    writer: tokio::net::tcp::OwnedWriteHalf,
-    lines: tokio::io::Lines<BufReader<tokio::net::tcp::OwnedReadHalf>>,
+impl From<StateBridgeError> for StateError {
+    fn from(error: StateBridgeError) -> Self {
+        match error {
+            StateBridgeError::Zenoh(detail) => Self::Zenoh(detail),
+            StateBridgeError::Timeout(_) => Self::Timeout,
+            StateBridgeError::NoReporter(path) => {
+                Self::Payload(format!("no StateReporter actor at {path}"))
+            }
+            StateBridgeError::Payload(detail) => Self::Payload(detail),
+        }
+    }
 }
 
-/// Connects to a canvas server at `addr` and fetches one whole-system
-/// snapshot, giving up after `timeout` in total across connect+request
-/// and again on the reply.
+/// Queries [`state_report::STATE_KEY`] and decodes the fresh
+/// `SystemExport` document the answering system reports.
 ///
 /// # Errors
 ///
-/// - [`CanvasError::Connect`] when the TCP connection fails.
-/// - [`CanvasError::Timeout`] when connecting or reading outlives
-///   `timeout`.
-/// - [`CanvasError::Closed`] when the server hangs up before replying.
-/// - [`CanvasError::Protocol`] when the reply is an error envelope, a
-///   different protocol version, or not a known envelope at all.
-/// - [`CanvasError::Payload`] when a snapshot document fails to decode.
-pub async fn connect_snapshot(addr: SocketAddr, timeout: Duration) -> Result<SystemExport, CanvasError> {
-    let mut connected = open(addr, timeout).await?;
-    let line = read_reply_line(&mut connected, addr, timeout).await?;
-    decode_reply(&line, addr)
+/// - [`StateError::Zenoh`] when the transport fails.
+/// - [`StateError::Timeout`] when nothing answers within the budget.
+/// - [`StateError::Payload`] when a reply fails to decode.
+pub async fn fetch_export() -> Result<SystemExport, StateError> {
+    Ok(state_report::fetch().await?)
 }
 
-/// Opens the connection and writes the snapshot request.
-async fn open(addr: SocketAddr, timeout: Duration) -> Result<Connected, CanvasError> {
-    let stream = tokio::time::timeout(timeout, TcpStream::connect(addr))
-        .await
-        .map_err(|_| CanvasError::Timeout { addr, timeout })?
-        .map_err(|source| CanvasError::Connect { addr, source })?;
-    let (reader, mut writer) = stream.into_split();
-    let write = async {
-        writer.write_all(wire::REQUEST_LINE.as_bytes()).await?;
-        writer.write_all(b"\n").await?;
-        writer.flush().await
-    };
-    write
-        .await
-        .map_err(|source| CanvasError::Connect { addr, source })?;
-    Ok(Connected {
-        writer,
-        lines: BufReader::new(reader).lines(),
-    })
-}
-
-/// Reads the next non-empty reply line (empty lines are never replies).
-async fn read_reply_line(
-    connected: &mut Connected,
-    addr: SocketAddr,
-    timeout: Duration,
-) -> Result<String, CanvasError> {
-    loop {
-        let line = tokio::time::timeout(timeout, connected.lines.next_line())
-            .await
-            .map_err(|_| CanvasError::Timeout { addr, timeout })?
-            .map_err(|_| CanvasError::Closed { addr })?;
-        match line {
-            Some(line) if line.trim().is_empty() => continue,
-            Some(line) => return Ok(line),
-            None => return Err(CanvasError::Closed { addr }),
-        }
-    }
-}
-
-/// Decodes one reply line into a snapshot — or the error it carries.
-fn decode_reply(line: &str, addr: SocketAddr) -> Result<SystemExport, CanvasError> {
-    let envelope: serde_json::Value = serde_json::from_str(line).map_err(|source| {
-        CanvasError::Protocol {
-            addr,
-            code: ReplyKind::UNPARSEABLE.to_owned(),
-            detail: format!("reply was not valid JSON: {source}"),
-        }
-    })?;
-    match wire::classify(&envelope) {
-        ReplyKind::Snapshot => {
-            serde_json::from_value(envelope["export"].clone()).map_err(|source| {
-                CanvasError::Payload { addr, source }
-            })
-        }
-        ReplyKind::Error => {
-            let code = envelope["code"].as_str().unwrap_or("unknown").to_owned();
-            let detail = envelope["detail"].as_str().unwrap_or("").to_owned();
-            Err(CanvasError::Protocol { addr, code, detail })
-        }
-        ReplyKind::Unknown(version) => Err(CanvasError::Protocol {
-            addr,
-            code: ReplyKind::UNKNOWN_VERSION.to_owned(),
-            detail: format!(
-                "client speaks protocol v{}, reply carried v{version}",
-                wire::PROTOCOL_VERSION
-            ),
-        }),
-    }
-}
-
-/// The one-glance digest of a snapshot: counts per export section, with
+/// The one-glance digest of an export: counts per export section, with
 /// actor counts split by contract kind. Derived by [`SnapshotSummary::of`],
 /// rendered by [`SnapshotSummary::render`].
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -203,7 +84,7 @@ impl SnapshotSummary {
         let es = export
             .actors
             .iter()
-            .filter(|a| a.kind == ActorKind::EventSourced)
+            .filter(|a| a.kind == actor_runtime::types::ActorKind::EventSourced)
             .count();
         Self {
             schemas: export.schemas.len(),
@@ -251,7 +132,7 @@ mod tests {
     /// set with 3 activated entities. Everything else stays empty (which
     /// exercises the zero case of every remaining counter).
     fn sample_export() -> SystemExport {
-        let actor = |kind: ActorKind, path: &str| ActorExport {
+        let actor = |kind: actor_runtime::types::ActorKind, path: &str| ActorExport {
             path: ActorPath::new(path),
             kind,
             manifest: ActorManifest::new(),
@@ -269,8 +150,8 @@ mod tests {
                 })
                 .collect(),
             actors: vec![
-                actor(ActorKind::EventSourced, "es/one"),
-                actor(ActorKind::Service, "svc/two"),
+                actor(actor_runtime::types::ActorKind::EventSourced, "es/one"),
+                actor(actor_runtime::types::ActorKind::Service, "svc/two"),
             ],
             declared_edges: Vec::new(),
             observed_edges: Vec::new(),
@@ -290,7 +171,7 @@ mod tests {
 
     #[test]
     fn summary_counts_each_export_section() {
-        // Given a snapshot with known section sizes.
+        // Given an export with known section sizes.
         let export = sample_export();
 
         // When summarizing.
@@ -311,7 +192,7 @@ mod tests {
 
     #[test]
     fn render_shows_counts_in_two_lines() {
-        // Given a summary of a known snapshot.
+        // Given a summary of a known export.
         let summary = SnapshotSummary::of(&sample_export());
 
         // When rendering.

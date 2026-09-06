@@ -5,16 +5,16 @@ edition.workspace = true
 
 [dependencies]
 actor-runtime.workspace = true
+state-report.workspace = true
 tokio.workspace = true
-serde.workspace = true
 serde_json.workspace = true
 wherror.workspace = true
 
 [dev-dependencies]
 rstest.workspace = true
 futures.workspace = true
-canvas-server.workspace = true
 actor-runtime.workspace = true
+serde.workspace = true
 error-stack.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true

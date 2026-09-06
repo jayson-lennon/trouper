@@ -1,32 +1,28 @@
-//! The demo host: a small but complete system whose topology touches
-//! every export section — an ES actor, a service actor, a pool, a
-//! partition set with activated entities, a topic subscriber, and a tee
-//! rule — served to canvas clients over loopback TCP.
+//! A small but complete actor system whose topology touches every export
+//! section — an ES pool, a partition set with activated entities, a
+//! service-actor topic subscriber, and a tee rule — that answers state
+//! queries over zenoh until interrupted.
 //!
 //! Manual two-shell run (the example occupies the shell it runs in):
 //!
 //! ```text
-//! shell 1: cargo run --example demo_host
-//! shell 2: cargo run -p canvas -- --connect 127.0.0.1:7667
+//! shell 1: cargo run --example state_report
+//! shell 2: cargo run -p canvas
 //! ```
 //!
-//! The host keeps running (it IS the server) until interrupted.
-//!
-//! Run: `cargo run --example demo_host`
+//! Shell 1 keeps running (it IS the answering system) until ctrl-c; each
+//! `canvas` invocation in shell 2 prints that instant's export.
 
 use actor_runtime::actor::{CommandHandler, EventSourcedActor, MsgHandler, ServiceActor};
 use actor_runtime::prelude::*;
 use actor_runtime::registry::RegistryError;
+use actor_runtime::state_report::{ReportState, StateReported, StateReporter};
 use actor_runtime::system::ActorSystem;
 use error_stack::Report;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use std::net::SocketAddr;
 use std::sync::Arc;
 use tracing::Level;
-
-/// Where the demo host serves canvas clients.
-pub const DEMO_ADDR: &str = "127.0.0.1:7667";
 
 // --- the demo traffic ----------------------------------------------------
 
@@ -220,13 +216,15 @@ impl MsgHandler<FactMsg> for FactCounter {
     }
 }
 
-// --- the host -------------------------------------------------------------
+// --- the demo system -------------------------------------------------------
 
-/// Builds the demo system and runs its warm-up traffic until settled.
+/// Builds the demo system — demo topology, state reporter, warm-up
+/// traffic — and returns once everything has settled.
 ///
-/// Sections produced (for the export / canvas snapshot):
-/// - schemas: every demo message type;
-/// - actors: `watchdog` (service) + pool workers + partition entities;
+/// Sections produced (for the export the bridge will serve):
+/// - schemas: every demo message type plus the reporting pair;
+/// - actors: `watchdog` (service) + pool workers + partition entities +
+///   `state/reporter`;
 /// - pools: `api` (2 round-robin workers behind `api-parent`);
 /// - partitions: `accounts` (shard key `account`, 2 activated entities);
 /// - declared/observed edges: from the manifests above;
@@ -240,6 +238,8 @@ pub async fn build_demo_system() -> Arc<ActorSystem> {
     system.register_schema::<KeyedAdd>();
     system.register_schema::<Added>();
     system.register_schema::<FactMsg>();
+    system.register_schema::<ReportState>();
+    system.register_schema::<StateReported>();
 
     // 1. The topic subscriber: a service actor on `system.facts`.
     actor_runtime::builder::spawn_service_builder::<FactCounter>(&system)
@@ -309,7 +309,16 @@ pub async fn build_demo_system() -> Arc<ActorSystem> {
         })
         .expect("partition install");
 
-    // 5. Warm-up traffic: pool sends, keyed adds (activating 2
+    // 5. The state reporter: the journaled recorder the bridge serves
+    //    every state query through.
+    actor_runtime::builder::spawn_es_builder::<StateReporter>(&system)
+        .at(ActorPath::new("state/reporter"))
+        .args(json!({}))
+        .handles::<ReportState>()
+        .emits::<StateReported>()
+        .start();
+
+    // 6. Warm-up traffic: pool sends, keyed adds (activating 2
     //    entities), until each flow settles.
     for i in 0..6 {
         system
@@ -369,31 +378,34 @@ where
     panic!("demo condition never became true");
 }
 
-/// Runs the host: prints what it built, then serves canvas clients
-/// forever (the serve call IS the host's main loop).
+/// Runs the demo: installs the state bridge, prints what was built, then
+/// stays alive answering state queries until ctrl-c.
 ///
 /// # Errors
 ///
-/// Propagates listener failures from [`canvas_server::serve`].
-pub async fn run_demo_system(addr: SocketAddr) -> std::io::Result<()> {
+/// Propagates bridge installation failures (zenoh session/queryable).
+pub async fn run_demo_system() -> Result<(), state_report::StateBridgeError> {
     let system = build_demo_system().await;
+    let _session = state_report::install(system.clone(), ActorPath::new("state/reporter")).await?;
     println!("demo system ready:");
     println!("  pool       api       2 workers (round-robin)");
     println!("  partition  accounts  key=account, entities acme+globex");
     println!("  subscriber watchdog  on system.facts (service actor)");
     println!("  rule       tee       Work@api -> watchdog");
-    println!("serving canvas clients on {addr} (ctrl-c to stop)");
-    canvas_server::serve(system, addr).await
+    println!("  reporter   state/reporter (journaled StateReported)");
+    println!("answering state queries on the actor-runtime/state key (ctrl-c to stop)");
+    tokio::signal::ctrl_c()
+        .await
+        .expect("ctrl-c handler installs");
+    println!("bye");
+    Ok(())
 }
 
 #[tokio::main]
 async fn main() {
-    tracing_subscriber::fmt()
-        .with_max_level(Level::ERROR)
-        .init();
-    let addr: SocketAddr = DEMO_ADDR.parse().expect("valid demo addr");
-    if let Err(e) = run_demo_system(addr).await {
-        eprintln!("demo_host: {e}");
+    tracing_subscriber::fmt().with_max_level(Level::INFO).init();
+    if let Err(e) = run_demo_system().await {
+        eprintln!("state_report: {e}");
         std::process::exit(1);
     }
 }

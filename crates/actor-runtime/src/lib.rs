@@ -19,6 +19,7 @@ pub mod pool;
 pub mod registry;
 pub mod reply;
 pub mod schema;
+pub mod state_report;
 pub mod supervision;
 pub mod system;
 pub mod tap;
@@ -31,6 +32,7 @@ pub mod prelude {
     pub use crate::context::*;
     pub use crate::envelope::*;
     pub use crate::schema::*;
+    pub use crate::state_report::{ReportState, StateReported, StateReporter};
     pub use crate::system::*;
     pub use crate::types::*;
 }
