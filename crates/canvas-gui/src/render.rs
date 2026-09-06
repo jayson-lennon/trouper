@@ -126,6 +126,12 @@ pub fn drain_fetch(mut state: ResMut<SceneState>, channels: Res<FetchChannels>) 
                     export.pools.len(),
                     export.partitions.len()
                 );
+                bevy::log::info!(
+                    "scene v{} applied: {status}, {} rules, {} drawn arcs",
+                    state.version + 1,
+                    graph.rules.len(),
+                    laid.edges.len()
+                );
                 *state = SceneState {
                     graph,
                     layout: laid,
