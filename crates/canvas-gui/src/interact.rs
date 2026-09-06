@@ -215,29 +215,31 @@ fn ui_popups(mut contexts: EguiContexts, selection: Res<Selection>, state: Res<S
             anchored.y.clamp(8.0, (screen.height() - 320.0).max(8.0)),
         );
         egui::Window::new(format!("actor · {}", node.path))
-            .current_pos(pos)
+            .default_pos(pos)
+            .default_size(egui::vec2(360.0, 320.0))
+            .resizable(true)
             .show(ctx, |ui| {
-                kind_line(ui, node.kind);
-                contract_lines(ui, &node.manifest.handles, "handles");
-                contract_lines(ui, &node.manifest.emits, "emits");
-                if !node.manifest.subscribes.is_empty() {
-                    contract_lines(ui, &node.manifest.subscribes, "subscribes");
-                }
-                if let Some(cursor) = node.cursor {
-                    ui.label(format!("inbox cursor: {cursor}"));
-                }
-                if let Some(pretty) = node
-                    .state
-                    .as_ref()
-                    .and_then(|value| serde_json::to_string_pretty(value).ok())
-                {
-                    ui.separator();
-                    egui::ScrollArea::vertical()
-                        .max_height(180.0)
-                        .show(ui, |ui| {
+                egui::ScrollArea::vertical()
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        kind_line(ui, node.kind);
+                        contract_lines(ui, &node.manifest.handles, "handles");
+                        contract_lines(ui, &node.manifest.emits, "emits");
+                        if !node.manifest.subscribes.is_empty() {
+                            contract_lines(ui, &node.manifest.subscribes, "subscribes");
+                        }
+                        if let Some(cursor) = node.cursor {
+                            ui.label(format!("inbox cursor: {cursor}"));
+                        }
+                        if let Some(pretty) = node
+                            .state
+                            .as_ref()
+                            .and_then(|value| serde_json::to_string_pretty(value).ok())
+                        {
+                            ui.separator();
                             ui.monospace(pretty);
-                        });
-                }
+                        }
+                    });
             });
     }
 }
