@@ -18,6 +18,7 @@ use crate::types::{ActorKind, ActorPath, SchemaId, Topic};
 
 /// The topic every undeliverable message lands on; created at system boot.
 pub const DEAD_LETTER_TOPIC: &str = "system.deadletters";
+pub const FACTS_TOPIC: &str = "system.facts";
 
 /// The deliverable front door of one running actor endpoint.
 ///
@@ -234,6 +235,11 @@ impl Registry {
     /// The dead-letter topic (created at boot, always valid).
     pub fn dead_letter_topic() -> Topic {
         Topic::new(DEAD_LETTER_TOPIC)
+    }
+
+    /// The system facts topic (the tap's subscribable mirror).
+    pub fn facts_topic() -> Topic {
+        Topic::new(FACTS_TOPIC)
     }
 
     /// Registers a schema descriptor; idempotent per name+version.

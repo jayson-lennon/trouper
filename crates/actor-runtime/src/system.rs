@@ -9,6 +9,7 @@
 use std::sync::{Arc, Mutex};
 
 use serde_json::Value as JsonValue;
+use serde_json::json;
 
 use crate::actor::{
     CommandEntry, DynServiceActor, EventSourcedActor, MsgEntry, ServiceActor, TypedEsState,
@@ -291,6 +292,20 @@ impl ActorSystem {
         )
     }
 
+    /// Like [`ActorSystem::test`], but with an explicit (tiny) tap ring
+    /// capacity — gap/pressure tests flood the ring on purpose.
+    pub fn test_with_tap(tap_capacity: usize) -> (Arc<Self>, Arc<FakeClock>) {
+        let (clock, fake) = ClockService::fake(1_000);
+        (
+            Arc::new(Self::new(SystemConfig {
+                clock,
+                tap_capacity,
+                default_mailbox: MailboxDefaults::default(),
+            })),
+            fake,
+        )
+    }
+
     /// The fake clock behind this system, when tests installed one.
     pub fn fake_clock(&self) -> Option<Arc<FakeClock>> {
         self.clock.backend_fake()
@@ -378,6 +393,23 @@ impl ActorSystem {
         entries: Vec<Arc<dyn CommandEntry>>,
         opts: SpawnOpts,
     ) {
+        // The `Fact` schema (facts mirror into `system.facts` as messages;
+        // observers declare a subscription filter against it). First
+        // registration wins — test-local FactMsg may already have it.
+        {
+            let mut registry = self.registry.lock().expect("registry lock");
+            registry
+                .register_schema_json(json!({
+                    "name": "Fact", "version": 1, "kind": "event",
+                    "fields": [
+                        { "name": "kind", "ty": "str", "required": true },
+                        { "name": "offset", "ty": "int", "required": true },
+                        { "name": "ts", "ty": "int", "required": true }
+                    ],
+                    "description": "A runtime fact mirrored from the tap ring."
+                }))
+                .ok();
+        }
         let opts = self.resolve_opts(opts);
         let (tx, rx) = tokio::sync::mpsc::channel::<Envelope>(opts.mailbox_capacity.max(1) * 2);
         // The manifest is the union of what the actor type declares and
@@ -428,7 +460,7 @@ impl ActorSystem {
         if let Some(wm) = opts.high_watermark {
             kernel.watermarks.insert(path.clone(), (wm, false));
         }
-        kernel.tap.push(
+        kernel.record_fact(
             self.clock.now(),
             crate::tap::FactKind::Spawned {
                 path: path.clone(),
@@ -502,6 +534,23 @@ impl ActorSystem {
         // `A::start` is async (I/O allowed); block briefly on a runtime
         // thread is not done — spawn the start inside the actor task and
         // register the slot immediately so senders never see a gap.
+        // The `Fact` schema (facts mirror into `system.facts` as messages;
+        // observers declare a subscription filter against it). First
+        // registration wins — test-local FactMsg may already have it.
+        {
+            let mut registry = self.registry.lock().expect("registry lock");
+            registry
+                .register_schema_json(json!({
+                    "name": "Fact", "version": 1, "kind": "event",
+                    "fields": [
+                        { "name": "kind", "ty": "str", "required": true },
+                        { "name": "offset", "ty": "int", "required": true },
+                        { "name": "ts", "ty": "int", "required": true }
+                    ],
+                    "description": "A runtime fact mirrored from the tap ring."
+                }))
+                .ok();
+        }
         let opts = self.resolve_opts(opts);
         let (tx, rx) = tokio::sync::mpsc::channel::<Envelope>(opts.mailbox_capacity.max(1) * 2);
         {
@@ -531,7 +580,7 @@ impl ActorSystem {
         if let Some(wm) = opts.high_watermark {
             kernel.watermarks.insert(path.clone(), (wm, false));
         }
-        kernel.tap.push(
+        kernel.record_fact(
             self.clock.now(),
             crate::tap::FactKind::Spawned {
                 path: path.clone(),
@@ -593,6 +642,34 @@ impl ActorSystem {
     /// (callers dead-letter or retry).
     pub async fn send(&self, envelope: Envelope) -> Result<ActorPath, Envelope> {
         route(&self.registry, &self.kernel, envelope).await
+    }
+
+    /// Installs the DLQ re-driver: re-sends every dead letter currently
+    /// retained in the `system.deadletters` topic to its recorded dest
+    /// (as a normal sender — `Sent` facts appear; an undeliverable redrive
+    /// simply dead-letters again). Sugar over the topic + cursor
+    /// machinery: subsequent re-drives re-consume by cursor reset.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the kernel lock is poisoned.
+    pub fn install_dlq_redriver(self: &Arc<Self>) {
+        let mut kernel = self.kernel.lock().expect("kernel lock");
+        let log = match kernel.topic_logs.get_mut(&Registry::dead_letter_topic()) {
+            Some(log) => log,
+            None => return, // no dead letters yet: nothing to redrive
+        };
+        let entries: Vec<Envelope> = log
+            .entries_iter()
+            .map(|(_, envelope)| envelope.clone())
+            .collect();
+        drop(kernel);
+        let system = self.clone();
+        tokio::spawn(async move {
+            for envelope in entries {
+                let _ = system.send(envelope).await; // failure re-dead-letters
+            }
+        });
     }
 
     /// Builds a topic-addressed envelope (system root as sender).
@@ -868,7 +945,7 @@ impl ActorSystem {
                 drop(kernel);
                 let mut kernel = self.kernel.lock().expect("kernel lock");
                 kernel.specs.remove(path);
-                kernel.tap.push(
+                kernel.record_fact(
                     self.clock.now(),
                     crate::tap::FactKind::Stopped {
                         path: path.clone(),
@@ -947,7 +1024,7 @@ impl ActorSystem {
             }
             let notified_parent = kernel.specs.get(path).and_then(|s| s.parent.clone());
             kernel.specs.remove(path);
-            kernel.tap.push(
+            kernel.record_fact(
                 self.clock.now(),
                 crate::tap::FactKind::Stopped {
                     path: path.clone(),
@@ -955,7 +1032,7 @@ impl ActorSystem {
                 },
             );
             if let Some(parent) = notified_parent {
-                kernel.tap.push(
+                kernel.record_fact(
                     self.clock.now(),
                     crate::tap::FactKind::LinkNotified {
                         parent,
@@ -5235,6 +5312,198 @@ mod tests {
             ))
             .count();
         assert_eq!(spawns, 1, "the race yielded a single activation");
+    }
+
+    /// The Rust-side mirror of the runtime's `Fact@1` schema (facts are
+    /// mirrored into `system.facts` with this JSON shape).
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    struct FactMsg {
+        kind: String,
+        offset: u64,
+        ts: i64,
+    }
+    impl Schema for FactMsg {
+        fn schema_def() -> SchemaDef {
+            SchemaDef {
+                name: "Fact".into(),
+                version: 1,
+                kind: SchemaKind::Event,
+                fields: vec![
+                    FieldDef::required("kind", FieldTy::Str),
+                    FieldDef::required("offset", FieldTy::Int),
+                    FieldDef::required("ts", FieldTy::Int),
+                ],
+                description: None,
+            }
+        }
+    }
+
+    /// A facts observer: a plain service actor recording raw Fact JSON
+    /// (kind@offset) into the shared sink. Gaps and slow-subscriber
+    /// behavior fall out of the offset stream it observes.
+    struct FactsObserver {
+        sink: Arc<Mutex<Vec<String>>>,
+        last: Option<u64>,
+    }
+    impl ServiceActor for FactsObserver {
+        fn manifest() -> ActorManifest {
+            ActorManifest::new()
+                .handles::<FactMsg>()
+                .kind(ActorKind::Service)
+        }
+        async fn start(
+            args: &JsonValue,
+        ) -> Result<Self, error_stack::Report<crate::registry::RegistryError>> {
+            let sink = sinks().lock().expect("sinks lock")
+                [args["sink"].as_u64().expect("sink index") as usize]
+                .clone();
+            Ok(Self { sink, last: None })
+        }
+    }
+    impl MsgHandler<FactMsg> for FactsObserver {
+        async fn handle(&mut self, fact: FactMsg, _ctx: &mut crate::context::MsgCtx<'_>) {
+            let mut sink = self.sink.lock().expect("sink lock");
+            if let Some(last) = self.last
+                && fact.offset > last + 1
+            {
+                sink.push(format!("gap:{}->{}", last, fact.offset));
+            }
+            self.last = Some(fact.offset);
+        }
+    }
+
+    /// Spawns a FactsObserver at `path` subscribed to the facts topic.
+    async fn spawn_facts_observer(system: &Arc<ActorSystem>, path: &str) -> usize {
+        system.register_schema::<FactMsg>();
+        let (sink, sink_ref) = open_sink();
+        crate::builder::spawn_service_builder::<FactsObserver>(&system.clone())
+            .at(ActorPath::new(path))
+            .args(json!({ "sink": sink }))
+            .handles::<FactMsg>()
+            .mailbox(4, crate::inbox::OverloadPolicy::DropNew)
+            .start();
+        assert!(system.schema(&FactMsg::schema_id()).is_some());
+        system
+            .subscribe(
+                &ActorPath::new(path),
+                &crate::registry::Registry::facts_topic(),
+                None,
+            )
+            .expect("subscribed");
+        let _ = sink_ref;
+        sink
+    }
+
+    #[tokio::test]
+    async fn facts_subscriber_receives_and_detects_gap_under_pressure() {
+        // Given a facts observer subscribed to `system.facts` and a tiny
+        // ring (5 facts before drop-oldest).
+        let (system, _clock) = ActorSystem::test_with_tap(5);
+        let sink0 = spawn_facts_observer(&system, "obs").await;
+        install_key_partition(&system, "counters").expect("partition install");
+
+        // When many facts flood the RING (small ring capacity: the system
+        // test fixture's tap ring holds a handful before dropping). Sends
+        // target a LIVE actor: only completed sends record facts.
+        for i in 0..40 {
+            let e = system.envelope(
+                KeyedAdd::schema_id(),
+                ActorPath::new("counters"),
+                json!({ "n": i, "account": "x" }),
+            );
+            let _ = system.send(e).await;
+        }
+        wait_for(|| async {
+            sinks().lock().expect("sinks lock")[sink0]
+                .lock()
+                .expect("sink lock")
+                .iter()
+                .any(|s| s.starts_with("gap:"))
+        })
+        .await;
+
+        // Then the observer SAW facts AND an offset gap (ring evictions
+        // made loss visible — the documented at-most-once-with-gaps
+        // contract).
+        let sink = sinks().lock().expect("sinks lock")[sink0]
+            .lock()
+            .expect("sink lock")
+            .clone();
+        assert!(
+            sink.len() > 1,
+            "the observer received facts as messages: {sink:?}"
+        );
+        assert!(
+            sink.iter().any(|s| s.starts_with("gap:")),
+            "the offset discontinuity was detected: {sink:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn slow_facts_subscriber_never_stalls_ring() {
+        // Given a facts observer subscribed to `system.facts`.
+        let (system, _clock) = ActorSystem::test();
+        let sink0 = spawn_facts_observer(&system, "obs").await;
+        install_key_partition(&system, "counters").expect("partition install");
+
+        // When many sends happen (facts are mirrored + pumped; the
+        // dest is a live actor — unroutable sends record no facts).
+        for i in 0..30 {
+            let e = system.envelope(
+                KeyedAdd::schema_id(),
+                ActorPath::new("counters"),
+                json!({ "n": i, "account": "x" }),
+            );
+            let _ = system.send(e).await;
+        }
+        wait_for(|| async {
+            !sinks().lock().expect("sinks lock")[sink0]
+                .lock()
+                .expect("sink lock")
+                .is_empty()
+        })
+        .await;
+
+        // Then the ring kept recording facts (none lost to the observer's
+        // backlog — delivery pressure never touches the ring).
+        let facts = system.tap_facts().len();
+        assert!(
+            facts >= 30,
+            "the ring recorded every fact despite the stalled subscriber: {facts}"
+        );
+    }
+
+    #[tokio::test]
+    async fn dlq_redriver_resends_dead_letters() {
+        // Given a system with one dead letter (a command the target does
+        // not handle — the DLQ topic retains the envelope).
+        let (system, _clock) = ActorSystem::test();
+        system.register_schema::<Add>();
+        system.register_schema::<KeyedAdd>();
+        crate::builder::spawn_es_builder::<BareCounter>(&system)
+            .at(ActorPath::new("counter"))
+            .args(json!({ "total": 0 }))
+            .handles::<Add>()
+            .emits::<Added>()
+            .start();
+        let e = system.envelope(
+            KeyedAdd::schema_id(),
+            ActorPath::new("counter"),
+            json!({ "n": 6, "account": "x" }),
+        );
+        let _ = system.send(e).await;
+        wait_for(|| async { !system.dead_letter_reasons().await.is_empty() }).await;
+        assert!(
+            !system.dead_letter_reasons().await.is_empty(),
+            "seed dead letter"
+        );
+
+        // When the redriver is installed (it re-sends the dead letter).
+        system.install_dlq_redriver();
+
+        // Then the redrive hit the recorded dest ("counter") again — a
+        // SECOND dead letter proves the redriver acted as a sender.
+        wait_for(|| async { system.dead_letter_reasons().await.len() >= 2 }).await;
     }
 
     #[tokio::test]

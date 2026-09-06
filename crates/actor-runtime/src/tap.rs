@@ -243,6 +243,11 @@ impl TapRing {
         }
     }
 
+    /// The offset the NEXT pushed fact will carry.
+    pub fn next_offset(&self) -> u64 {
+        self.next_offset
+    }
+
     /// Appends a fact; the oldest drops when full. Returns the offset.
     pub fn push(&mut self, ts: crate::types::Timestamp, kind: FactKind) -> u64 {
         let offset = self.next_offset;

@@ -158,6 +158,40 @@ impl KernelState {
     }
 }
 
+impl KernelState {
+    /// Records one fact: the tap ring AND (mirrored, at-most-once) the
+    /// `system.facts` topic log. The ring's drop-oldest rule is untouched;
+    /// gaps appear when the RING drops, never in the topic log itself
+    /// (which is bounded separately). Fact offsets make any loss visible.
+    pub fn record_fact(&mut self, ts: crate::types::Timestamp, kind: crate::tap::FactKind) {
+        // Push a shadow fact with its ring offset into the facts topic,
+        // then the fact itself into the ring (same offset).
+        let shadow = crate::tap::Fact {
+            offset: self.tap.next_offset(),
+            ts,
+            kind: kind.clone(),
+        };
+        let log = self
+            .topic_logs
+            .entry(Registry::facts_topic())
+            .or_insert_with(|| crate::topics::TopicLog::new(4096));
+        log.append(Envelope::json(
+            SchemaId::new("Fact", 1),
+            crate::envelope::Address::Topic(Registry::facts_topic()),
+            shadow.to_json(),
+            TraceCtx::root(),
+        ));
+        self.tap.push(ts, kind);
+    }
+}
+
+/// Pumps the `system.facts` topic after a record (facts reach live
+/// subscribers as messages, per-subscriber cursors, slow-subscriber
+/// isolation — never touching the ring).
+async fn pump_facts(kernel: &Mutex<KernelState>, registry: &Mutex<Registry>) {
+    pump_topic(kernel, registry, &Registry::facts_topic()).await;
+}
+
 /// Emits one fact onto the tap with the given clock's timestamp.
 pub fn emit(
     tap_clock: &Mutex<KernelState>,
@@ -165,7 +199,7 @@ pub fn emit(
     kind: crate::tap::FactKind,
 ) {
     let ts = clock.now();
-    tap_clock.lock().expect("kernel lock").tap.push(ts, kind);
+    tap_clock.lock().expect("kernel lock").record_fact(ts, kind);
 }
 
 /// Kernel-facing handle for one running actor loop.
@@ -246,6 +280,17 @@ pub async fn route(
     kernel: &Mutex<KernelState>,
     envelope: Envelope,
 ) -> Result<ActorPath, Envelope> {
+    let result = route_inner(registry, kernel, envelope).await;
+    // Facts recorded anywhere on this send path reach live observers.
+    pump_facts(kernel, registry).await;
+    result
+}
+
+async fn route_inner(
+    registry: &Mutex<Registry>,
+    kernel: &Mutex<KernelState>,
+    envelope: Envelope,
+) -> Result<ActorPath, Envelope> {
     let dest = envelope.dest.clone();
     match dest {
         Address::Path(ref path) => {
@@ -272,7 +317,7 @@ pub async fn route(
                 if let Some(endpoint) = endpoint {
                     let _ = deliver_with_retry(&endpoint, copy).await;
                     let mut kernel_table = kernel.lock().expect("kernel lock");
-                    kernel_table.tap.push(
+                    kernel_table.record_fact(
                         origin_trace.causality_id.as_millis_ts(),
                         crate::tap::FactKind::Sent {
                             from: envelope.from.clone(),
@@ -331,7 +376,7 @@ pub async fn route(
             }
             {
                 let mut kernel = kernel.lock().expect("kernel lock");
-                kernel.tap.push(
+                kernel.record_fact(
                     envelope.trace.causality_id.as_millis_ts(),
                     crate::tap::FactKind::Sent {
                         from: envelope.from.clone(),
@@ -363,7 +408,7 @@ pub async fn route(
             deliver_with_retry(&endpoint, envelope.clone()).await?;
             {
                 let mut kernel = kernel.lock().expect("kernel lock");
-                kernel.tap.push(
+                kernel.record_fact(
                     envelope.trace.causality_id.as_millis_ts(),
                     crate::tap::FactKind::Sent {
                         from: envelope.from.clone(),
@@ -379,7 +424,7 @@ pub async fn route(
             publish_to_topic(kernel, registry, topic.clone(), envelope.clone()).await;
             {
                 let mut kernel = kernel.lock().expect("kernel lock");
-                kernel.tap.push(
+                kernel.record_fact(
                     envelope.trace.causality_id.as_millis_ts(),
                     crate::tap::FactKind::Sent {
                         from: envelope.from.clone(),
@@ -547,7 +592,7 @@ pub fn dead_letter(
         .entry(Registry::dead_letter_topic())
         .or_insert_with(|| crate::topics::TopicLog::new(256));
     log.append(envelope.clone());
-    kernel.tap.push(
+    kernel.record_fact(
         envelope.trace.causality_id.as_millis_ts(),
         crate::tap::FactKind::DeadLettered {
             dest: envelope.dest.clone(),
@@ -619,7 +664,7 @@ pub async fn front_door_loop(
         if let Some((wm, fired)) = kernel_state.watermarks.get_mut(&cell.path) {
             if depth > *wm && !*fired {
                 *fired = true;
-                kernel_state.tap.push(
+                kernel_state.record_fact(
                     envelope.trace.causality_id.as_millis_ts(),
                     crate::tap::FactKind::Backpressured {
                         path: cell.path.clone(),
@@ -691,7 +736,7 @@ async fn step_es(ctx: &EsLoop) -> Step {
     };
     {
         let mut kernel = ctx.kernel.lock().expect("kernel lock");
-        kernel.tap.push(
+        kernel.record_fact(
             envelope.trace.causality_id.as_millis_ts(),
             crate::tap::FactKind::Delivered {
                 to: ctx.path.clone(),
@@ -771,7 +816,7 @@ async fn step_es(ctx: &EsLoop) -> Step {
             {
                 let mut kernel = ctx.kernel.lock().expect("kernel lock");
                 kernel.crashed.insert(ctx.path.clone());
-                kernel.tap.push(
+                kernel.record_fact(
                     envelope.trace.causality_id.as_millis_ts(),
                     crate::tap::FactKind::Failed {
                         path: ctx.path.clone(),
@@ -844,7 +889,7 @@ async fn step_es(ctx: &EsLoop) -> Step {
     ctx.cell.inbox.lock().await.ack();
     {
         let mut kernel = ctx.kernel.lock().expect("kernel lock");
-        kernel.tap.push(
+        kernel.record_fact(
             envelope.trace.causality_id.as_millis_ts(),
             crate::tap::FactKind::Acked {
                 to: ctx.path.clone(),
@@ -873,6 +918,9 @@ async fn step_es(ctx: &EsLoop) -> Step {
 
     // 10. MAYBE SNAPSHOT (policy-gated, BETWEEN messages).
     maybe_snapshot(ctx, seqs).await;
+
+    // 11. FACTS PUMP (recorded facts reach live observers).
+    pump_facts(&ctx.kernel, &ctx.registry).await;
     Step::Work
 }
 
@@ -1003,7 +1051,7 @@ impl crate::context::AskPort for KernelAskPort {
                     dest: dest.clone(),
                     trace,
                 });
-                kernel.tap.push(
+                kernel.record_fact(
                     now,
                     crate::tap::FactKind::AskOpened {
                         from: ActorPath::new("anonymous"),
@@ -1039,7 +1087,7 @@ impl crate::context::AskPort for KernelAskPort {
             dest: dest.clone(),
             trace,
         });
-        kernel.tap.push(
+        kernel.record_fact(
             trace.causality_id.as_millis_ts(),
             crate::tap::FactKind::AskSettled { outcome, trace },
         );
@@ -1090,7 +1138,7 @@ fn record_publish_facts(
         from: envelope.from.clone(),
         trace: envelope.trace,
     });
-    kernel.tap.push(
+    kernel.record_fact(
         envelope.trace.causality_id.as_millis_ts(),
         crate::tap::FactKind::TopicPublished {
             topic: topic.clone(),
@@ -1257,7 +1305,7 @@ async fn snapshot_now(ctx: &EsLoop, last: crate::types::SeqNo) {
         let mut kernel = ctx.kernel.lock().expect("kernel lock");
         let journal = kernel.journals.entry(ctx.path.clone()).or_default();
         journal.append_snapshot(last, blob, now.as_millis());
-        kernel.tap.push(
+        kernel.record_fact(
             now,
             crate::tap::FactKind::SnapshotTaken {
                 path: ctx.path.clone(),
@@ -1360,7 +1408,7 @@ async fn step_service(ctx: &ServiceLoop) -> Step {
 
     {
         let mut kernel = ctx.es.kernel.lock().expect("kernel lock");
-        kernel.tap.push(
+        kernel.record_fact(
             envelope.trace.causality_id.as_millis_ts(),
             crate::tap::FactKind::Delivered {
                 to: ctx.es.path.clone(),
@@ -1466,6 +1514,9 @@ async fn step_service(ctx: &ServiceLoop) -> Step {
 
     // 6. FLUSH deferred effects from the handler.
     flush_outbox(&ctx.es, outbox).await;
+
+    // 7. FACTS PUMP (recorded facts reach live observers).
+    pump_facts(&ctx.es.kernel, &ctx.es.registry).await;
     Step::Work
 }
 
@@ -1528,7 +1579,7 @@ pub async fn restart_es(
             .es_state
             .insert(ctx.path.clone(), Arc::new(tokio::sync::Mutex::new(fresh)));
         kernel.crashed.remove(&ctx.path);
-        kernel.tap.push(
+        kernel.record_fact(
             ctx.clock.now(),
             crate::tap::FactKind::Spawned {
                 path: ctx.path.clone(),
@@ -1722,14 +1773,14 @@ async fn escalate(
         kernel.crashed.remove(&spec.path);
         // The child is gone: record the stop WITH its typed reason, then
         // the escalation.
-        kernel.tap.push(
+        kernel.record_fact(
             system.clock.now(),
             crate::tap::FactKind::Stopped {
                 path: spec.path.clone(),
                 reason: stop_reason,
             },
         );
-        kernel.tap.push(
+        kernel.record_fact(
             system.clock.now(),
             crate::tap::FactKind::Escalated {
                 path: spec.path.clone(),

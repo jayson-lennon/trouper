@@ -132,6 +132,11 @@ impl TopicLog {
         (self.floor, self.next_offset)
     }
 
+    /// Iterates the retained `(offset, envelope)` entries.
+    pub fn entries_iter(&self) -> impl Iterator<Item = &(u64, Envelope)> {
+        self.entries.iter()
+    }
+
     /// One pump pass: offers every subscriber every retained entry past
     /// its cursor. `deliver` receives `(subscriber, envelope)` and
     /// answers whether the subscriber's inbox ACCEPTED it; only then
