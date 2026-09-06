@@ -34,16 +34,6 @@ use crate::journal::{Journal, JournalEntry, JournalError};
 use crate::registry::{Endpoint, Registry};
 use crate::types::{ActorPath, InboxOffset, SchemaId, SeqNo};
 
-/// How often an ES actor takes journal snapshots. Default: OFF.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum SnapshotPolicy {
-    /// Never snapshot (replay is always full).
-    #[default]
-    Off,
-    /// Snapshot every `n` events (taken BETWEEN messages, never mid-step).
-    EveryN(u64),
-}
-
 /// An envelope the runtime could not deliver or decode.
 ///
 /// Kept inspectable — dropped messages must stay observable, never silently
@@ -190,6 +180,12 @@ impl KernelState {
 /// isolation — never touching the ring).
 async fn pump_facts(kernel: &Mutex<KernelState>, registry: &Mutex<Registry>) {
     pump_topic(kernel, registry, &Registry::facts_topic()).await;
+}
+
+/// Public facts pump for non-route fact sources (e.g. the stop path):
+/// pushes facts already recorded by those paths to live subscribers.
+pub async fn pump_facts_now(kernel: &Mutex<KernelState>, registry: &Mutex<Registry>) {
+    pump_facts(kernel, registry).await;
 }
 
 /// Emits one fact onto the tap with the given clock's timestamp.
@@ -985,7 +981,12 @@ fn apply_subscribe(
         .topic_logs
         .entry(topic.clone())
         .or_insert_with(|| crate::topics::TopicLog::new(256));
-    log.subscribe(path.clone(), policy, crate::topics::CursorFrom::Latest);
+    log.subscribe(
+        path.clone(),
+        policy,
+        crate::topics::CursorFrom::Latest,
+        crate::topics::SubscriptionFilter::all(),
+    );
 }
 
 /// The kernel's ask port: opens leases, routes request envelopes,

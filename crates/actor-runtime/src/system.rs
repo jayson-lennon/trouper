@@ -20,7 +20,7 @@ use crate::context::RuntimeView;
 use crate::envelope::{Address, Envelope, TraceCtx};
 use crate::inbox::{Inbox, OverloadPolicy};
 pub use crate::kernel::DeadLetter;
-use crate::kernel::{ActorCell, EsLoop, KernelState, route};
+use crate::kernel::{ActorCell, EsLoop, KernelState, pump_facts_now, route};
 use crate::registry::{Endpoint, EndpointInfo, Registry};
 use crate::schema::Schema;
 use crate::types::{ActorPath, InboxOffset, SchemaId, Timestamp};
@@ -787,6 +787,32 @@ impl ActorSystem {
         topic: &crate::types::Topic,
         offset: Option<u64>,
     ) -> Result<u64, error_stack::Report<crate::registry::RegistryError>> {
+        self.subscribe_filtered(
+            path,
+            topic,
+            offset,
+            crate::topics::SubscriptionFilter::all(),
+        )
+    }
+
+    /// Subscribes `path` to `topic` with an entry FILTER: only envelopes
+    /// passing the filter are offered to the actor's inbox; filtered-out
+    /// entries are skipped silently (the cursor moves past them — a
+    /// filter hides entries, it does not queue them). Use this to build
+    /// observers that care about one slice of a busy topic (e.g. only
+    /// `DeadLettered` facts on `system.facts`).
+    ///
+    /// # Errors
+    ///
+    /// [`crate::registry::RegistryError::UnknownPath`] when the
+    /// subscriber has no live cell (spawn it first).
+    pub fn subscribe_filtered(
+        &self,
+        path: &ActorPath,
+        topic: &crate::types::Topic,
+        offset: Option<u64>,
+        filter: crate::topics::SubscriptionFilter,
+    ) -> Result<u64, error_stack::Report<crate::registry::RegistryError>> {
         use error_stack::IntoReport;
         let mut kernel = self.kernel.lock().expect("kernel lock");
         let registry = self.registry.lock().expect("registry lock");
@@ -804,7 +830,7 @@ impl ActorSystem {
             .topic_logs
             .entry(topic.clone())
             .or_insert_with(|| crate::topics::TopicLog::new(256));
-        Ok(log.subscribe(path.clone(), policy, from))
+        Ok(log.subscribe(path.clone(), policy, from, filter))
     }
 
     /// Re-points a subscriber's topic cursor; the next publish pumps the
@@ -945,6 +971,17 @@ impl ActorSystem {
     ) -> Result<(), error_stack::Report<crate::registry::RegistryError>> {
         let mut registry = self.registry.lock().expect("registry lock");
         registry.install_partition_set(spec)
+    }
+
+    /// Appends a router rule (declaration order is priority order): when
+    /// a path-addressed envelope matches all of the rule's `Some`
+    /// criteria, the rule's action applies at [`route`](crate::kernel)
+    /// time — a `Tee` copies the envelope to an observer at-most-once
+    /// (never an audit mechanism), an `Inline` interposes the observer in
+    /// the primary's place.
+    pub fn install_rule(&self, rule: crate::pool::Rule) {
+        let mut registry = self.registry.lock().expect("registry lock");
+        registry.add_rule(rule);
     }
 
     /// The bounded stop; recursion depth bounded by timeout.
@@ -1088,6 +1125,9 @@ impl ActorSystem {
                 );
             }
         }
+        // Facts recorded by the stop path (StoppedWithMail DLs, Stopped,
+        // LinkNotified) reach live topic subscribers like any other fact.
+        pump_facts_now(&self.kernel, &self.registry).await;
     }
 
     /// Exports the system: schemas, live actors (ES state included),
@@ -5513,12 +5553,18 @@ mod tests {
             {
                 sink.push(format!("gap:{}->{}", last, fact.offset));
             }
+            sink.push(format!("{}@{}", fact.kind, fact.offset));
             self.last = Some(fact.offset);
         }
     }
 
-    /// Spawns a FactsObserver at `path` subscribed to the facts topic.
-    async fn spawn_facts_observer(system: &Arc<ActorSystem>, path: &str) -> usize {
+    /// Spawns a FactsObserver at `path` subscribed to the facts topic
+    /// with the given subscription filter (pass-through when `None`).
+    async fn spawn_facts_observer_filtered(
+        system: &Arc<ActorSystem>,
+        path: &str,
+        filter: Option<crate::topics::SubscriptionFilter>,
+    ) -> usize {
         system.register_schema::<FactMsg>();
         let (sink, sink_ref) = open_sink();
         crate::builder::spawn_service_builder::<FactsObserver>(&system.clone())
@@ -5528,15 +5574,27 @@ mod tests {
             .mailbox(4, crate::inbox::OverloadPolicy::DropNew)
             .start();
         assert!(system.schema(&FactMsg::schema_id()).is_some());
-        system
-            .subscribe(
+        let subscription = match filter {
+            Some(filter) => system.subscribe_filtered(
                 &ActorPath::new(path),
                 &crate::registry::Registry::facts_topic(),
                 None,
-            )
-            .expect("subscribed");
+                filter,
+            ),
+            None => system.subscribe(
+                &ActorPath::new(path),
+                &crate::registry::Registry::facts_topic(),
+                None,
+            ),
+        };
+        subscription.expect("subscribed");
         let _ = sink_ref;
         sink
+    }
+
+    /// Spawns a FactsObserver at `path` subscribed to the facts topic.
+    async fn spawn_facts_observer(system: &Arc<ActorSystem>, path: &str) -> usize {
+        spawn_facts_observer_filtered(system, path, None).await
     }
 
     #[tokio::test]
@@ -5582,6 +5640,56 @@ mod tests {
             sink.iter().any(|s| s.starts_with("gap:")),
             "the offset discontinuity was detected: {sink:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn subscribe_filtered_hides_non_matching_facts() {
+        // Given a facts observer subscribed to `system.facts` with a
+        // filter that only admits Stopped facts.
+        let (system, _clock) = ActorSystem::test();
+        system.register_schema::<Add>();
+        let sink0 = spawn_facts_observer_filtered(
+            &system,
+            "filtered-obs",
+            Some(crate::topics::SubscriptionFilter {
+                kind: Some("stopped".into()),
+                ..crate::topics::SubscriptionFilter::default()
+            }),
+        )
+        .await;
+
+        // When a command is sent (Sent/Delivered/Acked facts flow) and
+        // the target actor is then stopped (a Stopped fact flows).
+        let counter = ActorPath::new("fc");
+        system.spawn_es::<BareCounter, _>(
+            counter.clone(),
+            &json!({}),
+            SpawnOpts::default(),
+            || vec![Arc::new(TypedEsAdapter::<BareCounter, Add>::new::<Add>())],
+        );
+        system
+            .send(system.envelope(Add::schema_id(), counter.clone(), json!({ "n": 1 })))
+            .await
+            .expect("delivered");
+        wait_for_cursor(&system, &counter, 1).await;
+        system.stop(&counter).await;
+
+        // Then the observer received ONLY the Stopped fact — every other
+        // fact kind was hidden by the filter.
+        wait_for(|| async {
+            !sinks().lock().expect("sinks lock")[sink0]
+                .lock()
+                .expect("sink lock")
+                .is_empty()
+        })
+        .await;
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let sink = sinks().lock().expect("sinks lock")[sink0]
+            .lock()
+            .expect("sink lock")
+            .clone();
+        assert_eq!(sink.len(), 1, "only the Stopped fact passed: {sink:?}");
+        assert!(sink[0].starts_with("stopped"), "got: {sink:?}");
     }
 
     #[tokio::test]
@@ -5693,12 +5801,14 @@ mod tests {
 
         // Then every message landed in a worker through the public name
         // (the sender never saw a worker path), and the tap shows the
-        // router signature: Sent{dest: public} → Delivered{to: worker}.
+        // router signature: Sent{dest: public} → Delivered{to: worker},
+        // LINKED by a shared trace id (one causal conversation, routed).
         assert_eq!(
             *sink.lock().expect("sink lock"),
             vec!["n=1", "n=2", "n=3", "n=4", "n=5", "n=6"]
         );
-        let to_workers = system.tap_facts().iter().any(|f| {
+        let facts = system.tap_facts();
+        let to_workers = facts.iter().any(|f| {
             matches!(
                 &f.kind,
                 crate::tap::FactKind::Delivered { to, .. }
@@ -5706,21 +5816,95 @@ mod tests {
             )
         });
         assert!(to_workers, "deliveries landed on worker paths");
+        // Trace linkage: each Delivered-to-worker fact shares its trace id
+        // with the Sent fact of the same routed message (the router
+        // preserves the sender's trace; only the causality hop moves on).
+        let sent_traces: std::collections::HashSet<_> = facts
+            .iter()
+            .filter_map(|f| match &f.kind {
+                crate::tap::FactKind::Sent { trace, .. } => Some(trace.trace_id),
+                _ => None,
+            })
+            .collect();
+        let worker_delivered = facts.iter().filter(|f| {
+            matches!(&f.kind,
+                crate::tap::FactKind::Delivered { to, .. }
+                if to.as_str().starts_with("public/worker-"))
+        });
+        let mut linked = 0;
+        for fact in worker_delivered {
+            if let crate::tap::FactKind::Delivered { trace, .. } = &fact.kind {
+                assert!(
+                    sent_traces.contains(&trace.trace_id),
+                    "worker Delivered trace {} links to its sender's Sent trace",
+                    trace.trace_id
+                );
+                linked += 1;
+            }
+        }
+        assert!(linked > 0, "at least one routed delivery was trace-linked");
     }
 
     #[tokio::test]
     async fn pool_takeover_stop_drains_queued_mail_to_dlq() {
-        // Given a LIVE plain actor at "pub" (its slot + loop running).
+        // Given a LIVE service actor at "pub" whose FIRST handler parks
+        // forever: messages sent behind it stay QUEUED (un-acked).
+        #[derive(Serialize, Deserialize, Default)]
+        struct Parked;
+        impl ServiceActor for Parked {
+            fn manifest() -> ActorManifest {
+                ActorManifest::new().kind(ActorKind::Service)
+            }
+            async fn start(
+                _args: &JsonValue,
+            ) -> Result<Self, error_stack::Report<crate::registry::RegistryError>> {
+                Ok(Self)
+            }
+        }
+        impl MsgHandler<Add> for Parked {
+            async fn handle(&mut self, _msg: Add, _ctx: &mut crate::context::MsgCtx<'_>) {
+                if !TAKEOVER_PARK_ONE.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                    // Park until the test ends (dropped sender).
+                    let (_tx, rx) = tokio::sync::oneshot::channel::<()>();
+                    let _ = rx.await;
+                }
+            }
+        }
+
+        static TAKEOVER_PARK_ONE: std::sync::atomic::AtomicBool =
+            std::sync::atomic::AtomicBool::new(false);
         let (system, _clock) = ActorSystem::test();
         system.register_schema::<Add>();
         system.register_schema::<Added>();
         let public = ActorPath::new("pub");
-        system.spawn_es::<BareCounter, _>(public.clone(), &json!({}), SpawnOpts::default(), || {
-            vec![Arc::new(TypedEsAdapter::<BareCounter, Add>::new::<Add>())]
+        system.spawn_service::<Parked, _>(public.clone(), &json!({}), SpawnOpts::default(), || {
+            vec![Arc::new(TypedServiceAdapter::<Parked, Add>::new::<Add>())]
         });
         wait_for(|| async { system.inbox_cursor(&public).is_some() }).await;
+        // One message is taken (the handler parks), two more stay queued.
+        for n in 1..=3_i64 {
+            system
+                .send(system.envelope(Add::schema_id(), public.clone(), json!({ "n": n })))
+                .await
+                .expect("delivered");
+        }
+        wait_for(|| async {
+            system
+                .inbox_cursor(&public)
+                .map(|c| c.as_u64())
+                .unwrap_or(0)
+                >= 1
+        })
+        .await;
+        let queued = {
+            let kernel = system.kernel.lock().expect("kernel lock");
+            let cell = kernel.cells.get(&public).expect("cell");
+            cell.inbox.try_lock().map(|inbox| inbox.len()).unwrap_or(0)
+        };
+        assert!(queued >= 2, "mail is queued behind the parked handler");
 
-        // When the pool takes the public path over (stop-drain first).
+        // When the pool takes the public path over: the takeover stop-
+        // drains the live actor FIRST, flushing its queued mail to the DLQ.
         let (sink_idx, sink) = open_sink();
         bind_sink(&ActorPath::new("pub"), sink.clone());
         system
@@ -5734,24 +5918,33 @@ mod tests {
             .await
             .expect("takeover installs");
 
-        // Then the pool claimed the public path, the plain actor's slot is
-        // gone, and mail keeps flowing to the SAME public name (senders
-        // unchanged; the takeover was invisible to them). The stop-drain's
-        // undelivered-mail → DLQ half is exercised by the stop tests.
+        // Then the takeover was invisible to senders (the pool claimed the
+        // public path, and post-takeover mail reaches a worker).
         let taken = {
             let registry = system.registry.lock().expect("registry lock");
             registry.pools.contains_key(&public)
         };
         assert!(taken, "pool claimed the public path");
-        wait_for(|| async {
-            system
-                .send(system.envelope(Add::schema_id(), public.clone(), json!({ "n": 9 })))
-                .await
-                .is_ok()
-        })
-        .await;
+        system
+            .send(system.envelope(Add::schema_id(), public.clone(), json!({ "n": 9 })))
+            .await
+            .expect("delivered to a worker");
         wait_for(|| async { sink.lock().expect("sink lock").len() == 1 }).await;
         assert_eq!(*sink.lock().expect("sink lock"), vec!["n=9"]);
+
+        // And the stop-drain flushed the parked actor's queued mail to the
+        // DLQ with the typed StoppedWithMail reason (2 queued messages).
+        let stopped_with_mail = system
+            .dead_letter_reasons()
+            .await
+            .iter()
+            .filter(|r| r.as_str().contains("StoppedWithMail"))
+            .count();
+        assert!(
+            stopped_with_mail >= 1,
+            "takeover stop-drain DLQed the queued mail; reasons: {:?}",
+            system.dead_letter_reasons().await
+        );
     }
 
     #[tokio::test]
@@ -5799,35 +5992,156 @@ mod tests {
 
     #[tokio::test]
     async fn pool_worker_escalates_to_spec_parent() {
-        // Given a pool whose workers are supervised children of "boss".
+        // Given a pool whose one worker is a supervised child of "boss"
+        // (an Overseer service actor handling the Escalated control
+        // schema), and the worker's handler ALWAYS panics.
+        struct BoomWorker;
+        impl ServiceActor for BoomWorker {
+            fn manifest() -> ActorManifest {
+                ActorManifest::new().kind(ActorKind::Service)
+            }
+            async fn start(
+                _args: &JsonValue,
+            ) -> Result<Self, error_stack::Report<crate::registry::RegistryError>> {
+                Ok(Self)
+            }
+        }
+        impl MsgHandler<Add> for BoomWorker {
+            async fn handle(&mut self, _msg: Add, _ctx: &mut crate::context::MsgCtx<'_>) {
+                panic!("worker always panics");
+            }
+        }
+
+        // The overseer receives the Escalated control message via the
+        // shared by-path sink table (the engine sends it as a plain send).
         let (system, _clock) = ActorSystem::test();
-        system.register_schema::<Add>();
-        let (sink_idx, sink) = open_sink();
-        bind_sink(&ActorPath::new("crew"), sink);
         let parent = ActorPath::new("boss");
+        bind_sink(&parent, Arc::new(std::sync::Mutex::new(Vec::new())));
+        struct Overseer;
+        impl ServiceActor for Overseer {
+            fn manifest() -> ActorManifest {
+                ActorManifest::new().kind(ActorKind::Service)
+            }
+            async fn start(
+                _args: &JsonValue,
+            ) -> Result<Self, error_stack::Report<crate::registry::RegistryError>> {
+                Ok(Self)
+            }
+        }
+        #[derive(serde::Deserialize)]
+        struct EscalatedMsg {
+            escalated: String,
+        }
+        impl Schema for EscalatedMsg {
+            fn schema_def() -> SchemaDef {
+                SchemaDef {
+                    name: "Escalated".into(),
+                    version: 1,
+                    kind: SchemaKind::Command,
+                    fields: vec![FieldDef::required("escalated", FieldTy::Str)],
+                    description: None,
+                }
+            }
+        }
+        impl MsgHandler<EscalatedMsg> for Overseer {
+            async fn handle(&mut self, msg: EscalatedMsg, _ctx: &mut crate::context::MsgCtx<'_>) {
+                if let Some(s) = SINK_BY_PATH
+                    .get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+                    .lock()
+                    .expect("table")
+                    .get("boss")
+                {
+                    s.lock()
+                        .expect("sink lock")
+                        .push(format!("escalated:{}", msg.escalated))
+                }
+            }
+        }
+        system.spawn_service::<Overseer, _>(
+            parent.clone(),
+            &json!({}),
+            SpawnOpts::default(),
+            || {
+                vec![Arc::new(
+                    TypedServiceAdapter::<Overseer, EscalatedMsg>::new::<EscalatedMsg>(),
+                )]
+            },
+        );
+
+        // The pool factory spawns the panicking worker (a supervised
+        // child of "boss" — install_pool wires the spec when a parent is
+        // declared).
+        let (sink_idx, _sink) = open_sink();
+        let system_for_spec = system.clone();
         system
-            .install_pool(pool_spec(
-                "crew",
-                1,
-                crate::pool::PoolAlgo::RoundRobin,
-                sink_idx,
-                Some(parent.clone()),
-            ))
+            .install_pool(crate::pool::PoolSpec {
+                public: ActorPath::new("crew"),
+                workers: 1,
+                algo: crate::pool::PoolAlgo::RoundRobin,
+                factory: Arc::new(move |system, path, args| {
+                    system.spawn_service::<BoomWorker, _>(
+                        path.clone(),
+                        args,
+                        SpawnOpts::default(),
+                        || {
+                            vec![Arc::new(
+                                TypedServiceAdapter::<BoomWorker, Add>::new::<Add>(),
+                            )]
+                        },
+                    );
+                    let _ = &system_for_spec;
+                }),
+                args: Some(json!({ "sink": sink_idx })),
+                parent: Some(parent.clone()),
+                seed: 42,
+            })
             .await
             .expect("pool installs");
+        wait_for(|| async {
+            system
+                .inbox_cursor(&ActorPath::new("crew/worker-0"))
+                .is_some()
+        })
+        .await;
 
-        // When the child spec registers the escalation target.
-        let spec_parent = {
-            let kernel = system.kernel.lock().expect("kernel lock");
-            kernel
-                .specs
-                .get(&ActorPath::new("crew/worker-0"))
-                .map(|s| s.parent.clone())
-                .unwrap_or(None)
-        };
+        // When the worker crashes repeatedly inside the budget window
+        // (5 restarts per 10s): the 6th crash exhausts the budget and
+        // escalates to "boss". Sends after the slot is removed are
+        // EXPECTED to fail (dead letters).
+        for n in 1..=8_i64 {
+            let _ = system
+                .send(system.envelope(Add::schema_id(), ActorPath::new("crew"), json!({ "n": n })))
+                .await;
+            tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+        }
 
-        // Then the worker's escalation flows to the spec parent.
-        assert_eq!(spec_parent, Some(parent));
+        // Then the escalation arrived at the spec parent END-TO-END: the
+        // overseer's sink records the control message naming the worker.
+        let mut escalated = false;
+        for _ in 0..2_000 {
+            escalated = sink_read(&parent)
+                .iter()
+                .any(|l| l.starts_with("escalated:crew/worker-0"));
+            if escalated {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        assert!(
+            escalated,
+            "overseer received the worker's escalation: {:?}",
+            sink_read(&parent)
+        );
+
+        // And the tap recorded the worker's budget-exhausted stop.
+        assert!(
+            system.tap_facts().iter().any(|f| matches!(
+                &f.kind,
+                crate::tap::FactKind::Escalated { path, .. }
+                    if *path == ActorPath::new("crew/worker-0")
+            )),
+            "Escalated fact recorded for the worker"
+        );
     }
 
     #[tokio::test]

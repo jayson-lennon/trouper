@@ -16,6 +16,61 @@ use crate::envelope::Envelope;
 use crate::inbox::OverloadPolicy;
 use crate::types::{ActorPath, InboxOffset, SchemaId, Topic};
 
+/// What a subscriber wants to receive from a topic. `None` criteria are
+/// wildcards (a default filter matches everything). Evaluated at pump
+/// time against each envelope BEFORE the subscriber's inbox is offered
+/// it — filtered-out entries are simply skipped (the cursor still moves
+/// past them: a filter hides entries, it does not queue them).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct SubscriptionFilter {
+    /// Only envelopes whose payload schema matches this id.
+    pub schema: Option<SchemaId>,
+    /// Only envelopes whose fact kind matches this string (facts mirror
+    /// their `kind` into the schema id — e.g. "sent", "delivered").
+    pub kind: Option<String>,
+    /// Only envelopes whose `from` path starts with this prefix.
+    pub from_prefix: Option<String>,
+}
+
+impl SubscriptionFilter {
+    /// Matches everything (the pass-through default).
+    pub fn all() -> Self {
+        Self::default()
+    }
+
+    /// Only envelopes of the given schema id.
+    pub fn schema(schema: impl Into<SchemaId>) -> Self {
+        Self {
+            schema: Some(schema.into()),
+            ..Self::default()
+        }
+    }
+
+    /// Whether `envelope` passes this filter.
+    pub fn accepts(&self, envelope: &Envelope) -> bool {
+        if let Some(schema) = &self.schema
+            && envelope.schema != *schema
+        {
+            return false;
+        }
+        if let Some(kind) = &self.kind {
+            // The facts topic mirrors each fact's `kind` as a JSON field
+            // (all fact envelopes share the `Fact` schema, so the schema
+            // name cannot discriminate). Compare against the payload.
+            if envelope.payload_json()["kind"].as_str() != Some(kind.as_str()) {
+                return false;
+            }
+        }
+        if let Some(prefix) = &self.from_prefix {
+            match &envelope.from {
+                Some(from) if from.as_str().starts_with(prefix.as_str()) => {}
+                _ => return false,
+            }
+        }
+        true
+    }
+}
+
 /// The fact recorded when an envelope is published onto a topic.
 #[derive(Debug, Clone)]
 pub struct TopicPublishFact {
@@ -54,6 +109,8 @@ pub struct TopicLog {
     cursors: HashMap<ActorPath, u64>,
     /// Per-subscriber inbox policy, applied by the pump.
     policies: HashMap<ActorPath, OverloadPolicy>,
+    /// Per-subscriber filter, applied by the pump before the inbox offer.
+    filters: HashMap<ActorPath, SubscriptionFilter>,
 }
 
 impl TopicLog {
@@ -66,6 +123,7 @@ impl TopicLog {
             floor: 0,
             cursors: HashMap::new(),
             policies: HashMap::new(),
+            filters: HashMap::new(),
         }
     }
 
@@ -83,16 +141,24 @@ impl TopicLog {
         offset
     }
 
-    /// Subscribes a path with an inbox policy, starting per `from`.
+    /// Subscribes a path with an inbox policy and an entry filter,
+    /// starting per `from`.
     ///
     /// Re-subscribing resets the cursor (the caller's choice).
-    pub fn subscribe(&mut self, path: ActorPath, policy: OverloadPolicy, from: CursorFrom) -> u64 {
+    pub fn subscribe(
+        &mut self,
+        path: ActorPath,
+        policy: OverloadPolicy,
+        from: CursorFrom,
+        filter: SubscriptionFilter,
+    ) -> u64 {
         let start = match from {
             CursorFrom::Latest => self.next_offset,
             CursorFrom::Offset(o) => o.max(self.floor),
         };
         self.cursors.insert(path.clone(), start);
-        self.policies.insert(path, policy);
+        self.policies.insert(path.clone(), policy);
+        self.filters.insert(path, filter);
         start
     }
 
@@ -100,6 +166,7 @@ impl TopicLog {
     pub fn unsubscribe(&mut self, path: &ActorPath) -> bool {
         let had = self.cursors.remove(path).is_some();
         self.policies.remove(path);
+        self.filters.remove(path);
         had
     }
 
@@ -138,9 +205,11 @@ impl TopicLog {
     }
 
     /// One pump pass: offers every subscriber every retained entry past
-    /// its cursor. `deliver` receives `(subscriber, envelope)` and
-    /// answers whether the subscriber's inbox ACCEPTED it; only then
-    /// does the cursor advance.
+    /// its cursor that passes its subscription filter. `deliver` receives
+    /// `(subscriber, envelope)` and answers whether the subscriber's
+    /// inbox ACCEPTED it; only then does the cursor advance. Filtered-out
+    /// entries are skipped WITHOUT an inbox offer — the cursor moves past
+    /// them (a filter hides entries, it never queues them).
     ///
     /// Returns `(delivered, skipped)` counts for the tap/tests.
     pub fn pump_once(
@@ -153,9 +222,19 @@ impl TopicLog {
             let Some(policy) = self.policies.get(&path).copied() else {
                 continue;
             };
+            let filter = self
+                .filters
+                .get(&path)
+                .cloned()
+                .unwrap_or_else(SubscriptionFilter::all);
             // Offer entries cursor..next_offset that are still retained.
             for (offset, envelope) in &self.entries {
                 if *offset < cursor {
+                    continue;
+                }
+                if !filter.accepts(envelope) {
+                    // Hidden by the filter: advance past it silently.
+                    self.cursors.insert(path.clone(), offset + 1);
                     continue;
                 }
                 if deliver(&path, envelope, policy) {
@@ -215,6 +294,7 @@ mod tests {
             ActorPath::new("watcher"),
             OverloadPolicy::DropNew,
             CursorFrom::Latest,
+            SubscriptionFilter::all(),
         );
 
         // Then the cursor starts past the existing entry.
@@ -234,6 +314,7 @@ mod tests {
             ActorPath::new("watcher"),
             OverloadPolicy::DropNew,
             CursorFrom::Offset(0),
+            SubscriptionFilter::all(),
         );
 
         // Then the cursor clamps to the floor.
@@ -251,6 +332,7 @@ mod tests {
             ActorPath::new("sub"),
             OverloadPolicy::DropNew,
             CursorFrom::Offset(0),
+            SubscriptionFilter::all(),
         );
 
         // When pumping with a deliver fn that rejects odd payloads.
@@ -281,6 +363,7 @@ mod tests {
             ActorPath::new("ahead"),
             OverloadPolicy::DropNew,
             CursorFrom::Latest,
+            SubscriptionFilter::all(),
         );
         log.reset_cursor(&ActorPath::new("ahead"), 2)
             .expect("subscribed");
@@ -288,6 +371,7 @@ mod tests {
             ActorPath::new("behind"),
             OverloadPolicy::DropNew,
             CursorFrom::Offset(0),
+            SubscriptionFilter::all(),
         );
 
         // When pumping with an always-accept deliver.
@@ -308,6 +392,7 @@ mod tests {
             ActorPath::new("sub"),
             OverloadPolicy::DropNew,
             CursorFrom::Offset(0),
+            SubscriptionFilter::all(),
         );
         log.pump_once(|_, _, _| true);
 
@@ -340,6 +425,7 @@ mod tests {
             ActorPath::new("sub"),
             OverloadPolicy::DropNew,
             CursorFrom::Latest,
+            SubscriptionFilter::all(),
         );
 
         // When unsubscribing.
@@ -361,6 +447,90 @@ mod tests {
 
         // Then the reset is refused, echoing the requested offset.
         assert_eq!(result, Err(4));
+    }
+
+    #[test]
+    fn schema_filter_delivers_only_matching_schemas() {
+        // Given a log with a Tick and an Add entry, subscribed with a
+        // schema filter for Tick@1.
+        let mut log = TopicLog::new(8);
+        log.append(envelope(0));
+        log.append(Envelope::json(
+            SchemaId::new("Add", 1),
+            crate::envelope::Address::Topic(Topic::new("ticks")),
+            json!({ "n": 1 }),
+            TraceCtx::root(),
+        ));
+        log.subscribe(
+            ActorPath::new("sub"),
+            OverloadPolicy::DropNew,
+            CursorFrom::Offset(0),
+            SubscriptionFilter::schema(SchemaId::new("Tick", 1)),
+        );
+
+        // When pumping with an always-accept deliver.
+        let (delivered, _) = log.pump_once(|_, _, _| true);
+
+        // Then only the Tick entry reached the inbox (the Add entry was
+        // hidden by the filter, not queued).
+        assert_eq!(delivered, 1);
+    }
+
+    #[test]
+    fn filtered_entries_advance_the_cursor_silently() {
+        // Given a subscriber whose filter hides every entry.
+        let mut log = TopicLog::new(8);
+        log.append(envelope(0));
+        log.append(envelope(1));
+        log.subscribe(
+            ActorPath::new("sub"),
+            OverloadPolicy::DropNew,
+            CursorFrom::Offset(0),
+            SubscriptionFilter {
+                kind: Some("NoSuchKind".into()),
+                ..SubscriptionFilter::default()
+            },
+        );
+
+        // When pumping with a deliver fn that would count any offer.
+        let mut offers = 0;
+        let (delivered, _) = log.pump_once(|_, _, _| {
+            offers += 1;
+            true
+        });
+
+        // Then nothing was delivered and the inbox was NEVER offered an
+        // entry — and a later pump has nothing left (cursors advanced).
+        assert_eq!(delivered, 0);
+        assert_eq!(offers, 0);
+        let (again, _) = log.pump_once(|_, _, _| true);
+        assert_eq!(again, 0);
+    }
+
+    #[test]
+    fn default_filter_passes_everything_through() {
+        // Given a subscriber with the pass-through filter and two entries
+        // of different schemas.
+        let mut log = TopicLog::new(8);
+        log.append(envelope(0));
+        log.append(Envelope::json(
+            SchemaId::new("Add", 1),
+            crate::envelope::Address::Topic(Topic::new("ticks")),
+            json!({ "n": 1 }),
+            TraceCtx::root(),
+        ));
+        log.subscribe(
+            ActorPath::new("sub"),
+            OverloadPolicy::DropNew,
+            CursorFrom::Offset(0),
+            SubscriptionFilter::all(),
+        );
+
+        // When pumping.
+        let (delivered, _) = log.pump_once(|_, _, _| true);
+
+        // Then both entries were delivered.
+        assert_eq!(delivered, 2);
     }
 
     #[test]

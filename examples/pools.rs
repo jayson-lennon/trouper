@@ -77,6 +77,64 @@ impl CommandHandler<Work> for Worker {
     }
 }
 
+#[derive(Deserialize)]
+struct WorkCopy {
+    #[allow(dead_code)]
+    n: i64,
+}
+
+impl Schema for WorkCopy {
+    fn schema_def() -> SchemaDef {
+        SchemaDef {
+            name: "WorkCopy".into(),
+            version: 1,
+            kind: SchemaKind::Command,
+            fields: vec![FieldDef::required("n", FieldTy::Int)],
+            description: None,
+        }
+    }
+}
+
+#[derive(Deserialize)]
+struct CopyDone {
+    #[allow(dead_code)]
+    n: i64,
+}
+
+impl Schema for CopyDone {
+    fn schema_def() -> SchemaDef {
+        SchemaDef {
+            name: "CopyDone".into(),
+            version: 1,
+            kind: SchemaKind::Event,
+            fields: vec![FieldDef::required("n", FieldTy::Int)],
+            description: None,
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize, Default)]
+struct Watcher;
+
+impl EventSourcedActor for Watcher {
+    fn manifest() -> ActorManifest {
+        ActorManifest::new()
+            .handles::<WorkCopy>()
+            .emits::<CopyDone>()
+            .kind(ActorKind::EventSourced)
+    }
+    fn restore(_args: &serde_json::Value) -> Self {
+        Self
+    }
+    fn apply(&mut self, _event: &Event) {}
+}
+
+impl CommandHandler<WorkCopy> for Watcher {
+    fn handle(&self, cmd: WorkCopy, _ctx: &mut CmdCtx<'_>) -> Vec<Event> {
+        vec![Event::new(CopyDone::schema_id(), json!({ "n": cmd.n }))]
+    }
+}
+
 #[tokio::main]
 async fn main() {
     tracing_subscriber::fmt()
@@ -158,8 +216,46 @@ async fn main() {
         println!("   {worker} served {served} of 6 (round-robin rotation)");
     }
 
-    // -- 3. Escalation parent + export --------------------------------------
-    println!("== 3. declared topology ==");
+    // -- 3. Tee rule: a watcher observes the pool flow ----------------------
+    println!("== 3. tee rule ==");
+    system.register_schema::<WorkCopy>();
+    actor_runtime::builder::spawn_es_builder::<Watcher>(&system)
+        .at(ActorPath::new("watcher"))
+        .args(json!({}))
+        .handles::<WorkCopy>()
+        .emits::<CopyDone>()
+        .start();
+    system.install_rule(actor_runtime::pool::Rule {
+        source: None,
+        schema: Some(Work::schema_id()),
+        dest: Some(ActorPath::new("api")),
+        action: actor_runtime::pool::RuleAction::Tee(ActorPath::new("watcher")),
+    });
+    // Two more sends: each is copied to the watcher at-most-once (a teed
+    // copy is never an audit mechanism — the primary flow is untouched).
+    for i in 10..12 {
+        system
+            .send(system.envelope(Work::schema_id(), ActorPath::new("api"), json!({ "n": i })))
+            .await
+            .expect("delivered to a worker");
+    }
+    wait(|| async {
+        system.tap_facts().iter().any(|f| {
+            matches!(&f.kind,
+                    FactKind::Delivered { to, .. }
+                    if to.as_str() == "watcher")
+        })
+    })
+    .await;
+    let teed = system
+        .tap_facts()
+        .iter()
+        .filter(|f| matches!(&f.kind, FactKind::Delivered { to, .. } if to.as_str() == "watcher"))
+        .count();
+    println!("   watcher received {teed} teed cop(y/ies) of Work sends (at-most-once)");
+
+    // -- 4. Escalation parent + export --------------------------------------
+    println!("== 4. declared topology ==");
     let export = system.export().await;
     for pool in &export.pools {
         println!(
