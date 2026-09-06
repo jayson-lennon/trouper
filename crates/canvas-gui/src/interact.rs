@@ -115,7 +115,10 @@ fn handle_input(
     }
     if drag.held {
         drag.traveled += motion.delta.length();
-        let delta = view::Vec2::new(motion.delta.x, motion.delta.y) * view.zoom;
+        // Screen-pixel delta (y-down) → world pan delta (y-up): flip
+        // the sign of y, and divide by zoom so content tracks the
+        // cursor 1:1 at any zoom level.
+        let delta = view::Vec2::new(motion.delta.x, -motion.delta.y) / view.zoom;
         view.pan = view.pan - delta;
     }
     if mouse_buttons.just_released(MouseButton::Left) {
@@ -132,8 +135,8 @@ fn handle_input(
     }
 
     if scroll.delta.y != 0.0 {
-        let next = (view.zoom * ZOOM_STEP.powf(scroll.delta.y)).clamp(MIN_ZOOM, MAX_ZOOM);
-        *view = view.zoom_at(cursor, window_size(window), next);
+        let factor = ZOOM_STEP.powf(scroll.delta.y);
+        *view = view.zoom_at(cursor, window_size(window), factor);
     }
 }
 

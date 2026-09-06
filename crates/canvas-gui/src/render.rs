@@ -202,22 +202,22 @@ pub fn build_scene(
         let Some(placement) = state.layout.containers.get(&container.id) else {
             continue;
         };
-        let (min, _) = placement.bounds();
+        // The layout reserves CONTAINER_LABEL at the container top.
+        let label_offset = Vec2::new(0.0, placement.size.y * 0.5 - 14.0);
         spawn_box(
             &mut commands,
             &mesh,
             container_material.clone(),
             *placement,
             Z_CONTAINER,
-        )
-        .with_children(|parent| {
-            parent.spawn((
-                Text2d::new(container.label.clone()),
-                TextFont::from_font_size(16.0),
-                TextColor(Color::srgb(0.85, 0.87, 0.92)),
-                Transform::from_xyz(0.0, min.y - placement.pos.y + 8.0, 1.0),
-            ));
-        });
+        );
+        spawn_label(
+            &mut commands,
+            container.label.clone(),
+            16.0,
+            Color::srgb(0.85, 0.87, 0.92),
+            placement.pos + label_offset,
+        );
     }
 
     for edge in &state.layout.edges {
@@ -247,35 +247,54 @@ pub fn build_scene(
             NodeKind::Service => service_material.clone(),
             NodeKind::Topic => topic_material.clone(),
         };
-        let summary = node_summary(node);
-        let cursor_note = node.cursor.map(|cursor| format!("cursor {cursor}"));
-        spawn_box(&mut commands, &mesh, material, *placement, Z_NODE).with_children(|parent| {
-            parent.spawn((
-                Text2d::new(node.path.clone()),
-                TextFont::from_font_size(19.0),
-                TextColor(Color::srgb(0.94, 0.95, 0.97)),
-                Transform::from_xyz(0.0, 18.0, 1.0),
-            ));
-            parent.spawn((
-                Text2d::new(summary),
-                TextFont::from_font_size(13.0),
-                TextColor(Color::srgb(0.75, 0.78, 0.83)),
-                Transform::from_xyz(0.0, -4.0, 1.0),
-            ));
-            if let Some(cursor_note) = cursor_note {
-                parent.spawn((
-                    Text2d::new(cursor_note),
-                    TextFont::from_font_size(12.0),
-                    TextColor(Color::srgb(0.60, 0.64, 0.70)),
-                    Transform::from_xyz(0.0, -26.0, 1.0),
-                ));
-            }
-        });
+        spawn_box(&mut commands, &mesh, material, *placement, Z_NODE);
+        spawn_label(
+            &mut commands,
+            node.path.clone(),
+            19.0,
+            Color::srgb(0.94, 0.95, 0.97),
+            placement.pos + Vec2::new(0.0, 18.0),
+        );
+        spawn_label(
+            &mut commands,
+            node_summary(node),
+            13.0,
+            Color::srgb(0.75, 0.78, 0.83),
+            placement.pos + Vec2::new(0.0, -4.0),
+        );
+        if let Some(cursor_note) = node.cursor.map(|cursor| format!("cursor {cursor}")) {
+            spawn_label(
+                &mut commands,
+                cursor_note,
+                12.0,
+                Color::srgb(0.60, 0.64, 0.70),
+                placement.pos + Vec2::new(0.0, -26.0),
+            );
+        }
     }
 }
 
+/// Spawns an independent label entity (never a child of the scaled
+/// box, so text keeps its glyph size) at an absolute world position.
+fn spawn_label(
+    commands: &mut Commands,
+    text: String,
+    font_size: f32,
+    color: Color,
+    world_pos: Vec2,
+) {
+    commands.spawn((
+        SceneEntity,
+        Text2d::new(text),
+        TextFont::from_font_size(font_size),
+        TextColor(color),
+        Transform::from_xyz(world_pos.x, world_pos.y, Z_NODE + 1.0),
+    ));
+}
+
 /// Spawns one scaled quad (container fill, node box) with the given
-/// material; children (labels) are positioned relative to its center.
+/// material; labels are separate `SceneEntity` entities so they never
+/// inherit the box's scale.
 fn spawn_box<'a>(
     commands: &'a mut Commands,
     mesh: &bevy::asset::Handle<Mesh>,
