@@ -83,6 +83,8 @@ pub struct SceneState {
     pub version: u64,
     /// Human-readable status (waiting / fetched / fetch error).
     pub status: String,
+    /// When the displayed export was fetched (drives the age label).
+    pub fetched_at: Option<std::time::Instant>,
 }
 
 impl Default for SceneState {
@@ -93,6 +95,7 @@ impl Default for SceneState {
             hit_order: Vec::new(),
             version: 0,
             status: "waiting for first export…".into(),
+            fetched_at: None,
         }
     }
 }
@@ -129,6 +132,7 @@ pub fn drain_fetch(mut state: ResMut<SceneState>, channels: Res<FetchChannels>) 
                     hit_order,
                     version: state.version + 1,
                     status,
+                    fetched_at: Some(message.at),
                 };
             }
             Err(error) => {

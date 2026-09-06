@@ -54,12 +54,6 @@ impl Vec2 {
     pub fn length(self) -> f32 {
         (self.x * self.x + self.y * self.y).sqrt()
     }
-
-    /// True when both components are within `eps`.
-    #[must_use]
-    pub fn approx_eq(self, other: Self, eps: f32) -> bool {
-        (self.x - other.x).abs() <= eps && (self.y - other.y).abs() <= eps
-    }
 }
 
 impl Add for Vec2 {
@@ -123,8 +117,10 @@ impl ViewTransform {
         Vec2::new(self.pan.x + offset.x, self.pan.y - offset.y)
     }
 
-    /// World point (y-up) → screen pixels (y-down); inverse of
-    /// [`ViewTransform::screen_to_world`].
+    /// World point (y-up) → screen pixels (y-down); the documented
+    /// inverse of [`ViewTransform::screen_to_world`], exercised by the
+    /// round-trip test.
+    #[cfg_attr(not(test), allow(dead_code))]
     #[must_use]
     pub fn world_to_screen(&self, world: Vec2, viewport_px: Vec2) -> Vec2 {
         let offset = world - self.pan;
@@ -144,15 +140,6 @@ impl ViewTransform {
         Self {
             pan: Vec2::new(anchor.x - offset.x, anchor.y + offset.y),
             zoom,
-        }
-    }
-
-    /// Pans by screen-pixel delta (converted through zoom).
-    #[must_use]
-    pub fn pan_by_px(&self, delta_px: Vec2) -> Self {
-        Self {
-            pan: self.pan + Vec2::new(delta_px.x, -delta_px.y) / self.zoom,
-            zoom: self.zoom,
         }
     }
 }
@@ -218,6 +205,11 @@ pub fn clip_segment_between_boxes(
 
 #[cfg(test)]
 mod tests {
+    /// Test assertion helper: true when both components are within `eps`.
+    fn approx_eq(a: Vec2, b: Vec2, eps: f32) -> bool {
+        (a.x - b.x).abs() <= eps && (a.y - b.y).abs() <= eps
+    }
+
     use super::*;
 
     #[test]
@@ -237,7 +229,7 @@ mod tests {
             let back = view.world_to_screen(view.screen_to_world(screen, viewport), viewport);
 
             // Then it lands on itself (the y-flip cancels out).
-            assert!(back.approx_eq(screen, 1e-3), "{back:?} != {screen:?}");
+            assert!(approx_eq(back, screen, 1e-3), "{back:?} != {screen:?}");
         }
     }
 
@@ -258,14 +250,14 @@ mod tests {
 
         // Then the world point under the cursor is unchanged in both.
         assert!(
-            zoomed_in
-                .screen_to_world(cursor, viewport)
-                .approx_eq(anchored, 1e-3)
+            approx_eq(zoomed_in.screen_to_world(cursor, viewport), anchored, 1e-3),
+            "{:?} != {anchored:?}",
+            zoomed_in.screen_to_world(cursor, viewport)
         );
         assert!(
-            zoomed_out
-                .screen_to_world(cursor, viewport)
-                .approx_eq(anchored, 1e-3)
+            approx_eq(zoomed_out.screen_to_world(cursor, viewport), anchored, 1e-3),
+            "{:?} != {anchored:?}",
+            zoomed_out.screen_to_world(cursor, viewport)
         );
         // And the zoom clamp holds at the extremes.
         assert_eq!(view.zoom_at(cursor, viewport, 1e6).zoom, MAX_ZOOM);
@@ -285,9 +277,9 @@ mod tests {
             clip_segment_between_boxes(a, size_a, b, size_b).expect("segment exists");
 
         // Then the start lies on box A's border (x at the right edge).
-        assert!(start.approx_eq(Vec2::new(100.0, 40.0), 1e-4));
+        assert!(approx_eq(start, Vec2::new(100.0, 40.0), 1e-4));
         // And the end lies on box B's border (x at the left edge).
-        assert!(end.approx_eq(Vec2::new(400.0, 160.0), 1e-4));
+        assert!(approx_eq(end, Vec2::new(400.0, 160.0), 1e-4));
     }
 
     #[test]

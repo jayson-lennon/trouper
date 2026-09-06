@@ -14,6 +14,7 @@ use bevy_egui::EguiPrimaryContextPass;
 mod fetch;
 #[cfg(test)]
 mod fixture;
+mod interact;
 mod layout;
 mod model;
 mod render;
@@ -66,6 +67,7 @@ fn main() {
     })
     .add_systems(Startup, spawn_camera);
     render::plugin(&mut app);
+    interact::plugin(&mut app);
     app.add_systems(EguiPrimaryContextPass, egui_shell);
     app.run();
     let _ = fetcher.join();

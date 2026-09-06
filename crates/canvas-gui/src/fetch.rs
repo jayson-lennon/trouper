@@ -25,7 +25,7 @@ pub struct ExportMsg {
     /// The export, or why the fetch failed (string-mapped at the
     /// thread boundary so the GUI has no zenoh error types).
     pub export: Result<SystemExport, String>,
-    /// When the fetch completed.
+    /// When the fetch completed (drives the legend's age display).
     pub at: Instant,
 }
 
