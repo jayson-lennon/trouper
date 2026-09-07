@@ -1,12 +1,15 @@
 //! canvas: queries a running system's state over zenoh and consumes the
-//! export document.
+//! export document, and passes control commands through to a running
+//! system's control bridge.
 //!
 //! The library seam is [`fetch_export`]: one call, one fresh
-//! `SystemExport` back (or a [`StateError`] naming what failed). All
-//! transport lives in `state-report` — this crate is a pure projection.
-//! The `canvas` binary wraps it: query-or-abort — on any failure it
-//! prints a legible stderr message and exits non-zero before any GUI
-//! startup path (no GUI exists yet, and none may be stubbed here).
+//! `SystemExport` back (or a [`StateError`] naming what failed) — and
+//! [`ctl_command`]: one command in, one result document back (or a
+//! [`ControlError`]). All transport lives in `state-report` — this crate
+//! is a pure projection. The `canvas` binary wraps both: query-or-abort —
+//! on any failure it prints a legible stderr message and exits non-zero
+//! before any GUI startup path (no GUI exists yet, and none may be
+//! stubbed here).
 
 use actor_runtime::system::SystemExport;
 use state_report::StateBridgeError;
@@ -59,6 +62,80 @@ pub async fn fetch_export() -> Result<SystemExport, StateError> {
 /// As [`fetch_export`].
 pub async fn fetch_export_on(key: state_report::StateKey) -> Result<SystemExport, StateError> {
     Ok(state_report::fetch_on(key).await?)
+}
+
+/// Everything that can go wrong between "send a command" and "result in
+/// hand". A command the bridge *ran and failed* is not a transport
+/// failure — it is [`ControlError::Command`], the bridge's own legible
+/// reason, printed as-is.
+#[derive(Debug, wherror::Error)]
+pub enum ControlError {
+    /// A zenoh operation failed.
+    #[error("zenoh command failed: {0}")]
+    Zenoh(String),
+    /// No bridge answered within the send budget.
+    #[error(
+        "no system answered the control command; is one running with a control bridge installed?"
+    )]
+    Timeout,
+    /// The reply did not decode into a `ControlReply`.
+    #[error("reply was not a decodable ControlReply: {0}")]
+    Payload(String),
+    /// The bridge ran the command and it failed; this is its reason.
+    #[error("{0}")]
+    Command(String),
+}
+
+impl From<state_report::ControlBridgeError> for ControlError {
+    fn from(error: state_report::ControlBridgeError) -> Self {
+        match error {
+            state_report::ControlBridgeError::Zenoh(detail) => Self::Zenoh(detail),
+            state_report::ControlBridgeError::Timeout(_) => Self::Timeout,
+            state_report::ControlBridgeError::Payload(detail) => Self::Payload(detail),
+        }
+    }
+}
+
+/// Sends one control command to [`state_report::CONTROL_KEY`] and returns
+/// the command's result document.
+///
+/// # Errors
+///
+/// - [`ControlError::Zenoh`] when the transport fails.
+/// - [`ControlError::Timeout`] when no bridge answers within the budget.
+/// - [`ControlError::Payload`] when the reply fails to decode.
+/// - [`ControlError::Command`] when the bridge ran the command and the
+///   command failed — the error text is the command's own reason.
+pub async fn ctl_command(
+    name: impl Into<String>,
+    args: serde_json::Value,
+) -> Result<serde_json::Value, ControlError> {
+    ctl_command_on(state_report::ControlKey::production(), name, args).await
+}
+
+/// [`ctl_command`] on an explicit key — the test seam for per-test zenoh
+/// island keys (see [`state_report::ControlKey`]).
+///
+/// # Errors
+///
+/// As [`ctl_command`].
+pub async fn ctl_command_on(
+    key: state_report::ControlKey,
+    name: impl Into<String>,
+    args: serde_json::Value,
+) -> Result<serde_json::Value, ControlError> {
+    let reply = state_report::send_command_on(
+        key,
+        state_report::ControlRequest {
+            command: name.into(),
+            args,
+        },
+    )
+    .await?;
+    match reply {
+        state_report::ControlReply::Ok { result } => Ok(result),
+        state_report::ControlReply::Err { error } => Err(ControlError::Command(error)),
+    }
 }
 
 /// The one-glance digest of an export: counts per export section, with

@@ -17,11 +17,14 @@
 //!   channel is gone, the fact channel is not).
 //!
 //! A state-report bridge is installed, so a second shell can reflect the
-//! system:
+//! system; a control bridge is installed too, so a second shell can act
+//! on it — scaling `fs.saver` from outside the process:
 //!
 //! ```text
 //! shell 1: cargo run --example file_save
 //! shell 2: cargo run -p canvas
+//! shell 2: cargo run -p canvas -- ctl ScalePool '{"kind":"saver","workers":3}'
+//! shell 2: cargo run -p canvas   # the export now shows fs.saver as a 3-worker pool
 //! ```
 
 use actor_runtime::actor::{MsgHandler, ServiceActor};
@@ -255,7 +258,7 @@ where
 /// # Errors
 ///
 /// Propagates bridge installation failures (zenoh session/queryable).
-async fn run_demo() -> Result<(), state_report::StateBridgeError> {
+async fn run_demo() -> Result<(), Box<dyn std::error::Error>> {
     let system = Arc::new(ActorSystem::new(SystemConfig::production()));
 
     // Spawn: the builder declares the whole surface (and registers the
@@ -405,8 +408,39 @@ async fn run_demo() -> Result<(), state_report::StateBridgeError> {
 
     // Keep the bridge session alive — dropping it closes the queryable.
     let _session = state_report::install(system.clone(), ActorPath::new("state/reporter")).await?;
+
+    // The control plane: the allow-list is the app's choice, made here.
+    // The blueprint binds the code half (the FileSaver type behind the
+    // factory, the public name, the algo, the seed); the wire only ever
+    // carries the variable half — `workers`.
+    let blueprints = state_report::Blueprints::new().with_kind(
+        "saver",
+        state_report::PoolBlueprint {
+            public: ActorPath::new("fs.saver"),
+            algo: actor_runtime::pool::PoolAlgo::RoundRobin,
+            parent: None,
+            seed: 42,
+            args: Some(json!({})),
+            factory: Arc::new(|system, path, args| {
+                actor_runtime::builder::spawn_service_builder::<FileSaver<RealFs>>(system)
+                    .at(path.clone())
+                    .args(args.clone())
+                    .handles::<SaveFile>()
+                    .emits::<SaveAck>()
+                    .emits::<SaveFailed>()
+                    .start();
+            }),
+        },
+    );
+    let router =
+        state_report::ControlRouter::new().with(state_report::ScalePoolCmd::new(blueprints));
+    let _control = state_report::install_control(system.clone(), router).await?;
+
     println!(
         "serving state on the actor-runtime/state key — run `cargo run -p canvas` (or the GUI) now (ctrl-c to stop)"
+    );
+    println!(
+        "serving commands on the actor-runtime/control key — try:\n  cargo run -p canvas -- ctl\n  cargo run -p canvas -- ctl ScalePool '{{\"kind\":\"saver\",\"workers\":3}}'"
     );
     tokio::signal::ctrl_c()
         .await
