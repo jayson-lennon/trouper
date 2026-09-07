@@ -1,15 +1,20 @@
 //! The minimal useful actor: a file-saver.
 //!
-//! The whole actor is ~15 lines (`FileSaver` below): a service actor with
-//! a `start` and ONE typed message handler. No `manifest()` override (the
-//! builder supplies the surface), no registration calls (the builder
-//! registers every declared schema), no hand-serialized payloads (the
-//! typed `system.tell`/`system.ask` do serde).
+//! The runtime-facing surface is a `start` and ONE typed handler (no
+//! `manifest()` override — the builder supplies it; no registration calls —
+//! the builder registers every declared schema; no hand-serialized payloads
+//! — the typed `system.tell`/`system.ask` do serde). The DOMAIN logic is a
+//! plain `save` method over an injected `FileStore`, testable with `MemFs`
+//! and no runtime at all.
 //!
-//! Demonstrates both flows:
+//! Demonstrates the full outcome grammar:
 //! - `tell` — fire-and-forget (the handler's `ctx.reply` is silently
 //!   dropped: nobody asked);
-//! - `ask` — save & confirm (the lease-backed reply comes back).
+//! - `ask` — save & confirm (the lease-backed reply comes back);
+//! - failed ask — a `SaveFailed` REPLY names the reason (point-to-point);
+//! - failed tell — the same failure PUBLISHED on the `fs.events` topic,
+//!   observed by the `fs.audit` subscriber (a tell has no asker: the reply
+//!   channel is gone, the fact channel is not).
 //!
 //! A state-report bridge is installed, so a second shell can reflect the
 //! system:
@@ -67,7 +72,7 @@ impl FileStore for RealFs {
 /// numbers representation — which is what [`FieldTy::Json`] exists for
 /// ("arbitrary JSON; the escape hatch for payloads the canvas need not
 /// inspect deeply").
-#[derive(Serialize, Deserialize, Clone)]
+#[derive(Serialize, Deserialize)]
 struct SaveFile {
     path: std::path::PathBuf,
     contents: Vec<u8>,
@@ -88,10 +93,11 @@ impl Schema for SaveFile {
     }
 }
 
-/// The ack: the save attempt's outcome.
+/// The ack: how many bytes were written. A save that did NOT succeed
+/// never produces this — it produces [`SaveFailed`] instead — so there is
+/// no `ok` flag to lie: the schema of the reply IS the outcome.
 #[derive(Serialize, Deserialize, Debug)]
 struct SaveAck {
-    ok: bool,
     bytes: i64,
 }
 
@@ -101,10 +107,7 @@ impl Schema for SaveAck {
             name: "SaveAck".into(),
             version: 1,
             kind: SchemaKind::Event,
-            fields: vec![
-                FieldDef::required("ok", FieldTy::Bool),
-                FieldDef::required("bytes", FieldTy::Int),
-            ],
+            fields: vec![FieldDef::required("bytes", FieldTy::Int)],
             description: None,
         }
     }
@@ -153,20 +156,24 @@ fn audit_topic() -> actor_runtime::types::Topic {
 /// success replies the asker; failure replies AND publishes the fact (a
 /// failed tell is otherwise invisible — nobody asked, so no reply goes
 /// anywhere).
-struct FileSaver<S: FileStore> {
+struct FileSaver<S> {
     store: S,
 }
 
 impl<S: FileStore> FileSaver<S> {
-    /// The domain operation: save these contents, answer in bytes.
-    async fn save(&mut self, cmd: SaveFile) -> Result<SaveAck, SaveError> {
+    /// The domain operation: write these contents to this path, answer
+    /// in bytes. Takes refs — the caller keeps its command.
+    async fn save(
+        &mut self,
+        path: &std::path::Path,
+        contents: &[u8],
+    ) -> Result<SaveAck, SaveError> {
         let bytes = self
             .store
-            .write(&cmd.path, &cmd.contents)
+            .write(path, contents)
             .await
             .map_err(|e| SaveError { kind: e.kind() })?;
         Ok(SaveAck {
-            ok: true,
             bytes: bytes as i64,
         })
     }
@@ -182,7 +189,7 @@ impl<S: FileStore + Default> ServiceActor for FileSaver<S> {
 
 impl<S: FileStore + Default> MsgHandler<SaveFile> for FileSaver<S> {
     async fn handle(&mut self, msg: SaveFile, ctx: &mut MsgCtx<'_>) {
-        match self.save(msg.clone()).await {
+        match self.save(&msg.path, &msg.contents).await {
             Ok(ack) => {
                 // Point-to-point: to the asker when asked, silently
                 // dropped on a tell.
@@ -319,9 +326,9 @@ async fn run_demo() -> Result<(), state_report::StateBridgeError> {
         )
         .await
         .expect("acked");
-    assert!(
-        ack["ok"] == true,
-        "the ask ack must confirm the save: {ack}"
+    assert_eq!(
+        ack["bytes"], 30,
+        "the ask ack must report the written bytes: {ack}"
     );
     println!("ask: ack {ack}");
 
@@ -472,7 +479,7 @@ mod tests {
     }
 
     /// The domain method under test — no runtime, no disk, deterministic.
-    async fn saver() -> FileSaver<MemFs> {
+    fn saver() -> FileSaver<MemFs> {
         FileSaver {
             store: MemFs::new(),
         }
@@ -481,17 +488,11 @@ mod tests {
     #[tokio::test]
     async fn save_writes_contents_and_answers_in_bytes() {
         // Given a file saver over an in-memory store.
-        let mut f = saver().await;
+        let mut f = saver();
         let path = std::path::PathBuf::from("/virtual/doc.txt");
 
         // When saving.
-        let ack = f
-            .save(SaveFile {
-                path: path.clone(),
-                contents: b"hello facts".to_vec(),
-            })
-            .await
-            .expect("saved");
+        let ack = f.save(&path, b"hello facts").await.expect("saved");
 
         // Then the ack counts the bytes and the store holds the contents.
         assert_eq!(ack.bytes, 11);
@@ -504,18 +505,12 @@ mod tests {
     #[tokio::test]
     async fn save_declines_a_denied_path_with_the_io_reason() {
         // Given a store that denies one path.
-        let mut f = saver().await;
+        let mut f = saver();
         let path = std::path::PathBuf::from("/virtual/locked.txt");
         MemFs::deny(&path);
 
         // When saving to the denied path.
-        let err = f
-            .save(SaveFile {
-                path,
-                contents: b"nope".to_vec(),
-            })
-            .await
-            .expect_err("denied");
+        let err = f.save(&path, b"nope").await.expect_err("denied");
 
         // Then the domain error names the io reason.
         assert_eq!(err.kind, std::io::ErrorKind::PermissionDenied);
@@ -568,8 +563,8 @@ mod tests {
             .await
             .expect("acked");
 
-        // Then the SaveAck reply confirms the write.
-        assert_eq!(ack["ok"], true);
+        // Then the SaveAck reply reports the written bytes — a failed
+        // save would have replied SaveFailed instead.
         assert_eq!(ack["bytes"], 7);
     }
 
@@ -600,9 +595,12 @@ mod tests {
 
     #[tokio::test]
     async fn a_failed_tell_is_observable_through_the_published_fact() {
-        // Given the actor + audit on a real system.
+        // Given the actor + audit on a real system. The AUDIT sink is
+        // process-global and tests run concurrently — so wait for GROWTH
+        // past a baseline rather than a non-empty sink, and use a path
+        // unique to this test.
         let (system, saver, _audit) = demo_system().await;
-        AUDIT.lock().clear();
+        let baseline = AUDIT.lock().len();
         let path = std::env::temp_dir().join("adapter-tell-denied.txt");
         MemFs::deny(&path);
 
@@ -620,7 +618,7 @@ mod tests {
 
         // Then the failure still surfaces — as a published fact at the
         // audit subscriber. Never a broadcast reply; a topic publish.
-        wait(|| async { !AUDIT.lock().is_empty() }).await;
+        wait(|| async { AUDIT.lock().len() > baseline }).await;
         let seen = AUDIT.lock();
         assert!(
             seen.iter()
