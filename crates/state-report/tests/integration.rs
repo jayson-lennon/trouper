@@ -285,3 +285,266 @@ async fn install_rejects_unknown_reporter_path() {
         other => panic!("expected NoReporter, got {other:?}"),
     }
 }
+
+// ----- the control plane over the wire --------------------------------------
+
+use state_report::{
+    Blueprints, ControlCommand, ControlKey, ControlReply, ControlRequest, ControlRouter,
+    PoolBlueprint, ScalePoolCmd, install_control_on, send_command_on,
+};
+
+/// A wire-test command that parses `{"text": …}` before echoing — the
+/// decode-before-effect shape the malformed-args test leans on.
+struct Echo;
+
+impl ControlCommand for Echo {
+    fn name(&self) -> &'static str {
+        "Echo"
+    }
+
+    async fn execute(
+        &self,
+        _system: &Arc<actor_runtime::system::ActorSystem>,
+        args: &serde_json::Value,
+    ) -> Result<serde_json::Value, String> {
+        let text = args
+            .get("text")
+            .and_then(|t| t.as_str())
+            .ok_or_else(|| "args must be {\"text\": <string>}".to_string())?;
+        Ok(json!({ "echoed": text }))
+    }
+}
+
+/// Installs a control bridge serving `Echo` on its own island key.
+async fn echo_bridge(scope: &str) -> (ControlKey, zenoh::Session) {
+    let key = ControlKey::scoped(scope);
+    let system = Arc::new(actor_runtime::system::ActorSystem::new(
+        SystemConfig::production(),
+    ));
+    let session = install_control_on(key.clone(), system, ControlRouter::new().with(Echo))
+        .await
+        .expect("control bridge installed");
+    (key, session)
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn control_bridge_serves_a_wire_round_trip() {
+    // Given a control bridge installed on its own island key.
+    let (key, bridge) = echo_bridge("wire-round-trip").await;
+
+    // When a second zenoh session sends a command through the client
+    // seam. `send_command_on` is one-shot by contract, so a cold mesh
+    // needs the same discovery warm-up the state tests ride out: the
+    // first attempt(s) scout for the bridge, later ones land.
+    let mut reply = None;
+    for _ in 0..20 {
+        if let Ok(r) = send_command_on(
+            key.clone(),
+            ControlRequest {
+                command: "Echo".into(),
+                args: json!({ "text": "over the wire" }),
+            },
+        )
+        .await
+        {
+            reply = Some(r);
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+    let reply = reply.expect("a reply within the discovery warm-up");
+
+    // Then the reply is the command's own result — the full wire path
+    // (payload attach, bridge decode, dispatch, reply decode) works.
+    assert_eq!(
+        reply.result(),
+        Some(json!({ "echoed": "over the wire" })),
+        "the wire round trip carries the command result"
+    );
+
+    // Teardown: leave the mesh gracefully.
+    bridge.close().await.expect("bridge session closed");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn control_bridge_replies_an_error_for_unknown_commands_over_the_wire() {
+    // Given a control bridge with Echo registered.
+    let (key, bridge) = echo_bridge("wire-unknown").await;
+
+    // When sending a command name nothing registered.
+    let mut reply = None;
+    for _ in 0..20 {
+        if let Ok(r) = send_command_on(key.clone(), ControlRequest::bare("Nope")).await {
+            reply = Some(r);
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+    let reply = reply.expect("an error reply within the discovery warm-up");
+
+    // Then the bridge answers (never silence) with the unknown-command
+    // error.
+    match reply {
+        ControlReply::Err { error } => {
+            assert!(
+                error.contains("no such command") && error.contains("Nope"),
+                "expected the unknown command named, got: {error}"
+            );
+        }
+        other => panic!("expected an Err reply, got {other:?}"),
+    }
+
+    // Teardown.
+    bridge.close().await.expect("bridge session closed");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn control_bridge_replies_an_error_for_malformed_envelopes() {
+    // Given a control bridge on its own island key.
+    let (key, bridge) = echo_bridge("wire-malformed").await;
+
+    // When a raw zenoh query arrives whose payload is not a
+    // ControlRequest at all (the envelope is the transport's to decode).
+    let client = zenoh::open(zenoh::Config::default())
+        .await
+        .expect("session");
+    let mut raw_reply = None;
+    for _ in 0..20 {
+        if let Ok(replies) = client
+            .get(key.as_str())
+            .payload(b"this is not a control envelope".as_slice())
+            .timeout(Duration::from_secs(1))
+            .await
+            && let Ok(reply) = replies.recv_async().await
+            && let Ok(sample) = reply.result()
+            && let Ok(text) = sample.payload().try_to_string()
+        {
+            raw_reply = Some(text.to_string());
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+    let raw_reply = raw_reply.expect("the bridge answered the malformed envelope");
+
+    // Then the reply is a legible error document — silence on a control
+    // channel would read as success.
+    let reply: ControlReply = serde_json::from_str(&raw_reply).expect("the error document decodes");
+    match reply {
+        ControlReply::Err { error } => {
+            assert!(
+                error.contains("malformed request"),
+                "expected a malformed-request error, got: {error}"
+            );
+        }
+        other => panic!("expected an Err reply, got {other:?}"),
+    }
+
+    // And the malformed envelope did not wedge the bridge: the next
+    // well-formed command still round-trips.
+    let mut still_alive = None;
+    for _ in 0..20 {
+        if let Ok(r) = send_command_on(key.clone(), ControlRequest::bare("Echo")).await {
+            still_alive = Some(r);
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+    match still_alive.expect("the bridge survived a malformed envelope") {
+        ControlReply::Err { error } => {
+            // Echo with Null args is a decode failure — but an error
+            // REPLY from the command proves the serving loop is alive.
+            assert!(
+                error.contains("text"),
+                "expected Echo's own decode error, got: {error}"
+            );
+        }
+        other => panic!("expected a reply, got {other:?}"),
+    }
+
+    // Teardown.
+    client.close().await.expect("client session closed");
+    bridge.close().await.expect("bridge session closed");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn control_bridge_scales_pools_over_the_wire() {
+    // Given a system where a plain actor holds the public path and a
+    // control bridge serves ScalePool for it.
+    let key = ControlKey::scoped("wire-scale");
+    let system = Arc::new(actor_runtime::system::ActorSystem::new(
+        SystemConfig::production(),
+    ));
+    actor_runtime::builder::spawn_es_builder::<Worker>(&system)
+        .at(ActorPath::new("api"))
+        .args(json!({}))
+        .handles::<Work>()
+        .emits::<WorkDone>()
+        .start();
+    let blueprints = Blueprints::new().with_kind(
+        "api",
+        PoolBlueprint {
+            public: ActorPath::new("api"),
+            algo: actor_runtime::pool::PoolAlgo::RoundRobin,
+            parent: None,
+            seed: 42,
+            args: Some(json!({})),
+            factory: Arc::new(|system, path, args| {
+                actor_runtime::builder::spawn_es_builder::<Worker>(system)
+                    .at(path.clone())
+                    .args(args.clone())
+                    .handles::<Work>()
+                    .emits::<WorkDone>()
+                    .start();
+            }),
+        },
+    );
+    let bridge = install_control_on(
+        key.clone(),
+        system.clone(),
+        ControlRouter::new().with(ScalePoolCmd::new(blueprints)),
+    )
+    .await
+    .expect("control bridge installed");
+
+    // When scaling the pool from a second session, riding out discovery.
+    let mut reply = None;
+    for _ in 0..20 {
+        if let Ok(r) = send_command_on(
+            key.clone(),
+            ControlRequest {
+                command: "ScalePool".into(),
+                args: json!({ "kind": "api", "workers": 3 }),
+            },
+        )
+        .await
+        {
+            reply = Some(r);
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+
+    // Then the takeover is confirmed over the wire…
+    let reply = reply.expect("a scale reply within the discovery warm-up");
+    assert_eq!(
+        reply.result(),
+        Some(json!({
+            "kind": "api",
+            "public": "api",
+            "workers": 3,
+            "algo": "round-robin",
+        })),
+        "ScalePool's summary crosses the wire"
+    );
+
+    // …and the system actually has the pool: work sent to the public
+    // path reaches the three workers (the takeover drained the plain
+    // holder — the export's pools section is the source of truth).
+    let pools = system.export().await.pools;
+    assert_eq!(pools.len(), 1, "exactly the scaled pool exists");
+    assert_eq!(pools[0].path.as_str(), "api");
+    assert_eq!(pools[0].workers.len(), 3, "three worker slots");
+
+    // Teardown.
+    bridge.close().await.expect("bridge session closed");
+}

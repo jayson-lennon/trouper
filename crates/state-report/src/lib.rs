@@ -1345,12 +1345,17 @@ mod tests {
     }
 
     fn probe_blueprints() -> Blueprints {
+        probe_blueprints_under(None)
+    }
+
+    /// The `probe` blueprint with an optional supervised parent.
+    fn probe_blueprints_under(parent: Option<ActorPath>) -> Blueprints {
         Blueprints::new().with_kind(
             "probe",
             PoolBlueprint {
                 public: ActorPath::new("scale.me"),
                 algo: actor_runtime::pool::PoolAlgo::RoundRobin,
-                parent: None,
+                parent,
                 seed: 42,
                 args: Some(json!({})),
                 factory: std::sync::Arc::new(|system, path, args| {
@@ -1365,18 +1370,23 @@ mod tests {
         )
     }
 
-    /// Sends `count` probes to the pool's public path.
-    async fn send_probes(system: &ActorSystem, count: usize) {
+    /// Sends `count` probes to a pool's public path (any blueprint —
+    /// they differ only in supervision).
+    async fn send_probes_to(system: &ActorSystem, public: &str, count: usize) {
         for i in 0..count {
             system
                 .send(system.envelope(
                     Probe::schema_id(),
-                    ActorPath::new("scale.me"),
+                    ActorPath::new(public),
                     json!({ "n": i }),
                 ))
                 .await
                 .expect("probe delivered to the pool");
         }
+    }
+
+    async fn send_probes(system: &ActorSystem, count: usize) {
+        send_probes_to(system, "scale.me", count).await;
     }
 
     /// Counts `Delivered` facts addressed to a specific worker path.
@@ -1641,6 +1651,71 @@ mod tests {
             .map(|c| c.as_u64())
             != Some(1)
         {
+            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn scale_pool_honors_a_supervised_parent_blueprint() {
+        // Given a blueprint whose workers are supervised children of a
+        // live parent actor (the pools example's escalation topology).
+        let system = probe_blueprint_system();
+        actor_runtime::builder::spawn_es_builder::<ProbeWorker>(&system)
+            .at(ActorPath::new("scale.parent"))
+            .args(json!({}))
+            .handles::<Probe>()
+            .emits::<Probed>()
+            .start();
+        let router = ControlRouter::new().with(ScalePoolCmd::new(probe_blueprints_under(Some(
+            ActorPath::new("scale.parent"),
+        ))));
+
+        // When scaling through the router.
+        let reply = router
+            .dispatch(
+                &system,
+                ControlRequest {
+                    command: "ScalePool".into(),
+                    args: json!({ "kind": "probe", "workers": 2 }),
+                },
+            )
+            .await;
+
+        // Then the install succeeds and the reply is the usual summary.
+        assert_eq!(
+            reply.result(),
+            Some(json!({
+                "kind": "probe",
+                "public": "scale.me",
+                "workers": 2,
+                "algo": "round-robin",
+            })),
+            "a supervised blueprint scales like any other"
+        );
+
+        // And the workers serve as pool slots — routing works under the
+        // supervised topology (escalation wiring itself is the runtime's
+        // own tested concern; the command must simply not break it).
+        send_probes(&system, 2).await;
+        while delivered_to(&system, "scale.me/worker-0")
+            + delivered_to(&system, "scale.me/worker-1")
+            < 2
+        {
+            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+        }
+
+        // And the supervision link is observable: stopping a worker
+        // notifies the blueprint's parent (workers were spawned as its
+        // children).
+        system.stop(&ActorPath::new("scale.me/worker-0")).await;
+        while !system.tap_facts().iter().any(|f| {
+            matches!(
+                &f.kind,
+                FactKind::LinkNotified { parent, child }
+                    if parent.as_str() == "scale.parent"
+                        && child.as_str() == "scale.me/worker-0"
+            )
+        }) {
             tokio::time::sleep(std::time::Duration::from_millis(2)).await;
         }
     }
