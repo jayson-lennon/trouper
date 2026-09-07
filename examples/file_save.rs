@@ -58,51 +58,6 @@ impl FileStore for RealFs {
     }
 }
 
-/// Test store: an in-memory map with injectable write denials.
-///
-/// Denials are process-global (`DENIED`): a spawned actor owns its own
-/// `MemFs` instance, so tests seed the global list to make THE ACTOR'S
-/// store deny a path.
-#[cfg(test)]
-#[derive(Default)]
-struct MemFs {
-    files: parking_lot::Mutex<std::collections::HashMap<std::path::PathBuf, Vec<u8>>>,
-}
-
-/// Paths every `MemFs` must refuse (test fixture).
-#[cfg(test)]
-static DENIED: parking_lot::Mutex<Vec<std::path::PathBuf>> = parking_lot::Mutex::new(Vec::new());
-
-#[cfg(test)]
-impl MemFs {
-    fn new() -> Self {
-        Self::default()
-    }
-
-    /// Marks `path` so writes to it fail with `PermissionDenied`.
-    fn deny(path: &std::path::Path) {
-        DENIED.lock().push(path.to_owned());
-    }
-
-    /// What a path's contents ended up as (test assertions).
-    fn written(&self, path: &std::path::Path) -> Option<Vec<u8>> {
-        self.files.lock().get(path).cloned()
-    }
-}
-
-#[cfg(test)]
-impl FileStore for MemFs {
-    fn write<'a>(&'a self, path: &'a std::path::Path, contents: &'a [u8]) -> FileWriteFuture<'a> {
-        Box::pin(async move {
-            if DENIED.lock().iter().any(|p| p == path) {
-                return Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied));
-            }
-            self.files.lock().insert(path.to_owned(), contents.to_vec());
-            Ok(contents.len())
-        })
-    }
-}
-
 // ---------- the minimal actor ---------------------------------------------
 
 /// The command: save these contents to this path.
@@ -469,6 +424,52 @@ async fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Test store: an in-memory map with injectable write denials.
+    ///
+    /// Denials are process-global (`DENIED`): a spawned actor owns its own
+    /// `MemFs` instance, so tests seed the global list to make THE ACTOR'S
+    /// store deny a path.
+    #[derive(Default)]
+    struct MemFs {
+        files: parking_lot::Mutex<std::collections::HashMap<std::path::PathBuf, Vec<u8>>>,
+    }
+
+    /// Paths every `MemFs` must refuse (test fixture).
+    static DENIED: parking_lot::Mutex<Vec<std::path::PathBuf>> =
+        parking_lot::Mutex::new(Vec::new());
+
+    impl MemFs {
+        fn new() -> Self {
+            Self::default()
+        }
+
+        /// Marks `path` so writes to it fail with `PermissionDenied`.
+        fn deny(path: &std::path::Path) {
+            DENIED.lock().push(path.to_owned());
+        }
+
+        /// What a path's contents ended up as (test assertions).
+        fn written(&self, path: &std::path::Path) -> Option<Vec<u8>> {
+            self.files.lock().get(path).cloned()
+        }
+    }
+
+    impl FileStore for MemFs {
+        fn write<'a>(
+            &'a self,
+            path: &'a std::path::Path,
+            contents: &'a [u8],
+        ) -> FileWriteFuture<'a> {
+            Box::pin(async move {
+                if DENIED.lock().iter().any(|p| p == path) {
+                    return Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied));
+                }
+                self.files.lock().insert(path.to_owned(), contents.to_vec());
+                Ok(contents.len())
+            })
+        }
+    }
 
     /// The domain method under test — no runtime, no disk, deterministic.
     async fn saver() -> FileSaver<MemFs> {
