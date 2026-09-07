@@ -66,12 +66,12 @@ impl FileStore for RealFs {
 #[cfg(test)]
 #[derive(Default)]
 struct MemFs {
-    files: std::sync::Mutex<std::collections::HashMap<std::path::PathBuf, Vec<u8>>>,
+    files: parking_lot::Mutex<std::collections::HashMap<std::path::PathBuf, Vec<u8>>>,
 }
 
 /// Paths every `MemFs` must refuse (test fixture).
 #[cfg(test)]
-static DENIED: std::sync::Mutex<Vec<std::path::PathBuf>> = std::sync::Mutex::new(Vec::new());
+static DENIED: parking_lot::Mutex<Vec<std::path::PathBuf>> = parking_lot::Mutex::new(Vec::new());
 
 #[cfg(test)]
 impl MemFs {
@@ -81,12 +81,12 @@ impl MemFs {
 
     /// Marks `path` so writes to it fail with `PermissionDenied`.
     fn deny(path: &std::path::Path) {
-        DENIED.lock().expect("lock").push(path.to_owned());
+        DENIED.lock().push(path.to_owned());
     }
 
     /// What a path's contents ended up as (test assertions).
     fn written(&self, path: &std::path::Path) -> Option<Vec<u8>> {
-        self.files.lock().expect("lock").get(path).cloned()
+        self.files.lock().get(path).cloned()
     }
 }
 
@@ -94,13 +94,10 @@ impl MemFs {
 impl FileStore for MemFs {
     fn write<'a>(&'a self, path: &'a std::path::Path, contents: &'a [u8]) -> FileWriteFuture<'a> {
         Box::pin(async move {
-            if DENIED.lock().expect("lock").iter().any(|p| p == path) {
+            if DENIED.lock().iter().any(|p| p == path) {
                 return Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied));
             }
-            self.files
-                .lock()
-                .expect("lock")
-                .insert(path.to_owned(), contents.to_vec());
+            self.files.lock().insert(path.to_owned(), contents.to_vec());
             Ok(contents.len())
         })
     }
@@ -259,7 +256,7 @@ impl<S: FileStore + Default> MsgHandler<SaveFile> for FileSaver<S> {
 /// because the fact travels through the runtime to another ACTOR — the
 /// main flow only polls it (topics are at-most-once mirrors: poll, never
 /// assume ordering with the reply).
-static AUDIT: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+static AUDIT: parking_lot::Mutex<Vec<String>> = parking_lot::Mutex::new(Vec::new());
 
 /// The audit subscriber: an ordinary service actor that handles
 /// `SaveFailed` — the observer side of the pattern.
@@ -275,7 +272,6 @@ impl MsgHandler<SaveFailed> for SaveAudit {
     async fn handle(&mut self, fact: SaveFailed, _ctx: &mut MsgCtx<'_>) {
         AUDIT
             .lock()
-            .expect("lock")
             .push(format!("{} ({})", fact.path, fact.reason));
     }
 }
@@ -407,8 +403,8 @@ async fn run_demo() -> Result<(), state_report::StateBridgeError> {
         )
         .await
         .expect("told");
-    wait(|| async { !AUDIT.lock().expect("lock").is_empty() }).await;
-    for fact in AUDIT.lock().expect("lock").iter() {
+    wait(|| async { !AUDIT.lock().is_empty() }).await;
+    for fact in AUDIT.lock().iter() {
         println!("audit saw the failed tell: {fact}");
     }
 
@@ -605,7 +601,7 @@ mod tests {
     async fn a_failed_tell_is_observable_through_the_published_fact() {
         // Given the actor + audit on a real system.
         let (system, saver, _audit) = demo_system().await;
-        AUDIT.lock().expect("lock").clear();
+        AUDIT.lock().clear();
         let path = std::env::temp_dir().join("adapter-tell-denied.txt");
         MemFs::deny(&path);
 
@@ -623,8 +619,8 @@ mod tests {
 
         // Then the failure still surfaces — as a published fact at the
         // audit subscriber. Never a broadcast reply; a topic publish.
-        wait(|| async { !AUDIT.lock().expect("lock").is_empty() }).await;
-        let seen = AUDIT.lock().expect("lock");
+        wait(|| async { !AUDIT.lock().is_empty() }).await;
+        let seen = AUDIT.lock();
         assert!(
             seen.iter()
                 .any(|f| f.contains("adapter-tell-denied.txt") && f.contains("PermissionDenied")),

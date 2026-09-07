@@ -16,6 +16,7 @@ serde = { version = "1.0", features = ["derive", "rc"] }
 serde_json = "1.0"
 uuid = { version = "1.26", features = ["v7", "serde"] }
 arc-swap = "1.9"
+parking_lot = "0.12"
 wherror = "2.4"
 error-stack = "0.8"
 derive_more = { version = "2.1", features = ["debug"] }
@@ -32,6 +33,7 @@ edition.workspace = true
 
 [dependencies]
 actor-runtime.workspace = true
+parking_lot.workspace = true
 state-report.workspace = true
 error-stack.workspace = true
 tokio.workspace = true

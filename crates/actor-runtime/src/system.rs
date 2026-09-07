@@ -6,7 +6,8 @@
 //! The system also implements [`RuntimeView`]: handler-side lookups snapshot
 //! through this read-only surface, never through kernel-mutable locks.
 
-use std::sync::{Arc, Mutex};
+use parking_lot::Mutex;
+use std::sync::Arc;
 
 use serde_json::Value as JsonValue;
 use serde_json::json;
@@ -130,7 +131,7 @@ pub struct ActorSystem {
     /// The read-only view handed to handler contexts (the system itself).
     pub(crate) view: Arc<dyn RuntimeView>,
     /// Supervision engine shutdown handles (one per supervised child).
-    child_shutdowns: std::sync::Mutex<Vec<tokio::sync::watch::Sender<bool>>>,
+    child_shutdowns: parking_lot::Mutex<Vec<tokio::sync::watch::Sender<bool>>>,
     /// System-wide mailbox defaults (per-spawn opts override).
     pub(crate) mailbox_defaults: MailboxDefaults,
 }
@@ -285,7 +286,7 @@ impl ActorSystem {
     /// supervision engine for crash handling.
     pub fn spawn_child(self: &Arc<Self>, spec: crate::supervision::ChildSpec) {
         {
-            let mut kernel = self.kernel.lock().expect("kernel lock");
+            let mut kernel = self.kernel.lock();
             kernel.specs.insert(spec.path.clone(), spec.clone());
             kernel
                 .failures
@@ -296,10 +297,7 @@ impl ActorSystem {
         let path = spec.path.clone();
         (spec.spawn)(&engine, &path, &spec.args);
         let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
-        self.child_shutdowns
-            .lock()
-            .expect("shutdown lock")
-            .push(_shutdown_tx);
+        self.child_shutdowns.lock().push(_shutdown_tx);
         tokio::spawn(crate::kernel::supervise_child(
             engine,
             engine_spec,
@@ -320,7 +318,7 @@ impl ActorSystem {
             ))),
             clock: config.clock,
             view,
-            child_shutdowns: std::sync::Mutex::new(Vec::new()),
+            child_shutdowns: parking_lot::Mutex::new(Vec::new()),
             mailbox_defaults: config.default_mailbox,
         }
     }
@@ -386,7 +384,7 @@ impl ActorSystem {
     /// Idempotent per name+version: the first registration wins, and the
     /// returned id is stable across repeat registrations.
     pub fn register_schema<S: Schema>(&self) -> SchemaId {
-        let mut registry = self.registry.lock().expect("registry lock");
+        let mut registry = self.registry.lock();
         registry.register_schema_of::<S>()
     }
 
@@ -400,13 +398,13 @@ impl ActorSystem {
         &self,
         json: JsonValue,
     ) -> Result<SchemaId, error_stack::Report<crate::schema::SchemaError>> {
-        let mut registry = self.registry.lock().expect("registry lock");
+        let mut registry = self.registry.lock();
         registry.register_schema_json(json)
     }
 
     /// The registered descriptor for an exact `name@version` id, if any.
     pub fn schema(&self, id: &SchemaId) -> Option<crate::schema::SchemaDef> {
-        let registry = self.registry.lock().expect("registry lock");
+        let registry = self.registry.lock();
         registry.schema(id).cloned()
     }
 
@@ -444,7 +442,7 @@ impl ActorSystem {
         // observers declare a subscription filter against it). First
         // registration wins — test-local FactMsg may already have it.
         {
-            let mut registry = self.registry.lock().expect("registry lock");
+            let mut registry = self.registry.lock();
             registry
                 .register_schema_json(json!({
                     "name": "Fact", "version": 1, "kind": "event",
@@ -469,7 +467,7 @@ impl ActorSystem {
                 manifest.handles.push(schema);
             }
         }
-        let mut registry = self.registry.lock().expect("registry lock");
+        let mut registry = self.registry.lock();
         registry
             .insert_slot(
                 path.clone(),
@@ -488,7 +486,7 @@ impl ActorSystem {
         // undeclared schemas pre-append) — the builder/foreign paths feed
         // extra declarations through `declare_emits` before the first step.
         drop(registry);
-        let mut kernel = self.kernel.lock().expect("kernel lock");
+        let mut kernel = self.kernel.lock();
         let cell = Arc::new(ActorCell::new(
             path.clone(),
             Inbox::new(opts.mailbox_capacity.max(1), opts.mailbox_policy),
@@ -528,7 +526,7 @@ impl ActorSystem {
         };
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
         loop_ctx.start(rx, shutdown_rx);
-        let kernel = self.kernel.lock().expect("kernel lock");
+        let kernel = self.kernel.lock();
         if let Some(cell) = kernel.cells.get(&path)
             && let Ok(mut handle) = cell.handle.try_lock()
         {
@@ -585,7 +583,7 @@ impl ActorSystem {
         // observers declare a subscription filter against it). First
         // registration wins — test-local FactMsg may already have it.
         {
-            let mut registry = self.registry.lock().expect("registry lock");
+            let mut registry = self.registry.lock();
             registry
                 .register_schema_json(json!({
                     "name": "Fact", "version": 1, "kind": "event",
@@ -601,7 +599,7 @@ impl ActorSystem {
         let opts = self.resolve_opts(opts);
         let (tx, rx) = tokio::sync::mpsc::channel::<Envelope>(opts.mailbox_capacity.max(1) * 2);
         {
-            let mut registry = self.registry.lock().expect("registry lock");
+            let mut registry = self.registry.lock();
             registry
                 .insert_slot(
                     path.clone(),
@@ -616,7 +614,7 @@ impl ActorSystem {
                 registry.add_route(schema, path.clone());
             }
         }
-        let mut kernel = self.kernel.lock().expect("kernel lock");
+        let mut kernel = self.kernel.lock();
         let cell = Arc::new(ActorCell::new(
             path.clone(),
             Inbox::new(opts.mailbox_capacity.max(1), opts.mailbox_policy),
@@ -658,14 +656,14 @@ impl ActorSystem {
             let started = start.await;
             match started {
                 Ok(instance) => {
-                    let mut kernel = kernel_table.lock().expect("kernel lock");
+                    let mut kernel = kernel_table.lock();
                     kernel.services.insert(
                         started_path.clone(),
                         Arc::new(tokio::sync::Mutex::new(instance)),
                     );
                 }
                 Err(report) => {
-                    let mut kernel = kernel_table.lock().expect("kernel lock");
+                    let mut kernel = kernel_table.lock();
                     kernel.crashed.insert(started_path.clone());
                     let _ = report;
                 }
@@ -767,7 +765,7 @@ impl ActorSystem {
     ///
     /// Panics if the kernel lock is poisoned.
     pub fn install_dlq_redriver(self: &Arc<Self>) {
-        let mut kernel = self.kernel.lock().expect("kernel lock");
+        let mut kernel = self.kernel.lock();
         let log = match kernel.topic_logs.get_mut(&Registry::dead_letter_topic()) {
             Some(log) => log,
             None => return, // no dead letters yet: nothing to redrive
@@ -820,7 +818,7 @@ impl ActorSystem {
         genesis_args: &JsonValue,
     ) -> Result<(), error_stack::Report<crate::journal::JournalError>> {
         let loop_ctx = {
-            let kernel = self.kernel.lock().expect("kernel lock");
+            let kernel = self.kernel.lock();
             let cell = kernel.cells.get(path).cloned();
             drop(kernel);
             cell
@@ -880,8 +878,8 @@ impl ActorSystem {
         filter: crate::topics::SubscriptionFilter,
     ) -> Result<u64, error_stack::Report<crate::registry::RegistryError>> {
         use error_stack::IntoReport;
-        let mut kernel = self.kernel.lock().expect("kernel lock");
-        let registry = self.registry.lock().expect("registry lock");
+        let mut kernel = self.kernel.lock();
+        let registry = self.registry.lock();
         if !kernel.cells.contains_key(path) {
             return Err(crate::registry::RegistryError::UnknownPath(path.clone())
                 .into_report()
@@ -911,7 +909,7 @@ impl ActorSystem {
         topic: &crate::types::Topic,
         to: u64,
     ) -> Result<u64, u64> {
-        let mut kernel = self.kernel.lock().expect("kernel lock");
+        let mut kernel = self.kernel.lock();
         let Some(log) = kernel.topic_logs.get_mut(topic) else {
             return Err(to);
         };
@@ -920,13 +918,13 @@ impl ActorSystem {
 
     /// The topic log's retained offset range (inspection).
     pub fn topic_range(&self, topic: &crate::types::Topic) -> Option<(u64, u64)> {
-        let kernel = self.kernel.lock().expect("kernel lock");
+        let kernel = self.kernel.lock();
         kernel.topic_logs.get(topic).map(|log| log.retained())
     }
 
     /// A snapshot of tap facts from an offset (inspection/tests).
     pub fn tap_facts_from(&self, from: u64) -> Vec<crate::tap::Fact> {
-        let kernel = self.kernel.lock().expect("kernel lock");
+        let kernel = self.kernel.lock();
         kernel.tap.subscribe(from).1
     }
 
@@ -966,13 +964,7 @@ impl ActorSystem {
     ) -> Result<(), error_stack::Report<crate::registry::RegistryError>> {
         // 1. TAKEOVER: stop-drain whoever holds the public path today (a
         // plain actor). A no-op when the path is free.
-        if self
-            .registry
-            .lock()
-            .expect("registry lock")
-            .lookup(&spec.public)
-            .is_some()
-        {
+        if self.registry.lock().lookup(&spec.public).is_some() {
             self.stop(&spec.public).await;
         }
         // 2. WORKERS: spawn through the factory; each worker registers its
@@ -1013,7 +1005,7 @@ impl ActorSystem {
         // 3. INSTALL: one registry transaction — the pool entry claims the
         // public name (workers own the deliverable slots).
         let entry = crate::pool::pool_entry(spec.algo, workers, spec.seed, spec.parent.clone());
-        let mut registry = self.registry.lock().expect("registry lock");
+        let mut registry = self.registry.lock();
         registry.install_pool(spec.public, entry)
     }
 
@@ -1035,7 +1027,7 @@ impl ActorSystem {
         self: &Arc<Self>,
         spec: crate::pool::PartitionSpec,
     ) -> Result<(), error_stack::Report<crate::registry::RegistryError>> {
-        let mut registry = self.registry.lock().expect("registry lock");
+        let mut registry = self.registry.lock();
         registry.install_partition_set(spec)
     }
 
@@ -1046,7 +1038,7 @@ impl ActorSystem {
     /// (never an audit mechanism), an `Inline` interposes the observer in
     /// the primary's place.
     pub fn install_rule(&self, rule: crate::pool::Rule) {
-        let mut registry = self.registry.lock().expect("registry lock");
+        let mut registry = self.registry.lock();
         registry.add_rule(rule);
     }
 
@@ -1066,7 +1058,7 @@ impl ActorSystem {
         }
         // 1. CHILDREN FIRST (recursive): any spec whose parent is this path.
         let children: Vec<ActorPath> = {
-            let kernel = self.kernel.lock().expect("kernel lock");
+            let kernel = self.kernel.lock();
             kernel
                 .specs
                 .values()
@@ -1088,12 +1080,12 @@ impl ActorSystem {
         // An edge-only path (no cell — e.g. a supervised spec whose actor
         // never started) still cascades below.
         let join_task = {
-            let kernel = self.kernel.lock().expect("kernel lock");
+            let kernel = self.kernel.lock();
             let Some(cell) = kernel.cells.get(path) else {
                 // No running instance: drop the spec edge, record the
                 // stop, and finish.
                 drop(kernel);
-                let mut kernel = self.kernel.lock().expect("kernel lock");
+                let mut kernel = self.kernel.lock();
                 kernel.specs.remove(path);
                 kernel.record_fact(
                     self.clock.now(),
@@ -1124,7 +1116,7 @@ impl ActorSystem {
 
         // 4. UNDELIVERED → DLQ; then close the inbox.
         let undelivered: Vec<Envelope> = {
-            let kernel = self.kernel.lock().expect("kernel lock");
+            let kernel = self.kernel.lock();
             let mut drained = Vec::new();
             if let Some(cell) = kernel.cells.get(path)
                 && let Ok(mut inbox) = cell.inbox.try_lock()
@@ -1137,7 +1129,7 @@ impl ActorSystem {
             drained
         };
         {
-            let mut kernel = self.kernel.lock().expect("kernel lock");
+            let mut kernel = self.kernel.lock();
             let mut letters = Vec::with_capacity(undelivered.len());
             for envelope in &undelivered {
                 letters.push(crate::kernel::DeadLetter {
@@ -1163,11 +1155,11 @@ impl ActorSystem {
         // link notification (a supervised child stopping notifies its
         // parent as a tap fact).
         {
-            let mut registry = self.registry.lock().expect("registry lock");
+            let mut registry = self.registry.lock();
             let _ = registry.remove_slot(path);
         }
         {
-            let mut kernel = self.kernel.lock().expect("kernel lock");
+            let mut kernel = self.kernel.lock();
             kernel.cells.remove(path);
             for log in kernel.topic_logs.values_mut() {
                 log.unsubscribe(path);
@@ -1201,13 +1193,13 @@ impl ActorSystem {
     pub async fn export(&self) -> SystemExport {
         // Schemas (all versions).
         let schemas = {
-            let registry = self.registry.lock().expect("registry lock");
+            let registry = self.registry.lock();
             registry.schemas().all().into_iter().cloned().collect()
         };
 
         // Live actors: manifests from slots, state/cursor from kernel.
         let slot_manifests = {
-            let registry = self.registry.lock().expect("registry lock");
+            let registry = self.registry.lock();
             registry.slot_manifests()
         };
         let mut actors = Vec::new();
@@ -1215,7 +1207,7 @@ impl ActorSystem {
             // Scope the kernel guard: drop it before awaiting the state
             // shell (a std Mutex must never span an await point).
             let (state, cursor) = {
-                let kernel = self.kernel.lock().expect("kernel lock");
+                let kernel = self.kernel.lock();
                 let cursor = kernel.cells.get(&path).and_then(|cell| {
                     cell.inbox
                         .try_lock()
@@ -1228,7 +1220,7 @@ impl ActorSystem {
             let state = match state {
                 Some(()) => {
                     let shell = {
-                        let kernel = self.kernel.lock().expect("kernel lock");
+                        let kernel = self.kernel.lock();
                         kernel.es_state.get(&path).cloned()
                     };
                     match shell {
@@ -1253,7 +1245,7 @@ impl ActorSystem {
         // Runtime topic subscriptions (subscribe calls) are declared
         // edges too: read them from the topic logs.
         let runtime_subscriptions: Vec<(ActorPath, crate::types::Topic)> = {
-            let kernel = self.kernel.lock().expect("kernel lock");
+            let kernel = self.kernel.lock();
             kernel
                 .topic_logs
                 .iter()
@@ -1344,7 +1336,7 @@ impl ActorSystem {
         // Declared pool/partition/rule topology (the canvas's structural
         // view; the observed router signature lives in the tap facts).
         let (pools, partitions, rules) = {
-            let registry = self.registry.lock().expect("registry lock");
+            let registry = self.registry.lock();
             registry.topology()
         };
 
@@ -1362,13 +1354,13 @@ impl ActorSystem {
     /// The cursor of an actor's inbox (inspection; Phase 10 tests).
     /// How many envelopes the runtime could not deliver (inspection).
     pub async fn dead_letter_count(&self) -> usize {
-        let kernel = self.kernel.lock().expect("kernel lock");
+        let kernel = self.kernel.lock();
         kernel.dead_letters.len()
     }
 
     /// Why envelopes died (inspection/tests/demo debugging).
     pub async fn dead_letter_reasons(&self) -> Vec<String> {
-        let kernel = self.kernel.lock().expect("kernel lock");
+        let kernel = self.kernel.lock();
         kernel
             .dead_letters
             .iter()
@@ -1381,7 +1373,7 @@ impl ActorSystem {
         // Clone the Arc out of the kernel guard, then await the inbox
         // lock without holding the kernel's std Mutex.
         let cell = {
-            let kernel = self.kernel.lock().expect("kernel lock");
+            let kernel = self.kernel.lock();
             kernel.cells.get(path).cloned()
         };
         match cell {
@@ -1391,7 +1383,7 @@ impl ActorSystem {
     }
 
     pub fn inbox_cursor(&self, path: &ActorPath) -> Option<InboxOffset> {
-        let kernel = self.kernel.lock().expect("kernel lock");
+        let kernel = self.kernel.lock();
         kernel.cells.get(path).map(|cell| {
             cell.inbox
                 .try_lock()
@@ -1403,7 +1395,7 @@ impl ActorSystem {
     /// The captured ES state of an actor (for export/inspection).
     pub async fn es_state(&self, path: &ActorPath) -> Option<JsonValue> {
         let state = {
-            let kernel = self.kernel.lock().expect("kernel lock");
+            let kernel = self.kernel.lock();
             kernel.es_state.get(path).cloned()?
         };
         let state = state.lock().await;
@@ -1413,7 +1405,7 @@ impl ActorSystem {
     /// The event schemas currently journaled for `path`, in order
     /// (inspection: snapshots are skipped — they are not decisions).
     pub fn journal_schemas(&self, path: &ActorPath) -> Vec<SchemaId> {
-        let kernel = self.kernel.lock().expect("kernel lock");
+        let kernel = self.kernel.lock();
         kernel
             .journals
             .get(path)
@@ -1435,12 +1427,12 @@ struct NullView {
 
 impl RuntimeView for NullView {
     fn lookup(&self, path: &ActorPath) -> Option<EndpointInfo> {
-        let registry = self.registry.lock().expect("registry lock");
+        let registry = self.registry.lock();
         registry.lookup(path)
     }
 
     fn who_handles(&self, schema: &SchemaId) -> Vec<ActorPath> {
-        let registry = self.registry.lock().expect("registry lock");
+        let registry = self.registry.lock();
         registry.who_handles(schema)
     }
 
@@ -1451,12 +1443,12 @@ impl RuntimeView for NullView {
 
 impl RuntimeView for ActorSystem {
     fn lookup(&self, path: &ActorPath) -> Option<EndpointInfo> {
-        let registry = self.registry.lock().expect("registry lock");
+        let registry = self.registry.lock();
         registry.lookup(path)
     }
 
     fn who_handles(&self, schema: &SchemaId) -> Vec<ActorPath> {
-        let registry = self.registry.lock().expect("registry lock");
+        let registry = self.registry.lock();
         registry.who_handles(schema)
     }
 
@@ -1477,7 +1469,7 @@ mod tests {
     impl ActorSystem {
         /// Whether the "aud" test actor subscribes to `topic` (tests).
         pub fn topic_has_subscriber(&self, topic: &crate::types::Topic) -> bool {
-            let kernel = self.kernel.lock().expect("kernel lock");
+            let kernel = self.kernel.lock();
             kernel
                 .topic_logs
                 .get(topic)
@@ -1487,13 +1479,13 @@ mod tests {
 
         /// The number of journalled entries for `path` (tests).
         pub fn journal_len(&self, path: &ActorPath) -> usize {
-            let kernel = self.kernel.lock().expect("kernel lock");
+            let kernel = self.kernel.lock();
             kernel.journals.get(path).map(|j| j.len()).unwrap_or(0)
         }
 
         /// Dead-letter schemas collected so far (tests).
         pub fn dead_letter_schemas(&self) -> Vec<SchemaId> {
-            let kernel = self.kernel.lock().expect("kernel lock");
+            let kernel = self.kernel.lock();
             kernel
                 .dead_letters
                 .iter()
@@ -1661,7 +1653,7 @@ mod tests {
         // inbox cursor advanced past the message (committed exactly once).
         let state = system.es_state(&path).await.expect("live");
         assert_eq!(state["total"], 5);
-        let kernel = system.kernel.lock().expect("lock");
+        let kernel = system.kernel.lock();
         let journal = &kernel.journals[&path];
         assert_eq!(journal.len(), 1);
         assert_eq!(journal.next_seq().as_u64(), 1);
@@ -1686,7 +1678,7 @@ mod tests {
 
         // Then it is dead-lettered, nothing is journalled, nothing applied.
         {
-            let kernel = system.kernel.lock().expect("lock");
+            let kernel = system.kernel.lock();
             assert_eq!(kernel.dead_letters.len(), 1);
             assert_eq!(kernel.dead_letters[0].schema, Boom::schema_id());
             assert_eq!(kernel.journals[&path].len(), 0);
@@ -1799,7 +1791,7 @@ mod tests {
 
         // The remaining two are still in the inbox (capacity allows).
         {
-            let kernel = system.kernel.lock().expect("lock");
+            let kernel = system.kernel.lock();
             let cell = kernel.cells.get(&path).expect("cell");
             let inbox = cell.inbox.try_lock().expect("inbox free between messages");
             assert_eq!(
@@ -1814,7 +1806,7 @@ mod tests {
 
         // Then the queued envelopes were flushed to the dead-letter
         // mirror with the typed StoppedWithMail reason.
-        let kernel = system.kernel.lock().expect("lock");
+        let kernel = system.kernel.lock();
         assert!(
             kernel
                 .dead_letters
@@ -1954,7 +1946,7 @@ mod tests {
         // Then NOTHING was appended, NOTHING acked, and the crash was
         // recorded: the message stays queued for redelivery after restart.
         {
-            let kernel = system.kernel.lock().expect("lock");
+            let kernel = system.kernel.lock();
             assert!(kernel.crashed.contains(&path));
             assert_eq!(kernel.journals.get(&path).map(|j| j.len()), Some(0));
             assert!(kernel.dead_letters.is_empty());
@@ -1997,7 +1989,7 @@ mod tests {
         // events, no double-apply), the pre-crash Add stayed committed, and
         // state equals the journal fold.
         {
-            let kernel = system.kernel.lock().expect("lock");
+            let kernel = system.kernel.lock();
             assert_eq!(kernel.journals[&path].len(), 1, "no duplicate events");
             assert!(kernel.dead_letters.is_empty(), "panic never dead-letters");
         }
@@ -2193,7 +2185,7 @@ mod tests {
 
         // Then delivery was unaffected: all 50 committed (journal count).
         let journal_len = {
-            let kernel = system.kernel.lock().expect("lock");
+            let kernel = system.kernel.lock();
             kernel.journals[&path].len()
         };
         assert_eq!(journal_len, 50);
@@ -2350,7 +2342,7 @@ mod tests {
         // lands in its sink via a plain send from the engine.
         let (system, _clock) = ActorSystem::test();
         let overseer = ActorPath::new("overseer");
-        bind_sink(&overseer, Arc::new(std::sync::Mutex::new(Vec::new())));
+        bind_sink(&overseer, Arc::new(parking_lot::Mutex::new(Vec::new())));
         struct Overseer;
         impl ServiceActor for Overseer {
             fn manifest() -> ActorManifest {
@@ -2382,14 +2374,11 @@ mod tests {
         impl MsgHandler<EscalatedMsg> for Overseer {
             async fn handle(&mut self, msg: EscalatedMsg, _ctx: &mut crate::context::MsgCtx<'_>) {
                 if let Some(s) = SINK_BY_PATH
-                    .get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+                    .get_or_init(|| parking_lot::Mutex::new(HashMap::new()))
                     .lock()
-                    .expect("table")
                     .get("overseer")
                 {
-                    s.lock()
-                        .expect("sink lock")
-                        .push(format!("escalated:{}", msg.escalated))
+                    s.lock().push(format!("escalated:{}", msg.escalated))
                 }
             }
         }
@@ -2449,7 +2438,7 @@ mod tests {
         let mut slot_gone = false;
         for _ in 0..2_000 {
             slot_gone = {
-                let registry = system.registry.lock().expect("lock");
+                let registry = system.registry.lock();
                 registry.resolve(&worker).is_none()
             };
             if slot_gone {
@@ -2533,7 +2522,7 @@ mod tests {
         );
         // Register the child spec AFTER its cell exists (supervised).
         {
-            let mut kernel = kernel.lock().expect("lock");
+            let mut kernel = kernel.lock();
             kernel.specs.insert(
                 child.clone(),
                 crate::supervision::ChildSpec {
@@ -2587,7 +2576,7 @@ mod tests {
 
         // And the child spec cascaded away with the parent.
         let child_cascaded = {
-            let kernel = system.kernel.lock().expect("lock");
+            let kernel = system.kernel.lock();
             !kernel.specs.contains_key(&child)
         };
         assert!(child_cascaded, "child spec cascaded with the parent");
@@ -2657,7 +2646,7 @@ mod tests {
         let mut slot_gone = false;
         for _ in 0..2_000 {
             slot_gone = {
-                let registry = system.registry.lock().expect("lock");
+                let registry = system.registry.lock();
                 registry.resolve(&child).is_none()
             };
             if slot_gone {
@@ -2693,7 +2682,7 @@ mod tests {
         let (system, _clock) = ActorSystem::test();
         let path = ActorPath::new("transient-child");
         {
-            let mut kernel = system.kernel.lock().expect("lock");
+            let mut kernel = system.kernel.lock();
             kernel.specs.insert(
                 path.clone(),
                 crate::supervision::ChildSpec {
@@ -2716,7 +2705,7 @@ mod tests {
         // Then no failure was recorded (the engine arms only on crashes)
         // and the stop fact says graceful.
         let stops: Vec<_> = {
-            let kernel = system.kernel.lock().expect("lock");
+            let kernel = system.kernel.lock();
             assert!(!kernel.specs.contains_key(&path), "spec removed on stop");
             kernel
                 .tap
@@ -2728,7 +2717,7 @@ mod tests {
         };
         assert_eq!(stops.len(), 1, "exactly one stop fact: {stops:?}");
         let no_failures = {
-            let kernel = system.kernel.lock().expect("lock");
+            let kernel = system.kernel.lock();
             kernel.failures.get(&path).map(|w| w.is_empty()) != Some(false)
         };
         assert!(no_failures, "no failure recorded for a normal exit");
@@ -2863,7 +2852,7 @@ mod tests {
             vec![Arc::new(TypedEsAdapter::<Counter, Add>::new::<Add>())]
         });
         let (slow_idx, _slow_sink) = open_sink();
-        bind_sink(&slow, sinks().lock().expect("sinks lock")[slow_idx].clone());
+        bind_sink(&slow, sinks().lock()[slow_idx].clone());
         system.spawn_service::<Auditor, _>(
             slow.clone(),
             &json!({ "sink": slow_idx }),
@@ -2893,7 +2882,7 @@ mod tests {
         // Then the publisher still committed everything.
         wait_for_cursor(&system, &path, 10).await;
         // And some deliveries were refused (dead-lettered), not blocked.
-        let dead = system.kernel.lock().expect("lock").dead_letters.len();
+        let dead = system.kernel.lock().dead_letters.len();
         assert!(
             dead > 0 || { !sink_read(&slow).is_empty() },
             "slow subscriber either dropped or received; never stalled the publisher"
@@ -2903,7 +2892,7 @@ mod tests {
     async fn wait_for_crash(system: &ActorSystem, path: &ActorPath) {
         for _ in 0..2_000 {
             {
-                let kernel = system.kernel.lock().expect("lock");
+                let kernel = system.kernel.lock();
                 if kernel.crashed.contains(path) {
                     return;
                 }
@@ -2932,25 +2921,21 @@ mod tests {
     }
 
     fn bind_sink(path: &ActorPath, sink: Arc<Mutex<Vec<String>>>) {
-        sink_table()
-            .lock()
-            .expect("sink table lock")
-            .insert(path.to_string(), sink);
+        sink_table().lock().insert(path.to_string(), sink);
     }
 
     /// Reads a subscriber's sink lines by path (test inspection).
     fn sink_read(path: &ActorPath) -> Vec<String> {
         sink_table()
             .lock()
-            .expect("sink table lock")
             .get(&path.to_string())
-            .map(|sink| sink.lock().expect("sink lock").clone())
+            .map(|sink| sink.lock().clone())
             .unwrap_or_default()
     }
 
     fn open_sink() -> (usize, Arc<Mutex<Vec<String>>>) {
         let sink = Arc::new(Mutex::new(Vec::new()));
-        let mut all = sinks().lock().expect("sinks lock");
+        let mut all = sinks().lock();
         all.push(sink.clone());
         (all.len() - 1, sink)
     }
@@ -2970,17 +2955,14 @@ mod tests {
             args: &JsonValue,
         ) -> Result<Self, error_stack::Report<crate::registry::RegistryError>> {
             let idx = args["sink"].as_u64().expect("sink index") as usize;
-            let sink = sinks().lock().expect("sinks lock")[idx].clone();
+            let sink = sinks().lock()[idx].clone();
             Ok(Self { sink })
         }
     }
 
     impl MsgHandler<Added> for Auditor {
         async fn handle(&mut self, msg: Added, _ctx: &mut crate::context::MsgCtx<'_>) {
-            self.sink
-                .lock()
-                .expect("sink lock")
-                .push(format!("Added:{}", msg.n));
+            self.sink.lock().push(format!("Added:{}", msg.n));
         }
     }
 
@@ -2992,10 +2974,7 @@ mod tests {
                 ctx.subscribe(crate::types::Topic::new("auditor.join"));
                 return;
             }
-            self.sink
-                .lock()
-                .expect("sink lock")
-                .push(format!("n={}", msg.n));
+            self.sink.lock().push(format!("n={}", msg.n));
         }
     }
 
@@ -3031,16 +3010,13 @@ mod tests {
             args: &JsonValue,
         ) -> Result<Self, error_stack::Report<crate::registry::RegistryError>> {
             let idx = args["sink"].as_u64().expect("sink index") as usize;
-            let sink = sinks().lock().expect("sinks lock")[idx].clone();
+            let sink = sinks().lock()[idx].clone();
             Ok(Self { sink })
         }
     }
     impl MsgHandler<BoomMsg> for DlqWatcher {
         async fn handle(&mut self, msg: BoomMsg, _ctx: &mut crate::context::MsgCtx<'_>) {
-            self.sink
-                .lock()
-                .expect("sink lock")
-                .push(format!("dead letter: {}", msg.why));
+            self.sink.lock().push(format!("dead letter: {}", msg.why));
         }
     }
 
@@ -3072,7 +3048,7 @@ mod tests {
 
         // Then the handler ran (impure side effect recorded).
         for _ in 0..2_000 {
-            if sink.lock().expect("sink lock").as_slice() == ["n=7"] {
+            if sink.lock().as_slice() == ["n=7"] {
                 return;
             }
             tokio::time::sleep(std::time::Duration::from_millis(2)).await;
@@ -3134,14 +3110,8 @@ mod tests {
                     .await;
                 let recorded = RESULTS.get_or_init(|| Mutex::new(Vec::new()));
                 match reply {
-                    Ok(value) => recorded
-                        .lock()
-                        .expect("results lock")
-                        .push(format!("replied:{}", value["echo"])),
-                    Err(_) => recorded
-                        .lock()
-                        .expect("results lock")
-                        .push("failed".to_owned()),
+                    Ok(value) => recorded.lock().push(format!("replied:{}", value["echo"])),
+                    Err(_) => recorded.lock().push("failed".to_owned()),
                 }
             }
         }
@@ -3178,15 +3148,12 @@ mod tests {
 
         // Then the ask settles as Replied with the echo's payload.
         for _ in 0..2_000 {
-            if results.lock().expect("lock").as_slice() == ["replied:21"] {
+            if results.lock().as_slice() == ["replied:21"] {
                 return;
             }
             tokio::time::sleep(std::time::Duration::from_millis(2)).await;
         }
-        panic!(
-            "ask never settled as replied: {:?}",
-            results.lock().unwrap()
-        );
+        panic!("ask never settled as replied: {:?}", results.lock());
     }
 
     #[tokio::test]
@@ -3239,7 +3206,7 @@ mod tests {
                     )
                     .await;
                 let recorded = RESULTS.get_or_init(|| Mutex::new(Vec::new()));
-                recorded.lock().expect("lock").push(
+                recorded.lock().push(
                     if reply.is_ok() {
                         "replied"
                     } else {
@@ -3282,8 +3249,8 @@ mod tests {
 
         // Then the ask settles as a timeout (and the lease is gone).
         for _ in 0..2_000 {
-            if results.lock().expect("lock").as_slice() == ["timed-out"] {
-                let kernel = system.kernel.lock().expect("lock");
+            if results.lock().as_slice() == ["timed-out"] {
+                let kernel = system.kernel.lock();
                 assert!(kernel.replies.is_empty(), "lease leaked after timeout");
                 assert!(!kernel.ask_facts.is_empty(), "no ask facts recorded");
                 assert!(
@@ -3296,7 +3263,7 @@ mod tests {
             }
             tokio::time::sleep(std::time::Duration::from_millis(2)).await;
         }
-        panic!("ask never timed out: {:?}", results.lock().unwrap());
+        panic!("ask never timed out: {:?}", results.lock());
     }
 
     #[tokio::test]
@@ -3361,7 +3328,6 @@ mod tests {
                 FAILED_RESULTS
                     .get_or_init(|| Mutex::new(Vec::new()))
                     .lock()
-                    .expect("results lock")
                     .push(settled.to_string());
             }
         }
@@ -3398,7 +3364,7 @@ mod tests {
         // same sweep that runs on system maintenance): the slot's sender
         // drops while the asker still awaits → receiver errs → Failed.
         wait_for(|| async {
-            let kernel = system.kernel.lock().expect("lock");
+            let kernel = system.kernel.lock();
             kernel.replies.len() == 1
         })
         .await;
@@ -3409,7 +3375,7 @@ mod tests {
             .expect("fake clock")
             .advance(std::time::Duration::from_secs(31));
         {
-            let kernel = system.kernel.lock().expect("lock");
+            let kernel = system.kernel.lock();
             kernel.replies.prune(crate::types::Timestamp::from_millis(
                 system.clock.now().as_millis(),
             ));
@@ -3418,8 +3384,8 @@ mod tests {
         // Then the ask settles as Failed (not Timeout), with an error.
         let results = FAILED_RESULTS.get_or_init(|| Mutex::new(Vec::new()));
         for _ in 0..2_000 {
-            if results.lock().expect("lock").as_slice() == ["failed"] {
-                let kernel = system.kernel.lock().expect("lock");
+            if results.lock().as_slice() == ["failed"] {
+                let kernel = system.kernel.lock();
                 assert!(
                     kernel
                         .ask_facts
@@ -3432,7 +3398,7 @@ mod tests {
             }
             tokio::time::sleep(std::time::Duration::from_millis(2)).await;
         }
-        panic!("ask never settled as failed: {:?}", results.lock().unwrap());
+        panic!("ask never settled as failed: {:?}", results.lock());
     }
 
     #[tokio::test]
@@ -3464,7 +3430,6 @@ mod tests {
                 RECEIVED
                     .get_or_init(|| Mutex::new(Vec::new()))
                     .lock()
-                    .expect("lock")
                     .push(format!("got n={}", msg.n));
             }
         }
@@ -3545,8 +3510,8 @@ mod tests {
         // Then the collector receives the reply as an ordinary message
         // (a durable-path continuation — the name survives, no lease).
         for _ in 0..2_000 {
-            if !received.lock().expect("lock").is_empty() {
-                let got = received.lock().expect("lock")[0].clone();
+            if !received.lock().is_empty() {
+                let got = received.lock()[0].clone();
                 assert!(got.starts_with("got n=5"), "wrong payload: {got}");
                 return;
             }
@@ -3559,7 +3524,7 @@ mod tests {
     async fn reply_slots_carry_the_mechanism_and_expire_cleanly() {
         // Given a live reply table with two leases: one short, one long.
         let system = ActorSystem::new(SystemConfig::production());
-        let kernel = system.kernel.lock().expect("lock");
+        let kernel = system.kernel.lock();
         let (short_lease, _short_rx) = kernel
             .replies
             .open(std::time::Duration::from_millis(5), system.clock.now());
@@ -3672,7 +3637,7 @@ mod tests {
         // The emit edge the decision closure produces is declared explicitly
         // (emit enforcement drops undeclared schemas, so this is load-bearing).
         {
-            let mut registry = system.registry.lock().expect("registry lock");
+            let mut registry = system.registry.lock();
             registry
                 .declare_emits(&ActorPath::new("tally-actor"), schema.clone())
                 .expect("live slot");
@@ -3765,7 +3730,7 @@ mod tests {
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         assert_eq!(sink_read(&ActorPath::new("sub")).len(), 1);
         let subscribers = {
-            let kernel = system.kernel.lock().expect("lock");
+            let kernel = system.kernel.lock();
             kernel
                 .topic_logs
                 .get(&topic)
@@ -3880,7 +3845,7 @@ mod tests {
             .await
             .expect("pool install");
         {
-            let mut registry = system.registry.lock().expect("registry lock");
+            let mut registry = system.registry.lock();
             registry.add_rule(crate::pool::Rule {
                 source: None,
                 schema: Some(Add::schema_id()),
@@ -3998,14 +3963,8 @@ mod tests {
         }
         impl MsgHandler<EscalatedMsg2> for Overseer2 {
             async fn handle(&mut self, msg: EscalatedMsg2, _ctx: &mut crate::context::MsgCtx<'_>) {
-                if let Some(sink) = sink_table()
-                    .lock()
-                    .expect("sink table lock")
-                    .get(&overseer_path().to_string())
-                {
-                    sink.lock()
-                        .expect("sink lock")
-                        .push(format!("escalated:{}", msg.escalated));
+                if let Some(sink) = sink_table().lock().get(&overseer_path().to_string()) {
+                    sink.lock().push(format!("escalated:{}", msg.escalated));
                 }
             }
         }
@@ -4267,7 +4226,7 @@ mod tests {
         // under the default Off policy) and the live fold matches.
         assert_eq!(system.journal_len(&path), 3);
         let entries = {
-            let kernel = system.kernel.lock().expect("lock");
+            let kernel = system.kernel.lock();
             kernel.journals[&path].entries().to_vec()
         };
         let mut folded = Counter::restore(&json!({}));
@@ -4307,7 +4266,7 @@ mod tests {
         // journal holds 4 events + 2 snapshots, and the LATEST snapshot
         // anchors the fast path: rebuild replays only the tail after it.
         {
-            let kernel = system.kernel.lock().expect("lock");
+            let kernel = system.kernel.lock();
             let journal = &kernel.journals[&path];
             assert_eq!(journal.len(), 6, "4 events + 2 snapshots");
             let last = journal.last_snapshot().expect("snapshot exists");
@@ -4330,7 +4289,7 @@ mod tests {
         // The latest snapshot's fold already contains Adds 1-4 (total 10):
         // the fast path restores it, then replays an empty tail.
         {
-            let kernel = system.kernel.lock().expect("lock");
+            let kernel = system.kernel.lock();
             let snap = match kernel.journals[&path].last_snapshot().expect("snap") {
                 crate::journal::JournalEntry::Snapshot { state, .. } => state.clone(),
                 _ => unreachable!(),
@@ -4363,7 +4322,7 @@ mod tests {
 
         // Then the journal holds only events, and no SnapshotTaken fact.
         {
-            let kernel = system.kernel.lock().expect("lock");
+            let kernel = system.kernel.lock();
             let journal = &kernel.journals[&path];
             assert_eq!(journal.len(), 5);
             assert!(journal.last_snapshot().is_none());
@@ -4575,7 +4534,7 @@ mod tests {
         // and crashes the actor again (at-least-once); nothing is lost.
         wait_for_crash(&system, &path).await;
         {
-            let kernel = system.kernel.lock().expect("lock");
+            let kernel = system.kernel.lock();
             let events = kernel.journals[&path]
                 .entries()
                 .iter()
@@ -4653,7 +4612,7 @@ mod tests {
         let state = system.es_state(&path).await.expect("live");
         assert_eq!(state["total"], json!(4), "only the declared event applied");
         {
-            let kernel = system.kernel.lock().expect("lock");
+            let kernel = system.kernel.lock();
             let event_schemas: Vec<_> = kernel.journals[&path]
                 .entries()
                 .iter()
@@ -4687,7 +4646,7 @@ mod tests {
 
     /// Kernel crash-record peek (tests).
     fn kernel_has_crash(system: &ActorSystem, path: &ActorPath) -> bool {
-        let kernel = system.kernel.lock().expect("lock");
+        let kernel = system.kernel.lock();
         kernel.crashed.contains(path)
     }
 
@@ -4715,7 +4674,7 @@ mod tests {
         assert_eq!(state["total"], json!(3));
         let mut folded = MixedEmitter::restore(&json!({}));
         {
-            let kernel = system.kernel.lock().expect("lock");
+            let kernel = system.kernel.lock();
             for entry in kernel.journals[&path].entries() {
                 if let crate::journal::JournalEntry::Event { event, .. } = entry {
                     folded.apply(event);
@@ -4755,7 +4714,7 @@ mod tests {
         // Then snapshots landed exactly on the old EveryN(2) boundaries
         // (after the 2nd and 4th events, i.e. seqs 1 and 3).
         let snap_seqs: Vec<u64> = {
-            let kernel = system.kernel.lock().expect("lock");
+            let kernel = system.kernel.lock();
             kernel.journals[&path]
                 .entries()
                 .iter()
@@ -4803,7 +4762,7 @@ mod tests {
         })
         .await;
         let snap_seq = {
-            let kernel = system.kernel.lock().expect("lock");
+            let kernel = system.kernel.lock();
             let snap = kernel.journals[&path].last_snapshot().expect("snapshots");
             match snap {
                 crate::journal::JournalEntry::Snapshot { seq, .. } => seq.as_u64(),
@@ -4909,13 +4868,13 @@ mod tests {
         system: &ActorSystem,
         path: &ActorPath,
     ) -> Option<crate::schema::ActorManifest> {
-        let registry = system.registry.lock().expect("registry lock");
+        let registry = system.registry.lock();
         registry.lookup(path).map(|info| info.manifest.clone())
     }
 
     /// Reads the route table's destination set for a schema (tests).
     fn route_dests(system: &ActorSystem, schema: &SchemaId) -> Vec<ActorPath> {
-        let registry = system.registry.lock().expect("registry lock");
+        let registry = system.registry.lock();
         registry.route_dests(schema)
     }
 
@@ -4935,7 +4894,7 @@ mod tests {
             || vec![Arc::new(TypedEsAdapter::<BareCounter, Add>::new::<Add>())],
         );
         {
-            let mut registry = system.registry.lock().expect("registry lock");
+            let mut registry = system.registry.lock();
             registry
                 .declare_emits(&positional_path, Added::schema_id())
                 .expect("declare positional emit edge");
@@ -5062,7 +5021,7 @@ mod tests {
         // The positional flavor declares its emit edge post-spawn; the
         // builder declares it inline — same table, same enforcement.
         {
-            let mut registry = system.registry.lock().expect("registry lock");
+            let mut registry = system.registry.lock();
             registry
                 .declare_emits(&ActorPath::new("t-pos"), schema.clone())
                 .expect("live slot");
@@ -5377,7 +5336,7 @@ mod tests {
         // Then the reply decodes as the handler's payload.
         assert_eq!(reply["echo"], 21);
         // And the ask settled as Replied with its own fact.
-        let kernel = system.kernel.lock().expect("lock");
+        let kernel = system.kernel.lock();
         assert!(
             kernel
                 .ask_facts
@@ -5423,7 +5382,7 @@ mod tests {
         // (kernel-internal detail for the late-reply probe: the settled
         // ask's lease slot is gone, so `complete` finds nothing.)
         let late_lease = {
-            let kernel = system.kernel.lock().expect("lock");
+            let kernel = system.kernel.lock();
             assert!(
                 kernel
                     .ask_facts
@@ -5438,7 +5397,7 @@ mod tests {
 
         // Then the late reply lands nowhere: no lease knows its id.
         {
-            let kernel = system.kernel.lock().expect("lock");
+            let kernel = system.kernel.lock();
             assert!(
                 !kernel.replies.complete(&late_lease, json!({ "echo": 1 })),
                 "a dead lease must not accept a late reply"
@@ -5487,7 +5446,7 @@ mod tests {
                 )
                 .await
         });
-        wait_for(|| async { system.kernel.lock().expect("lock").replies.len() == 1 }).await;
+        wait_for(|| async { system.kernel.lock().replies.len() == 1 }).await;
         // The lease TTL mirrors the ask's 30s timeout: advance the fake
         // clock past it, then prune.
         system
@@ -5495,7 +5454,7 @@ mod tests {
             .expect("fake clock")
             .advance(std::time::Duration::from_secs(31));
         {
-            let kernel = system.kernel.lock().expect("lock");
+            let kernel = system.kernel.lock();
             kernel.replies.prune(crate::types::Timestamp::from_millis(
                 system.clock.now().as_millis(),
             ));
@@ -5504,7 +5463,7 @@ mod tests {
         // Then the ask settles as Failed (not Timeout), with its fact.
         let outcome = ask_task.await.expect("ask task");
         assert!(outcome.is_err(), "lease death must surface as an error");
-        let kernel = system.kernel.lock().expect("lock");
+        let kernel = system.kernel.lock();
         assert!(
             kernel
                 .ask_facts
@@ -5602,7 +5561,7 @@ mod tests {
                 }),
                 SpawnOpts::default(),
             );
-            let mut registry = system.registry.lock().expect("registry lock");
+            let mut registry = system.registry.lock();
             registry
                 .declare_emits(&foreign_path, SchemaId::new("depcmd", 1))
                 .expect("declare");
@@ -5652,17 +5611,14 @@ mod tests {
             args: &JsonValue,
         ) -> Result<Self, error_stack::Report<crate::registry::RegistryError>> {
             let idx = args["sink"].as_u64().expect("sink index") as usize;
-            let sink = sinks().lock().expect("sinks lock")[idx].clone();
+            let sink = sinks().lock()[idx].clone();
             Ok(Self { sink })
         }
     }
 
     impl MsgHandler<Add> for PoolWorker {
         async fn handle(&mut self, msg: Add, _ctx: &mut crate::context::MsgCtx<'_>) {
-            self.sink
-                .lock()
-                .expect("sink lock")
-                .push(format!("n={}", msg.n));
+            self.sink.lock().push(format!("n={}", msg.n));
         }
     }
 
@@ -5681,7 +5637,7 @@ mod tests {
             args: &JsonValue,
         ) -> Result<Self, error_stack::Report<crate::registry::RegistryError>> {
             let idx = args["sink"].as_u64().expect("sink index") as usize;
-            let sink = sinks().lock().expect("sinks lock")[idx].clone();
+            let sink = sinks().lock()[idx].clone();
             let to = args["forward_to"].as_str().expect("forward_to");
             Ok(Self {
                 sink,
@@ -5692,10 +5648,7 @@ mod tests {
 
     impl MsgHandler<Add> for Forwarder {
         async fn handle(&mut self, msg: Add, ctx: &mut crate::context::MsgCtx<'_>) {
-            self.sink
-                .lock()
-                .expect("sink lock")
-                .push(format!("seen={}", msg.n));
+            self.sink.lock().push(format!("seen={}", msg.n));
             ctx.send(
                 Address::Path(self.forward_to.clone()),
                 Add::schema_id(),
@@ -6057,15 +6010,13 @@ mod tests {
         async fn start(
             args: &JsonValue,
         ) -> Result<Self, error_stack::Report<crate::registry::RegistryError>> {
-            let sink = sinks().lock().expect("sinks lock")
-                [args["sink"].as_u64().expect("sink index") as usize]
-                .clone();
+            let sink = sinks().lock()[args["sink"].as_u64().expect("sink index") as usize].clone();
             Ok(Self { sink, last: None })
         }
     }
     impl MsgHandler<FactMsg> for FactsObserver {
         async fn handle(&mut self, fact: FactMsg, _ctx: &mut crate::context::MsgCtx<'_>) {
-            let mut sink = self.sink.lock().expect("sink lock");
+            let mut sink = self.sink.lock();
             if let Some(last) = self.last
                 && fact.offset > last + 1
             {
@@ -6135,9 +6086,8 @@ mod tests {
             let _ = system.send(e).await;
         }
         wait_for(|| async {
-            sinks().lock().expect("sinks lock")[sink0]
+            sinks().lock()[sink0]
                 .lock()
-                .expect("sink lock")
                 .iter()
                 .any(|s| s.starts_with("gap:"))
         })
@@ -6146,10 +6096,7 @@ mod tests {
         // Then the observer SAW facts AND an offset gap (ring evictions
         // made loss visible — the documented at-most-once-with-gaps
         // contract).
-        let sink = sinks().lock().expect("sinks lock")[sink0]
-            .lock()
-            .expect("sink lock")
-            .clone();
+        let sink = sinks().lock()[sink0].lock().clone();
         assert!(
             sink.len() > 1,
             "the observer received facts as messages: {sink:?}"
@@ -6194,18 +6141,9 @@ mod tests {
 
         // Then the observer received ONLY the Stopped fact — every other
         // fact kind was hidden by the filter.
-        wait_for(|| async {
-            !sinks().lock().expect("sinks lock")[sink0]
-                .lock()
-                .expect("sink lock")
-                .is_empty()
-        })
-        .await;
+        wait_for(|| async { !sinks().lock()[sink0].lock().is_empty() }).await;
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        let sink = sinks().lock().expect("sinks lock")[sink0]
-            .lock()
-            .expect("sink lock")
-            .clone();
+        let sink = sinks().lock()[sink0].lock().clone();
         assert_eq!(sink.len(), 1, "only the Stopped fact passed: {sink:?}");
         assert!(sink[0].starts_with("stopped"), "got: {sink:?}");
     }
@@ -6227,13 +6165,7 @@ mod tests {
             );
             let _ = system.send(e).await;
         }
-        wait_for(|| async {
-            !sinks().lock().expect("sinks lock")[sink0]
-                .lock()
-                .expect("sink lock")
-                .is_empty()
-        })
-        .await;
+        wait_for(|| async { !sinks().lock()[sink0].lock().is_empty() }).await;
 
         // Then the ring kept recording facts (none lost to the observer's
         // backlog — delivery pressure never touches the ring).
@@ -6315,16 +6247,13 @@ mod tests {
                 .await
                 .expect("delivered to a worker");
         }
-        wait_for(|| async { sink.lock().expect("sink lock").len() == 6 }).await;
+        wait_for(|| async { sink.lock().len() == 6 }).await;
 
         // Then every message landed in a worker through the public name
         // (the sender never saw a worker path), and the tap shows the
         // router signature: Sent{dest: public} → Delivered{to: worker},
         // LINKED by a shared trace id (one causal conversation, routed).
-        assert_eq!(
-            *sink.lock().expect("sink lock"),
-            vec!["n=1", "n=2", "n=3", "n=4", "n=5", "n=6"]
-        );
+        assert_eq!(*sink.lock(), vec!["n=1", "n=2", "n=3", "n=4", "n=5", "n=6"]);
         let facts = system.tap_facts();
         let to_workers = facts.iter().any(|f| {
             matches!(
@@ -6415,7 +6344,7 @@ mod tests {
         })
         .await;
         let queued = {
-            let kernel = system.kernel.lock().expect("kernel lock");
+            let kernel = system.kernel.lock();
             let cell = kernel.cells.get(&public).expect("cell");
             cell.inbox.try_lock().map(|inbox| inbox.len()).unwrap_or(0)
         };
@@ -6439,7 +6368,7 @@ mod tests {
         // Then the takeover was invisible to senders (the pool claimed the
         // public path, and post-takeover mail reaches a worker).
         let taken = {
-            let registry = system.registry.lock().expect("registry lock");
+            let registry = system.registry.lock();
             registry.pools.contains_key(&public)
         };
         assert!(taken, "pool claimed the public path");
@@ -6447,8 +6376,8 @@ mod tests {
             .send(system.envelope(Add::schema_id(), public.clone(), json!({ "n": 9 })))
             .await
             .expect("delivered to a worker");
-        wait_for(|| async { sink.lock().expect("sink lock").len() == 1 }).await;
-        assert_eq!(*sink.lock().expect("sink lock"), vec!["n=9"]);
+        wait_for(|| async { sink.lock().len() == 1 }).await;
+        assert_eq!(*sink.lock(), vec!["n=9"]);
 
         // And the stop-drain flushed the parked actor's queued mail to the
         // DLQ with the typed StoppedWithMail reason (2 queued messages).
@@ -6499,11 +6428,11 @@ mod tests {
                 .await
                 .expect("delivered");
         }
-        wait_for(|| async { sink.lock().expect("sink lock").len() == 4 }).await;
+        wait_for(|| async { sink.lock().len() == 4 }).await;
 
         // Then every message was handled exactly once (distribution across
         // workers is algo-driven; the shared sink sees the union).
-        let mut got = sink.lock().expect("sink lock").clone();
+        let mut got = sink.lock().clone();
         got.sort();
         assert_eq!(got, vec!["n=1", "n=2", "n=3", "n=4"]);
     }
@@ -6534,7 +6463,7 @@ mod tests {
         // shared by-path sink table (the engine sends it as a plain send).
         let (system, _clock) = ActorSystem::test();
         let parent = ActorPath::new("boss");
-        bind_sink(&parent, Arc::new(std::sync::Mutex::new(Vec::new())));
+        bind_sink(&parent, Arc::new(parking_lot::Mutex::new(Vec::new())));
         struct Overseer;
         impl ServiceActor for Overseer {
             fn manifest() -> ActorManifest {
@@ -6564,14 +6493,11 @@ mod tests {
         impl MsgHandler<EscalatedMsg> for Overseer {
             async fn handle(&mut self, msg: EscalatedMsg, _ctx: &mut crate::context::MsgCtx<'_>) {
                 if let Some(s) = SINK_BY_PATH
-                    .get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+                    .get_or_init(|| parking_lot::Mutex::new(HashMap::new()))
                     .lock()
-                    .expect("table")
                     .get("boss")
                 {
-                    s.lock()
-                        .expect("sink lock")
-                        .push(format!("escalated:{}", msg.escalated))
+                    s.lock().push(format!("escalated:{}", msg.escalated))
                 }
             }
         }
@@ -6689,7 +6615,7 @@ mod tests {
             || vec![Arc::new(TypedEsAdapter::<BareCounter, Add>::new::<Add>())],
         );
         {
-            let mut registry = system.registry.lock().expect("registry lock");
+            let mut registry = system.registry.lock();
             registry
                 .declare_emits(&counter, Added::schema_id())
                 .expect("declare");
@@ -6771,7 +6697,7 @@ mod tests {
             },
         );
         {
-            let mut registry = system.registry.lock().expect("registry lock");
+            let mut registry = system.registry.lock();
             registry.add_rule(crate::pool::Rule {
                 source: None,
                 schema: Some(Add::schema_id()),
@@ -6825,7 +6751,7 @@ mod tests {
             args: &JsonValue,
         ) -> Result<Self, error_stack::Report<crate::registry::RegistryError>> {
             let idx = args["sink"].as_u64().expect("sink index") as usize;
-            let sink = sinks().lock().expect("sinks lock")[idx].clone();
+            let sink = sinks().lock()[idx].clone();
             Ok(Self { sink })
         }
     }
@@ -6835,10 +6761,7 @@ mod tests {
             if msg.n == 0 {
                 WORKER_GATE.notified().await;
             }
-            self.sink
-                .lock()
-                .expect("sink lock")
-                .push(format!("n={}", msg.n));
+            self.sink.lock().push(format!("n={}", msg.n));
         }
     }
 

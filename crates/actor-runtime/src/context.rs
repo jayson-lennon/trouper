@@ -499,7 +499,7 @@ mod tests {
     use crate::registry::EndpointInfo;
     use crate::schema::{ActorManifest, SchemaKind};
     use crate::types::ActorKind;
-    use std::sync::Mutex;
+    use parking_lot::Mutex;
 
     /// A view over static data; tests never touch a real registry.
     struct FakeView {
@@ -591,7 +591,7 @@ mod tests {
     fn reply_targets_the_requester_only_when_reply_to_exists() {
         // Given a context whose message carries a reply-to path.
         let mut view = Mutex::new(FakeView::at_millis(0));
-        let view = view.get_mut().expect("locked");
+        let view = view.get_mut();
         let trace = TraceCtx::root();
         let mut outbox = Outbox::new();
         let path = ActorPath::new("server");

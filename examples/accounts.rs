@@ -207,15 +207,15 @@ impl CommandHandler<Poison> for Account {
 
 // -- The facts observer ----------------------------------------------------
 
-static LINES: OnceLock<std::sync::Mutex<Vec<String>>> = OnceLock::new();
+static LINES: OnceLock<parking_lot::Mutex<Vec<String>>> = OnceLock::new();
 
-fn lines() -> &'static std::sync::Mutex<Vec<String>> {
-    LINES.get_or_init(|| std::sync::Mutex::new(Vec::new()))
+fn lines() -> &'static parking_lot::Mutex<Vec<String>> {
+    LINES.get_or_init(|| parking_lot::Mutex::new(Vec::new()))
 }
 
 fn tell(line: String) {
     println!("   {line}");
-    lines().lock().expect("lines lock").push(line);
+    lines().lock().push(line);
 }
 
 /// The Rust mirror of the runtime's `Fact@1` schema (what `system.facts`

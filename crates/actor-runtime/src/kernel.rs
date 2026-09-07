@@ -17,9 +17,10 @@
 //! Loop discipline (project skill): one loop per function; loop bodies are
 //! named step functions.
 
+use parking_lot::Mutex;
 use std::collections::{HashMap, HashSet};
 use std::panic::AssertUnwindSafe;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use serde_json::Value as JsonValue;
 use tokio::sync::{Notify, mpsc, watch};
@@ -279,7 +280,7 @@ async fn route_inner(
             // the flow (Tee copies with a linked causality; Inline
             // interposes the observer in the primary's place).
             let (delivery, primary_dest) = {
-                let reg = registry.lock().expect("registry lock");
+                let reg = registry.lock();
                 apply_rules(&reg, &envelope, path.clone())
             };
             if let Some(tee) = delivery {
@@ -292,12 +293,12 @@ async fn route_inner(
                 copy.trace.trace_id = origin_trace.trace_id;
                 copy.trace.causality_id = crate::types::CausalityId::new();
                 let endpoint = {
-                    let reg = registry.lock().expect("registry lock");
+                    let reg = registry.lock();
                     reg.resolve(&tee_dest)
                 };
                 if let Some(endpoint) = endpoint {
                     let _ = deliver_with_retry(&endpoint, copy).await;
-                    let mut kernel_table = kernel.lock().expect("kernel lock");
+                    let mut kernel_table = kernel.lock();
                     kernel_table.record_fact(
                         origin_trace.causality_id.as_millis_ts(),
                         crate::tap::FactKind::Sent {
@@ -338,7 +339,7 @@ async fn route_inner(
             };
             // POOLS: a public pool path resolves to ONE worker (algo pick).
             let path = {
-                let reg = registry.lock().expect("registry lock");
+                let reg = registry.lock();
                 match reg.pools.get(&path) {
                     Some(pool) => {
                         let idx = pool.algo.pick(pool.workers.len(), &pool.next);
@@ -348,7 +349,7 @@ async fn route_inner(
                 }
             };
             let endpoint = {
-                let registry = registry.lock().expect("registry lock");
+                let registry = registry.lock();
                 registry.resolve(&path)
             };
             match endpoint {
@@ -356,7 +357,7 @@ async fn route_inner(
                 None => return Err(envelope),
             }
             {
-                let mut kernel = kernel.lock().expect("kernel lock");
+                let mut kernel = kernel.lock();
                 kernel.record_fact(
                     envelope.trace.causality_id.as_millis_ts(),
                     crate::tap::FactKind::Sent {
@@ -374,7 +375,7 @@ async fn route_inner(
             // Schema-addressed send: the route table picks the handler
             // (rotating when several actors handle the same schema).
             let (target, endpoint) = {
-                let mut registry = registry.lock().expect("registry lock");
+                let mut registry = registry.lock();
                 match registry.route(schema) {
                     Some(target) => {
                         let endpoint = registry.resolve(&target);
@@ -388,7 +389,7 @@ async fn route_inner(
             };
             deliver_with_retry(&endpoint, envelope.clone()).await?;
             {
-                let mut kernel = kernel.lock().expect("kernel lock");
+                let mut kernel = kernel.lock();
                 kernel.record_fact(
                     envelope.trace.causality_id.as_millis_ts(),
                     crate::tap::FactKind::Sent {
@@ -404,7 +405,7 @@ async fn route_inner(
         Address::Topic(ref topic) => {
             publish_to_topic(kernel, registry, topic.clone(), envelope.clone()).await;
             {
-                let mut kernel = kernel.lock().expect("kernel lock");
+                let mut kernel = kernel.lock();
                 kernel.record_fact(
                     envelope.trace.causality_id.as_millis_ts(),
                     crate::tap::FactKind::Sent {
@@ -437,7 +438,7 @@ async fn resolve_partition(
     dest: ActorPath,
 ) -> Result<Option<ActorPath>, Envelope> {
     let spec = {
-        let reg = registry.lock().expect("registry lock");
+        let reg = registry.lock();
         let Some(spec) = reg.partitions.get(&dest) else {
             return Ok(None);
         };
@@ -445,7 +446,7 @@ async fn resolve_partition(
     };
     // Schema-aware key extraction from the payload (schema lock scoped).
     let key = {
-        let reg = registry.lock().expect("registry lock");
+        let reg = registry.lock();
         let payload = envelope.as_json().cloned().unwrap_or(JsonValue::Null);
         match reg.schema(&envelope.schema) {
             Some(def) => crate::pool::extract_shard_key(def, &spec.key_field, &payload),
@@ -462,12 +463,7 @@ async fn resolve_partition(
     // Determinism is structural: same key → same derived path.
     let entity_path = ActorPath::new(format!("{}/{}", dest, key).as_str());
     // Fast path: the entity is already live.
-    if registry
-        .lock()
-        .expect("registry lock")
-        .lookup(&entity_path)
-        .is_some()
-    {
+    if registry.lock().lookup(&entity_path).is_some() {
         return Ok(Some(entity_path));
     }
     // ACTIVATE: spawn the entity from the shared factory. The factory's
@@ -557,7 +553,7 @@ pub(crate) fn dead_letter(
     reason: crate::types::DeadLetterReason,
     detail: &str,
 ) {
-    let mut kernel = kernel.lock().expect("kernel lock");
+    let mut kernel = kernel.lock();
     kernel.dead_letters.push(DeadLetter {
         schema: envelope.schema.clone(),
         dest: envelope.dest.clone(),
@@ -641,7 +637,7 @@ pub(crate) async fn front_door_loop(
         // WATERMARK CHECK (rate-limited): fires on the UP-crossing only;
         // the latch re-arms when the depth falls back to/below the mark.
         let depth = cell.inbox.lock().await.len() as u64;
-        let mut kernel_state = kernel.lock().expect("kernel lock");
+        let mut kernel_state = kernel.lock();
         if let Some((wm, fired)) = kernel_state.watermarks.get_mut(&cell.path) {
             if depth > *wm && !*fired {
                 *fired = true;
@@ -716,7 +712,7 @@ async fn step_es(ctx: &EsLoop) -> Step {
         return Step::Idle;
     };
     {
-        let mut kernel = ctx.kernel.lock().expect("kernel lock");
+        let mut kernel = ctx.kernel.lock();
         kernel.record_fact(
             envelope.trace.causality_id.as_millis_ts(),
             crate::tap::FactKind::Delivered {
@@ -729,7 +725,7 @@ async fn step_es(ctx: &EsLoop) -> Step {
 
     // 2. FIND the command entry for this schema.
     let entry = {
-        let kernel = ctx.kernel.lock().expect("kernel lock");
+        let kernel = ctx.kernel.lock();
         kernel.entries.get(&ctx.path).and_then(|entries| {
             entries
                 .iter()
@@ -795,7 +791,7 @@ async fn step_es(ctx: &EsLoop) -> Step {
             // The state may be poisoned — mark crashed and stop; the
             // supervisor rebuilds from the journal (never reuses `state`).
             {
-                let mut kernel = ctx.kernel.lock().expect("kernel lock");
+                let mut kernel = ctx.kernel.lock();
                 kernel.crashed.insert(ctx.path.clone());
                 kernel.record_fact(
                     envelope.trace.causality_id.as_millis_ts(),
@@ -818,7 +814,7 @@ async fn step_es(ctx: &EsLoop) -> Step {
     // outcome (apply runs per appended event), while failing the step would
     // burn restart budget on a static condition redelivery can never heal.
     let declared = {
-        let registry = ctx.registry.lock().expect("registry lock");
+        let registry = ctx.registry.lock();
         registry
             .lookup(&ctx.path)
             .map(|info| info.manifest.emits)
@@ -857,7 +853,7 @@ async fn step_es(ctx: &EsLoop) -> Step {
 
     // 5. JOURNAL APPEND (durable record first).
     let seqs = {
-        let mut kernel = ctx.kernel.lock().expect("kernel lock");
+        let mut kernel = ctx.kernel.lock();
         let journal = kernel.journals.entry(ctx.path.clone()).or_default();
         let seqs: Vec<_> = events
             .iter()
@@ -869,7 +865,7 @@ async fn step_es(ctx: &EsLoop) -> Step {
     // 6. ACK (the commit point: this message will never redeliver).
     ctx.cell.inbox.lock().await.ack();
     {
-        let mut kernel = ctx.kernel.lock().expect("kernel lock");
+        let mut kernel = ctx.kernel.lock();
         kernel.record_fact(
             envelope.trace.causality_id.as_millis_ts(),
             crate::tap::FactKind::Acked {
@@ -908,7 +904,7 @@ async fn step_es(ctx: &EsLoop) -> Step {
 impl EsLoop {
     /// The live state shell.
     async fn state(&self) -> Arc<tokio::sync::Mutex<Box<dyn DynEsActor>>> {
-        let kernel = self.kernel.lock().expect("kernel lock");
+        let kernel = self.kernel.lock();
         kernel
             .es_state
             .get(&self.path)
@@ -958,10 +954,10 @@ fn apply_subscribe(
     topic: &crate::types::Topic,
 ) {
     let policy = {
-        let registry = registry.lock().expect("registry lock");
+        let registry = registry.lock();
         registry.inbox_policy(path)
     };
-    let mut kernel = kernel.lock().expect("kernel lock");
+    let mut kernel = kernel.lock();
     let log = kernel
         .topic_logs
         .entry(topic.clone())
@@ -1017,7 +1013,7 @@ impl crate::context::AskPort for KernelAskPort {
                         crate::context::AskError::Unresolved(format!("{dest:?}")),
                     ));
                 };
-                registry.lock().expect("registry lock").resolve(path)
+                registry.lock().resolve(path)
             };
             let Some(endpoint) = endpoint else {
                 return Err(error_stack::Report::new(
@@ -1028,7 +1024,7 @@ impl crate::context::AskPort for KernelAskPort {
             // Open the lease and route the request envelope.
             let now = clock.now();
             let (lease, receiver) = {
-                let mut kernel = kernel.lock().expect("kernel lock");
+                let mut kernel = kernel.lock();
                 let trace = crate::envelope::TraceCtx::root();
                 let (lease, receiver) = kernel.replies.open(ttl, now);
                 kernel.ask_facts.push(AskFact {
@@ -1066,7 +1062,7 @@ impl crate::context::AskPort for KernelAskPort {
         outcome: AskOutcome,
         trace: TraceCtx,
     ) {
-        let mut kernel = self.kernel.lock().expect("kernel lock");
+        let mut kernel = self.kernel.lock();
         kernel.ask_facts.push(AskFact {
             opened: false,
             outcome: Some(outcome.clone()),
@@ -1098,7 +1094,7 @@ async fn publish_to_topic(
     // Append + collect subscriber endpoints without holding locks across
     // delivery; pump_once owns per-subscriber cursor/backlog semantics.
     let offset = {
-        let mut kernel = kernel.lock().expect("kernel lock");
+        let mut kernel = kernel.lock();
         let log = kernel
             .topic_logs
             .entry(topic.clone())
@@ -1116,7 +1112,7 @@ fn record_publish_facts(
     envelope: &Envelope,
     offset: u64,
 ) {
-    let mut kernel = kernel.lock().expect("kernel lock");
+    let mut kernel = kernel.lock();
     kernel.topic_facts.push(crate::topics::TopicPublishFact {
         topic: topic.clone(),
         offset: crate::types::InboxOffset::new(offset),
@@ -1144,8 +1140,8 @@ async fn pump_topic(
     topic: &crate::types::Topic,
 ) {
     let targets: Vec<(ActorPath, std::sync::Arc<Endpoint>)> = {
-        let kernel = kernel.lock().expect("kernel lock");
-        let registry = registry.lock().expect("registry lock");
+        let kernel = kernel.lock();
+        let registry = registry.lock();
         kernel
             .topic_logs
             .get(topic)
@@ -1155,7 +1151,7 @@ async fn pump_topic(
             .filter_map(|path| registry.resolve(&path).map(|endpoint| (path, endpoint)))
             .collect()
     };
-    let mut kernel = kernel.lock().expect("kernel lock");
+    let mut kernel = kernel.lock();
     let Some(log) = kernel.topic_logs.get_mut(topic) else {
         return;
     };
@@ -1183,11 +1179,7 @@ async fn resolve_reply(
             // Mechanism: complete the lease if it is still live; a dead
             // (expired/pruned) slot just drops the reply — the asker is
             // gone, and the ask timed out on its side already.
-            kernel
-                .lock()
-                .expect("kernel lock")
-                .replies
-                .complete(&lease, payload);
+            kernel.lock().replies.complete(&lease, payload);
         }
         Address::Schema(_) => {
             // A schema-addressed reply is an ordinary routed send (the
@@ -1227,7 +1219,7 @@ async fn resolve_reply(
 /// restart must not duplicate topic deliveries).
 async fn fan_out_emits(ctx: &EsLoop, events: &[crate::envelope::Event]) {
     let topics = {
-        let registry = ctx.registry.lock().expect("registry lock");
+        let registry = ctx.registry.lock();
         let Some(info) = registry.lookup(&ctx.path) else {
             return;
         };
@@ -1259,7 +1251,7 @@ async fn maybe_snapshot(
     (next_seq, seqs): (crate::types::SeqNo, Vec<crate::types::SeqNo>),
 ) {
     let cadence = {
-        let kernel = ctx.kernel.lock().expect("kernel lock");
+        let kernel = ctx.kernel.lock();
         kernel
             .snapshot_policy
             .get(&ctx.path)
@@ -1288,7 +1280,7 @@ async fn snapshot_now(ctx: &EsLoop, last: crate::types::SeqNo) {
     let state = state.lock().await;
     if let Ok(blob) = state.capture_erased() {
         let now = ctx.clock.now();
-        let mut kernel = ctx.kernel.lock().expect("kernel lock");
+        let mut kernel = ctx.kernel.lock();
         let journal = kernel.journals.entry(ctx.path.clone()).or_default();
         journal.append_snapshot(last, blob, now.as_millis());
         kernel.record_fact(
@@ -1308,7 +1300,7 @@ async fn snapshot_now(ctx: &EsLoop, last: crate::types::SeqNo) {
 /// the inbox.
 async fn maybe_snapshot_on_idle(ctx: &EsLoop) {
     let cadence = {
-        let kernel = ctx.kernel.lock().expect("kernel lock");
+        let kernel = ctx.kernel.lock();
         kernel
             .snapshot_policy
             .get(&ctx.path)
@@ -1319,7 +1311,7 @@ async fn maybe_snapshot_on_idle(ctx: &EsLoop) {
         return;
     };
     let (last_seq, since_snapshot_ms) = {
-        let mut kernel = ctx.kernel.lock().expect("kernel lock");
+        let mut kernel = ctx.kernel.lock();
         let journal = kernel.journals.entry(ctx.path.clone()).or_default();
         // An empty journal never snapshots: the anchor seq would be
         // "genesis", and a later restore would wrongly skip event seq 0.
@@ -1393,7 +1385,7 @@ async fn step_service(ctx: &ServiceLoop) -> Step {
     };
 
     {
-        let mut kernel = ctx.es.kernel.lock().expect("kernel lock");
+        let mut kernel = ctx.es.kernel.lock();
         kernel.record_fact(
             envelope.trace.causality_id.as_millis_ts(),
             crate::tap::FactKind::Delivered {
@@ -1406,7 +1398,7 @@ async fn step_service(ctx: &ServiceLoop) -> Step {
 
     // 2. FIND the message entry.
     let entry = {
-        let kernel = ctx.es.kernel.lock().expect("kernel lock");
+        let kernel = ctx.es.kernel.lock();
         kernel.msg_entries.get(&ctx.es.path).and_then(|entries| {
             entries
                 .iter()
@@ -1456,7 +1448,7 @@ async fn step_service(ctx: &ServiceLoop) -> Step {
     // a time (its inbox serializes).
     let path = ctx.es.path.clone();
     let service = {
-        let kernel = ctx.es.kernel.lock().expect("kernel lock");
+        let kernel = ctx.es.kernel.lock();
         kernel
             .services
             .get(&path)
@@ -1491,7 +1483,7 @@ async fn step_service(ctx: &ServiceLoop) -> Step {
     });
     let outbox = if handle.await.is_err() {
         // Handler panicked: mark crashed (supervision restarts via `start`).
-        let mut kernel = ctx.es.kernel.lock().expect("kernel lock");
+        let mut kernel = ctx.es.kernel.lock();
         kernel.crashed.insert(ctx.es.path.clone());
         return Step::Crashed;
     } else {
@@ -1524,7 +1516,7 @@ pub(crate) async fn restart_es(
     genesis_args: &JsonValue,
 ) -> Result<(), error_stack::Report<JournalError>> {
     let (snapshot, snap_seq, tail) = {
-        let kernel = ctx.kernel.lock().expect("kernel lock");
+        let kernel = ctx.kernel.lock();
         let Some(journal) = kernel.journals.get(&ctx.path) else {
             return Ok(());
         };
@@ -1547,7 +1539,7 @@ pub(crate) async fn restart_es(
     // guard across the await (a sync guard held across .await can deadlock
     // tasks that need the sync lock to make progress).
     let old = {
-        let kernel = ctx.kernel.lock().expect("kernel lock");
+        let kernel = ctx.kernel.lock();
         kernel
             .es_state
             .get(&ctx.path)
@@ -1560,7 +1552,7 @@ pub(crate) async fn restart_es(
     };
     // Fresh instance swapped in; the poisoned one is gone.
     {
-        let mut kernel = ctx.kernel.lock().expect("kernel lock");
+        let mut kernel = ctx.kernel.lock();
         kernel
             .es_state
             .insert(ctx.path.clone(), Arc::new(tokio::sync::Mutex::new(fresh)));
@@ -1580,7 +1572,7 @@ pub(crate) async fn restart_es(
     let (tx, rx) = mpsc::channel(capacity_hint());
     let endpoint = Endpoint::new(tx);
     {
-        let mut registry = ctx.registry.lock().expect("registry lock");
+        let mut registry = ctx.registry.lock();
         registry
             .swap_endpoint(&ctx.path, endpoint)
             .expect("slot exists at restart");
@@ -1618,7 +1610,7 @@ pub async fn supervise_child(
         let watch = async {
             loop {
                 let crashed = {
-                    let kernel = system.kernel.lock().expect("kernel lock");
+                    let kernel = system.kernel.lock();
                     kernel.crashed.contains(&spec.path)
                 };
                 if crashed {
@@ -1651,7 +1643,7 @@ pub async fn supervise_child(
 
         // Budget: record the failure first, then check the window.
         let budget_exhausted = {
-            let mut kernel = system.kernel.lock().expect("kernel lock");
+            let mut kernel = system.kernel.lock();
             let window = kernel.failures.entry(spec.path.clone()).or_default();
             window.record(now);
             window.prune(now, &spec.budget);
@@ -1674,7 +1666,7 @@ pub async fn supervise_child(
         // with pending mail intact); a Service child restarts through
         // the spec's spawn closure (a fresh start — no journal).
         let consecutive = {
-            let kernel = system.kernel.lock().expect("kernel lock");
+            let kernel = system.kernel.lock();
             kernel
                 .failures
                 .get(&spec.path)
@@ -1691,7 +1683,7 @@ pub async fn supervise_child(
             let ctx = crate::kernel::EsLoop {
                 path: spec.path.clone(),
                 cell: {
-                    let kernel = system.kernel.lock().expect("kernel lock");
+                    let kernel = system.kernel.lock();
                     kernel
                         .cells
                         .get(&spec.path)
@@ -1704,7 +1696,7 @@ pub async fn supervise_child(
                 clock: system.clock.clone(),
             };
             let genesis_args = {
-                let kernel = system.kernel.lock().expect("kernel lock");
+                let kernel = system.kernel.lock();
                 kernel
                     .genesis_args
                     .get(&spec.path)
@@ -1720,7 +1712,7 @@ pub async fn supervise_child(
             // insert included); clear the dead instance's slot first so
             // the path is free.
             {
-                let mut registry = system.registry.lock().expect("registry lock");
+                let mut registry = system.registry.lock();
                 let _ = registry.remove_slot(&spec.path);
             }
             (spec.spawn)(&system, &spec.path, &spec.args);
@@ -1728,7 +1720,7 @@ pub async fn supervise_child(
             // loop); clear the stale crash flag so the next wait observes a
             // NEW crash, not the one we just handled.
             {
-                let mut kernel = system.kernel.lock().expect("kernel lock");
+                let mut kernel = system.kernel.lock();
                 kernel.crashed.remove(&spec.path);
             }
         }
@@ -1741,7 +1733,7 @@ fn system_is_es_child(
     system: &std::sync::Arc<crate::system::ActorSystem>,
     path: &ActorPath,
 ) -> bool {
-    let kernel = system.kernel.lock().expect("kernel lock");
+    let kernel = system.kernel.lock();
     kernel.es_state.contains_key(path)
 }
 
@@ -1755,7 +1747,7 @@ async fn escalate(
     stop_reason: crate::types::StopReason,
 ) {
     {
-        let mut kernel = system.kernel.lock().expect("kernel lock");
+        let mut kernel = system.kernel.lock();
         kernel.crashed.remove(&spec.path);
         // The child is gone: record the stop WITH its typed reason, then
         // the escalation.
@@ -1777,7 +1769,7 @@ async fn escalate(
     // Remove the child's slot (its identity leaves the registry; the
     // graceful-stop cascade arrives with the stop API in Phase 9).
     {
-        let mut registry = system.registry.lock().expect("registry lock");
+        let mut registry = system.registry.lock();
         let _ = registry.remove_slot(&spec.path);
     }
     let message = spec.escalation_message(reason);

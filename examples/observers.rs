@@ -13,9 +13,10 @@ use actor_runtime::actor::{CommandHandler, EventSourcedActor, MsgHandler, Servic
 use actor_runtime::prelude::*;
 use actor_runtime::registry::RegistryError;
 use error_stack::Report;
+use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, OnceLock};
 use tracing::Level;
 
 static SINK: OnceLock<Mutex<Vec<String>>> = OnceLock::new();
@@ -28,7 +29,7 @@ fn sink() -> &'static Mutex<Vec<String>> {
 
 fn record(line: String) {
     println!("   {line}");
-    sink().lock().expect("sink lock").push(line);
+    sink().lock().push(line);
 }
 
 /// The Rust mirror of the runtime's Fact@1 schema (what `system.facts`
@@ -206,19 +207,14 @@ async fn main() {
             .await;
     }
     for _ in 0..1_000 {
-        if sink()
-            .lock()
-            .expect("sink lock")
-            .iter()
-            .any(|l| l.starts_with("GAP"))
-        {
+        if sink().lock().iter().any(|l| l.starts_with("GAP")) {
             // Let the pump drain the backlog before reporting.
             tokio::time::sleep(std::time::Duration::from_millis(150)).await;
             break;
         }
         tokio::time::sleep(std::time::Duration::from_millis(2)).await;
     }
-    let facts_seen = sink().lock().expect("sink lock").len();
+    let facts_seen = sink().lock().len();
     let gaps = GAPS.load(std::sync::atomic::Ordering::Relaxed);
     println!(
         "   observer consumed {facts_seen} fact messages and detected {gaps} gaps (at-most-once with accounted-for losses; the ring never slowed down)"

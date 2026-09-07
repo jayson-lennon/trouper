@@ -6,8 +6,8 @@
 //! a dead asker's slot can never leak). The log records only names; slots
 //! are runtime-internal and die with the ask.
 
+use parking_lot::Mutex;
 use std::collections::HashMap;
-use std::sync::Mutex;
 use std::time::Duration;
 
 use serde_json::Value as JsonValue;
@@ -36,7 +36,7 @@ impl ReplyTable {
     pub fn open(&self, ttl: Duration, now: Timestamp) -> (LeaseId, oneshot::Receiver<JsonValue>) {
         let (sender, receiver) = oneshot::channel();
         let lease = LeaseId::new();
-        self.slots.lock().expect("reply table lock").insert(
+        self.slots.lock().insert(
             lease,
             ReplySlot {
                 sender,
@@ -49,7 +49,7 @@ impl ReplyTable {
     /// Completes a lease: delivers `payload` to the asker if the slot is
     /// still live. Returns false when the slot is gone (expired or pruned).
     pub fn complete(&self, lease: &LeaseId, payload: JsonValue) -> bool {
-        match self.slots.lock().expect("reply table lock").remove(lease) {
+        match self.slots.lock().remove(lease) {
             Some(slot) => slot.sender.send(payload).is_ok(),
             None => false,
         }
@@ -58,20 +58,17 @@ impl ReplyTable {
     /// Cancels a lease outright (timeout/settle): the slot is removed so
     /// a late reply finds nothing. Idempotent.
     pub fn cancel(&self, lease: &LeaseId) {
-        self.slots.lock().expect("reply table lock").remove(lease);
+        self.slots.lock().remove(lease);
     }
 
     /// Drops expired leases (a dead asker's slot must not accumulate).
     pub fn prune(&self, now: Timestamp) {
-        self.slots
-            .lock()
-            .expect("reply table lock")
-            .retain(|_, slot| slot.expires_at > now);
+        self.slots.lock().retain(|_, slot| slot.expires_at > now);
     }
 
     /// The number of live leases (inspection).
     pub fn len(&self) -> usize {
-        self.slots.lock().expect("reply table lock").len()
+        self.slots.lock().len()
     }
 
     /// Whether no leases are live.
