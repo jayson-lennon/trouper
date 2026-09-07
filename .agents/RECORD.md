@@ -57,3 +57,4 @@ Entries are added or amended **only with human approval**.
 - (canvas) System state is served and consumed as zenoh messages on the actor-runtime/state key (Config::default()); the canvas CLI queries it and prints the export.
 - (canvas) The canvas GUI consumes the same zenoh state key as the CLI and renders the export as an interactive graph with pan, zoom, and cursor-anchored popups; the runtime serves it no differently than the CLI.
 - (canvas) The canvas GUI lives in its own repo next to the SDK (../actor-canvas) and consumes actor-runtime and state-report by path dependency; this SDK carries no bevy anymore.
+- (runtime) Handler effects are typed: ctx reply/publish/send take Message values (Schema + serde), derive the schema id from the type, and serialize at intent time; raw JSON variants remain as the *_json escape hatch.

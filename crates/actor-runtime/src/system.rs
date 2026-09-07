@@ -1543,7 +1543,7 @@ mod tests {
         }
     }
 
-    #[derive(serde::Deserialize)]
+    #[derive(serde::Serialize, serde::Deserialize)]
     struct Added {
         n: i64,
     }
@@ -2040,7 +2040,7 @@ mod tests {
     async fn tap_causality_chain_links_hops_with_a_shared_trace() {
         // Given A→B→C: a counter whose Add handler forwards to an Echo
         // service, and an Echo service that handles Ping.
-        #[derive(serde::Deserialize)]
+        #[derive(serde::Serialize, serde::Deserialize)]
         struct Ping {
             #[serde(default)]
             #[allow(dead_code)] // payload shape; the handler ignores it
@@ -2073,12 +2073,7 @@ mod tests {
         }
         impl CommandHandler<Add> for Forwarder {
             fn handle(&self, _cmd: Add, ctx: &mut CmdCtx<'_>) -> Vec<crate::envelope::Event> {
-                ctx.send(
-                    Address::Path(ActorPath::new("echo")),
-                    Ping::schema_id(),
-                    json!({ "n": 0 }),
-                    None,
-                );
+                ctx.send(Address::Path(ActorPath::new("echo")), &Ping { n: 0 }, None);
                 Vec::new()
             }
         }
@@ -3081,7 +3076,7 @@ mod tests {
         }
         impl MsgHandler<Add> for Echo {
             async fn handle(&mut self, msg: Add, ctx: &mut crate::context::MsgCtx<'_>) {
-                ctx.reply(Add::schema_id(), json!({ "echo": msg.n }));
+                ctx.reply(msg);
             }
         }
 
@@ -3110,7 +3105,7 @@ mod tests {
                     .await;
                 let recorded = RESULTS.get_or_init(|| Mutex::new(Vec::new()));
                 match reply {
-                    Ok(value) => recorded.lock().push(format!("replied:{}", value["echo"])),
+                    Ok(value) => recorded.lock().push(format!("replied:{}", value["n"])),
                     Err(_) => recorded.lock().push("failed".to_owned()),
                 }
             }
@@ -3461,8 +3456,7 @@ mod tests {
                     .unwrap_or_else(|| crate::envelope::Address::Path(ctx.self_path().clone()));
                 ctx.send(
                     dest,
-                    Added::schema_id(),
-                    json!({ "n": cmd.n }),
+                    &Added { n: cmd.n },
                     Some(crate::envelope::Address::Path(ctx.self_path().clone())),
                 );
                 vec![crate::envelope::Event::new(
@@ -5313,7 +5307,7 @@ mod tests {
         }
         impl MsgHandler<Add> for Echo {
             async fn handle(&mut self, msg: Add, ctx: &mut crate::context::MsgCtx<'_>) {
-                ctx.reply(Add::schema_id(), json!({ "echo": msg.n }));
+                ctx.reply(msg);
             }
         }
 
@@ -5333,8 +5327,8 @@ mod tests {
             .await
             .expect("replied");
 
-        // Then the reply decodes as the handler's payload.
-        assert_eq!(reply["echo"], 21);
+        // Then the reply decodes as the handler's payload (the echoed Add).
+        assert_eq!(reply["n"], 21);
         // And the ask settled as Replied with its own fact.
         let kernel = system.kernel.lock();
         assert!(
@@ -5651,8 +5645,7 @@ mod tests {
             self.sink.lock().push(format!("seen={}", msg.n));
             ctx.send(
                 Address::Path(self.forward_to.clone()),
-                Add::schema_id(),
-                json!({ "n": msg.n }),
+                &Add { n: msg.n },
                 None,
             );
         }

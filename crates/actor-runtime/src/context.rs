@@ -12,6 +12,7 @@
 
 use crate::envelope::{Address, Envelope, TraceCtx};
 use crate::kernel::AskOutcome;
+use crate::schema::Message;
 use crate::types::{ActorPath, SchemaId, Timestamp, Topic};
 use serde_json::Value as JsonValue;
 
@@ -153,11 +154,33 @@ impl CtxCore<'_> {
         self.trace.caused()
     }
 
-    /// Records a send to `dest`.
+    /// Records a send to `dest` (typed: the schema id comes from the
+    /// message type, the payload from serde).
+    pub fn send<M: Message>(&mut self, dest: Address, msg: &M, reply_to: Option<Address>) {
+        let payload = serde_json::to_value(msg).expect("schema payload serializes");
+        self.send_json(dest, M::schema_id(), payload, reply_to);
+    }
+
+    /// Records a publish onto `topic` (typed).
+    pub fn publish<M: Message>(&mut self, topic: Topic, msg: &M) {
+        let payload = serde_json::to_value(msg).expect("schema payload serializes");
+        self.publish_json(topic, M::schema_id(), payload);
+    }
+
+    /// Records a reply to the message's `reply_to`, if the sender asked
+    /// (typed).
     ///
-    /// The schema is explicit: it is the wire contract, and the destination
-    /// decodes with it. The effect is deferred until the kernel flushes.
-    pub fn send(
+    /// A reply without a `reply_to` is dropped silently: the asker is gone,
+    /// so the fact is unobservable by definition. It is NEVER a broadcast —
+    /// use [`CtxCore::publish`] for topics.
+    pub fn reply<M: Message>(&mut self, msg: M) {
+        let payload = serde_json::to_value(&msg).expect("schema payload serializes");
+        self.reply_json(M::schema_id(), payload);
+    }
+
+    /// Escape hatch: records a send with an explicit schema id and
+    /// hand-built payload.
+    pub fn send_json(
         &mut self,
         dest: Address,
         schema: SchemaId,
@@ -172,8 +195,9 @@ impl CtxCore<'_> {
         self.outbox.push_send(envelope);
     }
 
-    /// Records a publish onto `topic`.
-    pub fn publish(&mut self, topic: Topic, schema: SchemaId, payload: JsonValue) {
+    /// Escape hatch: records a publish with an explicit schema id and
+    /// hand-built payload.
+    pub fn publish_json(&mut self, topic: Topic, schema: SchemaId, payload: JsonValue) {
         let envelope = Envelope::json(
             schema,
             Address::Topic(topic.clone()),
@@ -184,11 +208,9 @@ impl CtxCore<'_> {
         self.outbox.push_publish(topic, envelope);
     }
 
-    /// Records a reply to the message's `reply_to`, if the sender asked.
-    ///
-    /// A reply without a `reply_to` is dropped silently: the asker is gone,
-    /// so the fact is unobservable by definition.
-    pub fn reply(&mut self, schema: SchemaId, payload: JsonValue) {
+    /// Escape hatch: records a reply with an explicit schema id and
+    /// hand-built payload. Same silent-drop contract as [`CtxCore::reply`].
+    pub fn reply_json(&mut self, schema: SchemaId, payload: JsonValue) {
         if let Some(reply_to) = self.reply_to {
             self.outbox
                 .push_reply(reply_to.clone(), schema, payload, self.child_trace());
@@ -249,19 +271,15 @@ impl<'a> CmdCtx<'a> {
     }
 
     /// Records a send to `dest` (deferred; the kernel flushes post-ack).
-    pub fn send(
-        &mut self,
-        dest: Address,
-        schema: SchemaId,
-        payload: JsonValue,
-        reply_to: Option<Address>,
-    ) {
-        self.core.send(dest, schema, payload, reply_to);
+    /// Typed: the schema id comes from the message type.
+    pub fn send<M: Message>(&mut self, dest: Address, msg: &M, reply_to: Option<Address>) {
+        self.core.send(dest, msg, reply_to);
     }
 
-    /// Records a publish onto `topic` (deferred; flushed post-ack).
-    pub fn publish(&mut self, topic: Topic, schema: SchemaId, payload: JsonValue) {
-        self.core.publish(topic, schema, payload);
+    /// Records a publish onto `topic` (deferred; flushed post-ack). Typed:
+    /// the schema id comes from the message type.
+    pub fn publish<M: Message>(&mut self, topic: Topic, msg: &M) {
+        self.core.publish(topic, msg);
     }
 
     /// Records a reply to the message's `reply_to`, if the sender asked.
@@ -269,8 +287,31 @@ impl<'a> CmdCtx<'a> {
     /// A reply without a `reply_to` is dropped silently: the asker is gone,
     /// so the fact is unobservable by definition. It is NEVER a broadcast —
     /// use [`CmdCtx::publish`] for topics.
-    pub fn reply(&mut self, schema: SchemaId, payload: JsonValue) {
-        self.core.reply(schema, payload);
+    pub fn reply<M: Message>(&mut self, msg: M) {
+        self.core.reply(msg);
+    }
+
+    /// Escape hatch: send with an explicit schema id and hand-built payload.
+    pub fn send_json(
+        &mut self,
+        dest: Address,
+        schema: SchemaId,
+        payload: JsonValue,
+        reply_to: Option<Address>,
+    ) {
+        self.core.send_json(dest, schema, payload, reply_to);
+    }
+
+    /// Escape hatch: publish with an explicit schema id and hand-built
+    /// payload.
+    pub fn publish_json(&mut self, topic: Topic, schema: SchemaId, payload: JsonValue) {
+        self.core.publish_json(topic, schema, payload);
+    }
+
+    /// Escape hatch: reply with an explicit schema id and hand-built
+    /// payload. Same silent-drop contract as [`CmdCtx::reply`].
+    pub fn reply_json(&mut self, schema: SchemaId, payload: JsonValue) {
+        self.core.reply_json(schema, payload);
     }
 
     /// Snapshot info about a path.
@@ -441,19 +482,15 @@ impl<'a> MsgCtx<'a> {
     }
 
     /// Records a send to `dest` (deferred; the kernel flushes post-ack).
-    pub fn send(
-        &mut self,
-        dest: Address,
-        schema: SchemaId,
-        payload: JsonValue,
-        reply_to: Option<Address>,
-    ) {
-        self.core.send(dest, schema, payload, reply_to);
+    /// Typed: the schema id comes from the message type.
+    pub fn send<M: Message>(&mut self, dest: Address, msg: &M, reply_to: Option<Address>) {
+        self.core.send(dest, msg, reply_to);
     }
 
-    /// Records a publish onto `topic` (deferred; flushed post-ack).
-    pub fn publish(&mut self, topic: Topic, schema: SchemaId, payload: JsonValue) {
-        self.core.publish(topic, schema, payload);
+    /// Records a publish onto `topic` (deferred; flushed post-ack). Typed:
+    /// the schema id comes from the message type.
+    pub fn publish<M: Message>(&mut self, topic: Topic, msg: &M) {
+        self.core.publish(topic, msg);
     }
 
     /// Records a reply to the message's `reply_to`, if the sender asked.
@@ -461,8 +498,31 @@ impl<'a> MsgCtx<'a> {
     /// A reply without a `reply_to` is dropped silently: the asker is gone,
     /// so the fact is unobservable by definition. It is NEVER a broadcast —
     /// use [`MsgCtx::publish`] for topics.
-    pub fn reply(&mut self, schema: SchemaId, payload: JsonValue) {
-        self.core.reply(schema, payload);
+    pub fn reply<M: Message>(&mut self, msg: M) {
+        self.core.reply(msg);
+    }
+
+    /// Escape hatch: send with an explicit schema id and hand-built payload.
+    pub fn send_json(
+        &mut self,
+        dest: Address,
+        schema: SchemaId,
+        payload: JsonValue,
+        reply_to: Option<Address>,
+    ) {
+        self.core.send_json(dest, schema, payload, reply_to);
+    }
+
+    /// Escape hatch: publish with an explicit schema id and hand-built
+    /// payload.
+    pub fn publish_json(&mut self, topic: Topic, schema: SchemaId, payload: JsonValue) {
+        self.core.publish_json(topic, schema, payload);
+    }
+
+    /// Escape hatch: reply with an explicit schema id and hand-built
+    /// payload. Same silent-drop contract as [`MsgCtx::reply`].
+    pub fn reply_json(&mut self, schema: SchemaId, payload: JsonValue) {
+        self.core.reply_json(schema, payload);
     }
 
     /// Snapshot info about a path.
@@ -497,9 +557,88 @@ impl<'a> MsgCtx<'a> {
 mod tests {
     use super::*;
     use crate::registry::EndpointInfo;
-    use crate::schema::{ActorManifest, SchemaKind};
+    use crate::schema::{ActorManifest, Schema, SchemaDef, SchemaKind};
     use crate::types::ActorKind;
     use parking_lot::Mutex;
+    use serde::{Deserialize, Serialize};
+
+    /// Typed messages for the effect tests: the schema id comes from the
+    /// type, so the assertions prove the derivation.
+    #[derive(Serialize, Deserialize)]
+    struct ReserveStock {
+        qty: i64,
+    }
+    impl Schema for ReserveStock {
+        fn schema_def() -> SchemaDef {
+            SchemaDef {
+                name: "ReserveStock".into(),
+                version: 1,
+                kind: SchemaKind::Command,
+                fields: vec![],
+                description: None,
+            }
+        }
+    }
+
+    #[derive(Serialize, Deserialize)]
+    struct Reserved {
+        ok: bool,
+    }
+    impl Schema for Reserved {
+        fn schema_def() -> SchemaDef {
+            SchemaDef {
+                name: "Reserved".into(),
+                version: 1,
+                kind: SchemaKind::Event,
+                fields: vec![],
+                description: None,
+            }
+        }
+    }
+
+    #[derive(Serialize, Deserialize)]
+    struct StockReserved {
+        qty: i64,
+    }
+    impl Schema for StockReserved {
+        fn schema_def() -> SchemaDef {
+            SchemaDef {
+                name: "StockReserved".into(),
+                version: 1,
+                kind: SchemaKind::Event,
+                fields: vec![],
+                description: None,
+            }
+        }
+    }
+
+    #[derive(Serialize, Deserialize)]
+    struct Ping;
+    impl Schema for Ping {
+        fn schema_def() -> SchemaDef {
+            SchemaDef {
+                name: "Ping".into(),
+                version: 1,
+                kind: SchemaKind::Command,
+                fields: vec![],
+                description: None,
+            }
+        }
+    }
+
+    #[derive(Serialize, Deserialize)]
+    struct Pong;
+    impl Schema for Pong {
+        fn schema_def() -> SchemaDef {
+            SchemaDef {
+                name: "Pong".into(),
+                version: 1,
+                kind: SchemaKind::Event,
+                fields: vec![],
+                description: None,
+            }
+        }
+    }
 
     /// A view over static data; tests never touch a real registry.
     struct FakeView {
@@ -559,11 +698,9 @@ mod tests {
         let mut ctx = CmdCtx::new(&path, &parent, None, &view, &mut outbox);
 
         // When sending a command.
-        let json = serde_json::json!({ "qty": 2 });
         ctx.send(
             Address::Path(ActorPath::new("inventory.west")),
-            SchemaId::new("ReserveStock", 1),
-            json,
+            &ReserveStock { qty: 2 },
             None,
         );
 
@@ -599,10 +736,7 @@ mod tests {
         let mut ctx = CmdCtx::new(&path, &trace, Some(&reply_to), view, &mut outbox);
 
         // When replying.
-        ctx.reply(
-            SchemaId::new("Reserved", 1),
-            serde_json::json!({ "ok": true }),
-        );
+        ctx.reply(Reserved { ok: true });
 
         // Then one reply intent targets the client.
         let drained: Vec<_> = outbox.drain().collect();
@@ -618,7 +752,7 @@ mod tests {
         // When a context without reply-to replies.
         let mut silent_outbox = Outbox::new();
         let mut silent = CmdCtx::new(&path, &trace, None, view, &mut silent_outbox);
-        silent.reply(SchemaId::new("Reserved", 1), serde_json::json!({}));
+        silent.reply(Reserved { ok: false });
 
         // Then nothing is recorded.
         assert!(silent_outbox.is_empty());
@@ -634,11 +768,7 @@ mod tests {
         let mut ctx = CmdCtx::new(&path, &trace, None, &view, &mut outbox);
 
         // When publishing an event onto a topic.
-        ctx.publish(
-            Topic::new("inventory.events"),
-            SchemaId::new("StockReserved", 1),
-            serde_json::json!({ "qty": 2 }),
-        );
+        ctx.publish(Topic::new("inventory.events"), &StockReserved { qty: 2 });
 
         // Then a publish intent is pending for that topic.
         let drained: Vec<_> = outbox.drain().collect();
@@ -681,18 +811,8 @@ mod tests {
         let mut outbox = Outbox::new();
         let path = ActorPath::new("a");
         let mut ctx = CmdCtx::new(&path, &trace, None, &view, &mut outbox);
-        ctx.send(
-            Address::Path(ActorPath::new("b")),
-            SchemaId::new("Ping", 1),
-            serde_json::json!({}),
-            None,
-        );
-        ctx.send(
-            Address::Path(ActorPath::new("c")),
-            SchemaId::new("Pong", 1),
-            serde_json::json!({}),
-            None,
-        );
+        ctx.send(Address::Path(ActorPath::new("b")), &Ping, None);
+        ctx.send(Address::Path(ActorPath::new("c")), &Pong, None);
 
         // When draining.
         let count = outbox.drain().count();
@@ -712,12 +832,7 @@ mod tests {
         let mut ctx = MsgCtx::new(&path, &trace, None, &view, &mut outbox, None);
 
         // When it sends.
-        ctx.send(
-            Address::Path(ActorPath::new("b")),
-            SchemaId::new("Ping", 1),
-            serde_json::json!({}),
-            None,
-        );
+        ctx.send(Address::Path(ActorPath::new("b")), &Ping, None);
 
         // Then the effect is deferred identically.
         assert_eq!(outbox.len(), 1);
@@ -736,7 +851,7 @@ mod tests {
         let mut ctx = MsgCtx::new(&path, &trace, None, &view, &mut outbox, None);
 
         // When the handler replies.
-        ctx.reply(SchemaId::new("Pong", 1), serde_json::json!({}));
+        ctx.reply(Pong);
 
         // Then the outbox stays empty — nothing is recorded anywhere.
         assert_eq!(outbox.len(), 0);
@@ -755,9 +870,153 @@ mod tests {
         let mut ctx = MsgCtx::new(&path, &trace, Some(&reply_to), &view, &mut outbox, None);
 
         // When the handler replies.
-        ctx.reply(SchemaId::new("Pong", 1), serde_json::json!({ "ok": 1 }));
+        ctx.reply(Pong);
 
         // Then exactly one Reply intent is recorded, addressed to the asker.
         assert_eq!(outbox.len(), 1);
+    }
+
+    /// The typed reply records EXACTLY the intent the raw variant does:
+    /// schema id from `E::schema_id()`, payload from serde.
+    #[test]
+    fn typed_reply_records_the_same_intent_as_the_raw_variant() {
+        // Given two identical contexts (one typed, one raw).
+        let view = FakeView::at_millis(0);
+        let trace = TraceCtx::root();
+        let reply_to = Address::Path(ActorPath::new("client"));
+        let path = ActorPath::new("server");
+        let mut typed_outbox = Outbox::new();
+        let mut raw_outbox = Outbox::new();
+        {
+            let mut typed = CmdCtx::new(&path, &trace, Some(&reply_to), &view, &mut typed_outbox);
+            let mut raw = CmdCtx::new(&path, &trace, Some(&reply_to), &view, &mut raw_outbox);
+
+            // When replying the same outcome both ways.
+            typed.reply(Reserved { ok: true });
+            raw.reply_json(Reserved::schema_id(), serde_json::json!({ "ok": true }));
+        }
+
+        // Then the drained intents are identical.
+        let typed_intents: Vec<_> = typed_outbox.drain().collect();
+        let raw_intents: Vec<_> = raw_outbox.drain().collect();
+        assert_eq!(typed_intents.len(), 1);
+        assert_eq!(raw_intents.len(), 1);
+        // (Both contexts dropped above; only the intents remain.)
+        match (&typed_intents[0], &raw_intents[0]) {
+            (
+                Intent::Reply {
+                    to: a,
+                    schema: sa,
+                    payload: pa,
+                    ..
+                },
+                Intent::Reply {
+                    to: b,
+                    schema: sb,
+                    payload: pb,
+                    ..
+                },
+            ) => {
+                assert_eq!(a, b);
+                assert_eq!(*sa, Reserved::schema_id());
+                assert_eq!(sa, sb);
+                assert_eq!(pa, pb);
+            }
+            _ => panic!("expected reply intents"),
+        }
+    }
+
+    /// Same equivalence for publish: topic, derived schema id, payload.
+    #[test]
+    fn typed_publish_records_the_same_intent_as_the_raw_variant() {
+        // Given two identical contexts.
+        let view = FakeView::at_millis(0);
+        let trace = TraceCtx::root();
+        let path = ActorPath::new("inventory.west");
+        let mut typed_outbox = Outbox::new();
+        let mut raw_outbox = Outbox::new();
+        {
+            let mut typed = CmdCtx::new(&path, &trace, None, &view, &mut typed_outbox);
+            typed.publish(Topic::new("inventory.events"), &StockReserved { qty: 2 });
+        }
+        {
+            let mut raw = CmdCtx::new(&path, &trace, None, &view, &mut raw_outbox);
+            raw.publish_json(
+                Topic::new("inventory.events"),
+                StockReserved::schema_id(),
+                serde_json::json!({ "qty": 2 }),
+            );
+        }
+
+        // Then the publish intents are identical.
+        let typed: Vec<_> = typed_outbox.drain().collect();
+        let raw: Vec<_> = raw_outbox.drain().collect();
+        match (&typed[0], &raw[0]) {
+            (
+                Intent::Publish {
+                    topic: ta,
+                    envelope: ea,
+                },
+                Intent::Publish {
+                    topic: tb,
+                    envelope: eb,
+                },
+            ) => {
+                assert_eq!(ta, tb);
+                assert_eq!(ea.schema, eb.schema);
+                assert_eq!(ea.schema, StockReserved::schema_id());
+                assert_eq!(
+                    ea.clone().into_json().expect("json"),
+                    eb.clone().into_json().expect("json")
+                );
+            }
+            _ => panic!("expected publish intents"),
+        }
+    }
+
+    /// Same equivalence for send: destination, derived schema id, payload,
+    /// sender stamp.
+    #[test]
+    fn typed_send_records_the_same_intent_as_the_raw_variant() {
+        // Given two identical contexts.
+        let view = FakeView::at_millis(0);
+        let trace = TraceCtx::root();
+        let path = ActorPath::new("storefront");
+        let mut typed_outbox = Outbox::new();
+        let mut raw_outbox = Outbox::new();
+        {
+            let mut typed = CmdCtx::new(&path, &trace, None, &view, &mut typed_outbox);
+            typed.send(
+                Address::Path(ActorPath::new("inventory")),
+                &ReserveStock { qty: 2 },
+                None,
+            );
+        }
+        {
+            let mut raw = CmdCtx::new(&path, &trace, None, &view, &mut raw_outbox);
+            raw.send_json(
+                Address::Path(ActorPath::new("inventory")),
+                ReserveStock::schema_id(),
+                serde_json::json!({ "qty": 2 }),
+                None,
+            );
+        }
+
+        // Then the send intents are identical.
+        let typed: Vec<_> = typed_outbox.drain().collect();
+        let raw: Vec<_> = raw_outbox.drain().collect();
+        match (&typed[0], &raw[0]) {
+            (Intent::Send(ea), Intent::Send(eb)) => {
+                assert_eq!(ea.dest, eb.dest);
+                assert_eq!(ea.schema, ReserveStock::schema_id());
+                assert_eq!(ea.schema, eb.schema);
+                assert_eq!(
+                    ea.clone().into_json().expect("json"),
+                    eb.clone().into_json().expect("json")
+                );
+                assert_eq!(ea.from, eb.from);
+            }
+            _ => panic!("expected send intents"),
+        }
     }
 }

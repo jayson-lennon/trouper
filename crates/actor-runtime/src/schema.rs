@@ -5,7 +5,7 @@
 //! [`SchemaDef`] parsed from JSON, indistinguishable from one derived from a
 //! Rust type. `SchemaId`s embed their version (`name@version`) from day one.
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::Value as JsonValue;
 
 use crate::types::SchemaId;
@@ -209,6 +209,16 @@ pub trait Schema {
         def.id()
     }
 }
+
+/// A type that round-trips the wire: a schema contract with serde on both
+/// ends. The bound for typed effect methods — the schema id comes from the
+/// type, the payload from serde.
+///
+/// Blanket-implemented: any `Schema` type with both serde derives IS a
+/// `Message` (the adapters decode inbound messages, so every schema type
+/// already carries the derives).
+pub trait Message: Schema + Serialize + DeserializeOwned {}
+impl<T: Schema + Serialize + DeserializeOwned> Message for T {}
 
 /// An actor's declared edges: which schemas it handles, which it emits, and
 /// which topics it emits to or subscribes.

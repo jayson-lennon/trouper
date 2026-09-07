@@ -193,20 +193,16 @@ impl<S: FileStore + Default> MsgHandler<SaveFile> for FileSaver<S> {
             Ok(ack) => {
                 // Point-to-point: to the asker when asked, silently
                 // dropped on a tell.
-                ctx.reply(
-                    SaveAck::schema_id(),
-                    serde_json::to_value(&ack).expect("ack serializes"),
-                );
+                ctx.reply(ack);
             }
             Err(e) => {
                 let fact = SaveFailed {
                     path: msg.path.display().to_string(),
                     reason: format!("{:?}", e.kind),
                 };
-                let payload = serde_json::to_value(&fact).expect("fact serializes");
-                ctx.reply(SaveFailed::schema_id(), payload.clone());
+                ctx.reply(fact.clone());
                 // The fact channel: observers (and tellers' audits) see it.
-                ctx.publish(audit_topic(), SaveFailed::schema_id(), payload);
+                ctx.publish(audit_topic(), &fact);
             }
         }
     }
