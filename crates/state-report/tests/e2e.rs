@@ -9,7 +9,7 @@
 #[allow(dead_code)]
 mod demo;
 
-use actor_runtime::prelude::*;
+use trouper::prelude::*;
 use state_report::{StateKey, fetch_on, install_on};
 
 #[tokio::test(flavor = "multi_thread")]

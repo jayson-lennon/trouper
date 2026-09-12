@@ -4,9 +4,9 @@
 //! or abort with a legible stderr message and a non-zero exit.
 //!
 //! Bare invocation fetches from whatever bridge answers
-//! `actor-runtime/state` on the local network (zenoh peer discovery;
+//! `trouper/state` on the local network (zenoh peer discovery;
 //! there are no addresses to configure). `-h`/`--help` prints usage.
-//! `ctl` sends commands on `actor-runtime/control`: bare `ctl` asks the
+//! `ctl` sends commands on `trouper/control`: bare `ctl` asks the
 //! bridge what it can do, `ctl <name> [json]` runs a command and prints
 //! the reply. Unknown flags or arguments are a usage error (exit 2); a
 //! failed fetch or a failed command is an abort (exit 1). A future GUI

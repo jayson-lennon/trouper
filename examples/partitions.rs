@@ -5,10 +5,10 @@
 //!
 //! Run: `cargo run --example partitions`
 
-use actor_runtime::actor::{CommandHandler, EventSourcedActor};
-use actor_runtime::prelude::*;
-use actor_runtime::tap::FactKind;
-use actor_runtime::types::DeadLetterReason;
+use trouper::actor::{CommandHandler, EventSourcedActor};
+use trouper::prelude::*;
+use trouper::tap::FactKind;
+use trouper::types::DeadLetterReason;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::sync::Arc;
@@ -91,11 +91,11 @@ async fn main() {
     system.register_schema::<KeyedAdd>();
 
     system
-        .install_partition_set(actor_runtime::pool::PartitionSpec {
+        .install_partition_set(trouper::pool::PartitionSpec {
             public: ActorPath::new("accounts"),
             system: system.clone(),
             factory: Arc::new(|system, path, args| {
-                actor_runtime::builder::spawn_es_builder::<Account>(system)
+                trouper::builder::spawn_es_builder::<Account>(system)
                     .at(path.clone())
                     .args(args.clone())
                     .handles::<KeyedAdd>()

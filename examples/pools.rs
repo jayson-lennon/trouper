@@ -5,10 +5,10 @@
 //!
 //! Run: `cargo run --example pools`
 
-use actor_runtime::actor::{CommandHandler, EventSourcedActor};
-use actor_runtime::prelude::*;
-use actor_runtime::tap::FactKind;
-use actor_runtime::types::DeadLetterReason;
+use trouper::actor::{CommandHandler, EventSourcedActor};
+use trouper::prelude::*;
+use trouper::tap::FactKind;
+use trouper::types::DeadLetterReason;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::sync::Arc;
@@ -131,7 +131,7 @@ async fn main() {
 
     // -- 1. Takeover: a plain actor holds "api"; the pool claims it --------
     println!("== 1. takeover ==");
-    actor_runtime::builder::spawn_es_builder::<Worker>(&system)
+    trouper::builder::spawn_es_builder::<Worker>(&system)
         .at(ActorPath::new("api"))
         .args(json!({}))
         .handles::<Work>()
@@ -151,12 +151,12 @@ async fn main() {
     println!("   plain actor served one request at 'api'");
 
     system
-        .install_pool(actor_runtime::pool::PoolSpec {
+        .install_pool(trouper::pool::PoolSpec {
             public: ActorPath::new("api"),
             workers: 3,
-            algo: actor_runtime::pool::PoolAlgo::RoundRobin,
+            algo: trouper::pool::PoolAlgo::RoundRobin,
             factory: Arc::new(|system, path, args| {
-                actor_runtime::builder::spawn_es_builder::<Worker>(system)
+                trouper::builder::spawn_es_builder::<Worker>(system)
                     .at(path.clone())
                     .args(args.clone())
                     .handles::<Work>()
@@ -203,17 +203,17 @@ async fn main() {
 
     // -- 3. Tee rule: a watcher observes the pool flow ----------------------
     println!("== 3. tee rule ==");
-    actor_runtime::builder::spawn_es_builder::<Watcher>(&system)
+    trouper::builder::spawn_es_builder::<Watcher>(&system)
         .at(ActorPath::new("watcher"))
         .args(json!({}))
         .handles::<WorkCopy>()
         .emits::<CopyDone>()
         .start();
-    system.install_rule(actor_runtime::pool::Rule {
+    system.install_rule(trouper::pool::Rule {
         source: None,
         schema: Some(Work::schema_id()),
         dest: Some(ActorPath::new("api")),
-        action: actor_runtime::pool::RuleAction::Tee(ActorPath::new("watcher")),
+        action: trouper::pool::RuleAction::Tee(ActorPath::new("watcher")),
     });
     // Two more sends: each is copied to the watcher at-most-once (a teed
     // copy is never an audit mechanism — the primary flow is untouched).

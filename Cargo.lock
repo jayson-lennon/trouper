@@ -3,39 +3,6 @@
 version = 4
 
 [[package]]
-name = "actor-canvas"
-version = "0.1.0"
-dependencies = [
- "actor-runtime",
- "error-stack",
- "parking_lot",
- "serde",
- "serde_json",
- "state-report",
- "tokio",
- "tracing",
- "tracing-subscriber",
-]
-
-[[package]]
-name = "actor-runtime"
-version = "0.1.0"
-dependencies = [
- "arc-swap",
- "derive_more",
- "error-stack",
- "futures",
- "parking_lot",
- "rstest",
- "serde",
- "serde_json",
- "tokio",
- "tracing",
- "uuid",
- "wherror",
-]
-
-[[package]]
 name = "adler2"
 version = "2.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -248,7 +215,6 @@ checksum = "fc652a48c352aef3ea3aed32080501cf3ef6ed5da78602a020c991775b0aff04"
 name = "canvas"
 version = "0.1.0"
 dependencies = [
- "actor-runtime",
  "error-stack",
  "futures",
  "rstest",
@@ -258,6 +224,7 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "trouper",
  "wherror",
 ]
 
@@ -2741,7 +2708,6 @@ checksum = "6ce2be8dc25455e1f91df71bfa12ad37d7af1092ae736f3a6cd0e37bc7810596"
 name = "state-report"
 version = "0.1.0"
 dependencies = [
- "actor-runtime",
  "error-stack",
  "futures",
  "rstest",
@@ -2750,6 +2716,7 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "trouper",
  "wherror",
  "zenoh",
 ]
@@ -3099,6 +3066,39 @@ dependencies = [
  "tracing-core",
  "tracing-log",
  "tracing-serde",
+]
+
+[[package]]
+name = "trouper"
+version = "0.1.0"
+dependencies = [
+ "arc-swap",
+ "derive_more",
+ "error-stack",
+ "futures",
+ "parking_lot",
+ "rstest",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+ "uuid",
+ "wherror",
+]
+
+[[package]]
+name = "trouper-sdk"
+version = "0.1.0"
+dependencies = [
+ "error-stack",
+ "parking_lot",
+ "serde",
+ "serde_json",
+ "state-report",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "trouper",
 ]
 
 [[package]]

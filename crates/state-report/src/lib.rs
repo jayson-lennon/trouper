@@ -18,7 +18,7 @@
 //! Test isolation: zenoh's default peer discovery puts every session on
 //! the machine (and network) into one mesh, so concurrent tests must not
 //! share the production keys. [`StateKey::scoped`] and [`ControlKey::scoped`]
-//! derive per-test island keys (`actor-runtime/{state,control}/<scope>`);
+//! derive per-test island keys (`trouper/{state,control}/<scope>`);
 //! a query on one island only ever reaches queryables declared on that
 //! same island.
 //!
@@ -38,7 +38,7 @@
 //!
 //!     async fn execute(
 //!         &self,
-//!         _system: &std::sync::Arc<actor_runtime::system::ActorSystem>,
+//!         _system: &std::sync::Arc<trouper::system::ActorSystem>,
 //!         args: &serde_json::Value,
 //!     ) -> Result<serde_json::Value, String> {
 //!         let text = args.get("text").and_then(|t| t.as_str()).unwrap_or("ping");
@@ -46,7 +46,7 @@
 //!     }
 //! }
 //!
-//! # async fn demo(system: std::sync::Arc<actor_runtime::system::ActorSystem>) -> Result<(), Box<dyn std::error::Error>> {
+//! # async fn demo(system: std::sync::Arc<trouper::system::ActorSystem>) -> Result<(), Box<dyn std::error::Error>> {
 //! // App startup: the allow-list is chosen once, here.
 //! let _bridge = state_report::install_control(
 //!     system.clone(),
@@ -63,9 +63,9 @@
 //! # }
 //! ```
 
-use actor_runtime::prelude::*;
-use actor_runtime::state_report::ReportState;
-use actor_runtime::system::{ActorSystem, SystemExport};
+use trouper::prelude::*;
+use trouper::state_report::ReportState;
+use trouper::system::{ActorSystem, SystemExport};
 use std::borrow::Cow;
 use std::time::Duration;
 use tokio::time::Instant;
@@ -76,10 +76,10 @@ use tokio::time::Instant;
 pub use zenoh;
 
 /// The zenoh key every state query travels on.
-pub const STATE_KEY: &str = "actor-runtime/state";
+pub const STATE_KEY: &str = "trouper/state";
 
 /// The zenoh key every control command travels on.
-pub const CONTROL_KEY: &str = "actor-runtime/control";
+pub const CONTROL_KEY: &str = "trouper/control";
 
 /// The zenoh key a control bridge serves and clients send commands to.
 ///
@@ -96,7 +96,7 @@ impl ControlKey {
         Self(CONTROL_KEY.to_string())
     }
 
-    /// A namespaced island key, `actor-runtime/control/<scope>`.
+    /// A namespaced island key, `trouper/control/<scope>`.
     pub fn scoped(scope: &str) -> Self {
         Self(format!("{CONTROL_KEY}/{scope}"))
     }
@@ -121,7 +121,7 @@ impl StateKey {
         Self(STATE_KEY.to_string())
     }
 
-    /// A namespaced island key, `actor-runtime/state/<scope>`.
+    /// A namespaced island key, `trouper/state/<scope>`.
     ///
     /// Keys are matched exactly (no wildcards here), so queries on one
     /// scope only reach queryables on the same scope — even though the
@@ -890,7 +890,7 @@ pub struct PoolBlueprint {
     /// The public path senders address (claimed by the pool).
     pub public: ActorPath,
     /// The worker-selection algorithm.
-    pub algo: actor_runtime::pool::PoolAlgo,
+    pub algo: trouper::pool::PoolAlgo,
     /// The supervised parent workers spawn under (escalation flows
     /// worker → parent); `None` = parentless workers.
     pub parent: Option<ActorPath>,
@@ -1003,7 +1003,7 @@ impl ControlCommand for ScalePoolCmd {
         // current generation first, discovered from the live export.
         drain_pool_workers(system, &blueprint.public).await;
 
-        let spec = actor_runtime::pool::PoolSpec {
+        let spec = trouper::pool::PoolSpec {
             public: blueprint.public.clone(),
             workers: args.workers,
             algo: blueprint.algo,
@@ -1259,15 +1259,15 @@ mod tests {
         // Given/When deriving keys for the same scope name.
         // Then control islands live under the control family, never the
         // state family.
-        assert_eq!(ControlKey::scoped("t").as_str(), "actor-runtime/control/t");
-        assert_eq!(StateKey::scoped("t").as_str(), "actor-runtime/state/t");
+        assert_eq!(ControlKey::scoped("t").as_str(), "trouper/control/t");
+        assert_eq!(StateKey::scoped("t").as_str(), "trouper/state/t");
         assert_eq!(ControlKey::production().as_str(), CONTROL_KEY);
     }
 
     // ----- ScalePool over a real system (tests 5-6) ------------------------
 
-    use actor_runtime::actor::{CommandHandler, EventSourcedActor};
-    use actor_runtime::tap::FactKind;
+    use trouper::actor::{CommandHandler, EventSourcedActor};
+    use trouper::tap::FactKind;
 
     /// The harness command: `{"n": int}`.
     #[derive(serde::Deserialize)]
@@ -1354,12 +1354,12 @@ mod tests {
             "probe",
             PoolBlueprint {
                 public: ActorPath::new("scale.me"),
-                algo: actor_runtime::pool::PoolAlgo::RoundRobin,
+                algo: trouper::pool::PoolAlgo::RoundRobin,
                 parent,
                 seed: 42,
                 args: Some(json!({})),
                 factory: std::sync::Arc::new(|system, path, args| {
-                    actor_runtime::builder::spawn_es_builder::<ProbeWorker>(system)
+                    trouper::builder::spawn_es_builder::<ProbeWorker>(system)
                         .at(path.clone())
                         .args(args.clone())
                         .handles::<Probe>()
@@ -1403,7 +1403,7 @@ mod tests {
         // Given a live system where a plain (non-pool) actor holds the
         // blueprint's public path and has served one request.
         let system = probe_blueprint_system();
-        actor_runtime::builder::spawn_es_builder::<ProbeWorker>(&system)
+        trouper::builder::spawn_es_builder::<ProbeWorker>(&system)
             .at(ActorPath::new("scale.me"))
             .args(json!({}))
             .handles::<Probe>()
@@ -1562,7 +1562,7 @@ mod tests {
     /// Spawns a plain `ProbeWorker` at the blueprint's public path — the
     /// pre-existing topology the rejection tests must not disturb.
     fn spawn_plain_holder(system: &std::sync::Arc<ActorSystem>) {
-        actor_runtime::builder::spawn_es_builder::<ProbeWorker>(system)
+        trouper::builder::spawn_es_builder::<ProbeWorker>(system)
             .at(ActorPath::new("scale.me"))
             .args(json!({}))
             .handles::<Probe>()
@@ -1660,7 +1660,7 @@ mod tests {
         // Given a blueprint whose workers are supervised children of a
         // live parent actor (the pools example's escalation topology).
         let system = probe_blueprint_system();
-        actor_runtime::builder::spawn_es_builder::<ProbeWorker>(&system)
+        trouper::builder::spawn_es_builder::<ProbeWorker>(&system)
             .at(ActorPath::new("scale.parent"))
             .args(json!({}))
             .handles::<Probe>()

@@ -13,11 +13,11 @@
 //! Shell 1 keeps running (it IS the answering system) until ctrl-c; each
 //! `canvas` invocation in shell 2 prints that instant's export.
 
-use actor_runtime::actor::{CommandHandler, EventSourcedActor, MsgHandler, ServiceActor};
-use actor_runtime::prelude::*;
-use actor_runtime::registry::RegistryError;
-use actor_runtime::state_report::{ReportState, StateReported, StateReporter};
-use actor_runtime::system::ActorSystem;
+use trouper::actor::{CommandHandler, EventSourcedActor, MsgHandler, ServiceActor};
+use trouper::prelude::*;
+use trouper::registry::RegistryError;
+use trouper::state_report::{ReportState, StateReported, StateReporter};
+use trouper::system::ActorSystem;
 use error_stack::Report;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -219,16 +219,16 @@ pub async fn build_demo_system() -> Arc<ActorSystem> {
     system.register_schema::<KeyedAdd>();
 
     // 1. The topic subscriber: a service actor on `system.facts`.
-    actor_runtime::builder::spawn_service_builder::<FactCounter>(&system)
+    trouper::builder::spawn_service_builder::<FactCounter>(&system)
         .at(ActorPath::new("watchdog"))
         .args(json!({}))
         .handles::<FactMsg>()
-        .mailbox(64, actor_runtime::inbox::OverloadPolicy::DropNew)
+        .mailbox(64, trouper::inbox::OverloadPolicy::DropNew)
         .start();
     system
         .subscribe(
             &ActorPath::new("watchdog"),
-            &actor_runtime::registry::Registry::facts_topic(),
+            &trouper::registry::Registry::facts_topic(),
             None,
         )
         .expect("subscribe watchdog to system.facts");
@@ -237,12 +237,12 @@ pub async fn build_demo_system() -> Arc<ActorSystem> {
     //    picks one of 2 workers round-robin (workers are children of
     //    `api-parent` for escalation).
     system
-        .install_pool(actor_runtime::pool::PoolSpec {
+        .install_pool(trouper::pool::PoolSpec {
             public: ActorPath::new("api"),
             workers: 2,
-            algo: actor_runtime::pool::PoolAlgo::RoundRobin,
+            algo: trouper::pool::PoolAlgo::RoundRobin,
             factory: Arc::new(|system, path, args| {
-                actor_runtime::builder::spawn_es_builder::<Worker>(system)
+                trouper::builder::spawn_es_builder::<Worker>(system)
                     .at(path.clone())
                     .args(args.clone())
                     .handles::<Work>()
@@ -260,20 +260,20 @@ pub async fn build_demo_system() -> Arc<ActorSystem> {
     //    cannot consume `Work` (it handles `FactMsg`) — so instead the
     //    rule's declared shape is exercised by the export (rules: 1) and
     //    the watchdog's real food is the facts topic.
-    system.install_rule(actor_runtime::pool::Rule {
+    system.install_rule(trouper::pool::Rule {
         source: None,
         schema: Some(Work::schema_id()),
         dest: Some(ActorPath::new("api")),
-        action: actor_runtime::pool::RuleAction::Tee(ActorPath::new("watchdog")),
+        action: trouper::pool::RuleAction::Tee(ActorPath::new("watchdog")),
     });
 
     // 4. The partition set: `accounts`, shard key `account`.
     system
-        .install_partition_set(actor_runtime::pool::PartitionSpec {
+        .install_partition_set(trouper::pool::PartitionSpec {
             public: ActorPath::new("accounts"),
             system: system.clone(),
             factory: Arc::new(|system, path, args| {
-                actor_runtime::builder::spawn_es_builder::<Account>(system)
+                trouper::builder::spawn_es_builder::<Account>(system)
                     .at(path.clone())
                     .args(args.clone())
                     .handles::<KeyedAdd>()
@@ -288,7 +288,7 @@ pub async fn build_demo_system() -> Arc<ActorSystem> {
 
     // 5. The state reporter: the journaled recorder the bridge serves
     //    every state query through.
-    actor_runtime::builder::spawn_es_builder::<StateReporter>(&system)
+    trouper::builder::spawn_es_builder::<StateReporter>(&system)
         .at(ActorPath::new("state/reporter"))
         .args(json!({}))
         .handles::<ReportState>()
@@ -331,7 +331,7 @@ pub async fn build_demo_system() -> Arc<ActorSystem> {
             .tap_facts()
             .iter()
             .filter(|f| {
-                matches!(&f.kind, actor_runtime::tap::FactKind::Delivered { to, .. }
+                matches!(&f.kind, trouper::tap::FactKind::Delivered { to, .. }
                     if to.as_str().starts_with("api/worker-"))
             })
             .count()
@@ -370,7 +370,7 @@ pub async fn run_demo_system() -> Result<(), state_report::StateBridgeError> {
     println!("  subscriber watchdog  on system.facts (service actor)");
     println!("  rule       tee       Work@api -> watchdog");
     println!("  reporter   state/reporter (journaled StateReported)");
-    println!("answering state queries on the actor-runtime/state key (ctrl-c to stop)");
+    println!("answering state queries on the trouper/state key (ctrl-c to stop)");
     tokio::signal::ctrl_c()
         .await
         .expect("ctrl-c handler installs");

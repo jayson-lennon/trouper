@@ -9,9 +9,9 @@
 //!
 //! Run: `cargo run --example observers`
 
-use actor_runtime::actor::{CommandHandler, EventSourcedActor, MsgHandler, ServiceActor};
-use actor_runtime::prelude::*;
-use actor_runtime::registry::RegistryError;
+use trouper::actor::{CommandHandler, EventSourcedActor, MsgHandler, ServiceActor};
+use trouper::prelude::*;
+use trouper::registry::RegistryError;
 use error_stack::Report;
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
@@ -177,22 +177,22 @@ async fn main() {
     let system = Arc::new(ActorSystem::test_with_tap(16).0);
 
     // The observer: a plain service actor + one subscribe call.
-    actor_runtime::builder::spawn_service_builder::<Observer>(&system)
+    trouper::builder::spawn_service_builder::<Observer>(&system)
         .at(ActorPath::new("observer"))
         .args(json!({}))
         .handles::<FactMsg>()
-        .mailbox(64, actor_runtime::inbox::OverloadPolicy::DropNew)
+        .mailbox(64, trouper::inbox::OverloadPolicy::DropNew)
         .start();
     system
         .subscribe(
             &ActorPath::new("observer"),
-            &actor_runtime::registry::Registry::facts_topic(),
+            &trouper::registry::Registry::facts_topic(),
             None,
         )
         .expect("subscribe");
 
     // The traffic source: a plain actor the demo sends commands to.
-    actor_runtime::builder::spawn_service_builder::<Ticker>(&system)
+    trouper::builder::spawn_service_builder::<Ticker>(&system)
         .at(ActorPath::new("ticker"))
         .args(json!({}))
         .handles::<Tick>()
@@ -224,7 +224,7 @@ async fn main() {
     // (UnknownSchema → the DLQ topic retains the envelope). The flood's
     // spawn-race mail may also be in the DLQ; the baseline below absorbs it.
     let baseline = system.dead_letter_count().await;
-    actor_runtime::builder::spawn_es_builder::<TickBouncer>(&system)
+    trouper::builder::spawn_es_builder::<TickBouncer>(&system)
         .at(ActorPath::new("strict"))
         .args(json!({}))
         .handles::<StrictCmd>()

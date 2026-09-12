@@ -26,7 +26,7 @@ use crate::types::{ActorKind, ActorPath, SchemaId, Topic};
 /// Begins a typed spawn of event-sourced actor `A`.
 ///
 /// ```ignore
-/// let h = actor_runtime::builder::spawn_es_builder::<Inventory>(&system)
+/// let h = trouper::builder::spawn_es_builder::<Inventory>(&system)
 ///     .at("inventory.west")
 ///     .args(json!({ "on_hand": 100 }))
 ///     .handles::<ReserveStock>()
@@ -58,6 +58,7 @@ pub fn spawn_service_builder<A: ServiceActor>(
         system: system.clone(),
         path: None,
         args: JsonValue::Null,
+        start_override: None,
         entries: Vec::new(),
         emits: Vec::new(),
         opts: SpawnOpts::default(),
@@ -207,6 +208,7 @@ pub struct ServiceBuilder<A: ServiceActor> {
     system: Arc<crate::system::ActorSystem>,
     path: Option<ActorPath>,
     args: JsonValue,
+    start_override: Option<crate::system::ServiceStart>,
     entries: Vec<Arc<dyn MsgEntry>>,
     emits: Vec<SchemaId>,
     opts: SpawnOpts,
@@ -223,6 +225,34 @@ impl<A: ServiceActor> ServiceBuilder<A> {
     /// Start arguments (I/O allowed inside `start`).
     pub fn args(mut self, args: JsonValue) -> Self {
         self.args = args;
+        self
+    }
+
+    /// Overrides the constructor used at spawn: instead of
+    /// `A::start(&args)`, the provided future builds the instance.
+    ///
+    /// For actors whose dependencies are typed values that cannot ride
+    /// JSON args (cells, channels, backend handles): capture them in a
+    /// closure and hand the future here. The manifest, edges, and
+    /// options are unaffected — `A::start` remains the default
+    /// constructor when this is not called.
+    pub fn start_with(
+        mut self,
+        start: impl FnOnce() -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<
+                    Output = Result<A, error_stack::Report<crate::registry::RegistryError>>,
+                > + Send,
+              >,
+          > + Send
+        + 'static,
+    ) -> Self {
+        self.start_override = Some(Box::pin(async move {
+            start().await.map(|instance| {
+                Box::new(crate::actor::TypedServiceState::new(instance))
+                    as Box<dyn crate::actor::DynServiceActor>
+            })
+        }));
         self
     }
 
@@ -291,12 +321,15 @@ impl<A: ServiceActor> ServiceBuilder<A> {
         }
         manifest = manifest.kind(ActorKind::Service);
         let start_args = self.args.clone();
-        let start: crate::system::ServiceStart = Box::pin(async move {
-            A::start(&start_args).await.map(|instance| {
-                Box::new(crate::actor::TypedServiceState::new(instance))
-                    as Box<dyn crate::actor::DynServiceActor>
-            })
-        });
+        let start: crate::system::ServiceStart = match self.start_override {
+            Some(overridden) => overridden,
+            None => Box::pin(async move {
+                A::start(&start_args).await.map(|instance| {
+                    Box::new(crate::actor::TypedServiceState::new(instance))
+                        as Box<dyn crate::actor::DynServiceActor>
+                })
+            }),
+        };
         self.system.spawn_service_erased(
             path.clone(),
             manifest,

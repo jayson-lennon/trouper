@@ -1,5 +1,5 @@
 [package]
-name = "actor-runtime"
+name = "trouper"
 version.workspace = true
 edition.workspace = true
 

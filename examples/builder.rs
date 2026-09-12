@@ -9,9 +9,9 @@
 //!
 //! Run: `cargo run --example builder`
 
-use actor_runtime::actor::{CommandHandler, EventSourcedActor};
-use actor_runtime::prelude::*;
-use actor_runtime::system::SnapshotCadence;
+use trouper::actor::{CommandHandler, EventSourcedActor};
+use trouper::prelude::*;
+use trouper::system::SnapshotCadence;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::sync::Arc;
@@ -102,14 +102,14 @@ async fn main() {
 
     // -- Typed spawn: the builder wires schema edges + adapters ------------
     println!("== typed builder ==");
-    let warehouse = actor_runtime::builder::spawn_es_builder::<Inventory>(&system)
+    let warehouse = trouper::builder::spawn_es_builder::<Inventory>(&system)
         .at(ActorPath::new("warehouse"))
         .args(json!({}))
         .handles::<Restock>()
         .emits::<Restocked>()
         .emits_on_topic(Topic::new("inventory.events"))
         .snapshot(SnapshotCadence::Messages(50))
-        .mailbox(64, actor_runtime::inbox::OverloadPolicy::Block)
+        .mailbox(64, trouper::inbox::OverloadPolicy::Block)
         .start();
     println!("   spawned {warehouse}");
 
@@ -139,7 +139,7 @@ async fn main() {
 
     // -- Foreign spawn: named handle/apply closures, JSON only -------------
     println!("== foreign builder ==");
-    let tally = actor_runtime::builder::spawn_foreign(&system)
+    let tally = trouper::builder::spawn_foreign(&system)
         .at(ActorPath::new("tally"))
         .schema(json!({
             "name": "TallyAdd", "version": 1, "kind": "command",

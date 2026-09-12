@@ -7,11 +7,11 @@
 //! shared the production key answered each other's queries under a
 //! parallel test runner. Island keys make the locks unnecessary.
 
-use actor_runtime::actor::{CommandHandler, EventSourcedActor};
-use actor_runtime::prelude::*;
-use actor_runtime::schema::{FieldDef, FieldTy, Schema, SchemaDef, SchemaKind};
-use actor_runtime::state_report::{ReportState, StateReported, StateReporter};
-use actor_runtime::system::SystemExport;
+use trouper::actor::{CommandHandler, EventSourcedActor};
+use trouper::prelude::*;
+use trouper::schema::{FieldDef, FieldTy, Schema, SchemaDef, SchemaKind};
+use trouper::state_report::{ReportState, StateReported, StateReporter};
+use trouper::system::SystemExport;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use state_report::{StateBridgeError, StateKey, fetch_on, install, install_on};
@@ -89,13 +89,13 @@ async fn reporting_system(total: i64) -> Arc<ActorSystem> {
     system.register_schema::<ReportState>();
     system.register_schema::<StateReported>();
 
-    actor_runtime::builder::spawn_es_builder::<Worker>(&system)
+    trouper::builder::spawn_es_builder::<Worker>(&system)
         .at(ActorPath::new("worker"))
         .args(json!({}))
         .handles::<Work>()
         .emits::<WorkDone>()
         .start();
-    actor_runtime::builder::spawn_es_builder::<StateReporter>(&system)
+    trouper::builder::spawn_es_builder::<StateReporter>(&system)
         .at(ActorPath::new("state/reporter"))
         .args(json!({}))
         .handles::<ReportState>()
@@ -304,7 +304,7 @@ impl ControlCommand for Echo {
 
     async fn execute(
         &self,
-        _system: &Arc<actor_runtime::system::ActorSystem>,
+        _system: &Arc<trouper::system::ActorSystem>,
         args: &serde_json::Value,
     ) -> Result<serde_json::Value, String> {
         let text = args
@@ -318,7 +318,7 @@ impl ControlCommand for Echo {
 /// Installs a control bridge serving `Echo` on its own island key.
 async fn echo_bridge(scope: &str) -> (ControlKey, zenoh::Session) {
     let key = ControlKey::scoped(scope);
-    let system = Arc::new(actor_runtime::system::ActorSystem::new(
+    let system = Arc::new(trouper::system::ActorSystem::new(
         SystemConfig::production(),
     ));
     let session = install_control_on(key.clone(), system, ControlRouter::new().with(Echo))
@@ -471,10 +471,10 @@ async fn control_bridge_scales_pools_over_the_wire() {
     // Given a system where a plain actor holds the public path and a
     // control bridge serves ScalePool for it.
     let key = ControlKey::scoped("wire-scale");
-    let system = Arc::new(actor_runtime::system::ActorSystem::new(
+    let system = Arc::new(trouper::system::ActorSystem::new(
         SystemConfig::production(),
     ));
-    actor_runtime::builder::spawn_es_builder::<Worker>(&system)
+    trouper::builder::spawn_es_builder::<Worker>(&system)
         .at(ActorPath::new("api"))
         .args(json!({}))
         .handles::<Work>()
@@ -484,12 +484,12 @@ async fn control_bridge_scales_pools_over_the_wire() {
         "api",
         PoolBlueprint {
             public: ActorPath::new("api"),
-            algo: actor_runtime::pool::PoolAlgo::RoundRobin,
+            algo: trouper::pool::PoolAlgo::RoundRobin,
             parent: None,
             seed: 42,
             args: Some(json!({})),
             factory: Arc::new(|system, path, args| {
-                actor_runtime::builder::spawn_es_builder::<Worker>(system)
+                trouper::builder::spawn_es_builder::<Worker>(system)
                     .at(path.clone())
                     .args(args.clone())
                     .handles::<Work>()

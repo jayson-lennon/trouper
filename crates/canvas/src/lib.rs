@@ -11,7 +11,7 @@
 //! before any GUI startup path (no GUI exists yet, and none may be
 //! stubbed here).
 
-use actor_runtime::system::SystemExport;
+use trouper::system::SystemExport;
 use state_report::StateBridgeError;
 
 /// Everything that can go wrong between "query" and "export in hand".
@@ -171,7 +171,7 @@ impl SnapshotSummary {
         let es = export
             .actors
             .iter()
-            .filter(|a| a.kind == actor_runtime::types::ActorKind::EventSourced)
+            .filter(|a| a.kind == trouper::types::ActorKind::EventSourced)
             .count();
         Self {
             schemas: export.schemas.len(),
@@ -210,16 +210,16 @@ impl SnapshotSummary {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use actor_runtime::schema::{ActorManifest, SchemaDef, SchemaKind};
-    use actor_runtime::system::{ActorExport, PartitionExport};
-    use actor_runtime::types::{ActorPath, InboxOffset};
+    use trouper::schema::{ActorManifest, SchemaDef, SchemaKind};
+    use trouper::system::{ActorExport, PartitionExport};
+    use trouper::types::{ActorPath, InboxOffset};
 
     /// An export with known, nonzero content where the summary has
     /// something to count: 5 schemas, one actor of each kind, a partition
     /// set with 3 activated entities. Everything else stays empty (which
     /// exercises the zero case of every remaining counter).
     fn sample_export() -> SystemExport {
-        let actor = |kind: actor_runtime::types::ActorKind, path: &str| ActorExport {
+        let actor = |kind: trouper::types::ActorKind, path: &str| ActorExport {
             path: ActorPath::new(path),
             kind,
             manifest: ActorManifest::new(),
@@ -237,8 +237,8 @@ mod tests {
                 })
                 .collect(),
             actors: vec![
-                actor(actor_runtime::types::ActorKind::EventSourced, "es/one"),
-                actor(actor_runtime::types::ActorKind::Service, "svc/two"),
+                actor(trouper::types::ActorKind::EventSourced, "es/one"),
+                actor(trouper::types::ActorKind::Service, "svc/two"),
             ],
             declared_edges: Vec::new(),
             observed_edges: Vec::new(),

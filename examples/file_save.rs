@@ -27,11 +27,11 @@
 //! shell 2: cargo run -p canvas   # the export now shows fs.saver as a 3-worker pool
 //! ```
 
-use actor_runtime::actor::{MsgHandler, ServiceActor};
-use actor_runtime::prelude::*;
-use actor_runtime::registry::RegistryError;
-use actor_runtime::state_report::{ReportState, StateReported, StateReporter};
-use actor_runtime::system::ActorSystem;
+use trouper::actor::{MsgHandler, ServiceActor};
+use trouper::prelude::*;
+use trouper::registry::RegistryError;
+use trouper::state_report::{ReportState, StateReported, StateReporter};
+use trouper::system::ActorSystem;
 use error_stack::Report;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -149,8 +149,8 @@ impl Schema for SaveFailed {
 
 /// The topic saves are announced on (the broadcast half of the pattern:
 /// reply = asker only, publish = everyone else).
-fn audit_topic() -> actor_runtime::types::Topic {
-    actor_runtime::types::Topic::new("fs.events")
+fn audit_topic() -> trouper::types::Topic {
+    trouper::types::Topic::new("fs.events")
 }
 
 /// THE minimal actor. The domain logic is `save` — a plain method on a
@@ -263,7 +263,7 @@ async fn run_demo() -> Result<(), Box<dyn std::error::Error>> {
 
     // Spawn: the builder declares the whole surface (and registers the
     // schemas — no caller-side register_schema anywhere in this file).
-    let saver = actor_runtime::builder::spawn_service_builder::<FileSaver<RealFs>>(&system)
+    let saver = trouper::builder::spawn_service_builder::<FileSaver<RealFs>>(&system)
         .at(ActorPath::new("fs.saver"))
         .args(json!({}))
         .handles::<SaveFile>()
@@ -273,7 +273,7 @@ async fn run_demo() -> Result<(), Box<dyn std::error::Error>> {
     wait(|| async { system.inbox_cursor(&saver).is_some() }).await;
 
     // The audit subscriber: sees every SaveFailed fact on fs.events.
-    let audit = actor_runtime::builder::spawn_service_builder::<SaveAudit>(&system)
+    let audit = trouper::builder::spawn_service_builder::<SaveAudit>(&system)
         .at(ActorPath::new("fs.audit"))
         .args(json!({}))
         .handles::<SaveFailed>()
@@ -284,7 +284,7 @@ async fn run_demo() -> Result<(), Box<dyn std::error::Error>> {
         .expect("subscribe fs.audit to fs.events");
 
     // The state reporter the bridge serves every query through.
-    actor_runtime::builder::spawn_es_builder::<StateReporter>(&system)
+    trouper::builder::spawn_es_builder::<StateReporter>(&system)
         .at(ActorPath::new("state/reporter"))
         .args(json!({}))
         .handles::<ReportState>()
@@ -298,7 +298,7 @@ async fn run_demo() -> Result<(), Box<dyn std::error::Error>> {
     .await;
 
     // --- tell: fire-and-forget, confirmed only by looking at the disk ---
-    let tell_path = std::env::temp_dir().join("actor-canvas-file-save-tell.txt");
+    let tell_path = std::env::temp_dir().join("trouper-sdk-file-save-tell.txt");
     system
         .tell(
             saver.clone(),
@@ -313,7 +313,7 @@ async fn run_demo() -> Result<(), Box<dyn std::error::Error>> {
     println!("tell: wrote {}", tell_path.display());
 
     // --- ask: save & confirm, the reply rides the lease back ---
-    let ask_path = std::env::temp_dir().join("actor-canvas-file-save-ask.txt");
+    let ask_path = std::env::temp_dir().join("trouper-sdk-file-save-ask.txt");
     let ack = system
         .ask(
             saver.clone(),
@@ -417,12 +417,12 @@ async fn run_demo() -> Result<(), Box<dyn std::error::Error>> {
         "saver",
         state_report::PoolBlueprint {
             public: ActorPath::new("fs.saver"),
-            algo: actor_runtime::pool::PoolAlgo::RoundRobin,
+            algo: trouper::pool::PoolAlgo::RoundRobin,
             parent: None,
             seed: 42,
             args: Some(json!({})),
             factory: Arc::new(|system, path, args| {
-                actor_runtime::builder::spawn_service_builder::<FileSaver<RealFs>>(system)
+                trouper::builder::spawn_service_builder::<FileSaver<RealFs>>(system)
                     .at(path.clone())
                     .args(args.clone())
                     .handles::<SaveFile>()
@@ -437,10 +437,10 @@ async fn run_demo() -> Result<(), Box<dyn std::error::Error>> {
     let _control = state_report::install_control(system.clone(), router).await?;
 
     println!(
-        "serving state on the actor-runtime/state key — run `cargo run -p canvas` (or the GUI) now (ctrl-c to stop)"
+        "serving state on the trouper/state key — run `cargo run -p canvas` (or the GUI) now (ctrl-c to stop)"
     );
     println!(
-        "serving commands on the actor-runtime/control key — try:\n  cargo run -p canvas -- ctl\n  cargo run -p canvas -- ctl ScalePool '{{\"kind\":\"saver\",\"workers\":3}}'"
+        "serving commands on the trouper/control key — try:\n  cargo run -p canvas -- ctl\n  cargo run -p canvas -- ctl ScalePool '{{\"kind\":\"saver\",\"workers\":3}}'"
     );
     tokio::signal::ctrl_c()
         .await
@@ -552,14 +552,14 @@ mod tests {
     /// wires the audit to fs.events.
     async fn demo_system() -> (std::sync::Arc<ActorSystem>, ActorPath, ActorPath) {
         let system = std::sync::Arc::new(ActorSystem::new(SystemConfig::production()));
-        let saver = actor_runtime::builder::spawn_service_builder::<FileSaver<MemFs>>(&system)
+        let saver = trouper::builder::spawn_service_builder::<FileSaver<MemFs>>(&system)
             .at(ActorPath::new("test.saver"))
             .args(json!({}))
             .handles::<SaveFile>()
             .emits::<SaveAck>()
             .emits::<SaveFailed>()
             .start();
-        let audit = actor_runtime::builder::spawn_service_builder::<SaveAudit>(&system)
+        let audit = trouper::builder::spawn_service_builder::<SaveAudit>(&system)
             .at(ActorPath::new("test.audit"))
             .args(json!({}))
             .handles::<SaveFailed>()

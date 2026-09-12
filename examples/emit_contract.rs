@@ -5,9 +5,9 @@
 //!
 //! Run: `cargo run --example emit_contract`
 
-use actor_runtime::actor::{CommandHandler, EventSourcedActor};
-use actor_runtime::prelude::*;
-use actor_runtime::tap::FactKind;
+use trouper::actor::{CommandHandler, EventSourcedActor};
+use trouper::prelude::*;
+use trouper::tap::FactKind;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::sync::Arc;
@@ -111,7 +111,7 @@ async fn main() {
         .init();
     let system = Arc::new(ActorSystem::new(SystemConfig::production()));
 
-    actor_runtime::builder::spawn_es_builder::<Counter>(&system)
+    trouper::builder::spawn_es_builder::<Counter>(&system)
         .at(ActorPath::new("counter"))
         .args(json!({}))
         .handles::<Ping>()
@@ -133,7 +133,7 @@ async fn main() {
         system
             .tap_facts()
             .iter()
-            .filter(|f| matches!(&f.kind, FactKind::DeadLettered { reason, .. } if *reason == actor_runtime::types::DeadLetterReason::UndeclaredEvent))
+            .filter(|f| matches!(&f.kind, FactKind::DeadLettered { reason, .. } if *reason == trouper::types::DeadLetterReason::UndeclaredEvent))
             .count()
             >= 3
     })
@@ -149,7 +149,7 @@ async fn main() {
         .iter()
         .filter(|f| {
             matches!(&f.kind, FactKind::DeadLettered { reason, .. }
-                if *reason == actor_runtime::types::DeadLetterReason::UndeclaredEvent)
+                if *reason == trouper::types::DeadLetterReason::UndeclaredEvent)
         })
         .count();
     println!(

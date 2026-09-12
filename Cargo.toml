@@ -7,7 +7,7 @@ version = "0.1.0"
 edition = "2024"
 
 [workspace.dependencies]
-actor-runtime = { path = "crates/actor-runtime" }
+trouper = { path = "crates/trouper" }
 canvas = { path = "crates/canvas" }
 state-report = { path = "crates/state-report" }
 zenoh = "1.10"
@@ -27,12 +27,12 @@ futures = "0.3"
 tracing-subscriber = "0.3"
 
 [package]
-name = "actor-canvas"
+name = "trouper-sdk"
 version.workspace = true
 edition.workspace = true
 
 [dependencies]
-actor-runtime.workspace = true
+trouper.workspace = true
 parking_lot.workspace = true
 state-report.workspace = true
 error-stack.workspace = true

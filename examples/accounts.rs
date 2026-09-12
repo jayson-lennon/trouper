@@ -19,10 +19,10 @@
 //!
 //! Run: `cargo run --example accounts`
 
-use actor_runtime::actor::{CommandHandler, EventSourcedActor, MsgHandler, ServiceActor};
-use actor_runtime::prelude::*;
-use actor_runtime::registry::RegistryError;
-use actor_runtime::tap::FactKind;
+use trouper::actor::{CommandHandler, EventSourcedActor, MsgHandler, ServiceActor};
+use trouper::prelude::*;
+use trouper::registry::RegistryError;
+use trouper::tap::FactKind;
 use error_stack::Report;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -277,20 +277,20 @@ async fn main() {
     let system = Arc::new(ActorSystem::new(SystemConfig::production()));
 
     // The story observer: one subscription, filtered to failed/spawned.
-    actor_runtime::builder::spawn_service_builder::<StoryObserver>(&system)
+    trouper::builder::spawn_service_builder::<StoryObserver>(&system)
         .at(ActorPath::new("story"))
         .args(json!({}))
         .handles::<FactMsg>()
-        .mailbox(64, actor_runtime::inbox::OverloadPolicy::DropNew)
+        .mailbox(64, trouper::inbox::OverloadPolicy::DropNew)
         .start();
     system
         .subscribe_filtered(
             &ActorPath::new("story"),
-            &actor_runtime::registry::Registry::facts_topic(),
+            &trouper::registry::Registry::facts_topic(),
             None,
-            actor_runtime::topics::SubscriptionFilter {
+            trouper::topics::SubscriptionFilter {
                 kind: Some("failed".into()),
-                ..actor_runtime::topics::SubscriptionFilter::default()
+                ..trouper::topics::SubscriptionFilter::default()
             },
         )
         .expect("subscribe");
@@ -300,15 +300,15 @@ async fn main() {
 
     // The account lives under supervision (restart budget 3 per 10s).
     let account = ActorPath::new("account");
-    let spec = actor_runtime::supervision::ChildSpec {
+    let spec = trouper::supervision::ChildSpec {
         path: account.clone(),
         parent: None,
-        restart: actor_runtime::supervision::RestartPolicy::Permanent,
-        budget: actor_runtime::supervision::RestartBudget::per(
+        restart: trouper::supervision::RestartPolicy::Permanent,
+        budget: trouper::supervision::RestartBudget::per(
             3,
             std::time::Duration::from_secs(10),
         ),
-        backoff: actor_runtime::supervision::Backoff {
+        backoff: trouper::supervision::Backoff {
             base: std::time::Duration::from_millis(20),
             max: std::time::Duration::from_millis(80),
             factor: 2.0,
@@ -316,7 +316,7 @@ async fn main() {
         args: json!({}),
         spawn: Arc::new(
             |sys: &Arc<ActorSystem>, path: &ActorPath, args: &serde_json::Value| {
-                actor_runtime::builder::spawn_es_builder::<Account>(sys)
+                trouper::builder::spawn_es_builder::<Account>(sys)
                     .at(path.clone())
                     .args(args.clone())
                     .handles::<Deposit>()
@@ -394,20 +394,20 @@ async fn main() {
 /// StoryObserver instance on the same path is illegal, so this installs a
 /// second observer "story2").
 fn add_spawn_filter(system: &Arc<ActorSystem>) {
-    actor_runtime::builder::spawn_service_builder::<StoryObserver>(&system.clone())
+    trouper::builder::spawn_service_builder::<StoryObserver>(&system.clone())
         .at(ActorPath::new("story2"))
         .args(json!({}))
         .handles::<FactMsg>()
-        .mailbox(64, actor_runtime::inbox::OverloadPolicy::DropNew)
+        .mailbox(64, trouper::inbox::OverloadPolicy::DropNew)
         .start();
     system
         .subscribe_filtered(
             &ActorPath::new("story2"),
-            &actor_runtime::registry::Registry::facts_topic(),
+            &trouper::registry::Registry::facts_topic(),
             None,
-            actor_runtime::topics::SubscriptionFilter {
+            trouper::topics::SubscriptionFilter {
                 kind: Some("spawned".into()),
-                ..actor_runtime::topics::SubscriptionFilter::default()
+                ..trouper::topics::SubscriptionFilter::default()
             },
         )
         .expect("subscribe");

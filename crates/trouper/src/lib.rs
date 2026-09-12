@@ -1,4 +1,4 @@
-//! # actor-runtime
+//! # trouper
 //!
 //! A single-machine actor runtime whose product is the communication fabric:
 //! a runtime-level schema registry, envelope/trace metadata, a tap stream of
@@ -11,6 +11,10 @@ pub mod actor;
 pub mod builder;
 pub mod clock;
 pub mod context;
+/// Re-export of the runtime's `error_stack` so downstream consumers
+/// whose own `error_stack` major differs can still name the exact
+/// `Report<E>` type our public signatures use (trait impls, helpers).
+pub use error_stack;
 pub mod envelope;
 pub mod inbox;
 pub mod journal;
