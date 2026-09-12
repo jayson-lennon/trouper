@@ -1600,7 +1600,7 @@ fn capacity_hint() -> usize {
 /// child's crash, then applying the spec — policy → budget → backoff →
 /// restart, or stop + escalate.
 pub async fn supervise_child(
-    system: std::sync::Arc<crate::system::ActorSystem>,
+    system: crate::system::ActorSystem,
     spec: crate::supervision::ChildSpec,
     mut shutdown: tokio::sync::watch::Receiver<bool>,
 ) {
@@ -1729,10 +1729,7 @@ pub async fn supervise_child(
 
 /// Whether `path` is a journaled (EventSourced) child: the engine must
 /// recover it through `restart_es` rather than a fresh spawn.
-fn system_is_es_child(
-    system: &std::sync::Arc<crate::system::ActorSystem>,
-    path: &ActorPath,
-) -> bool {
+fn system_is_es_child(system: &crate::system::ActorSystem, path: &ActorPath) -> bool {
     let kernel = system.kernel.lock();
     kernel.es_state.contains_key(path)
 }
@@ -1741,7 +1738,7 @@ fn system_is_es_child(
 /// to the parent (or the system record when parentless). Emits the
 /// Escalated fact.
 async fn escalate(
-    system: &std::sync::Arc<crate::system::ActorSystem>,
+    system: &crate::system::ActorSystem,
     spec: &crate::supervision::ChildSpec,
     reason: &str,
     stop_reason: crate::types::StopReason,

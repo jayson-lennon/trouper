@@ -5,13 +5,12 @@
 //!
 //! Run: `cargo run --example emit_contract`
 
+use serde::{Deserialize, Serialize};
+use serde_json::json;
+use tracing::Level;
 use trouper::actor::{CommandHandler, EventSourcedActor};
 use trouper::prelude::*;
 use trouper::tap::FactKind;
-use serde::{Deserialize, Serialize};
-use serde_json::json;
-use std::sync::Arc;
-use tracing::Level;
 
 #[derive(Deserialize)]
 struct Ping {
@@ -109,7 +108,7 @@ async fn main() {
     tracing_subscriber::fmt()
         .with_max_level(Level::ERROR)
         .init();
-    let system = Arc::new(ActorSystem::new(SystemConfig::production()));
+    let system = ActorSystem::new(SystemConfig::production());
 
     trouper::builder::spawn_es_builder::<Counter>(&system)
         .at(ActorPath::new("counter"))

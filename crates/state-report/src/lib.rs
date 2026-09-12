@@ -38,7 +38,7 @@
 //!
 //!     async fn execute(
 //!         &self,
-//!         _system: &std::sync::Arc<trouper::system::ActorSystem>,
+//!         _system: &trouper::system::ActorSystem,
 //!         args: &serde_json::Value,
 //!     ) -> Result<serde_json::Value, String> {
 //!         let text = args.get("text").and_then(|t| t.as_str()).unwrap_or("ping");
@@ -46,7 +46,7 @@
 //!     }
 //! }
 //!
-//! # async fn demo(system: std::sync::Arc<trouper::system::ActorSystem>) -> Result<(), Box<dyn std::error::Error>> {
+//! # async fn demo(system: trouper::system::ActorSystem) -> Result<(), Box<dyn std::error::Error>> {
 //! // App startup: the allow-list is chosen once, here.
 //! let _bridge = state_report::install_control(
 //!     system.clone(),
@@ -63,12 +63,12 @@
 //! # }
 //! ```
 
-use trouper::prelude::*;
-use trouper::state_report::ReportState;
-use trouper::system::{ActorSystem, SystemExport};
 use std::borrow::Cow;
 use std::time::Duration;
 use tokio::time::Instant;
+use trouper::prelude::*;
+use trouper::state_report::ReportState;
+use trouper::system::{ActorSystem, SystemExport};
 
 /// Re-exported so consumers of [`install_on`]/[`fetch_on`] can name
 /// session types (e.g. to close a bridge session) without adding their
@@ -196,7 +196,7 @@ pub enum ControlBridgeError {
 /// actor, or [`StateBridgeError::Zenoh`] when the session or queryable
 /// cannot be created.
 pub async fn install(
-    system: std::sync::Arc<ActorSystem>,
+    system: ActorSystem,
     reporter: ActorPath,
 ) -> Result<zenoh::Session, StateBridgeError> {
     install_on(StateKey::production(), system, reporter).await
@@ -210,7 +210,7 @@ pub async fn install(
 /// As [`install`].
 pub async fn install_on(
     key: StateKey,
-    system: std::sync::Arc<ActorSystem>,
+    system: ActorSystem,
     reporter: ActorPath,
 ) -> Result<zenoh::Session, StateBridgeError> {
     // Given the system already contains the reporter actor.
@@ -244,7 +244,7 @@ async fn serve_loop(
     session: zenoh::Session,
     key: StateKey,
     queryable: zenoh::query::Queryable<zenoh::handlers::FifoChannelHandler<zenoh::query::Query>>,
-    system: std::sync::Arc<ActorSystem>,
+    system: ActorSystem,
     reporter: ActorPath,
 ) {
     while let Ok(query) = queryable.recv_async().await {
@@ -257,7 +257,7 @@ async fn serve_loop(
 async fn serve_query(
     _session: &zenoh::Session,
     key: &StateKey,
-    system: &std::sync::Arc<ActorSystem>,
+    system: &ActorSystem,
     reporter: &ActorPath,
     query: zenoh::query::Query,
 ) {
@@ -497,7 +497,7 @@ impl ControlReply {
 /// The transport is generic — this trait is the entire extension surface.
 /// A command owns its argument decoding (shape errors are its own typed
 /// outcome, reported before any effect) and receives only the
-/// [`Arc<ActorSystem>`] that app code is already trusted with.
+/// [`ActorSystem`] handle that app code is already trusted with.
 ///
 /// Extension story: a struct + this impl + one
 /// [`ControlRouter::with`] registration line. Nothing else changes.
@@ -518,7 +518,7 @@ pub trait ControlCommand: Send + Sync {
     /// sees.
     fn execute(
         &self,
-        system: &std::sync::Arc<ActorSystem>,
+        system: &ActorSystem,
         args: &serde_json::Value,
     ) -> impl Future<Output = Result<serde_json::Value, String>> + Send;
 }
@@ -535,7 +535,7 @@ pub trait DynCommand: Send + Sync {
     /// As [`ControlCommand::execute`].
     fn execute<'a>(
         &'a self,
-        system: &'a std::sync::Arc<ActorSystem>,
+        system: &'a ActorSystem,
         args: &'a serde_json::Value,
     ) -> std::pin::Pin<
         Box<dyn std::future::Future<Output = Result<serde_json::Value, String>> + Send + 'a>,
@@ -549,7 +549,7 @@ impl<T: ControlCommand + ?Sized> DynCommand for T {
 
     fn execute<'a>(
         &'a self,
-        system: &'a std::sync::Arc<ActorSystem>,
+        system: &'a ActorSystem,
         args: &'a serde_json::Value,
     ) -> std::pin::Pin<
         Box<dyn std::future::Future<Output = Result<serde_json::Value, String>> + Send + 'a>,
@@ -565,7 +565,7 @@ impl<C: DynCommand + ?Sized> DynCommand for std::sync::Arc<C> {
 
     fn execute<'a>(
         &'a self,
-        system: &'a std::sync::Arc<ActorSystem>,
+        system: &'a ActorSystem,
         args: &'a serde_json::Value,
     ) -> std::pin::Pin<
         Box<dyn std::future::Future<Output = Result<serde_json::Value, String>> + Send + 'a>,
@@ -653,11 +653,7 @@ impl ControlRouter {
     /// The lookup happens before anything runs, so an unknown command
     /// never reaches a handler; `List` is answered from the router
     /// itself.
-    pub async fn dispatch(
-        &self,
-        system: &std::sync::Arc<ActorSystem>,
-        request: ControlRequest,
-    ) -> ControlReply {
+    pub async fn dispatch(&self, system: &ActorSystem, request: ControlRequest) -> ControlReply {
         if request.command == LIST_COMMAND {
             return ControlReply::Ok {
                 result: serde_json::json!({ "commands": self.names() }),
@@ -698,7 +694,7 @@ const SEND_BUDGET: Duration = Duration::from_secs(10);
 ///
 /// As [`install_control_on`].
 pub async fn install_control(
-    system: std::sync::Arc<ActorSystem>,
+    system: ActorSystem,
     router: ControlRouter,
 ) -> Result<zenoh::Session, ControlBridgeError> {
     install_control_on(ControlKey::production(), system, router).await
@@ -719,7 +715,7 @@ pub async fn install_control(
 /// cannot be created.
 pub async fn install_control_on(
     key: ControlKey,
-    system: std::sync::Arc<ActorSystem>,
+    system: ActorSystem,
     router: ControlRouter,
 ) -> Result<zenoh::Session, ControlBridgeError> {
     let router = std::sync::Arc::new(router.finish());
@@ -743,7 +739,7 @@ pub async fn install_control_on(
 async fn control_loop(
     key: ControlKey,
     queryable: zenoh::query::Queryable<zenoh::handlers::FifoChannelHandler<zenoh::query::Query>>,
-    system: std::sync::Arc<ActorSystem>,
+    system: ActorSystem,
     router: std::sync::Arc<FinishedRouter>,
 ) {
     while let Ok(query) = queryable.recv_async().await {
@@ -758,7 +754,7 @@ async fn control_loop(
 /// mutating command reads as success.
 async fn serve_command(
     key: &ControlKey,
-    system: &std::sync::Arc<ActorSystem>,
+    system: &ActorSystem,
     router: &FinishedRouter,
     query: zenoh::query::Query,
 ) {
@@ -875,9 +871,8 @@ fn decode_reply(reply: zenoh::query::Reply) -> Result<ControlReply, ControlBridg
 
 /// A factory closure: spawns ONE worker at the path the kernel gives it.
 /// The factory owns the actor type; the kernel owns the naming.
-pub type PoolFactory = std::sync::Arc<
-    dyn Fn(&std::sync::Arc<ActorSystem>, &ActorPath, &serde_json::Value) + Send + Sync,
->;
+pub type PoolFactory =
+    std::sync::Arc<dyn Fn(&ActorSystem, &ActorPath, &serde_json::Value) + Send + Sync>;
 
 /// The code half of a scalable pool, bound by the app at startup.
 ///
@@ -979,7 +974,7 @@ impl ControlCommand for ScalePoolCmd {
 
     async fn execute(
         &self,
-        system: &std::sync::Arc<ActorSystem>,
+        system: &ActorSystem,
         args: &serde_json::Value,
     ) -> Result<serde_json::Value, String> {
         // Decode the wire's variable half before anything runs.
@@ -1031,7 +1026,7 @@ impl ControlCommand for ScalePoolCmd {
 /// workers own their own slots and would make a re-install die on
 /// `PathTaken`. Discovers the live worker list from the export so the
 /// runtime's pool entry stays the source of truth.
-async fn drain_pool_workers(system: &std::sync::Arc<ActorSystem>, public: &ActorPath) {
+async fn drain_pool_workers(system: &ActorSystem, public: &ActorPath) {
     let workers: Vec<ActorPath> = system
         .export()
         .await
@@ -1079,7 +1074,7 @@ mod tests {
 
         async fn execute(
             &self,
-            _system: &std::sync::Arc<ActorSystem>,
+            _system: &ActorSystem,
             args: &serde_json::Value,
         ) -> Result<serde_json::Value, String> {
             // Decode first — a shape error must never reach the effect.
@@ -1103,15 +1098,15 @@ mod tests {
 
         async fn execute(
             &self,
-            _system: &std::sync::Arc<ActorSystem>,
+            _system: &ActorSystem,
             _args: &serde_json::Value,
         ) -> Result<serde_json::Value, String> {
             Ok(json!({}))
         }
     }
 
-    fn test_system() -> std::sync::Arc<ActorSystem> {
-        std::sync::Arc::new(ActorSystem::new(SystemConfig::production()))
+    fn test_system() -> ActorSystem {
+        ActorSystem::new(SystemConfig::production())
     }
 
     fn dispatch(router: &ControlRouter, request: ControlRequest) -> ControlReply {
@@ -1228,7 +1223,7 @@ mod tests {
             }
             async fn execute(
                 &self,
-                _system: &std::sync::Arc<ActorSystem>,
+                _system: &ActorSystem,
                 _args: &serde_json::Value,
             ) -> Result<serde_json::Value, String> {
                 Ok(json!({}))
@@ -1337,7 +1332,7 @@ mod tests {
     /// A fresh system with the harness schemas registered and a `Probe`
     /// blueprint named `probe` at the public path `scale.me` (RoundRobin,
     /// seed 42, parentless).
-    fn probe_blueprint_system() -> std::sync::Arc<ActorSystem> {
+    fn probe_blueprint_system() -> ActorSystem {
         let system = test_system();
         system.register_schema::<Probe>();
         system.register_schema::<Probed>();
@@ -1561,7 +1556,7 @@ mod tests {
 
     /// Spawns a plain `ProbeWorker` at the blueprint's public path — the
     /// pre-existing topology the rejection tests must not disturb.
-    fn spawn_plain_holder(system: &std::sync::Arc<ActorSystem>) {
+    fn spawn_plain_holder(system: &ActorSystem) {
         trouper::builder::spawn_es_builder::<ProbeWorker>(system)
             .at(ActorPath::new("scale.me"))
             .args(json!({}))

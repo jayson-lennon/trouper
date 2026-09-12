@@ -9,15 +9,15 @@
 //!
 //! Run: `cargo run --example observers`
 
-use trouper::actor::{CommandHandler, EventSourcedActor, MsgHandler, ServiceActor};
-use trouper::prelude::*;
-use trouper::registry::RegistryError;
 use error_stack::Report;
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use std::sync::{Arc, OnceLock};
+use std::sync::OnceLock;
 use tracing::Level;
+use trouper::actor::{CommandHandler, EventSourcedActor, MsgHandler, ServiceActor};
+use trouper::prelude::*;
+use trouper::registry::RegistryError;
 
 static SINK: OnceLock<Mutex<Vec<String>>> = OnceLock::new();
 
@@ -174,7 +174,7 @@ async fn main() {
         .with_max_level(Level::ERROR)
         .init();
     // A small tap ring: floods produce gaps quickly.
-    let system = Arc::new(ActorSystem::test_with_tap(16).0);
+    let system = ActorSystem::test_with_tap(16).0;
 
     // The observer: a plain service actor + one subscribe call.
     trouper::builder::spawn_service_builder::<Observer>(&system)

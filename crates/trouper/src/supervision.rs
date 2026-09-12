@@ -95,11 +95,8 @@ pub struct ChildSpec {
     /// Ok(()) after the child runs again; the kernel drives restarts.
     #[allow(clippy::type_complexity)]
     pub spawn: std::sync::Arc<
-        dyn Fn(
-                &std::sync::Arc<crate::system::ActorSystem>,
-                &crate::types::ActorPath,
-                &serde_json::Value,
-            ) + Send
+        dyn Fn(&crate::system::ActorSystem, &crate::types::ActorPath, &serde_json::Value)
+            + Send
             + Sync,
     >,
 }
@@ -168,6 +165,12 @@ impl FailureWindow {
     /// Whether no failure is recorded.
     pub fn is_empty(&self) -> bool {
         self.failures.is_empty()
+    }
+
+    /// The total number of recorded failures (inspection/tests; the
+    /// windowed count is [`Self::count`]).
+    pub fn len(&self) -> usize {
+        self.failures.len()
     }
 
     /// Drops failures older than the window (housekeeping).

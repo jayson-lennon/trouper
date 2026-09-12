@@ -7,16 +7,16 @@
 //! shared the production key answered each other's queries under a
 //! parallel test runner. Island keys make the locks unnecessary.
 
-use trouper::actor::{CommandHandler, EventSourcedActor};
-use trouper::prelude::*;
-use trouper::schema::{FieldDef, FieldTy, Schema, SchemaDef, SchemaKind};
-use trouper::state_report::{ReportState, StateReported, StateReporter};
-use trouper::system::SystemExport;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use state_report::{StateBridgeError, StateKey, fetch_on, install, install_on};
 use std::sync::Arc;
 use std::time::Duration;
+use trouper::actor::{CommandHandler, EventSourcedActor};
+use trouper::prelude::*;
+use trouper::schema::{FieldDef, FieldTy, Schema, SchemaDef, SchemaKind};
+use trouper::state_report::{ReportState, StateReported, StateReporter};
+use trouper::system::SystemExport;
 
 #[derive(Deserialize)]
 struct Work {
@@ -82,8 +82,8 @@ impl CommandHandler<Work> for Worker {
 
 /// Builds a live system: one journaled worker that has done `total` units
 /// of work, plus the state reporter.
-async fn reporting_system(total: i64) -> Arc<ActorSystem> {
-    let system = Arc::new(ActorSystem::new(SystemConfig::production()));
+async fn reporting_system(total: i64) -> ActorSystem {
+    let system = ActorSystem::new(SystemConfig::production());
     system.register_schema::<Work>();
     system.register_schema::<WorkDone>();
     system.register_schema::<ReportState>();
@@ -154,13 +154,9 @@ async fn installed_bridge_answers_a_second_sessions_query() {
     // island key.
     let key = StateKey::scoped("bridge-answers-second-session");
     let system = reporting_system(3).await;
-    let _session = install_on(
-        key.clone(),
-        system.clone(),
-        ActorPath::new("state/reporter"),
-    )
-    .await
-    .expect("bridge installed");
+    let _session = install_on(key.clone(), system, ActorPath::new("state/reporter"))
+        .await
+        .expect("bridge installed");
 
     // When a SECOND zenoh session queries the island key. Zenoh closes a
     // query immediately when no queryable is discovered yet, so the retry
@@ -204,13 +200,9 @@ async fn fetch_returns_a_decodable_export() {
     // island key.
     let key = StateKey::scoped("fetch-decodes");
     let system = reporting_system(5).await;
-    let _session = install_on(
-        key.clone(),
-        system.clone(),
-        ActorPath::new("state/reporter"),
-    )
-    .await
-    .expect("bridge installed");
+    let _session = install_on(key.clone(), system, ActorPath::new("state/reporter"))
+        .await
+        .expect("bridge installed");
 
     // When fetching (the retry budget absorbs discovery warm-up).
     let export = fetch_on(key).await.expect("fetch");
@@ -304,7 +296,7 @@ impl ControlCommand for Echo {
 
     async fn execute(
         &self,
-        _system: &Arc<trouper::system::ActorSystem>,
+        _system: &trouper::system::ActorSystem,
         args: &serde_json::Value,
     ) -> Result<serde_json::Value, String> {
         let text = args
@@ -318,9 +310,7 @@ impl ControlCommand for Echo {
 /// Installs a control bridge serving `Echo` on its own island key.
 async fn echo_bridge(scope: &str) -> (ControlKey, zenoh::Session) {
     let key = ControlKey::scoped(scope);
-    let system = Arc::new(trouper::system::ActorSystem::new(
-        SystemConfig::production(),
-    ));
+    let system = trouper::system::ActorSystem::new(SystemConfig::production());
     let session = install_control_on(key.clone(), system, ControlRouter::new().with(Echo))
         .await
         .expect("control bridge installed");
@@ -471,9 +461,7 @@ async fn control_bridge_scales_pools_over_the_wire() {
     // Given a system where a plain actor holds the public path and a
     // control bridge serves ScalePool for it.
     let key = ControlKey::scoped("wire-scale");
-    let system = Arc::new(trouper::system::ActorSystem::new(
-        SystemConfig::production(),
-    ));
+    let system = trouper::system::ActorSystem::new(SystemConfig::production());
     trouper::builder::spawn_es_builder::<Worker>(&system)
         .at(ActorPath::new("api"))
         .args(json!({}))

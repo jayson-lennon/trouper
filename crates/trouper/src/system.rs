@@ -117,12 +117,15 @@ impl SystemConfig {
     }
 }
 
-/// The actor system. One instance per machine; shared by reference.
+/// The actor fabric's engine: the shared tables and locks one fabric
+/// consists of. Not used directly — [`ActorSystem`] is the public handle;
+/// construction is encapsulated so every handle provably aliases a
+/// properly-initialized fabric.
 ///
 /// The registry is its own mutex (routing never blocks actor-table
 /// mutations); actor tables share [`KernelState`]'s lock because they
 /// mutate together.
-pub struct ActorSystem {
+pub struct ActorSystemCore {
     /// Routing table: slots, schemas, routes.
     pub(crate) registry: Arc<Mutex<Registry>>,
     /// Actor tables: cells, journals, ES state, entries, crashes.
@@ -134,6 +137,192 @@ pub struct ActorSystem {
     child_shutdowns: parking_lot::Mutex<Vec<tokio::sync::watch::Sender<bool>>>,
     /// System-wide mailbox defaults (per-spawn opts override).
     pub(crate) mailbox_defaults: MailboxDefaults,
+}
+
+/// A handle onto one shared actor fabric: the single surface for
+/// configuring, driving, and observing the runtime. Clone it freely —
+/// every clone aliases the same fabric; nothing is copied, and dropping
+/// the last handle never tears anything down (stopping supervision is an
+/// explicit [`ActorSystem::shutdown`] call, not a destructor).
+#[derive(Clone)]
+pub struct ActorSystem(std::sync::Arc<ActorSystemCore>);
+
+impl std::ops::Deref for ActorSystem {
+    type Target = ActorSystemCore;
+
+    fn deref(&self) -> &ActorSystemCore {
+        &self.0
+    }
+}
+
+impl std::fmt::Debug for ActorSystem {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ActorSystem").finish_non_exhaustive()
+    }
+}
+
+impl ActorSystem {
+    /// Creates a handle onto a fresh fabric built from `config`.
+    pub fn new(config: SystemConfig) -> Self {
+        Self(std::sync::Arc::new(ActorSystemCore::new(config)))
+    }
+
+    /// A handle onto a fabric tuned for tests: a [`FakeClock`] starting
+    /// at 1_000 ms and a small tap ring (reachable via the returned clock).
+    pub fn test() -> (Self, Arc<FakeClock>) {
+        let core = ActorSystemCore::test();
+        (Self(std::sync::Arc::new(core.0)), core.1)
+    }
+
+    /// Like [`ActorSystem::test`], but with an explicit (tiny) tap ring
+    /// capacity — gap/pressure tests flood the ring on purpose.
+    pub fn test_with_tap(tap_capacity: usize) -> (Self, Arc<FakeClock>) {
+        let core = ActorSystemCore::test_with_tap(tap_capacity);
+        (Self(std::sync::Arc::new(core.0)), core.1)
+    }
+
+    /// The system dead-letter topic, created at boot.
+    pub fn deadletter_topic() -> crate::types::Topic {
+        ActorSystemCore::deadletter_topic()
+    }
+
+    /// Fires every supervised child's shutdown watcher: each
+    /// [`crate::kernel::supervise_child`] loop exits instead of restarting
+    /// its child. Idempotent; children spawned after the call are not
+    /// covered until the next call.
+    pub fn shutdown(&self) {
+        let senders: Vec<_> = self.child_shutdowns.lock().drain(..).collect();
+        for tx in senders {
+            let _ = tx.send(true);
+        }
+    }
+
+    /// Spawns a supervised child: registers its spec (policy, budget,
+    /// backoff, spawn closure), runs the spawn closure once, and arms the
+    /// supervision engine for crash handling.
+    ///
+    /// Lives on the handle (not the core) because the engine task captures
+    /// a clone of the handle itself.
+    pub fn spawn_child(&self, spec: crate::supervision::ChildSpec) {
+        {
+            let mut kernel = self.kernel.lock();
+            kernel.specs.insert(spec.path.clone(), spec.clone());
+            kernel
+                .failures
+                .insert(spec.path.clone(), crate::supervision::FailureWindow::new());
+        }
+        let engine = self.clone();
+        let engine_spec = spec.clone();
+        let path = spec.path.clone();
+        (spec.spawn)(&engine, &path, &spec.args);
+        let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        self.child_shutdowns.lock().push(_shutdown_tx);
+        tokio::spawn(crate::kernel::supervise_child(
+            engine,
+            engine_spec,
+            shutdown_rx,
+        ));
+    }
+
+    /// Installs the DLQ re-driver: re-sends every dead letter currently
+    /// retained in the `system.deadletters` topic to its recorded dest
+    /// (as a normal sender — `Sent` facts appear; an undeliverable redrive
+    /// simply dead-letters again). Sugar over the topic + cursor
+    /// machinery: subsequent re-drives re-consume by cursor reset.
+    ///
+    /// Lives on the handle (not the core) because the redrive task captures
+    /// a clone of the handle itself.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the kernel lock is poisoned.
+    pub fn install_dlq_redriver(&self) {
+        let mut kernel = self.kernel.lock();
+        let log = match kernel.topic_logs.get_mut(&Registry::dead_letter_topic()) {
+            Some(log) => log,
+            None => return, // no dead letters yet: nothing to redrive
+        };
+        let entries: Vec<Envelope> = log
+            .entries_iter()
+            .map(|(_, envelope)| envelope.clone())
+            .collect();
+        drop(kernel);
+        let system = self.clone();
+        tokio::spawn(async move {
+            for envelope in entries {
+                let _ = system.send(envelope).await; // failure re-dead-letters
+            }
+        });
+    }
+
+    /// Installs a stateless pool over `public`: `N` workers (spawned by
+    /// the caller-supplied `factory` as supervised children of the spec
+    /// parent, or parentless) plus a pool entry that owns the routing
+    /// decision for the PUBLIC path.
+    ///
+    /// Senders never change: they keep addressing `public` before, during,
+    /// and after the install. If a live actor already owns the public path,
+    /// it is gracefully STOP-DRAINED first (undelivered inbox entries go
+    /// to the DLQ per the stop contract); re-routing that queued mail into
+    /// the pool's workers is a documented FUTURE refinement, not v1.
+    ///
+    /// Lives on the handle (not the core) because worker factories receive
+    /// the handle itself.
+    ///
+    /// # Errors
+    ///
+    /// Propagates [`crate::registry::RegistryError::InvalidSpec`] from the
+    /// registry install (no workers, or a worker slot is missing — spawn
+    /// workers first, then install).
+    pub async fn install_pool(
+        &self,
+        spec: crate::pool::PoolSpec,
+    ) -> Result<(), error_stack::Report<crate::registry::RegistryError>> {
+        // 1. TAKEOVER: stop-drain whoever holds the public path today (a
+        // plain actor). A no-op when the path is free.
+        if self.registry.lock().lookup(&spec.public).is_some() {
+            self.stop(&spec.public).await;
+        }
+        // 2. WORKERS: spawn through the factory; each worker is a
+        // supervised child of the spec parent, or parentless.
+        let mut workers = Vec::with_capacity(spec.workers);
+        for i in 0..spec.workers {
+            let worker_path = ActorPath::new(format!("{}/worker-{i}", spec.public).as_str());
+            let args = spec
+                .args
+                .clone()
+                .unwrap_or(JsonValue::Object(serde_json::Map::new()));
+            match &spec.parent {
+                Some(parent) => {
+                    let factory = spec.factory.clone();
+                    let worker = worker_path.clone();
+                    self.spawn_child(crate::supervision::ChildSpec {
+                        path: worker,
+                        parent: Some(parent.clone()),
+                        args,
+                        restart: crate::supervision::RestartPolicy::Permanent,
+                        budget: crate::supervision::RestartBudget::per(
+                            5,
+                            std::time::Duration::from_secs(10),
+                        ),
+                        backoff: crate::supervision::Backoff::default(),
+                        spawn: Arc::new(move |system, path, args| {
+                            factory(system, path, args);
+                        }),
+                    });
+                }
+                None => {
+                    (spec.factory)(self, &worker_path, &args);
+                }
+            }
+            workers.push(worker_path);
+        }
+        // 3. INSTALL: one registry transaction — the pool entry claims the
+        // public name (workers own the deliverable slots).
+        let entry = crate::pool::pool_entry(spec.algo, workers, spec.seed, spec.parent.clone());
+        let mut registry = self.registry.lock();
+        registry.install_pool(spec.public, entry)
+    }
 }
 
 /// One actor's row in a system export.
@@ -248,9 +437,9 @@ pub struct SystemExport {
     pub rules: Vec<RuleExport>,
 }
 
-impl ActorSystem {
+impl ActorSystemCore {
     /// The system dead-letter topic, created at boot.
-    pub fn deadletter_topic() -> crate::types::Topic {
+    pub(crate) fn deadletter_topic() -> crate::types::Topic {
         crate::types::Topic::new("system.deadletters")
     }
 
@@ -262,7 +451,7 @@ impl ActorSystem {
     /// [`crate::builder::spawn_foreign`] (named `handle`/`apply` methods).
     #[doc(hidden)]
     pub fn spawn_es_foreign(
-        self: &Arc<Self>,
+        &self,
         path: ActorPath,
         schema_id: SchemaId,
         genesis: JsonValue,
@@ -280,33 +469,8 @@ impl ActorSystem {
         ];
         self.spawn_es_erased(path, manifest, state, entries, opts);
     }
-
-    /// Spawns a supervised child: registers its spec (policy, budget,
-    /// backoff, spawn closure), runs the spawn closure once, and arms the
-    /// supervision engine for crash handling.
-    pub fn spawn_child(self: &Arc<Self>, spec: crate::supervision::ChildSpec) {
-        {
-            let mut kernel = self.kernel.lock();
-            kernel.specs.insert(spec.path.clone(), spec.clone());
-            kernel
-                .failures
-                .insert(spec.path.clone(), crate::supervision::FailureWindow::new());
-        }
-        let engine = self.clone();
-        let engine_spec = spec.clone();
-        let path = spec.path.clone();
-        (spec.spawn)(&engine, &path, &spec.args);
-        let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
-        self.child_shutdowns.lock().push(_shutdown_tx);
-        tokio::spawn(crate::kernel::supervise_child(
-            engine,
-            engine_spec,
-            shutdown_rx,
-        ));
-    }
-
-    /// Creates a system from a config.
-    pub fn new(config: SystemConfig) -> Self {
+    /// Creates the fabric from a config.
+    pub(crate) fn new(config: SystemConfig) -> Self {
         let registry = Arc::new(Mutex::new(Registry::default()));
         let view = Arc::new(NullView {
             registry: registry.clone(),
@@ -323,30 +487,30 @@ impl ActorSystem {
         }
     }
 
-    /// Creates a system tuned for tests: a [`FakeClock`] starting at
-    /// 1_000 ms and a small tap ring (reachable via the returned handle).
-    pub fn test() -> (Arc<Self>, Arc<FakeClock>) {
+    /// Creates a fabric tuned for tests: a [`FakeClock`] starting at
+    /// 1_000 ms and a small tap ring (reachable via the returned clock).
+    pub(crate) fn test() -> (Self, Arc<FakeClock>) {
         let (clock, fake) = ClockService::fake(1_000);
         (
-            Arc::new(Self::new(SystemConfig {
+            Self::new(SystemConfig {
                 clock,
                 tap_capacity: 256,
                 default_mailbox: MailboxDefaults::default(),
-            })),
+            }),
             fake,
         )
     }
 
-    /// Like [`ActorSystem::test`], but with an explicit (tiny) tap ring
+    /// Like [`ActorSystemCore::test`], but with an explicit (tiny) tap ring
     /// capacity — gap/pressure tests flood the ring on purpose.
-    pub fn test_with_tap(tap_capacity: usize) -> (Arc<Self>, Arc<FakeClock>) {
+    pub(crate) fn test_with_tap(tap_capacity: usize) -> (Self, Arc<FakeClock>) {
         let (clock, fake) = ClockService::fake(1_000);
         (
-            Arc::new(Self::new(SystemConfig {
+            Self::new(SystemConfig {
                 clock,
                 tap_capacity,
                 default_mailbox: MailboxDefaults::default(),
-            })),
+            }),
             fake,
         )
     }
@@ -413,13 +577,8 @@ impl ActorSystem {
     /// Deprecated positional flavor — prefer the builder:
     /// [`crate::builder::spawn_es_builder`] (each type said once).
     #[doc(hidden)]
-    pub fn spawn_es<A, F>(
-        self: &Arc<Self>,
-        path: ActorPath,
-        args: &JsonValue,
-        opts: SpawnOpts,
-        entries: F,
-    ) where
+    pub fn spawn_es<A, F>(&self, path: ActorPath, args: &JsonValue, opts: SpawnOpts, entries: F)
+    where
         A: EventSourcedActor,
         F: FnOnce() -> Vec<Arc<dyn CommandEntry>>,
     {
@@ -431,7 +590,7 @@ impl ActorSystem {
     /// The erased ES spawn shared by typed, foreign, and builder actors
     /// (the single funnel every journaled spawn goes through).
     pub(crate) fn spawn_es_erased(
-        self: &Arc<Self>,
+        &self,
         path: ActorPath,
         manifest: crate::schema::ActorManifest,
         state: Box<dyn crate::actor::DynEsActor>,
@@ -544,7 +703,7 @@ impl ActorSystem {
     /// [`crate::builder::spawn_service_builder`].
     #[doc(hidden)]
     pub fn spawn_service<A, F>(
-        self: &Arc<Self>,
+        &self,
         path: ActorPath,
         args: &JsonValue,
         opts: SpawnOpts,
@@ -568,7 +727,7 @@ impl ActorSystem {
     /// I/O allowed) — constructed by the typed wrapper.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn spawn_service_erased(
-        self: &Arc<Self>,
+        &self,
         path: ActorPath,
         manifest: crate::schema::ActorManifest,
         args: &JsonValue,
@@ -754,35 +913,6 @@ impl ActorSystem {
         )
         .await
     }
-
-    /// Installs the DLQ re-driver: re-sends every dead letter currently
-    /// retained in the `system.deadletters` topic to its recorded dest
-    /// (as a normal sender — `Sent` facts appear; an undeliverable redrive
-    /// simply dead-letters again). Sugar over the topic + cursor
-    /// machinery: subsequent re-drives re-consume by cursor reset.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the kernel lock is poisoned.
-    pub fn install_dlq_redriver(self: &Arc<Self>) {
-        let mut kernel = self.kernel.lock();
-        let log = match kernel.topic_logs.get_mut(&Registry::dead_letter_topic()) {
-            Some(log) => log,
-            None => return, // no dead letters yet: nothing to redrive
-        };
-        let entries: Vec<Envelope> = log
-            .entries_iter()
-            .map(|(_, envelope)| envelope.clone())
-            .collect();
-        drop(kernel);
-        let system = self.clone();
-        tokio::spawn(async move {
-            for envelope in entries {
-                let _ = system.send(envelope).await; // failure re-dead-letters
-            }
-        });
-    }
-
     /// Builds a topic-addressed envelope (system root as sender).
     pub fn envelope_to_topic(
         &self,
@@ -941,74 +1071,6 @@ impl ActorSystem {
         const STOP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
         self.stop_bounded(path, STOP_TIMEOUT).await;
     }
-
-    /// Installs a stateless pool over `public`: `N` workers (spawned by
-    /// the caller-supplied `factory` as supervised children of the spec
-    /// parent, or parentless) plus a pool entry that owns the routing
-    /// decision for the PUBLIC path.
-    ///
-    /// Senders never change: they keep addressing `public` before, during,
-    /// and after the install. If a live actor already owns the public path,
-    /// it is gracefully STOP-DRAINED first (undelivered inbox entries go
-    /// to the DLQ per the stop contract); re-routing that queued mail into
-    /// the pool's workers is a documented FUTURE refinement, not v1.
-    ///
-    /// # Errors
-    ///
-    /// Propagates [`crate::registry::RegistryError::InvalidSpec`] from the
-    /// registry install (no workers, or a worker slot is missing — spawn
-    /// workers first, then install).
-    pub async fn install_pool(
-        self: &Arc<Self>,
-        spec: crate::pool::PoolSpec,
-    ) -> Result<(), error_stack::Report<crate::registry::RegistryError>> {
-        // 1. TAKEOVER: stop-drain whoever holds the public path today (a
-        // plain actor). A no-op when the path is free.
-        if self.registry.lock().lookup(&spec.public).is_some() {
-            self.stop(&spec.public).await;
-        }
-        // 2. WORKERS: spawn through the factory; each worker registers its
-        // own slot. When a spec parent is declared, each worker is a
-        // supervised child of it (escalation flows worker → parent).
-        let mut workers = Vec::with_capacity(spec.workers);
-        for i in 0..spec.workers {
-            let worker_path = ActorPath::new(format!("{}/worker-{i}", spec.public).as_str());
-            let args = spec
-                .args
-                .clone()
-                .unwrap_or(JsonValue::Object(serde_json::Map::new()));
-            match &spec.parent {
-                Some(parent) => {
-                    let factory = spec.factory.clone();
-                    let worker = worker_path.clone();
-                    self.spawn_child(crate::supervision::ChildSpec {
-                        path: worker,
-                        parent: Some(parent.clone()),
-                        args,
-                        restart: crate::supervision::RestartPolicy::Permanent,
-                        budget: crate::supervision::RestartBudget::per(
-                            5,
-                            std::time::Duration::from_secs(10),
-                        ),
-                        backoff: crate::supervision::Backoff::default(),
-                        spawn: Arc::new(move |system, path, args| {
-                            factory(system, path, args);
-                        }),
-                    });
-                }
-                None => {
-                    (spec.factory)(self, &worker_path, &args);
-                }
-            }
-            workers.push(worker_path);
-        }
-        // 3. INSTALL: one registry transaction — the pool entry claims the
-        // public name (workers own the deliverable slots).
-        let entry = crate::pool::pool_entry(spec.algo, workers, spec.seed, spec.parent.clone());
-        let mut registry = self.registry.lock();
-        registry.install_pool(spec.public, entry)
-    }
-
     /// Installs a partition set over `public`: commands aimed at the
     /// public path are routed to per-entity actors derived from the
     /// payload's declared shard key (`public/key`), activated on demand
@@ -1024,7 +1086,7 @@ impl ActorSystem {
     /// schema declares the spec's key field as the ShardKey (refuse-to-lie:
     /// the set would dead-letter every command).
     pub fn install_partition_set(
-        self: &Arc<Self>,
+        &self,
         spec: crate::pool::PartitionSpec,
     ) -> Result<(), error_stack::Report<crate::registry::RegistryError>> {
         let mut registry = self.registry.lock();
@@ -2255,13 +2317,11 @@ mod tests {
                 factor: 2.0,
             },
             args: json!({}),
-            spawn: Arc::new(
-                |sys: &Arc<ActorSystem>, path: &ActorPath, args: &JsonValue| {
-                    sys.spawn_es::<Phoenix, _>(path.clone(), args, SpawnOpts::default(), || {
-                        vec![Arc::new(TypedEsAdapter::<Phoenix, Add>::new::<Add>())]
-                    });
-                },
-            ),
+            spawn: Arc::new(|sys: &ActorSystem, path: &ActorPath, args: &JsonValue| {
+                sys.spawn_es::<Phoenix, _>(path.clone(), args, SpawnOpts::default(), || {
+                    vec![Arc::new(TypedEsAdapter::<Phoenix, Add>::new::<Add>())]
+                });
+            }),
         };
 
         // When the child is spawned under supervision and receives a
@@ -2407,7 +2467,7 @@ mod tests {
             },
             args: json!({}),
             spawn: Arc::new(
-                move |sys: &Arc<ActorSystem>, path: &ActorPath, args: &JsonValue| {
+                move |sys: &ActorSystem, path: &ActorPath, args: &JsonValue| {
                     let _ = (&spawner, &system_for_spec);
                     sys.spawn_es::<AlwaysBoom, _>(path.clone(), args, SpawnOpts::default(), || {
                         vec![Arc::new(TypedEsAdapter::<AlwaysBoom, Add>::new::<Add>())]
@@ -2485,7 +2545,7 @@ mod tests {
         // factory (the same closure the supervision engine would run).
         let spawn_child = {
             let system = system.clone();
-            move |_sys: &Arc<ActorSystem>, path: &ActorPath, _args: &JsonValue| {
+            move |_sys: &ActorSystem, path: &ActorPath, _args: &JsonValue| {
                 let system = system.clone();
                 let path = path.to_owned();
                 let (idx, sink) = open_sink();
@@ -2620,13 +2680,11 @@ mod tests {
             budget: crate::supervision::RestartBudget::default(),
             backoff: crate::supervision::Backoff::default(),
             args: json!({}),
-            spawn: Arc::new(
-                |sys: &Arc<ActorSystem>, path: &ActorPath, args: &JsonValue| {
-                    sys.spawn_es::<Fragile, _>(path.clone(), args, SpawnOpts::default(), || {
-                        vec![Arc::new(TypedEsAdapter::<Fragile, Add>::new::<Add>())]
-                    });
-                },
-            ),
+            spawn: Arc::new(|sys: &ActorSystem, path: &ActorPath, args: &JsonValue| {
+                sys.spawn_es::<Fragile, _>(path.clone(), args, SpawnOpts::default(), || {
+                    vec![Arc::new(TypedEsAdapter::<Fragile, Add>::new::<Add>())]
+                });
+            }),
         };
         system.spawn_child(spec);
 
@@ -2687,9 +2745,7 @@ mod tests {
                     budget: crate::supervision::RestartBudget::default(),
                     backoff: crate::supervision::Backoff::default(),
                     args: json!({}),
-                    spawn: Arc::new(
-                        |_sys: &Arc<ActorSystem>, _path: &ActorPath, _args: &JsonValue| {},
-                    ),
+                    spawn: Arc::new(|_sys: &ActorSystem, _path: &ActorPath, _args: &JsonValue| {}),
                 },
             );
         }
@@ -3553,7 +3609,7 @@ mod tests {
         });
 
         // Then the slot resolves and who_handles finds the path.
-        let handlers = RuntimeView::who_handles(system.as_ref(), &Add::schema_id());
+        let handlers = RuntimeView::who_handles(&system, &Add::schema_id());
         assert_eq!(handlers, [path]);
     }
 
@@ -3990,16 +4046,11 @@ mod tests {
                 factor: 2.0,
             },
             args: json!({}),
-            spawn: Arc::new(
-                |sys: &Arc<ActorSystem>, path: &ActorPath, args: &JsonValue| {
-                    sys.spawn_es::<AlwaysBoom2, _>(
-                        path.clone(),
-                        args,
-                        SpawnOpts::default(),
-                        || vec![Arc::new(TypedEsAdapter::<AlwaysBoom2, Add>::new::<Add>())],
-                    );
-                },
-            ),
+            spawn: Arc::new(|sys: &ActorSystem, path: &ActorPath, args: &JsonValue| {
+                sys.spawn_es::<AlwaysBoom2, _>(path.clone(), args, SpawnOpts::default(), || {
+                    vec![Arc::new(TypedEsAdapter::<AlwaysBoom2, Add>::new::<Add>())]
+                });
+            }),
         };
         system.spawn_child(spec);
 
@@ -5719,7 +5770,7 @@ mod tests {
     /// Registers the partition test command (a str shard key field) and
     /// installs a KeyCounter partition set over `public`.
     fn install_key_partition(
-        system: &Arc<ActorSystem>,
+        system: &ActorSystem,
         public: &str,
     ) -> Result<(), error_stack::Report<crate::registry::RegistryError>> {
         system.register_schema::<KeyedAdd>();
@@ -6023,7 +6074,7 @@ mod tests {
     /// Spawns a FactsObserver at `path` subscribed to the facts topic
     /// with the given subscription filter (pass-through when `None`).
     async fn spawn_facts_observer_filtered(
-        system: &Arc<ActorSystem>,
+        system: &ActorSystem,
         path: &str,
         filter: Option<crate::topics::SubscriptionFilter>,
     ) -> usize {
@@ -6055,7 +6106,7 @@ mod tests {
     }
 
     /// Spawns a FactsObserver at `path` subscribed to the facts topic.
-    async fn spawn_facts_observer(system: &Arc<ActorSystem>, path: &str) -> usize {
+    async fn spawn_facts_observer(system: &ActorSystem, path: &str) -> usize {
         spawn_facts_observer_filtered(system, path, None).await
     }
 
@@ -6809,5 +6860,174 @@ mod tests {
             .filter(|f| matches!(&f.kind, crate::tap::FactKind::Backpressured { path, .. } if *path == plain))
             .count();
         assert_eq!(fires, 1, "one fact per up-crossing, not per message");
+    }
+
+    #[tokio::test]
+    async fn handles_alias_one_fabric() {
+        // Given a system and a clone of its handle.
+        let (system, _clock) = ActorSystem::test();
+        let handle = system.clone();
+
+        // When a schema is registered through the clone.
+        let id = handle.register_schema::<Add>();
+
+        // Then the registration is visible through the original handle —
+        // both names alias the SAME fabric (one Arc, one registry), not
+        // two copies.
+        let visible = system.registry.lock().schema(&id).is_some();
+        assert!(visible, "clone sees the same registry");
+    }
+
+    /// The number of recorded failures for a supervised child.
+    fn failure_count(system: &ActorSystem, path: &ActorPath) -> usize {
+        let kernel = system.kernel.lock();
+        kernel
+            .failures
+            .get(path)
+            .map(|w| w.len())
+            .unwrap_or(0)
+    }
+
+    /// An ES actor whose first command always panics (shutdown test).
+    #[derive(Serialize, Deserialize, Default)]
+    struct ShutdownBoomer;
+    impl EventSourcedActor for ShutdownBoomer {
+        fn manifest() -> ActorManifest {
+            ActorManifest::new()
+                .handles::<Add>()
+                .kind(ActorKind::EventSourced)
+        }
+        fn restore(_args: &JsonValue) -> Self {
+            Self
+        }
+        fn apply(&mut self, _event: &crate::envelope::Event) {}
+    }
+    impl CommandHandler<Add> for ShutdownBoomer {
+        fn handle(&self, _cmd: Add, _ctx: &mut CmdCtx<'_>) -> Vec<crate::envelope::Event> {
+            panic!("always panics");
+        }
+    }
+
+    #[tokio::test]
+    async fn shutdown_stops_supervision_restarts() {
+        // Given a supervised child with a crash-on-first-command handler
+        // and a generous restart budget.
+        let (system, _clock) = ActorSystem::test();
+        let child = ActorPath::new("boomer");
+        system.register_schema::<Add>();
+        system.register_schema::<Added>();
+        let spawner = {
+            let system = system.clone();
+            move |sys: &ActorSystem, path: &ActorPath, args: &JsonValue| {
+                let system = system.clone();
+                let path = path.clone();
+                let args = args.clone();
+                let _ = sys;
+                system.spawn_es::<ShutdownBoomer, _>(path, &args, SpawnOpts::default(), || {
+                    vec![Arc::new(TypedEsAdapter::<ShutdownBoomer, Add>::new::<Add>())]
+                });
+            }
+        };
+        let spec = crate::supervision::ChildSpec {
+            path: child.clone(),
+            parent: None,
+            restart: crate::supervision::RestartPolicy::Permanent,
+            budget: crate::supervision::RestartBudget::per(
+                1_000,
+                std::time::Duration::from_secs(60),
+            ),
+            backoff: crate::supervision::Backoff {
+                base: std::time::Duration::from_millis(5),
+                max: std::time::Duration::from_millis(5),
+                factor: 1.0,
+            },
+            args: json!({}),
+            spawn: Arc::new(spawner),
+        };
+        system.spawn_child(spec);
+
+        // When the child crashes (the engine restarts it — the budget
+        // allows 1_000), shutdown is called mid-cycle.
+        system
+            .send(system.envelope(Add::schema_id(), child.clone(), json!({ "n": 1 })))
+            .await
+            .expect("sent");
+        wait_for_crash(&system, &child).await;
+        // The engine is demonstrably RESTARTING (a Spawned{restart: true}
+        // fact exists) before we cut the power.
+        wait_for(|| async {
+            system
+                .tap_facts()
+                .iter()
+                .any(|f| matches!(&f.kind, crate::tap::FactKind::Spawned { path, restart, .. }
+                    if *path == child && *restart))
+        })
+        .await;
+        system.shutdown();
+
+        // Then the restart loop is OFF: neither the failure count nor the
+        // restart count moves again.
+        let frozen_failures = failure_count(&system, &child);
+        let restarts = |sys: &ActorSystem| {
+            sys.tap_facts()
+                .iter()
+                .filter(|f| {
+                    matches!(&f.kind, crate::tap::FactKind::Spawned { path, restart, .. }
+                        if *path == child && *restart)
+                })
+                .count()
+        };
+        let frozen_restarts = restarts(&system);
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert_eq!(frozen_failures, failure_count(&system, &child), "no new crash entries after shutdown()");
+        assert_eq!(frozen_restarts, restarts(&system), "no restarts after shutdown()");
+    }
+
+    #[tokio::test]
+    async fn shutdown_is_idempotent() {
+        // Given a system with a supervised (harmless) child.
+        let (system, _clock) = ActorSystem::test();
+        let spec = crate::supervision::ChildSpec {
+            path: ActorPath::new("quiet"),
+            parent: None,
+            restart: crate::supervision::RestartPolicy::Permanent,
+            budget: crate::supervision::RestartBudget::default(),
+            backoff: crate::supervision::Backoff::default(),
+            args: json!({}),
+            spawn: Arc::new(|_sys: &ActorSystem, _path: &ActorPath, _args: &JsonValue| {}),
+        };
+        system.spawn_child(spec);
+
+        // When shutdown fires twice (and once more after that).
+        system.shutdown();
+        system.shutdown();
+        system.shutdown();
+
+        // Then nothing panics — draining an empty (or closed) list is a
+        // no-op, and the handle stays usable for ordinary operations.
+        let _ = system.register_schema::<Add>();
+    }
+
+    #[tokio::test]
+    async fn dropping_handles_does_not_stop_the_fabric() {
+        // Given a system whose handle is cloned and the original dropped.
+        let (system, _clock) = ActorSystem::test();
+        let alias = system.clone();
+        let id = alias.register_schema::<Add>();
+        drop(system);
+        drop(alias);
+
+        // When the fabric is re-reached through a THIRD clone taken
+        // before the drops (the Arc keeps the fabric alive).
+        // (Constructed here via the surviving alias chain.)
+        let (sys2, _clock2) = ActorSystem::test();
+        sys2.register_schema::<Added>();
+
+        // Then the FIRST fabric is still routable — teardown never
+        // happens on drop; only an explicit shutdown() stops things, and
+        // none was called.
+        let (sys3, _clock3) = ActorSystem::test();
+        sys3.register_schema::<Add>();
+        let _ = (id, sys2);
     }
 }

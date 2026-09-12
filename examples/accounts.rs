@@ -19,15 +19,15 @@
 //!
 //! Run: `cargo run --example accounts`
 
-use trouper::actor::{CommandHandler, EventSourcedActor, MsgHandler, ServiceActor};
-use trouper::prelude::*;
-use trouper::registry::RegistryError;
-use trouper::tap::FactKind;
 use error_stack::Report;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::sync::{Arc, OnceLock};
 use tracing::Level;
+use trouper::actor::{CommandHandler, EventSourcedActor, MsgHandler, ServiceActor};
+use trouper::prelude::*;
+use trouper::registry::RegistryError;
+use trouper::tap::FactKind;
 
 // -- Commands -------------------------------------------------------------
 
@@ -274,7 +274,7 @@ async fn main() {
     tracing_subscriber::fmt()
         .with_max_level(Level::ERROR)
         .init();
-    let system = Arc::new(ActorSystem::new(SystemConfig::production()));
+    let system = ActorSystem::new(SystemConfig::production());
 
     // The story observer: one subscription, filtered to failed/spawned.
     trouper::builder::spawn_service_builder::<StoryObserver>(&system)
@@ -304,10 +304,7 @@ async fn main() {
         path: account.clone(),
         parent: None,
         restart: trouper::supervision::RestartPolicy::Permanent,
-        budget: trouper::supervision::RestartBudget::per(
-            3,
-            std::time::Duration::from_secs(10),
-        ),
+        budget: trouper::supervision::RestartBudget::per(3, std::time::Duration::from_secs(10)),
         backoff: trouper::supervision::Backoff {
             base: std::time::Duration::from_millis(20),
             max: std::time::Duration::from_millis(80),
@@ -315,7 +312,7 @@ async fn main() {
         },
         args: json!({}),
         spawn: Arc::new(
-            |sys: &Arc<ActorSystem>, path: &ActorPath, args: &serde_json::Value| {
+            |sys: &ActorSystem, path: &ActorPath, args: &serde_json::Value| {
                 trouper::builder::spawn_es_builder::<Account>(sys)
                     .at(path.clone())
                     .args(args.clone())
@@ -393,7 +390,7 @@ async fn main() {
 /// Adds a SECOND filtered subscription admitting spawned facts (a second
 /// StoryObserver instance on the same path is illegal, so this installs a
 /// second observer "story2").
-fn add_spawn_filter(system: &Arc<ActorSystem>) {
+fn add_spawn_filter(system: &ActorSystem) {
     trouper::builder::spawn_service_builder::<StoryObserver>(&system.clone())
         .at(ActorPath::new("story2"))
         .args(json!({}))
@@ -415,7 +412,7 @@ fn add_spawn_filter(system: &Arc<ActorSystem>) {
 
 /// Sends one command with an int payload `{"n": n}` (Poison uses n as its
 /// transient-fault marker: n = 1 panics the first time only).
-async fn send(system: &Arc<ActorSystem>, schema: SchemaId, n: i64) {
+async fn send(system: &ActorSystem, schema: SchemaId, n: i64) {
     system
         .send(system.envelope(schema, ActorPath::new("account"), json!({ "n": n })))
         .await
@@ -423,7 +420,7 @@ async fn send(system: &Arc<ActorSystem>, schema: SchemaId, n: i64) {
 }
 
 /// Polls until the account's live balance is `want` (5s budget).
-async fn wait_for_balance(system: &Arc<ActorSystem>, path: &ActorPath, want: i64) {
+async fn wait_for_balance(system: &ActorSystem, path: &ActorPath, want: i64) {
     wait(|| async {
         system
             .es_state(path)
@@ -435,7 +432,7 @@ async fn wait_for_balance(system: &Arc<ActorSystem>, path: &ActorPath, want: i64
 }
 
 /// Polls until the journal holds `want` entries (5s budget).
-async fn wait_for_journal_len(system: &Arc<ActorSystem>, path: &ActorPath, want: usize) {
+async fn wait_for_journal_len(system: &ActorSystem, path: &ActorPath, want: usize) {
     wait(|| async { system.journal_schemas(path).len() >= want }).await;
 }
 

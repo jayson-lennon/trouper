@@ -5,14 +5,14 @@
 //!
 //! Run: `cargo run --example pools`
 
-use trouper::actor::{CommandHandler, EventSourcedActor};
-use trouper::prelude::*;
-use trouper::tap::FactKind;
-use trouper::types::DeadLetterReason;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::sync::Arc;
 use tracing::Level;
+use trouper::actor::{CommandHandler, EventSourcedActor};
+use trouper::prelude::*;
+use trouper::tap::FactKind;
+use trouper::types::DeadLetterReason;
 
 #[derive(Deserialize)]
 struct Work {
@@ -127,7 +127,7 @@ async fn main() {
     tracing_subscriber::fmt()
         .with_max_level(Level::ERROR)
         .init();
-    let system = Arc::new(ActorSystem::new(SystemConfig::production()));
+    let system = ActorSystem::new(SystemConfig::production());
 
     // -- 1. Takeover: a plain actor holds "api"; the pool claims it --------
     println!("== 1. takeover ==");

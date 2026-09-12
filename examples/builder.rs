@@ -9,13 +9,13 @@
 //!
 //! Run: `cargo run --example builder`
 
-use trouper::actor::{CommandHandler, EventSourcedActor};
-use trouper::prelude::*;
-use trouper::system::SnapshotCadence;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::sync::Arc;
 use tracing::Level;
+use trouper::actor::{CommandHandler, EventSourcedActor};
+use trouper::prelude::*;
+use trouper::system::SnapshotCadence;
 
 // -- A typed event-sourced actor -------------------------------------------
 
@@ -98,7 +98,7 @@ async fn main() {
     tracing_subscriber::fmt()
         .with_max_level(Level::ERROR)
         .init();
-    let system = Arc::new(ActorSystem::new(SystemConfig::production()));
+    let system = ActorSystem::new(SystemConfig::production());
 
     // -- Typed spawn: the builder wires schema edges + adapters ------------
     println!("== typed builder ==");

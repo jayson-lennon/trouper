@@ -27,17 +27,17 @@
 //! shell 2: cargo run -p canvas   # the export now shows fs.saver as a 3-worker pool
 //! ```
 
-use trouper::actor::{MsgHandler, ServiceActor};
-use trouper::prelude::*;
-use trouper::registry::RegistryError;
-use trouper::state_report::{ReportState, StateReported, StateReporter};
-use trouper::system::ActorSystem;
 use error_stack::Report;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::sync::Arc;
 use std::time::Duration;
 use tracing::Level;
+use trouper::actor::{MsgHandler, ServiceActor};
+use trouper::prelude::*;
+use trouper::registry::RegistryError;
+use trouper::state_report::{ReportState, StateReported, StateReporter};
+use trouper::system::ActorSystem;
 
 // ---------- the domain seam -------------------------------------------------
 
@@ -259,7 +259,7 @@ where
 ///
 /// Propagates bridge installation failures (zenoh session/queryable).
 async fn run_demo() -> Result<(), Box<dyn std::error::Error>> {
-    let system = Arc::new(ActorSystem::new(SystemConfig::production()));
+    let system = ActorSystem::new(SystemConfig::production());
 
     // Spawn: the builder declares the whole surface (and registers the
     // schemas — no caller-side register_schema anywhere in this file).
@@ -550,8 +550,8 @@ mod tests {
 
     /// Spawns `FileSaver<MemFs>` + `SaveAudit` on a fresh test system and
     /// wires the audit to fs.events.
-    async fn demo_system() -> (std::sync::Arc<ActorSystem>, ActorPath, ActorPath) {
-        let system = std::sync::Arc::new(ActorSystem::new(SystemConfig::production()));
+    async fn demo_system() -> (ActorSystem, ActorPath, ActorPath) {
+        let system = ActorSystem::new(SystemConfig::production());
         let saver = trouper::builder::spawn_service_builder::<FileSaver<MemFs>>(&system)
             .at(ActorPath::new("test.saver"))
             .args(json!({}))

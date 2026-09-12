@@ -9,8 +9,8 @@
 #[allow(dead_code)]
 mod demo;
 
-use trouper::prelude::*;
 use state_report::{StateKey, fetch_on, install_on};
+use trouper::prelude::*;
 
 #[tokio::test(flavor = "multi_thread")]
 async fn demo_system_answers_queries_with_its_full_topology_over_zenoh() {

@@ -13,16 +13,16 @@
 //! Shell 1 keeps running (it IS the answering system) until ctrl-c; each
 //! `canvas` invocation in shell 2 prints that instant's export.
 
-use trouper::actor::{CommandHandler, EventSourcedActor, MsgHandler, ServiceActor};
-use trouper::prelude::*;
-use trouper::registry::RegistryError;
-use trouper::state_report::{ReportState, StateReported, StateReporter};
-use trouper::system::ActorSystem;
 use error_stack::Report;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::sync::Arc;
 use tracing::Level;
+use trouper::actor::{CommandHandler, EventSourcedActor, MsgHandler, ServiceActor};
+use trouper::prelude::*;
+use trouper::registry::RegistryError;
+use trouper::state_report::{ReportState, StateReported, StateReporter};
+use trouper::system::ActorSystem;
 
 // --- the demo traffic ----------------------------------------------------
 
@@ -209,8 +209,8 @@ impl MsgHandler<FactMsg> for FactCounter {
 /// - partitions: `accounts` (shard key `account`, 2 activated entities);
 /// - declared/observed edges: from the manifests above;
 /// - rules: one tee rule mirroring `Work` traffic to `watchdog`.
-pub async fn build_demo_system() -> Arc<ActorSystem> {
-    let system = Arc::new(ActorSystem::new(SystemConfig::production()));
+pub async fn build_demo_system() -> ActorSystem {
+    let system = ActorSystem::new(SystemConfig::production());
 
     // The partition spec below validates against the schema table AT
     // INSTALL TIME — but the Account builder registers KeyedAdd only when

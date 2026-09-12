@@ -5,14 +5,14 @@
 //!
 //! Run: `cargo run --example partitions`
 
-use trouper::actor::{CommandHandler, EventSourcedActor};
-use trouper::prelude::*;
-use trouper::tap::FactKind;
-use trouper::types::DeadLetterReason;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::sync::Arc;
 use tracing::Level;
+use trouper::actor::{CommandHandler, EventSourcedActor};
+use trouper::prelude::*;
+use trouper::tap::FactKind;
+use trouper::types::DeadLetterReason;
 
 #[derive(Deserialize)]
 struct KeyedAdd {
@@ -82,7 +82,7 @@ async fn main() {
     tracing_subscriber::fmt()
         .with_max_level(Level::ERROR)
         .init();
-    let system = Arc::new(ActorSystem::new(SystemConfig::production()));
+    let system = ActorSystem::new(SystemConfig::production());
 
     // The partition spec below validates against the schema table AT
     // INSTALL TIME — but the Account builder registers KeyedAdd only when

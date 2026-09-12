@@ -36,7 +36,7 @@ use crate::types::{ActorKind, ActorPath, SchemaId, Topic};
 ///     .start();
 /// ```
 pub fn spawn_es_builder<A: crate::actor::EventSourcedActor>(
-    system: &Arc<crate::system::ActorSystem>,
+    system: &crate::system::ActorSystem,
 ) -> SpawnBuilder<A> {
     SpawnBuilder {
         system: system.clone(),
@@ -52,7 +52,7 @@ pub fn spawn_es_builder<A: crate::actor::EventSourcedActor>(
 
 /// Begins a typed spawn of service actor `A`.
 pub fn spawn_service_builder<A: ServiceActor>(
-    system: &Arc<crate::system::ActorSystem>,
+    system: &crate::system::ActorSystem,
 ) -> ServiceBuilder<A> {
     ServiceBuilder {
         system: system.clone(),
@@ -67,7 +67,7 @@ pub fn spawn_service_builder<A: ServiceActor>(
 }
 
 /// Begins a foreign (no-Rust-types) event-sourced spawn.
-pub fn spawn_foreign(system: &Arc<crate::system::ActorSystem>) -> ForeignBuilder {
+pub fn spawn_foreign(system: &crate::system::ActorSystem) -> ForeignBuilder {
     ForeignBuilder {
         system: system.clone(),
         path: None,
@@ -84,7 +84,7 @@ pub fn spawn_foreign(system: &Arc<crate::system::ActorSystem>) -> ForeignBuilder
 /// `A` at [`spawn_es_builder`], each command `C` at [`SpawnBuilder::handles`],
 /// each event `E` at [`SpawnBuilder::emits`].
 pub struct SpawnBuilder<A: crate::actor::EventSourcedActor> {
-    system: Arc<crate::system::ActorSystem>,
+    system: crate::system::ActorSystem,
     path: Option<ActorPath>,
     args: JsonValue,
     entries: Vec<Arc<dyn CommandEntry>>,
@@ -205,7 +205,7 @@ impl<A: crate::actor::EventSourcedActor> SpawnBuilder<A> {
 
 /// The typed service builder.
 pub struct ServiceBuilder<A: ServiceActor> {
-    system: Arc<crate::system::ActorSystem>,
+    system: crate::system::ActorSystem,
     path: Option<ActorPath>,
     args: JsonValue,
     start_override: Option<crate::system::ServiceStart>,
@@ -241,10 +241,10 @@ impl<A: ServiceActor> ServiceBuilder<A> {
         start: impl FnOnce() -> std::pin::Pin<
             Box<
                 dyn std::future::Future<
-                    Output = Result<A, error_stack::Report<crate::registry::RegistryError>>,
-                > + Send,
-              >,
-          > + Send
+                        Output = Result<A, error_stack::Report<crate::registry::RegistryError>>,
+                    > + Send,
+            >,
+        > + Send
         + 'static,
     ) -> Self {
         self.start_override = Some(Box::pin(async move {
@@ -345,7 +345,7 @@ impl<A: ServiceActor> ServiceBuilder<A> {
 /// The foreign event-sourced builder: JSON schema in, JSON state out,
 /// decision + fold closures attached by NAME instead of positional soup.
 pub struct ForeignBuilder {
-    system: Arc<crate::system::ActorSystem>,
+    system: crate::system::ActorSystem,
     path: Option<ActorPath>,
     schema_json: Option<JsonValue>,
     genesis: JsonValue,

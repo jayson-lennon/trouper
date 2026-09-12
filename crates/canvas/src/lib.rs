@@ -11,8 +11,8 @@
 //! before any GUI startup path (no GUI exists yet, and none may be
 //! stubbed here).
 
-use trouper::system::SystemExport;
 use state_report::StateBridgeError;
+use trouper::system::SystemExport;
 
 /// Everything that can go wrong between "query" and "export in hand".
 /// The binary prints these verbatim to stderr before aborting.

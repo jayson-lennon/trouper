@@ -120,9 +120,7 @@ pub struct PoolSpec {
     /// Spawns one worker at the given path (slot included).
     #[allow(clippy::type_complexity)]
     pub factory: std::sync::Arc<
-        dyn Fn(&std::sync::Arc<crate::system::ActorSystem>, &ActorPath, &serde_json::Value)
-            + Send
-            + Sync,
+        dyn Fn(&crate::system::ActorSystem, &ActorPath, &serde_json::Value) + Send + Sync,
     >,
     /// Genesis args handed to the factory (the workers' shared config).
     pub args: Option<serde_json::Value>,
@@ -156,15 +154,13 @@ pub struct PartitionSpec {
     pub public: ActorPath,
     /// The system handle the factory spawns entities through (captured at
     /// install so the router can activate without extra plumbing).
-    pub system: std::sync::Arc<crate::system::ActorSystem>,
+    pub system: crate::system::ActorSystem,
     /// Spawns ONE entity at the given path (an ES spawn — the entity owns
     /// its journal). The factory owns the actor type; the kernel owns the
     /// naming and the activation moment.
     #[allow(clippy::type_complexity)]
     pub factory: std::sync::Arc<
-        dyn Fn(&std::sync::Arc<crate::system::ActorSystem>, &ActorPath, &serde_json::Value)
-            + Send
-            + Sync,
+        dyn Fn(&crate::system::ActorSystem, &ActorPath, &serde_json::Value) + Send + Sync,
     >,
     /// The command field carrying the shard key (extracted per envelope).
     /// Must be marked [`crate::schema::FieldRole::ShardKey`] in at least one

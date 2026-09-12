@@ -7,15 +7,14 @@
 //! tests that shared the production key answered each other's queries
 //! under a parallel test runner. Island keys make the locks unnecessary.
 
+use canvas::{SnapshotSummary, StateError, fetch_export_on};
+use serde::{Deserialize, Serialize};
+use serde_json::json;
+use std::time::Duration;
 use trouper::actor::{CommandHandler, EventSourcedActor};
 use trouper::prelude::*;
 use trouper::schema::{FieldDef, FieldTy, Schema, SchemaDef, SchemaKind};
 use trouper::state_report::{ReportState, StateReported, StateReporter};
-use canvas::{SnapshotSummary, StateError, fetch_export_on};
-use serde::{Deserialize, Serialize};
-use serde_json::json;
-use std::sync::Arc;
-use std::time::Duration;
 
 #[derive(Deserialize)]
 struct Work {
@@ -84,8 +83,8 @@ impl CommandHandler<Work> for Worker {
 async fn serving_system(
     key: state_report::StateKey,
     total: i64,
-) -> (Arc<ActorSystem>, state_report::zenoh::Session) {
-    let system = Arc::new(ActorSystem::new(SystemConfig::production()));
+) -> (ActorSystem, state_report::zenoh::Session) {
+    let system = ActorSystem::new(SystemConfig::production());
     system.register_schema::<Work>();
     system.register_schema::<WorkDone>();
     system.register_schema::<ReportState>();
