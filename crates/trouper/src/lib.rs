@@ -11,10 +11,8 @@ pub mod actor;
 pub mod builder;
 pub mod clock;
 pub mod context;
-/// Re-export of the runtime's `error_stack` so downstream consumers
-/// whose own `error_stack` major differs can still name the exact
-/// `Report<E>` type our public signatures use (trait impls, helpers).
-pub use error_stack;
+/// Note: public signatures use `error-stack` **0.8** — depend on that
+/// version to name the `Report<E>` types this crate returns.
 pub mod envelope;
 pub mod inbox;
 pub mod journal;
@@ -38,6 +36,7 @@ pub mod prelude {
     pub use crate::envelope::*;
     pub use crate::inbox::InboxOffset;
     pub use crate::journal::SeqNo;
+    pub use crate::kernel::DeadLetterReason;
     pub use crate::reply::LeaseId;
     pub use crate::schema::*;
     pub use crate::state_report::{ReportState, StateReported, StateReporter};

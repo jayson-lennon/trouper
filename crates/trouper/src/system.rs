@@ -2223,11 +2223,11 @@ mod tests {
     async fn tap_drop_oldest_under_pressure_keeps_delivery_working() {
         // Given a system whose tap ring is tiny (test-visible capacity).
         let (clock, fake) = ClockService::fake(1_000);
-        let system = Arc::new(ActorSystem::new(SystemConfig {
+        let system = ActorSystem::new(SystemConfig {
             clock,
             tap_capacity: 4,
             default_mailbox: MailboxDefaults::default(),
-        }));
+        });
         let _clock = fake;
         let path = ActorPath::new("counter");
         system.spawn_es::<Counter, _>(path.clone(), &json!({}), SpawnOpts::default(), || {
