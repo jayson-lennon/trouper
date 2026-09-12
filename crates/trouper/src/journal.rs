@@ -7,7 +7,6 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 
 use crate::envelope::Event;
-use crate::types::SeqNo;
 
 /// One durable entry in an actor's journal.
 ///
@@ -121,7 +120,7 @@ impl Journal {
     /// Millis elapsed since the last snapshot (or since the spawn-time
     /// anchor); `None` when the cadence was never anchored — the caller
     /// treats that as "not due" (never snapshot on an unanchored journal).
-    pub fn since_snapshot_ms(&self, now: crate::types::Timestamp) -> Option<u64> {
+    pub fn since_snapshot_ms(&self, now: crate::clock::Timestamp) -> Option<u64> {
         self.last_snapshot_ms
             .map(|ms| now.as_millis().saturating_sub(ms))
     }
@@ -161,10 +160,50 @@ impl Journal {
     }
 }
 
+/// Sequence number of a journal entry within one actor's journal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct SeqNo(u64);
+
+impl SeqNo {
+    /// The sequence of the first journal entry.
+    pub fn genesis() -> Self {
+        Self(0)
+    }
+
+    /// The sequence "before genesis": replaying `after(this)` yields every
+    /// event, including the first.
+    pub fn before_genesis() -> Self {
+        Self(u64::MAX)
+    }
+
+    /// Wraps a raw sequence value.
+    pub fn new(v: u64) -> Self {
+        Self(v)
+    }
+
+    /// The raw sequence value.
+    pub fn as_u64(self) -> u64 {
+        self.0
+    }
+
+    /// Whether this is the [`before_genesis`] sentinel (compare by value,
+    /// since `u64::MAX` is unreachable by honest counting).
+    pub fn is_before_genesis(self) -> bool {
+        self.0 == u64::MAX
+    }
+}
+
+impl std::fmt::Display for SeqNo {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::SchemaId;
+    use crate::schema::SchemaId;
     use serde_json::json;
 
     fn event(qty: i64) -> Event {
@@ -307,4 +346,20 @@ mod tests {
         // Then both events replay.
         assert_eq!(all, [SeqNo::new(0), SeqNo::new(1)]);
     }
+}
+
+#[test]
+fn seqno_orders_numerically_and_roundtrips() {
+    // Given two sequence numbers.
+    let earlier = SeqNo::genesis();
+    let later = SeqNo::new(7);
+
+    // When comparing and round-tripping through JSON.
+    let ordered = earlier < later;
+    let round: SeqNo =
+        serde_json::from_str(&serde_json::to_string(&later).expect("ser")).expect("de");
+
+    // Then ordering follows the numeric value and the value survives.
+    assert!(ordered);
+    assert_eq!(round, later);
 }

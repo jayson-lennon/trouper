@@ -11,11 +11,11 @@
 //! [`ActorSystem::es_state`], which is how a bridge detects that a fresh
 //! report has landed.
 
+use crate::actor::ActorKind;
 use crate::actor::{CommandHandler, EventSourcedActor};
 use crate::context::CmdCtx;
 use crate::envelope::Event;
 use crate::schema::{ActorManifest, FieldDef, FieldTy, Schema, SchemaDef, SchemaKind};
-use crate::types::ActorKind;
 use serde::Deserialize;
 use serde_json::Value;
 
@@ -107,9 +107,10 @@ impl CommandHandler<ReportState> for StateReporter {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::actor::ActorPath;
     use crate::context::{CmdCtx, Outbox, RuntimeView};
     use crate::envelope::TraceCtx;
-    use crate::types::{ActorPath, SchemaId};
+    use crate::schema::SchemaId;
     use serde_json::json;
 
     fn test_export(actors: usize) -> Value {
@@ -125,8 +126,8 @@ mod tests {
             fn who_handles(&self, _schema: &SchemaId) -> Vec<ActorPath> {
                 Vec::new()
             }
-            fn now(&self) -> crate::types::Timestamp {
-                crate::types::Timestamp::from_millis(0)
+            fn now(&self) -> crate::clock::Timestamp {
+                crate::clock::Timestamp::from_millis(0)
             }
         }
         // Leak is bounded: a per-test fixture, never read after the call.

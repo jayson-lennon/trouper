@@ -11,7 +11,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use derive_more::Debug;
 use tokio::sync::watch;
 
-use crate::types::Timestamp;
+use serde::{Deserialize, Serialize};
 
 /// The capability to know what time it is.
 ///
@@ -247,4 +247,33 @@ mod tests {
         // Then the waiter fails instead of hanging.
         assert!(result.is_err());
     }
+}
+
+/// Milliseconds since the Unix epoch, always sourced from the injected clock.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct Timestamp(u64);
+
+impl Timestamp {
+    /// Wraps raw epoch milliseconds (from the injected clock).
+    pub fn from_millis(millis: u64) -> Self {
+        Self(millis)
+    }
+
+    /// Raw epoch milliseconds.
+    pub fn as_millis(self) -> u64 {
+        self.0
+    }
+}
+
+#[test]
+fn timestamp_roundtrips_millis() {
+    // Given raw epoch milliseconds.
+    let ts = Timestamp::from_millis(1_756_000_000_000);
+
+    // When reading them back.
+    let millis = ts.as_millis();
+
+    // Then the value is preserved.
+    assert_eq!(millis, 1_756_000_000_000);
 }

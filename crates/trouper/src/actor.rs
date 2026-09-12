@@ -14,14 +14,13 @@
 
 use std::sync::Arc;
 
-use serde::Serialize;
-use serde::de::DeserializeOwned;
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::Value as JsonValue;
+use std::fmt;
 
 use crate::context::CmdCtx;
 use crate::journal::JournalError;
-use crate::schema::{ActorManifest, Schema};
-use crate::types::SchemaId;
+use crate::schema::{ActorManifest, Schema, SchemaId};
 
 /// Event-sourced domain actor: pure, journaled, replayable.
 ///
@@ -502,8 +501,8 @@ impl ServiceAny for dyn DynServiceActor {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::actor::{ActorKind, ActorPath};
     use crate::schema::{FieldDef, FieldTy, SchemaDef, SchemaKind};
-    use crate::types::{ActorKind, ActorPath};
     use serde::Deserialize;
     use serde_json::json;
 
@@ -662,8 +661,8 @@ mod tests {
             fn who_handles(&self, _schema: &SchemaId) -> Vec<ActorPath> {
                 Vec::new()
             }
-            fn now(&self) -> crate::types::Timestamp {
-                crate::types::Timestamp::from_millis(0)
+            fn now(&self) -> crate::clock::Timestamp {
+                crate::clock::Timestamp::from_millis(0)
             }
         }
         let trace = crate::envelope::TraceCtx::root();
@@ -708,8 +707,8 @@ mod tests {
             fn who_handles(&self, _schema: &SchemaId) -> Vec<ActorPath> {
                 Vec::new()
             }
-            fn now(&self) -> crate::types::Timestamp {
-                crate::types::Timestamp::from_millis(0)
+            fn now(&self) -> crate::clock::Timestamp {
+                crate::clock::Timestamp::from_millis(0)
             }
         }
         let trace = crate::envelope::TraceCtx::root();
@@ -752,8 +751,8 @@ mod tests {
             fn who_handles(&self, _schema: &SchemaId) -> Vec<ActorPath> {
                 Vec::new()
             }
-            fn now(&self) -> crate::types::Timestamp {
-                crate::types::Timestamp::from_millis(0)
+            fn now(&self) -> crate::clock::Timestamp {
+                crate::clock::Timestamp::from_millis(0)
             }
         }
         let trace = crate::envelope::TraceCtx::root();
@@ -812,4 +811,101 @@ mod tests {
         // Then it is an empty decision.
         assert!(events.is_empty());
     }
+}
+
+/// Actor identity IS its path: handles survive restarts because the registry
+/// maps the path to a swappable endpoint slot.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct ActorPath(Arc<str>);
+
+/// Which of the two actor contracts an actor implements.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum ActorKind {
+    /// Pure, journaled, replayable — implements [`crate::actor::EventSourced`].
+    EventSourced,
+    /// Impure by design: async handlers, I/O and `ask` allowed.
+    Service,
+}
+
+/// Why an actor's endpoint ceased to exist.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum StopReason {
+    /// Finished on its own or was stopped gracefully via the system.
+    Normal,
+    /// A handler panicked and the supervisor declined to restart it.
+    Crashed,
+    /// The restart budget was exhausted; escalated to the parent.
+    Escalated,
+}
+
+/// How often an event-sourced actor takes journal snapshots. Default: OFF.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub enum SnapshotCadence {
+    /// Never snapshot (replay is always full).
+    #[default]
+    Off,
+    /// Snapshot every `n` events (taken BETWEEN messages, never mid-step) —
+    /// bounds recovery cost deterministically.
+    Messages(u64),
+    /// Snapshot when at least this much clock time passed since the last
+    /// snapshot. Checked while the actor idles (never mid-step), so a
+    /// steady-trickle actor that never reaches a message count still gets
+    /// bounded recovery cost.
+    Time(std::time::Duration),
+}
+
+impl ActorPath {
+    /// Creates a path from a string.
+    pub fn new(s: impl Into<Arc<str>>) -> Self {
+        Self(s.into())
+    }
+
+    /// The path as a string slice.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for ActorPath {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+#[test]
+fn path_survives_serde_roundtrip() {
+    // Given an actor path.
+    let path = ActorPath::new("inventory.west");
+
+    // When round-tripping through JSON.
+    let json = serde_json::to_string(&path).expect("serialize");
+    let round: ActorPath = serde_json::from_str(&json).expect("deserialize");
+
+    // Then the value is preserved as a bare string.
+    assert_eq!(json, "\"inventory.west\"");
+    assert_eq!(round, path);
+}
+#[test]
+fn path_displays_as_bare_name() {
+    // Given an actor path.
+    let path = ActorPath::new("inventory.west");
+
+    // When displaying it.
+    let rendered = path.to_string();
+
+    // Then only the name is shown.
+    assert_eq!(rendered, "inventory.west");
+}
+#[test]
+fn stop_reason_survives_serde_roundtrip() {
+    // Given a stop reason.
+    let reason = StopReason::Escalated;
+
+    // When round-tripping through JSON.
+    let json = serde_json::to_string(&reason).expect("serialize");
+    let round: StopReason = serde_json::from_str(&json).expect("deserialize");
+
+    // Then the variant is preserved.
+    assert_eq!(round, reason);
 }

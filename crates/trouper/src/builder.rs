@@ -15,13 +15,15 @@ use std::sync::Arc;
 
 use serde_json::Value as JsonValue;
 
+use crate::actor::{ActorKind, ActorPath};
 use crate::actor::{
     CommandEntry, ForeignCommandEntry, ForeignDecision, ForeignEsState, ForeignFold, MsgEntry,
     ServiceActor, TypedEsAdapter, TypedServiceAdapter,
 };
 use crate::schema::Schema;
+use crate::schema::SchemaId;
 use crate::system::SpawnOpts;
-use crate::types::{ActorKind, ActorPath, SchemaId, Topic};
+use crate::topics::Topic;
 
 /// Begins a typed spawn of event-sourced actor `A`.
 ///
@@ -150,7 +152,7 @@ impl<A: crate::actor::EventSourcedActor> SpawnBuilder<A> {
     }
 
     /// The snapshot cadence (default Off).
-    pub fn snapshot(mut self, cadence: crate::types::SnapshotCadence) -> Self {
+    pub fn snapshot(mut self, cadence: crate::actor::SnapshotCadence) -> Self {
         self.opts.snapshot = cadence;
         self
     }
@@ -396,7 +398,7 @@ impl ForeignBuilder {
     }
 
     /// Snapshot cadence.
-    pub fn snapshot(mut self, cadence: crate::types::SnapshotCadence) -> Self {
+    pub fn snapshot(mut self, cadence: crate::actor::SnapshotCadence) -> Self {
         self.opts.snapshot = cadence;
         self
     }

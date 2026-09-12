@@ -10,10 +10,12 @@ use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::time::Duration;
 
+use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 use tokio::sync::oneshot;
+use uuid::Uuid;
 
-use crate::types::{LeaseId, Timestamp};
+use crate::clock::Timestamp;
 
 /// One reply slot: the asker's oneshot plus its expiry.
 pub struct ReplySlot {
@@ -77,6 +79,12 @@ impl ReplyTable {
     }
 }
 
+impl std::fmt::Display for LeaseId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -134,5 +142,23 @@ mod tests {
                 std::thread::yield_now();
             }
         }
+    }
+}
+
+/// Lease for a reply slot (an `ask` in flight); a runtime-internal mechanism,
+/// never persisted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct LeaseId(Uuid);
+
+impl LeaseId {
+    /// Generates a fresh lease id.
+    pub fn new() -> Self {
+        Self(Uuid::now_v7())
+    }
+}
+impl Default for LeaseId {
+    fn default() -> Self {
+        Self::new()
     }
 }

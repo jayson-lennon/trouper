@@ -10,7 +10,8 @@
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use crate::types::{ActorPath, SchemaId};
+use crate::actor::ActorPath;
+use crate::schema::SchemaId;
 
 /// How a pool picks the worker for the next envelope.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -10,10 +10,13 @@
 //! view — user code never holds the registry lock, so lookups from inside a
 //! handler can never deadlock the kernel.
 
+use crate::actor::ActorPath;
+use crate::clock::Timestamp;
 use crate::envelope::{Address, Envelope, TraceCtx};
 use crate::kernel::AskOutcome;
 use crate::schema::Message;
-use crate::types::{ActorPath, SchemaId, Timestamp, Topic};
+use crate::schema::SchemaId;
+use crate::topics::Topic;
 use serde_json::Value as JsonValue;
 
 /// Read-only runtime view for handlers: registry lookups plus the clock.
@@ -120,7 +123,7 @@ pub(crate) type AskChannelFuture = std::pin::Pin<
         dyn std::future::Future<
                 Output = Result<
                     (
-                        crate::types::LeaseId,
+                        crate::reply::LeaseId,
                         tokio::sync::oneshot::Receiver<JsonValue>,
                     ),
                     error_stack::Report<AskError>,
@@ -361,7 +364,7 @@ pub(crate) trait AskPort: Send + Sync {
     /// timed-out ask must not leak its slot).
     fn ask_settled(
         &self,
-        lease: crate::types::LeaseId,
+        lease: crate::reply::LeaseId,
         dest: Address,
         outcome: AskOutcome,
         trace: TraceCtx,
@@ -556,9 +559,9 @@ impl<'a> MsgCtx<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::actor::ActorKind;
     use crate::registry::EndpointInfo;
     use crate::schema::{ActorManifest, Schema, SchemaDef, SchemaKind};
-    use crate::types::ActorKind;
     use parking_lot::Mutex;
     use serde::{Deserialize, Serialize};
 

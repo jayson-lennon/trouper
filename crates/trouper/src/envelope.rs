@@ -7,8 +7,13 @@
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
+use uuid::Uuid;
 
-use crate::types::{ActorPath, CausalityId, LeaseId, SchemaId, Topic, TraceId};
+use crate::actor::ActorPath;
+use crate::clock::Timestamp;
+use crate::reply::LeaseId;
+use crate::schema::SchemaId;
+use crate::topics::Topic;
 
 /// Where a message is headed.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -292,4 +297,93 @@ mod tests {
         assert!(rendered.contains("<erased>"));
         assert!(envelope.as_json().is_none());
     }
+}
+
+/// Identifies a whole causal conversation (a request and everything it caused).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct TraceId(Uuid);
+
+impl TraceId {
+    /// Generates a fresh, time-ordered (v7) trace id.
+    pub fn new() -> Self {
+        Self(Uuid::now_v7())
+    }
+}
+impl std::fmt::Display for TraceId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+impl Default for TraceId {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+/// Identifies one hop's position within a [`TraceId`] conversation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct CausalityId(Uuid);
+
+impl CausalityId {
+    /// Generates a fresh, time-ordered (v7) causality id.
+    pub fn new() -> Self {
+        Self(Uuid::now_v7())
+    }
+}
+impl std::fmt::Display for CausalityId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+impl CausalityId {
+    /// The millisecond timestamp embedded in the v7 uuid (fact ts fallback).
+    pub fn as_millis_ts(self) -> crate::clock::Timestamp {
+        let ms = self
+            .0
+            .get_timestamp()
+            .map(|t| t.to_unix().0 * 1_000 + u64::from(t.to_unix().1) / 1_000_000)
+            .unwrap_or(0);
+        Timestamp::from_millis(ms)
+    }
+}
+impl Default for CausalityId {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[test]
+fn trace_id_is_version_7() {
+    // Given a freshly generated trace id.
+    let id = TraceId::new();
+
+    // When asking for its UUID version.
+    let version = id.0.get_version_num();
+
+    // Then it is v7 (time-ordered, for the canvas).
+    assert_eq!(version, 7);
+}
+#[test]
+fn trace_id_survives_serde_roundtrip() {
+    // Given a trace id.
+    let id = TraceId::new();
+
+    // When round-tripping through JSON.
+    let json = serde_json::to_string(&id).expect("serialize");
+    let round: TraceId = serde_json::from_str(&json).expect("deserialize");
+
+    // Then the value is preserved.
+    assert_eq!(round, id);
+}
+#[test]
+fn causality_id_is_version_7() {
+    // Given a freshly generated causality id.
+    let id = CausalityId::new();
+
+    // When asking for its UUID version.
+    let version = id.0.get_version_num();
+
+    // Then it is v7.
+    assert_eq!(version, 7);
 }

@@ -12,21 +12,24 @@ use std::sync::Arc;
 use serde_json::Value as JsonValue;
 use serde_json::json;
 
+use crate::actor::ActorPath;
 use crate::actor::{
     CommandEntry, DynServiceActor, EventSourcedActor, MsgEntry, ServiceActor, TypedEsState,
     TypedServiceState,
 };
+use crate::clock::Timestamp;
 use crate::clock::{ClockService, FakeClock, SystemClock};
 use crate::context::RuntimeView;
 use crate::envelope::{Address, Envelope, TraceCtx};
+use crate::inbox::InboxOffset;
 use crate::inbox::{Inbox, OverloadPolicy};
 pub use crate::kernel::DeadLetter;
 use crate::kernel::{ActorCell, EsLoop, KernelState, pump_facts_now, route};
 use crate::registry::{Endpoint, EndpointInfo, Registry};
 use crate::schema::Schema;
-use crate::types::{ActorPath, InboxOffset, SchemaId, Timestamp};
+use crate::schema::SchemaId;
 
-pub use crate::types::SnapshotCadence;
+pub use crate::actor::SnapshotCadence;
 
 /// Spawn-time options for an actor.
 #[derive(Debug, Clone)]
@@ -182,7 +185,7 @@ impl ActorSystem {
     }
 
     /// The system dead-letter topic, created at boot.
-    pub fn deadletter_topic() -> crate::types::Topic {
+    pub fn deadletter_topic() -> crate::topics::Topic {
         ActorSystemCore::deadletter_topic()
     }
 
@@ -331,7 +334,7 @@ pub struct ActorExport {
     /// The actor's path (its identity).
     pub path: ActorPath,
     /// The contract kind (EventSourced | Service).
-    pub kind: crate::types::ActorKind,
+    pub kind: crate::actor::ActorKind,
     /// The actor's declared edges.
     pub manifest: crate::schema::ActorManifest,
     /// Live ES state via `capture` (ES actors only).
@@ -350,7 +353,7 @@ pub struct DeclaredEdge {
     /// The direction: Handles (inbound) or Emits (outbound).
     pub direction: EdgeDirection,
     /// The topic, when the edge is a topic edge.
-    pub topic: Option<crate::types::Topic>,
+    pub topic: Option<crate::topics::Topic>,
 }
 
 /// The direction of a declared edge.
@@ -439,8 +442,8 @@ pub struct SystemExport {
 
 impl ActorSystemCore {
     /// The system dead-letter topic, created at boot.
-    pub(crate) fn deadletter_topic() -> crate::types::Topic {
-        crate::types::Topic::new("system.deadletters")
+    pub(crate) fn deadletter_topic() -> crate::topics::Topic {
+        crate::topics::Topic::new("system.deadletters")
     }
 
     /// Spawns a foreign (no-Rust-types) event-sourced actor: the schema,
@@ -462,7 +465,7 @@ impl ActorSystemCore {
         let state = Box::new(crate::actor::ForeignEsState::new(genesis, fold));
         let manifest = crate::schema::ActorManifest::new()
             .handles_id(schema_id.clone())
-            .kind(crate::types::ActorKind::EventSourced);
+            .kind(crate::actor::ActorKind::EventSourced);
         let entries = vec![
             Arc::new(crate::actor::ForeignCommandEntry::new(schema_id, decision))
                 as Arc<dyn crate::actor::CommandEntry>,
@@ -668,7 +671,7 @@ impl ActorSystemCore {
             self.clock.now(),
             crate::tap::FactKind::Spawned {
                 path: path.clone(),
-                kind: crate::types::ActorKind::EventSourced,
+                kind: crate::actor::ActorKind::EventSourced,
                 restart: false,
             },
         );
@@ -788,7 +791,7 @@ impl ActorSystemCore {
             self.clock.now(),
             crate::tap::FactKind::Spawned {
                 path: path.clone(),
-                kind: crate::types::ActorKind::Service,
+                kind: crate::actor::ActorKind::Service,
                 restart: false,
             },
         );
@@ -917,7 +920,7 @@ impl ActorSystemCore {
     pub fn envelope_to_topic(
         &self,
         event: crate::envelope::Event,
-        topic: crate::types::Topic,
+        topic: crate::topics::Topic,
     ) -> Envelope {
         Envelope::json(
             event.schema,
@@ -978,7 +981,7 @@ impl ActorSystemCore {
     pub fn subscribe(
         &self,
         path: &ActorPath,
-        topic: &crate::types::Topic,
+        topic: &crate::topics::Topic,
         offset: Option<u64>,
     ) -> Result<u64, error_stack::Report<crate::registry::RegistryError>> {
         self.subscribe_filtered(
@@ -1003,7 +1006,7 @@ impl ActorSystemCore {
     pub fn subscribe_filtered(
         &self,
         path: &ActorPath,
-        topic: &crate::types::Topic,
+        topic: &crate::topics::Topic,
         offset: Option<u64>,
         filter: crate::topics::SubscriptionFilter,
     ) -> Result<u64, error_stack::Report<crate::registry::RegistryError>> {
@@ -1036,7 +1039,7 @@ impl ActorSystemCore {
     pub fn reset_topic_cursor(
         &self,
         path: &ActorPath,
-        topic: &crate::types::Topic,
+        topic: &crate::topics::Topic,
         to: u64,
     ) -> Result<u64, u64> {
         let mut kernel = self.kernel.lock();
@@ -1047,7 +1050,7 @@ impl ActorSystemCore {
     }
 
     /// The topic log's retained offset range (inspection).
-    pub fn topic_range(&self, topic: &crate::types::Topic) -> Option<(u64, u64)> {
+    pub fn topic_range(&self, topic: &crate::topics::Topic) -> Option<(u64, u64)> {
         let kernel = self.kernel.lock();
         kernel.topic_logs.get(topic).map(|log| log.retained())
     }
@@ -1153,7 +1156,7 @@ impl ActorSystemCore {
                     self.clock.now(),
                     crate::tap::FactKind::Stopped {
                         path: path.clone(),
-                        reason: crate::types::StopReason::Normal,
+                        reason: crate::actor::StopReason::Normal,
                     },
                 );
                 return;
@@ -1197,7 +1200,7 @@ impl ActorSystemCore {
                 letters.push(crate::kernel::DeadLetter {
                     schema: envelope.schema.clone(),
                     dest: envelope.dest.clone(),
-                    reason: crate::types::DeadLetterReason::StoppedWithMail,
+                    reason: crate::kernel::DeadLetterReason::StoppedWithMail,
                     detail: "stopped with a non-empty inbox".to_owned(),
                     trace: envelope.trace,
                 });
@@ -1232,7 +1235,7 @@ impl ActorSystemCore {
                 self.clock.now(),
                 crate::tap::FactKind::Stopped {
                     path: path.clone(),
-                    reason: crate::types::StopReason::Normal,
+                    reason: crate::actor::StopReason::Normal,
                 },
             );
             if let Some(parent) = notified_parent {
@@ -1297,7 +1300,7 @@ impl ActorSystemCore {
             };
             actors.push(ActorExport {
                 path,
-                kind: manifest.kind.unwrap_or(crate::types::ActorKind::Service),
+                kind: manifest.kind.unwrap_or(crate::actor::ActorKind::Service),
                 manifest,
                 state,
                 cursor,
@@ -1306,7 +1309,7 @@ impl ActorSystemCore {
 
         // Runtime topic subscriptions (subscribe calls) are declared
         // edges too: read them from the topic logs.
-        let runtime_subscriptions: Vec<(ActorPath, crate::types::Topic)> = {
+        let runtime_subscriptions: Vec<(ActorPath, crate::topics::Topic)> = {
             let kernel = self.kernel.lock();
             kernel
                 .topic_logs
@@ -1530,7 +1533,7 @@ mod tests {
     use rstest::rstest;
     impl ActorSystem {
         /// Whether the "aud" test actor subscribes to `topic` (tests).
-        pub fn topic_has_subscriber(&self, topic: &crate::types::Topic) -> bool {
+        pub fn topic_has_subscriber(&self, topic: &crate::topics::Topic) -> bool {
             let kernel = self.kernel.lock();
             kernel
                 .topic_logs
@@ -1581,10 +1584,10 @@ mod tests {
     }
 
     use super::*;
+    use crate::actor::ActorKind;
     use crate::actor::{CommandHandler, MsgHandler, TypedEsAdapter, TypedServiceAdapter};
     use crate::context::CmdCtx;
     use crate::schema::{ActorManifest, FieldDef, FieldTy, SchemaDef, SchemaKind};
-    use crate::types::ActorKind;
     use serde::{Deserialize, Serialize};
     use serde_json::json;
     use std::collections::HashMap;
@@ -1650,7 +1653,7 @@ mod tests {
             ActorManifest::new()
                 .handles::<Add>()
                 .emits::<Added>()
-                .emits_on_topic(crate::types::Topic::new("counter.events"))
+                .emits_on_topic(crate::topics::Topic::new("counter.events"))
                 .kind(ActorKind::EventSourced)
         }
         fn restore(_args: &JsonValue) -> Self {
@@ -1749,8 +1752,8 @@ mod tests {
         assert_eq!(state["total"], 0);
     }
 
-    fn topic_of_join() -> crate::types::Topic {
-        crate::types::Topic::new("auditor.join")
+    fn topic_of_join() -> crate::topics::Topic {
+        crate::topics::Topic::new("auditor.join")
     }
 
     #[tokio::test]
@@ -1873,7 +1876,7 @@ mod tests {
             kernel
                 .dead_letters
                 .iter()
-                .any(|l| l.reason == crate::types::DeadLetterReason::StoppedWithMail),
+                .any(|l| l.reason == crate::kernel::DeadLetterReason::StoppedWithMail),
             "undelivered mail typed StoppedWithMail: {:?}",
             kernel.dead_letters
         );
@@ -2513,7 +2516,7 @@ mod tests {
         let facts = system.tap_facts();
         let stopped_escalated = facts.iter().position(|f| {
             matches!(&f.kind, crate::tap::FactKind::Stopped { path, reason }
-                if *path == worker && *reason == crate::types::StopReason::Escalated)
+                if *path == worker && *reason == crate::actor::StopReason::Escalated)
         });
         let escalated = facts.iter().position(
             |f| matches!(&f.kind, crate::tap::FactKind::Escalated { path, .. } if *path == worker),
@@ -2713,7 +2716,7 @@ mod tests {
         wait_for(|| async {
             system.tap_facts().iter().any(|f| {
                 matches!(&f.kind, crate::tap::FactKind::Stopped { path, reason }
-                    if *path == child && *reason == crate::types::StopReason::Crashed)
+                    if *path == child && *reason == crate::actor::StopReason::Crashed)
             })
         })
         .await;
@@ -2796,7 +2799,7 @@ mod tests {
                 ]
             },
         );
-        let topic = crate::types::Topic::new("counter.events");
+        let topic = crate::topics::Topic::new("counter.events");
         system.subscribe(&sub, &topic, None).expect("subscribe");
 
         // When two Adds are sent and committed.
@@ -2861,7 +2864,7 @@ mod tests {
                 },
             );
         }
-        let topic = crate::types::Topic::new("counter.events");
+        let topic = crate::topics::Topic::new("counter.events");
 
         // When "early" subscribes before any publish and "late" after one.
         system.subscribe(&early, &topic, None).expect("subscribe");
@@ -2919,7 +2922,7 @@ mod tests {
                 ]
             },
         );
-        let topic = crate::types::Topic::new("counter.events");
+        let topic = crate::topics::Topic::new("counter.events");
         system.subscribe(&slow, &topic, None).expect("subscribe");
 
         // When many publishes happen in a row.
@@ -3022,7 +3025,7 @@ mod tests {
             if msg.n == 0 {
                 // The join command: subscribe DURING message handling
                 // (the deferred-intent syscall under test).
-                ctx.subscribe(crate::types::Topic::new("auditor.join"));
+                ctx.subscribe(crate::topics::Topic::new("auditor.join"));
                 return;
             }
             self.sink.lock().push(format!("n={}", msg.n));
@@ -3427,7 +3430,7 @@ mod tests {
             .advance(std::time::Duration::from_secs(31));
         {
             let kernel = system.kernel.lock();
-            kernel.replies.prune(crate::types::Timestamp::from_millis(
+            kernel.replies.prune(crate::clock::Timestamp::from_millis(
                 system.clock.now().as_millis(),
             ));
         }
@@ -3585,7 +3588,7 @@ mod tests {
         // When completing the long lease and pruning past the short one.
         assert!(kernel.replies.complete(&long_lease, json!({ "ok": true })));
         drop(long_rx);
-        kernel.replies.prune(crate::types::Timestamp::from_millis(
+        kernel.replies.prune(crate::clock::Timestamp::from_millis(
             system.clock.now().as_millis() + 10,
         ));
 
@@ -3731,7 +3734,7 @@ mod tests {
     async fn subscription_cascade_on_remove() {
         // Given a publisher and a subscriber bound to a topic.
         let (system, _clock) = ActorSystem::test();
-        let topic = crate::types::Topic::new("cascade.events");
+        let topic = crate::topics::Topic::new("cascade.events");
         system.spawn_es::<Counter, _>(
             ActorPath::new("pub"),
             &json!({}),
@@ -3795,7 +3798,7 @@ mod tests {
         // subscriber on a topic, and some send traffic.
         let (system, _clock) = ActorSystem::test();
         let schema = system.register_schema::<Add>();
-        let topic = crate::types::Topic::new("export.events");
+        let topic = crate::topics::Topic::new("export.events");
         system.spawn_es::<Counter, _>(
             ActorPath::new("source"),
             &json!({}),
@@ -3839,7 +3842,7 @@ mod tests {
             .iter()
             .find(|a| a.path == ActorPath::new("source"))
             .expect("source exported");
-        assert_eq!(source.kind, crate::types::ActorKind::EventSourced);
+        assert_eq!(source.kind, crate::actor::ActorKind::EventSourced);
         // And ES actors export their live state.
         assert_eq!(
             source.state.as_ref().and_then(|s| s["total"].as_i64()),
@@ -4094,7 +4097,7 @@ mod tests {
             facts.iter().any(|f| matches!(
                 &f.kind,
                 crate::tap::FactKind::Stopped { path, reason }
-                    if *path == worker && *reason == crate::types::StopReason::Crashed
+                    if *path == worker && *reason == crate::actor::StopReason::Crashed
             )),
             "Stopped {{ Crashed }} expected: {:?}",
             facts
@@ -4320,7 +4323,7 @@ mod tests {
             };
             assert_eq!(
                 *seq,
-                crate::types::SeqNo::new(3),
+                crate::journal::SeqNo::new(3),
                 "latest snapshot at seq 3 (4th Add)"
             );
         }
@@ -4438,7 +4441,7 @@ mod tests {
         }
         impl crate::actor::EventSourcedActor for Cached {
             fn manifest() -> crate::schema::ActorManifest {
-                ActorManifest::new().kind(crate::types::ActorKind::EventSourced)
+                ActorManifest::new().kind(crate::actor::ActorKind::EventSourced)
             }
             fn restore(_args: &JsonValue) -> Self {
                 Self {
@@ -4671,7 +4674,7 @@ mod tests {
             assert_eq!(kernel.dead_letters.len(), 1);
             assert_eq!(
                 kernel.dead_letters[0].reason,
-                crate::types::DeadLetterReason::UndeclaredEvent
+                crate::kernel::DeadLetterReason::UndeclaredEvent
             );
             assert_eq!(kernel.dead_letters[0].schema, Smuggled::schema_id());
         }
@@ -4679,7 +4682,7 @@ mod tests {
             system.tap_facts().iter().any(|f| matches!(
                 &f.kind,
                 crate::tap::FactKind::DeadLettered { reason, .. }
-                    if *reason == crate::types::DeadLetterReason::UndeclaredEvent
+                    if *reason == crate::kernel::DeadLetterReason::UndeclaredEvent
             )),
             "DeadLettered(UndeclaredEvent) fact on the tap"
         );
@@ -5005,7 +5008,7 @@ mod tests {
         assert!(system.tap_facts().iter().any(|f| matches!(
             &f.kind,
             crate::tap::FactKind::DeadLettered { reason, .. }
-                if *reason == crate::types::DeadLetterReason::UndeclaredEvent
+                if *reason == crate::kernel::DeadLetterReason::UndeclaredEvent
         )));
 
         // And the same actor WITH the declaration journals normally.
@@ -5437,7 +5440,7 @@ mod tests {
                 kernel.ask_facts
             );
             assert!(kernel.replies.is_empty(), "lease leaked after timeout");
-            crate::types::LeaseId::new()
+            crate::reply::LeaseId::new()
         };
 
         // Then the late reply lands nowhere: no lease knows its id.
@@ -5500,7 +5503,7 @@ mod tests {
             .advance(std::time::Duration::from_secs(31));
         {
             let kernel = system.kernel.lock();
-            kernel.replies.prune(crate::types::Timestamp::from_millis(
+            kernel.replies.prune(crate::clock::Timestamp::from_millis(
                 system.clock.now().as_millis(),
             ));
         }
@@ -6881,11 +6884,7 @@ mod tests {
     /// The number of recorded failures for a supervised child.
     fn failure_count(system: &ActorSystem, path: &ActorPath) -> usize {
         let kernel = system.kernel.lock();
-        kernel
-            .failures
-            .get(path)
-            .map(|w| w.len())
-            .unwrap_or(0)
+        kernel.failures.get(path).map(|w| w.len()).unwrap_or(0)
     }
 
     /// An ES actor whose first command always panics (shutdown test).
@@ -6956,11 +6955,10 @@ mod tests {
         // The engine is demonstrably RESTARTING (a Spawned{restart: true}
         // fact exists) before we cut the power.
         wait_for(|| async {
-            system
-                .tap_facts()
-                .iter()
-                .any(|f| matches!(&f.kind, crate::tap::FactKind::Spawned { path, restart, .. }
-                    if *path == child && *restart))
+            system.tap_facts().iter().any(|f| {
+                matches!(&f.kind, crate::tap::FactKind::Spawned { path, restart, .. }
+                    if *path == child && *restart)
+            })
         })
         .await;
         system.shutdown();
@@ -6979,8 +6977,16 @@ mod tests {
         };
         let frozen_restarts = restarts(&system);
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-        assert_eq!(frozen_failures, failure_count(&system, &child), "no new crash entries after shutdown()");
-        assert_eq!(frozen_restarts, restarts(&system), "no restarts after shutdown()");
+        assert_eq!(
+            frozen_failures,
+            failure_count(&system, &child),
+            "no new crash entries after shutdown()"
+        );
+        assert_eq!(
+            frozen_restarts,
+            restarts(&system),
+            "no restarts after shutdown()"
+        );
     }
 
     #[tokio::test]

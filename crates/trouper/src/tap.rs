@@ -11,9 +11,13 @@ use std::collections::VecDeque;
 
 use serde_json::json;
 
+use crate::actor::{ActorKind, ActorPath, StopReason};
 use crate::envelope::{Address, TraceCtx};
+use crate::journal::SeqNo;
 use crate::kernel::AskOutcome;
-use crate::types::{ActorKind, ActorPath, DeadLetterReason, SchemaId, SeqNo, StopReason, Topic};
+use crate::kernel::DeadLetterReason;
+use crate::schema::SchemaId;
+use crate::topics::Topic;
 
 /// One observed runtime fact.
 #[derive(Debug, Clone)]
@@ -21,7 +25,7 @@ pub struct Fact {
     /// Monotonic offset in the global tap ring.
     pub offset: u64,
     /// Wall clock at emission (injected clock = deterministic tests).
-    pub ts: crate::types::Timestamp,
+    pub ts: crate::clock::Timestamp,
     /// What happened.
     pub kind: FactKind,
 }
@@ -249,7 +253,7 @@ impl TapRing {
     }
 
     /// Appends a fact; the oldest drops when full. Returns the offset.
-    pub fn push(&mut self, ts: crate::types::Timestamp, kind: FactKind) -> u64 {
+    pub fn push(&mut self, ts: crate::clock::Timestamp, kind: FactKind) -> u64 {
         let offset = self.next_offset;
         self.next_offset += 1;
         self.entries.push_back(Fact { offset, ts, kind });
@@ -293,8 +297,8 @@ impl TapRing {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::clock::Timestamp;
     use crate::envelope::TraceCtx;
-    use crate::types::Timestamp;
 
     fn ts(ms: u64) -> Timestamp {
         Timestamp::from_millis(ms)
@@ -303,7 +307,7 @@ mod tests {
     fn spawned_fact(path: &str) -> FactKind {
         FactKind::Spawned {
             path: ActorPath::new(path),
-            kind: crate::types::ActorKind::EventSourced,
+            kind: crate::actor::ActorKind::EventSourced,
             restart: false,
         }
     }

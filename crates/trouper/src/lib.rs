@@ -28,15 +28,19 @@ pub mod supervision;
 pub mod system;
 pub mod tap;
 pub mod topics;
-pub mod types;
 
 /// Everything a typical actor author needs.
 pub mod prelude {
+    pub use crate::actor::{ActorKind, ActorPath, SnapshotCadence, StopReason};
     pub use crate::builder::{spawn_es_builder, spawn_foreign, spawn_service_builder};
+    pub use crate::clock::Timestamp;
     pub use crate::context::*;
     pub use crate::envelope::*;
+    pub use crate::inbox::InboxOffset;
+    pub use crate::journal::SeqNo;
+    pub use crate::reply::LeaseId;
     pub use crate::schema::*;
     pub use crate::state_report::{ReportState, StateReported, StateReporter};
     pub use crate::system::*;
-    pub use crate::types::*;
+    pub use crate::topics::Topic;
 }

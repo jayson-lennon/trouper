@@ -12,9 +12,11 @@ use std::collections::{BTreeMap, HashMap};
 use serde_json::Value as JsonValue;
 use tokio::sync::mpsc;
 
+use crate::actor::{ActorKind, ActorPath};
 use crate::envelope::Envelope;
+use crate::schema::SchemaId;
 use crate::schema::{ActorManifest, Schema, SchemaDef, SchemaError};
-use crate::types::{ActorKind, ActorPath, SchemaId, Topic};
+use crate::topics::Topic;
 
 /// The topic every undeliverable message lands on; created at system boot.
 pub const DEAD_LETTER_TOPIC: &str = "system.deadletters";

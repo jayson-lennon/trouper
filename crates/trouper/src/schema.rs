@@ -7,8 +7,7 @@
 
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::Value as JsonValue;
-
-use crate::types::SchemaId;
+use std::sync::Arc;
 
 /// Errors surfaced while parsing schema descriptors.
 #[derive(Debug, wherror::Error)]
@@ -237,13 +236,13 @@ pub struct ActorManifest {
     pub emits: Vec<SchemaId>,
     /// Topics this actor publishes on.
     #[serde(default)]
-    pub emits_on_topics: Vec<crate::types::Topic>,
+    pub emits_on_topics: Vec<crate::topics::Topic>,
     /// Topics this actor subscribes to.
     #[serde(default)]
-    pub subscribes: Vec<crate::types::Topic>,
+    pub subscribes: Vec<crate::topics::Topic>,
     /// Which actor contract this actor implements.
     #[serde(default)]
-    pub kind: Option<crate::types::ActorKind>,
+    pub kind: Option<crate::actor::ActorKind>,
 }
 
 impl ActorManifest {
@@ -287,7 +286,7 @@ impl ActorManifest {
     }
 
     /// Declares that this actor publishes on `topic`.
-    pub fn emits_on_topic(mut self, topic: crate::types::Topic) -> Self {
+    pub fn emits_on_topic(mut self, topic: crate::topics::Topic) -> Self {
         if !self.emits_on_topics.contains(&topic) {
             self.emits_on_topics.push(topic);
         }
@@ -295,7 +294,7 @@ impl ActorManifest {
     }
 
     /// Declares that this actor subscribes to `topic`.
-    pub fn subscribes(mut self, topic: crate::types::Topic) -> Self {
+    pub fn subscribes(mut self, topic: crate::topics::Topic) -> Self {
         if !self.subscribes.contains(&topic) {
             self.subscribes.push(topic);
         }
@@ -303,9 +302,50 @@ impl ActorManifest {
     }
 
     /// Declares the actor contract this actor implements.
-    pub fn kind(mut self, kind: crate::types::ActorKind) -> Self {
+    pub fn kind(mut self, kind: crate::actor::ActorKind) -> Self {
         self.kind = Some(kind);
         self
+    }
+}
+
+/// A schema identifier of the form `name@version`, e.g. `StockReserved@1`.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct SchemaId(Arc<str>);
+
+impl SchemaId {
+    /// Builds `name@version` from its parts.
+    pub fn new(name: &str, version: u32) -> Self {
+        Self(format!("{name}@{version}").into())
+    }
+
+    /// Parses an existing `name@version` string.
+    ///
+    /// Returns `None` when the string has no `@` separator.
+    pub fn parse(s: &str) -> Option<Self> {
+        s.split_once('@').map(|_| Self(s.into()))
+    }
+
+    /// The schema name (everything before `@`).
+    pub fn name(&self) -> &str {
+        self.0.split_once('@').map_or(&self.0, |(name, _)| name)
+    }
+
+    /// The schema version (everything after `@`), or `None` if unversioned.
+    pub fn version(&self) -> Option<u32> {
+        let (_, version) = self.0.split_once('@')?;
+        version.parse().ok()
+    }
+
+    /// The identifier as a string slice.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Display for SchemaId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
     }
 }
 
@@ -432,14 +472,14 @@ mod tests {
             .handles::<ReserveStock>()
             .handles_id(foreign_tick.clone())
             .emits::<TickDone>()
-            .kind(crate::types::ActorKind::EventSourced);
+            .kind(crate::actor::ActorKind::EventSourced);
 
         // Then both flavors appear as plain schema ids.
         assert_eq!(
             manifest.handles,
             [SchemaId::new("ReserveStock", 1), foreign_tick]
         );
-        assert_eq!(manifest.kind, Some(crate::types::ActorKind::EventSourced));
+        assert_eq!(manifest.kind, Some(crate::actor::ActorKind::EventSourced));
     }
 
     #[test]
@@ -448,14 +488,14 @@ mod tests {
         let manifest = ActorManifest::new()
             .handles::<ReserveStock>()
             .handles::<ReserveStock>()
-            .emits_on_topic(crate::types::Topic::new("inventory.events"))
-            .emits_on_topic(crate::types::Topic::new("inventory.events"));
+            .emits_on_topic(crate::topics::Topic::new("inventory.events"))
+            .emits_on_topic(crate::topics::Topic::new("inventory.events"));
 
         // Then each edge is declared exactly once.
         assert_eq!(manifest.handles, [SchemaId::new("ReserveStock", 1)]);
         assert_eq!(
             manifest.emits_on_topics,
-            [crate::types::Topic::new("inventory.events")]
+            [crate::topics::Topic::new("inventory.events")]
         );
     }
 
@@ -465,9 +505,9 @@ mod tests {
         let manifest = ActorManifest::new()
             .handles::<ReserveStock>()
             .emits::<TickDone>()
-            .emits_on_topic(crate::types::Topic::new("inventory.events"))
-            .subscribes(crate::types::Topic::new("commands.audit"))
-            .kind(crate::types::ActorKind::Service);
+            .emits_on_topic(crate::topics::Topic::new("inventory.events"))
+            .subscribes(crate::topics::Topic::new("commands.audit"))
+            .kind(crate::actor::ActorKind::Service);
 
         // When round-tripping through JSON.
         let round: ActorManifest =
@@ -482,7 +522,7 @@ mod tests {
         // Given a manifest with handles and a subscription.
         let manifest = ActorManifest::new()
             .handles_id(SchemaId::new("ForeignPing", 4))
-            .subscribes(crate::types::Topic::new("inventory.events"));
+            .subscribes(crate::topics::Topic::new("inventory.events"));
 
         // When serializing it.
         let json = serde_json::to_value(&manifest).expect("ser");
@@ -531,4 +571,51 @@ mod field_role_tests {
         let plain = serde_json::to_value(FieldDef::required("n", FieldTy::Int)).expect("serialize");
         assert!(plain.get("role").is_none());
     }
+}
+
+#[test]
+fn schema_id_renders_name_and_version() {
+    // Given a name and version.
+    let id = SchemaId::new("StockReserved", 1);
+
+    // When displaying the id.
+    let rendered = id.to_string();
+
+    // Then it reads `name@version`.
+    assert_eq!(rendered, "StockReserved@1");
+}
+#[test]
+fn schema_id_parses_name_and_version_back_out() {
+    // Given a rendered schema id string.
+    let raw = "StockReserved@3";
+
+    // When parsing it.
+    let id = SchemaId::parse(raw).expect("parses");
+
+    // Then name and version round-trip.
+    assert_eq!(id.name(), "StockReserved");
+    assert_eq!(id.version(), Some(3));
+}
+#[test]
+fn schema_id_parse_rejects_unversioned_string() {
+    // Given a string without an `@` separator.
+    let raw = "StockReserved";
+
+    // When parsing it.
+    let parsed = SchemaId::parse(raw);
+
+    // Then parsing fails.
+    assert!(parsed.is_none());
+}
+#[test]
+fn schema_id_survives_serde_roundtrip() {
+    // Given a schema id.
+    let id = SchemaId::new("StockReserved", 1);
+
+    // When round-tripping through JSON.
+    let json = serde_json::to_string(&id).expect("serialize");
+    let round: SchemaId = serde_json::from_str(&json).expect("deserialize");
+
+    // Then the value is preserved.
+    assert_eq!(round, id);
 }

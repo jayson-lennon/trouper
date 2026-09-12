@@ -25,14 +25,15 @@ use std::sync::Arc;
 use serde_json::Value as JsonValue;
 use tokio::sync::{Notify, mpsc, watch};
 
-use crate::actor::{CommandEntry, DynEsActor, DynServiceActor, MsgEntry};
+use serde::{Deserialize, Serialize};
+
+use crate::actor::{ActorPath, CommandEntry, DynEsActor, DynServiceActor, MsgEntry};
 use crate::context::{CmdCtx, Outbox, RuntimeView};
-use crate::envelope::Event;
-use crate::envelope::{Address, Envelope, TraceCtx};
+use crate::envelope::{Address, Envelope, Event, TraceCtx};
 use crate::inbox::Inbox;
-use crate::journal::{Journal, JournalEntry, JournalError};
+use crate::journal::{Journal, JournalEntry, JournalError, SeqNo};
 use crate::registry::{Endpoint, Registry};
-use crate::types::{ActorPath, SchemaId, SeqNo};
+use crate::schema::SchemaId;
 
 /// An envelope the runtime could not deliver or decode.
 ///
@@ -45,7 +46,7 @@ pub struct DeadLetter {
     /// Where it was headed.
     pub dest: Address,
     /// Why it died.
-    pub reason: crate::types::DeadLetterReason,
+    pub reason: crate::kernel::DeadLetterReason,
     /// A human-readable detail line (context beyond the reason).
     pub detail: String,
     /// The trace of the hop that failed.
@@ -89,7 +90,7 @@ pub(crate) struct KernelState {
     pub(crate) journals: HashMap<ActorPath, Journal>,
     pub(crate) es_state: HashMap<ActorPath, Arc<tokio::sync::Mutex<Box<dyn DynEsActor>>>>,
     pub(crate) entries: HashMap<ActorPath, Vec<Arc<dyn CommandEntry>>>,
-    pub(crate) snapshot_policy: HashMap<ActorPath, crate::types::SnapshotCadence>,
+    pub(crate) snapshot_policy: HashMap<ActorPath, crate::actor::SnapshotCadence>,
     /// Live service instances (service actors are not journaled).
     pub(crate) services: HashMap<ActorPath, Arc<tokio::sync::Mutex<Box<dyn DynServiceActor>>>>,
     /// Reply-slot leases (the mechanism half of reply addresses).
@@ -105,7 +106,7 @@ pub(crate) struct KernelState {
     /// Envelopes that could not be delivered or decoded.
     pub(crate) dead_letters: Vec<DeadLetter>,
     /// Topic logs: bounded rings with per-subscriber cursors.
-    pub(crate) topic_logs: HashMap<crate::types::Topic, crate::topics::TopicLog>,
+    pub(crate) topic_logs: HashMap<crate::topics::Topic, crate::topics::TopicLog>,
     /// Topic publish facts (tap consumes in Phase 7).
     pub(crate) topic_facts: Vec<crate::topics::TopicPublishFact>,
     /// The global observation ring (drop-oldest).
@@ -157,7 +158,7 @@ impl KernelState {
     /// `system.facts` topic log. The ring's drop-oldest rule is untouched;
     /// gaps appear when the RING drops, never in the topic log itself
     /// (which is bounded separately). Fact offsets make any loss visible.
-    pub fn record_fact(&mut self, ts: crate::types::Timestamp, kind: crate::tap::FactKind) {
+    pub fn record_fact(&mut self, ts: crate::clock::Timestamp, kind: crate::tap::FactKind) {
         // Push a shadow fact with its ring offset into the facts topic,
         // then the fact itself into the ring (same offset).
         let shadow = crate::tap::Fact {
@@ -291,7 +292,7 @@ async fn route_inner(
                 // link observably without looking like a two-hop chain.
                 let (mut copy, tee_dest, origin_trace) = tee;
                 copy.trace.trace_id = origin_trace.trace_id;
-                copy.trace.causality_id = crate::types::CausalityId::new();
+                copy.trace.causality_id = crate::envelope::CausalityId::new();
                 let endpoint = {
                     let reg = registry.lock();
                     reg.resolve(&tee_dest)
@@ -330,7 +331,7 @@ async fn route_inner(
                     dead_letter(
                         kernel,
                         &missing_key_envelope,
-                        crate::types::DeadLetterReason::ShardKeyMissing,
+                        crate::kernel::DeadLetterReason::ShardKeyMissing,
                         "partition command without its shard key",
                     );
                     pump_dlq(registry, kernel).await;
@@ -516,7 +517,7 @@ fn apply_rules(
                 let mut trace = origin_trace;
                 // New causality for the copy, same trace id: a fresh cause
                 // INSIDE the original's trace, never a chain of two hops.
-                trace.causality_id = crate::types::CausalityId::new();
+                trace.causality_id = crate::envelope::CausalityId::new();
                 let Some(payload) = envelope.as_json().cloned() else {
                     return (tee, inline); // typed payload: not teeable at the waist
                 };
@@ -550,7 +551,7 @@ fn apply_rules(
 pub(crate) fn dead_letter(
     kernel: &Mutex<KernelState>,
     envelope: &Envelope,
-    reason: crate::types::DeadLetterReason,
+    reason: crate::kernel::DeadLetterReason,
     detail: &str,
 ) {
     let mut kernel = kernel.lock();
@@ -618,7 +619,7 @@ pub(crate) async fn front_door_loop(
                         dead_letter(
                             &kernel,
                             &envelope,
-                            crate::types::DeadLetterReason::InboxRefused,
+                            crate::kernel::DeadLetterReason::InboxRefused,
                             "inbox refused (overload/closed)",
                         );
                     } else {
@@ -626,7 +627,7 @@ pub(crate) async fn front_door_loop(
                         dead_letter(
                             &kernel,
                             &evicted,
-                            crate::types::DeadLetterReason::InboxRefused,
+                            crate::kernel::DeadLetterReason::InboxRefused,
                             "inbox evicted oldest (DropOld)",
                         );
                     }
@@ -739,7 +740,7 @@ async fn step_es(ctx: &EsLoop) -> Step {
         dead_letter(
             &ctx.kernel,
             &envelope,
-            crate::types::DeadLetterReason::UnknownSchema,
+            crate::kernel::DeadLetterReason::UnknownSchema,
             "no entry for this schema",
         );
         pump_dlq(&ctx.registry, &ctx.kernel).await;
@@ -779,7 +780,7 @@ async fn step_es(ctx: &EsLoop) -> Step {
             dead_letter(
                 &ctx.kernel,
                 &envelope,
-                crate::types::DeadLetterReason::Decode,
+                crate::kernel::DeadLetterReason::Decode,
                 &reason,
             );
             pump_dlq(&ctx.registry, &ctx.kernel).await;
@@ -843,7 +844,7 @@ async fn step_es(ctx: &EsLoop) -> Step {
                 dead_letter(
                     &ctx.kernel,
                     &dropped,
-                    crate::types::DeadLetterReason::UndeclaredEvent,
+                    crate::kernel::DeadLetterReason::UndeclaredEvent,
                     "emitted undeclared schema (dropped before journal append)",
                 );
             }
@@ -922,7 +923,7 @@ async fn flush_outbox(ctx: &EsLoop, mut outbox: Outbox) {
                     dead_letter(
                         &ctx.kernel,
                         &undeliverable,
-                        crate::types::DeadLetterReason::Unresolvable,
+                        crate::kernel::DeadLetterReason::Unresolvable,
                         "destination unresolved",
                     );
                 }
@@ -951,7 +952,7 @@ fn apply_subscribe(
     kernel: &Mutex<KernelState>,
     registry: &Mutex<Registry>,
     path: &ActorPath,
-    topic: &crate::types::Topic,
+    topic: &crate::topics::Topic,
 ) {
     let policy = {
         let registry = registry.lock();
@@ -994,7 +995,7 @@ impl crate::context::AskPort for KernelAskPort {
             dyn Future<
                     Output = Result<
                         (
-                            crate::types::LeaseId,
+                            crate::reply::LeaseId,
                             tokio::sync::oneshot::Receiver<JsonValue>,
                         ),
                         error_stack::Report<crate::context::AskError>,
@@ -1057,7 +1058,7 @@ impl crate::context::AskPort for KernelAskPort {
 
     fn ask_settled(
         &self,
-        lease: crate::types::LeaseId,
+        lease: crate::reply::LeaseId,
         dest: Address,
         outcome: AskOutcome,
         trace: TraceCtx,
@@ -1088,7 +1089,7 @@ impl crate::context::AskPort for KernelAskPort {
 async fn publish_to_topic(
     kernel: &Mutex<KernelState>,
     registry: &Mutex<Registry>,
-    topic: crate::types::Topic,
+    topic: crate::topics::Topic,
     envelope: Envelope,
 ) {
     // Append + collect subscriber endpoints without holding locks across
@@ -1108,14 +1109,14 @@ async fn publish_to_topic(
 /// Records the publish facts (topic log fact + tap fact) for one append.
 fn record_publish_facts(
     kernel: &Mutex<KernelState>,
-    topic: &crate::types::Topic,
+    topic: &crate::topics::Topic,
     envelope: &Envelope,
     offset: u64,
 ) {
     let mut kernel = kernel.lock();
     kernel.topic_facts.push(crate::topics::TopicPublishFact {
         topic: topic.clone(),
-        offset: crate::types::InboxOffset::new(offset),
+        offset: crate::inbox::InboxOffset::new(offset),
         schema: envelope.schema.clone(),
         from: envelope.from.clone(),
         trace: envelope.trace,
@@ -1137,7 +1138,7 @@ fn record_publish_facts(
 async fn pump_topic(
     kernel: &Mutex<KernelState>,
     registry: &Mutex<Registry>,
-    topic: &crate::types::Topic,
+    topic: &crate::topics::Topic,
 ) {
     let targets: Vec<(ActorPath, std::sync::Arc<Endpoint>)> = {
         let kernel = kernel.lock();
@@ -1189,7 +1190,7 @@ async fn resolve_reply(
                 dead_letter(
                     kernel,
                     &undeliverable,
-                    crate::types::DeadLetterReason::Unresolvable,
+                    crate::kernel::DeadLetterReason::Unresolvable,
                     "reply destination unresolved",
                 );
             }
@@ -1202,7 +1203,7 @@ async fn resolve_reply(
                 dead_letter(
                     kernel,
                     &undeliverable,
-                    crate::types::DeadLetterReason::Unresolvable,
+                    crate::kernel::DeadLetterReason::Unresolvable,
                     "reply destination unresolved",
                 );
             }
@@ -1248,7 +1249,7 @@ async fn fan_out_emits(ctx: &EsLoop, events: &[crate::envelope::Event]) {
 /// an n-boundary; a time cadence is checked on the idle path instead.
 async fn maybe_snapshot(
     ctx: &EsLoop,
-    (next_seq, seqs): (crate::types::SeqNo, Vec<crate::types::SeqNo>),
+    (next_seq, seqs): (crate::journal::SeqNo, Vec<crate::journal::SeqNo>),
 ) {
     let cadence = {
         let kernel = ctx.kernel.lock();
@@ -1258,7 +1259,7 @@ async fn maybe_snapshot(
             .copied()
             .unwrap_or_default()
     };
-    let crate::types::SnapshotCadence::Messages(n) = cadence else {
+    let crate::actor::SnapshotCadence::Messages(n) = cadence else {
         return;
     };
     if n == 0 || seqs.is_empty() {
@@ -1275,7 +1276,7 @@ async fn maybe_snapshot(
 
 /// Writes one snapshot of the live state at `seq` (the shared tail of both
 /// cadence checks; always BETWEEN messages, never mid-step).
-async fn snapshot_now(ctx: &EsLoop, last: crate::types::SeqNo) {
+async fn snapshot_now(ctx: &EsLoop, last: crate::journal::SeqNo) {
     let state = ctx.state().await;
     let state = state.lock().await;
     if let Ok(blob) = state.capture_erased() {
@@ -1307,7 +1308,7 @@ async fn maybe_snapshot_on_idle(ctx: &EsLoop) {
             .copied()
             .unwrap_or_default()
     };
-    let crate::types::SnapshotCadence::Time(interval) = cadence else {
+    let crate::actor::SnapshotCadence::Time(interval) = cadence else {
         return;
     };
     let (last_seq, since_snapshot_ms) = {
@@ -1410,7 +1411,7 @@ async fn step_service(ctx: &ServiceLoop) -> Step {
         dead_letter(
             &ctx.es.kernel,
             &envelope,
-            crate::types::DeadLetterReason::UnknownSchema,
+            crate::kernel::DeadLetterReason::UnknownSchema,
             "no entry for this schema",
         );
         pump_dlq(&ctx.es.registry, &ctx.es.kernel).await;
@@ -1430,7 +1431,7 @@ async fn step_service(ctx: &ServiceLoop) -> Step {
             dead_letter(
                 &ctx.es.kernel,
                 &envelope,
-                crate::types::DeadLetterReason::Decode,
+                crate::kernel::DeadLetterReason::Decode,
                 &reason,
             );
             pump_dlq(&ctx.es.registry, &ctx.es.kernel).await;
@@ -1561,7 +1562,7 @@ pub(crate) async fn restart_es(
             ctx.clock.now(),
             crate::tap::FactKind::Spawned {
                 path: ctx.path.clone(),
-                kind: crate::types::ActorKind::EventSourced,
+                kind: crate::actor::ActorKind::EventSourced,
                 restart: true,
             },
         );
@@ -1635,7 +1636,7 @@ pub async fn supervise_child(
                 &system,
                 &spec,
                 "policy Never (crashed)",
-                crate::types::StopReason::Crashed,
+                crate::actor::StopReason::Crashed,
             )
             .await;
             return;
@@ -1654,7 +1655,7 @@ pub async fn supervise_child(
                 &system,
                 &spec,
                 "restart budget exhausted",
-                crate::types::StopReason::Escalated,
+                crate::actor::StopReason::Escalated,
             )
             .await;
             return;
@@ -1741,7 +1742,7 @@ async fn escalate(
     system: &crate::system::ActorSystem,
     spec: &crate::supervision::ChildSpec,
     reason: &str,
-    stop_reason: crate::types::StopReason,
+    stop_reason: crate::actor::StopReason,
 ) {
     {
         let mut kernel = system.kernel.lock();
@@ -1773,11 +1774,30 @@ async fn escalate(
     if let Some(parent) = &spec.parent {
         system
             .send(system.envelope(
-                crate::types::SchemaId::new("Escalated", 1),
+                crate::schema::SchemaId::new("Escalated", 1),
                 parent.clone(),
                 message,
             ))
             .await
             .ok();
     }
+}
+
+/// Why an envelope was dead-lettered.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum DeadLetterReason {
+    /// No slot or route resolved for the destination.
+    Unresolvable,
+    /// No handler is registered for the payload's schema.
+    UnknownSchema,
+    /// The payload did not decode against its registered schema.
+    Decode,
+    /// The destination inbox refused the envelope (overload/closed).
+    InboxRefused,
+    /// The actor was stopped with undelivered inbox entries.
+    StoppedWithMail,
+    /// The actor emitted an event whose schema it never declared.
+    UndeclaredEvent,
+    /// A partition-set command arrived without its shard key.
+    ShardKeyMissing,
 }

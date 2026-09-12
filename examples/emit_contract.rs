@@ -132,7 +132,7 @@ async fn main() {
         system
             .tap_facts()
             .iter()
-            .filter(|f| matches!(&f.kind, FactKind::DeadLettered { reason, .. } if *reason == trouper::types::DeadLetterReason::UndeclaredEvent))
+            .filter(|f| matches!(&f.kind, FactKind::DeadLettered { reason, .. } if *reason == trouper::kernel::DeadLetterReason::UndeclaredEvent))
             .count()
             >= 3
     })
@@ -148,7 +148,7 @@ async fn main() {
         .iter()
         .filter(|f| {
             matches!(&f.kind, FactKind::DeadLettered { reason, .. }
-                if *reason == trouper::types::DeadLetterReason::UndeclaredEvent)
+                if *reason == trouper::kernel::DeadLetterReason::UndeclaredEvent)
         })
         .count();
     println!(

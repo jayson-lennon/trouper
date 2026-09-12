@@ -7,8 +7,9 @@
 
 use std::collections::VecDeque;
 
+use serde::{Deserialize, Serialize};
+
 use crate::envelope::Envelope;
-use crate::types::InboxOffset;
 
 /// What an inbox does when it is full.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -221,12 +222,41 @@ impl Inbox {
     }
 }
 
+/// Position within one actor's inbox; independent of the journal's [`SeqNo`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct InboxOffset(u64);
+
+impl InboxOffset {
+    /// The offset of the next never-delivered inbox entry.
+    pub fn zero() -> Self {
+        Self(0)
+    }
+
+    /// Wraps a raw offset value.
+    pub fn new(v: u64) -> Self {
+        Self(v)
+    }
+
+    /// The raw offset value.
+    pub fn as_u64(self) -> u64 {
+        self.0
+    }
+}
+
+impl std::fmt::Display for InboxOffset {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::actor::ActorPath;
     use crate::envelope::Envelope;
     use crate::envelope::TraceCtx;
-    use crate::types::{ActorPath, SchemaId};
+    use crate::schema::SchemaId;
     use serde_json::json;
 
     fn envelope(n: u32) -> Envelope {
@@ -368,4 +398,17 @@ mod tests {
         assert!(readable);
         assert!(!inbox.is_open());
     }
+}
+
+#[test]
+fn inbox_offset_orders_numerically() {
+    // Given two inbox offsets.
+    let earlier = InboxOffset::zero();
+    let later = InboxOffset::new(3);
+
+    // When comparing them.
+    let ordered = earlier < later;
+
+    // Then ordering follows the numeric value.
+    assert!(ordered);
 }

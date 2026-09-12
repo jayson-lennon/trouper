@@ -11,10 +11,14 @@
 //! retained tail).
 
 use std::collections::{HashMap, VecDeque};
+use std::sync::Arc;
 
+use serde::{Deserialize, Serialize};
+
+use crate::actor::ActorPath;
 use crate::envelope::Envelope;
-use crate::inbox::OverloadPolicy;
-use crate::types::{ActorPath, InboxOffset, SchemaId, Topic};
+use crate::inbox::{InboxOffset, OverloadPolicy};
+use crate::schema::SchemaId;
 
 /// What a subscriber wants to receive from a topic. `None` criteria are
 /// wildcards (a default filter matches everything). Evaluated at pump
@@ -252,11 +256,34 @@ impl TopicLog {
     }
 }
 
+/// A pub/sub topic name, e.g. `inventory.events`.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct Topic(Arc<str>);
+
+impl Topic {
+    /// Creates a topic from a string.
+    pub fn new(s: impl Into<Arc<str>>) -> Self {
+        Self(s.into())
+    }
+
+    /// The topic as a string slice.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Display for Topic {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::envelope::TraceCtx;
-    use crate::types::SchemaId;
+    use crate::schema::SchemaId;
     use serde_json::json;
 
     fn envelope(n: u64) -> Envelope {
@@ -543,5 +570,18 @@ mod tests {
 
         // Then it round-trips.
         assert_eq!(InboxOffset::new(raw).as_u64(), 7);
+    }
+
+    #[test]
+    fn topic_survives_serde_roundtrip() {
+        // Given a topic.
+        let topic = Topic::new("inventory.events");
+
+        // When round-tripping through JSON.
+        let json = serde_json::to_string(&topic).expect("serialize");
+        let round: Topic = serde_json::from_str(&json).expect("deserialize");
+
+        // Then the value is preserved.
+        assert_eq!(round, topic);
     }
 }

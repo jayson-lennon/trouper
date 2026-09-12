@@ -10,9 +10,9 @@ use serde_json::json;
 use std::sync::Arc;
 use tracing::Level;
 use trouper::actor::{CommandHandler, EventSourcedActor};
+use trouper::kernel::DeadLetterReason;
 use trouper::prelude::*;
 use trouper::tap::FactKind;
-use trouper::types::DeadLetterReason;
 
 #[derive(Deserialize)]
 struct Work {

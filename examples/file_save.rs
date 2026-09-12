@@ -149,8 +149,8 @@ impl Schema for SaveFailed {
 
 /// The topic saves are announced on (the broadcast half of the pattern:
 /// reply = asker only, publish = everyone else).
-fn audit_topic() -> trouper::types::Topic {
-    trouper::types::Topic::new("fs.events")
+fn audit_topic() -> trouper::topics::Topic {
+    trouper::topics::Topic::new("fs.events")
 }
 
 /// THE minimal actor. The domain logic is `save` — a plain method on a
