@@ -119,6 +119,12 @@ pub(crate) struct KernelState {
     /// `fired` latches the up-crossing (down-crossings re-arm it), so a
     /// sustained overload produces ONE fact, not one per message.
     pub(crate) watermarks: HashMap<ActorPath, (u64, bool)>,
+    /// Per-actor passivation config: path → idle window. The companion
+    /// `last_work_ms` map carries the injected-clock stamp of the last
+    /// completed step (kernel-side bookkeeping, off the journal store).
+    pub(crate) passivation: HashMap<ActorPath, crate::system::Passivation>,
+    /// Injected-clock millis of each actor's last completed message step.
+    pub(crate) last_work_ms: HashMap<ActorPath, u64>,
 }
 
 impl Default for KernelState {
@@ -149,6 +155,8 @@ impl KernelState {
             specs: HashMap::new(),
             failures: HashMap::new(),
             watermarks: HashMap::new(),
+            passivation: HashMap::new(),
+            last_work_ms: HashMap::new(),
         }
     }
 }
@@ -683,12 +691,16 @@ pub(crate) async fn es_actor_loop(loop_ctx: EsLoop, mut shutdown: watch::Receive
             break;
         }
         match step_es(&loop_ctx).await {
-            Step::Work => continue,
+            Step::Work => {
+                stamp_work(&loop_ctx);
+                continue;
+            }
             Step::Idle => {
                 // Idle window: the time-based snapshot cadence is checked
                 // here (the 20ms poll arm below is the wake), never
                 // mid-step — snapshots stay BETWEEN messages.
                 maybe_snapshot_on_idle(&loop_ctx).await;
+                maybe_passivate(&loop_ctx).await;
             }
             Step::Crashed => break, // supervisor (Phase 8) takes over
             Step::Stop => {
@@ -1438,6 +1450,63 @@ async fn drain_inbox_on_stop(ctx: &EsLoop) {
     // resumes from the cursor. (Graceful stop flushes to the DLQ — Phase 8.)
 }
 
+/// Stamps the injected-clock time of a completed message step. Only a
+/// COMPLETED step (acked/committed) resets the passivation timer — a
+/// message merely enqueued does not.
+fn stamp_work(ctx: &EsLoop) {
+    let now = ctx.clock.now().as_millis();
+    let mut kernel = ctx.kernel.lock();
+    kernel.last_work_ms.insert(ctx.path.clone(), now);
+}
+
+/// The idle arm's passivation check: when the actor's declared idle
+/// window has elapsed with no completed step, passivate — close the
+/// door FIRST (front door refuses new pushes to the DLQ), drain what is
+/// already queued through the normal step path (bounded by inbox
+/// capacity), then exit gracefully with `StopReason::Passivated`.
+///
+/// Suspended during the shutdown sweep: the sweep owns termination.
+async fn maybe_passivate(ctx: &EsLoop) {
+    let (idle_for, last_work_ms) = {
+        let kernel = ctx.kernel.lock();
+        match kernel.passivation.get(&ctx.path) {
+            Some(p) => (p.idle_for, kernel.last_work_ms.get(&ctx.path).copied()),
+            None => return,
+        }
+    };
+    let now = ctx.clock.now().as_millis();
+    let Some(last) = last_work_ms else {
+        return;
+    };
+    if now.saturating_sub(last) < idle_for.as_millis() as u64 {
+        return;
+    }
+    // CLOSE THE DOOR first: pushes now refuse to the DLQ, but entries
+    // already inside stay processable (peek/ack still work on a closed
+    // inbox). Then drain: process what's queued — the ES step is sync,
+    // so this is bounded by capacity.
+    {
+        let mut inbox = ctx.cell.inbox.lock().await;
+        inbox.close();
+    }
+    loop {
+        let has_mail = {
+            let mut inbox = ctx.cell.inbox.lock().await;
+            inbox.peek().is_some()
+        };
+        if !has_mail {
+            break;
+        }
+        match step_es(ctx).await {
+            Step::Work => continue,
+            // A poison message mid-drain: leave the crash for supervision
+            // (which restarts; the next idle re-passivates — converges).
+            _ => break,
+        }
+    }
+    ctx.graceful_exit(crate::actor::StopReason::Passivated).await;
+}
+
 /// The service actor loop: pop → decode → dispatch (async, impure) →
 /// drop the message. No journal, no cursor — service actors are at-most-once
 /// by design (Phase 8 adds supervision around this loop).
@@ -1447,7 +1516,10 @@ pub(crate) async fn service_actor_loop(loop_ctx: ServiceLoop, mut shutdown: watc
             break;
         }
         match step_service(&loop_ctx).await {
-            Step::Work => continue,
+            Step::Work => {
+                stamp_work(&loop_ctx.es);
+                continue;
+            }
             Step::Idle => {}
             Step::Crashed => break,
             Step::Stop => {

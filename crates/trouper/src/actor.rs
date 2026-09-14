@@ -888,6 +888,11 @@ pub enum StopReason {
     Crashed,
     /// The restart budget was exhausted; escalated to the parent.
     Escalated,
+    /// Idled past its declared passivation window; the runtime stopped
+    /// it (a partition set re-spawns the entity on the next send).
+    Passivated,
+    /// Torn down by the graceful shutdown sweep.
+    Shutdown,
 }
 
 /// How often an event-sourced actor takes journal snapshots. Default: OFF.

@@ -170,6 +170,15 @@ impl<A: crate::actor::EventSourcedActor> SpawnBuilder<A> {
         self
     }
 
+    /// Declarative idle passivation: the runtime stops this actor after
+    /// `idle_for` without a completed message step (close-door-then-drain,
+    /// `Stopped { Passivated }` fact; a partition set re-spawns it on the
+    /// next send). See [`crate::system::Passivation`].
+    pub fn passivate_after(mut self, idle_for: std::time::Duration) -> Self {
+        self.opts.passivation = Some(crate::system::Passivation { idle_for });
+        self
+    }
+
     /// Starts the actor; returns its path.
     ///
     /// # Panics
@@ -299,6 +308,15 @@ impl<A: ServiceActor> ServiceBuilder<A> {
     /// Inbox depth at which a `Backpressured` fact fires.
     pub fn high_watermark(mut self, depth: u64) -> Self {
         self.opts.high_watermark = Some(depth);
+        self
+    }
+
+    /// Declarative idle passivation: the runtime stops this actor after
+    /// `idle_for` without a completed message step (close-door-then-drain,
+    /// `Stopped { Passivated }` fact; a partition set re-spawns it on the
+    /// next send). See [`crate::system::Passivation`].
+    pub fn passivate_after(mut self, idle_for: std::time::Duration) -> Self {
+        self.opts.passivation = Some(crate::system::Passivation { idle_for });
         self
     }
 

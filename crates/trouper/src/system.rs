@@ -31,6 +31,25 @@ use crate::schema::SchemaId;
 
 pub use crate::actor::SnapshotCadence;
 
+/// Declarative idle passivation: the runtime stops the actor after this
+/// long without a completed message step.
+///
+/// Semantics: the idle timer stamps on each COMPLETED step (peek →
+/// dispatch → ack) — a message merely enqueued does not reset it, so a
+/// wedged actor still passivates. When the timer fires, the actor closes
+/// its inbox door and DRAINS what is already queued before tearing down
+/// (a race-arrival is processed, not dead-lettered; the drain is bounded
+/// by inbox capacity). A `Stopped { Passivated }` fact is recorded. A
+/// partition set re-spawns the entity on the next send to the public
+/// path; an ES entity replays its journal (lossless). Service entities
+/// restart from genesis — they must tolerate that.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Passivation {
+    /// Maximum idle time (no completed message step) before the actor
+    /// is passivated.
+    pub idle_for: std::time::Duration,
+}
+
 /// Spawn-time options for an actor.
 #[derive(Debug, Clone)]
 pub struct SpawnOpts {
@@ -44,6 +63,8 @@ pub struct SpawnOpts {
     /// fires (once per crossing); `None` = never. Pool/partition specs use
     /// it to make sustained overload observable.
     pub high_watermark: Option<u64>,
+    /// Idle passivation config; `None` = the actor lives until stopped.
+    pub passivation: Option<Passivation>,
 }
 
 impl Default for SpawnOpts {
@@ -53,6 +74,7 @@ impl Default for SpawnOpts {
             mailbox_capacity: 64,
             mailbox_policy: OverloadPolicy::Block,
             high_watermark: None,
+            passivation: None,
         }
     }
 }
@@ -561,6 +583,7 @@ impl ActorSystemCore {
                 opts.mailbox_policy
             },
             high_watermark: opts.high_watermark,
+            passivation: opts.passivation,
         }
     }
 
@@ -687,6 +710,17 @@ impl ActorSystemCore {
             .insert(path.clone(), Arc::new(tokio::sync::Mutex::new(state)));
         kernel.entries.insert(path.clone(), entries);
         kernel.snapshot_policy.insert(path.clone(), opts.snapshot);
+        if let Some(passivation) = opts.passivation {
+            kernel
+                .passivation
+                .insert(path.clone(), passivation);
+        }
+        // The spawn itself starts the idle clock: an actor spawned and
+        // never messaged passivates from its birth stamp, not from the
+        // first message.
+        kernel
+            .last_work_ms
+            .insert(path.clone(), self.clock.now().as_millis());
         if let Some(wm) = opts.high_watermark {
             kernel.watermarks.insert(path.clone(), (wm, false));
         }
@@ -807,6 +841,12 @@ impl ActorSystemCore {
         kernel.cells.insert(path.clone(), cell.clone());
         kernel.genesis_args.insert(path.clone(), args.clone());
         kernel.msg_entries.insert(path.clone(), entries);
+        if let Some(passivation) = opts.passivation {
+            kernel.passivation.insert(path.clone(), passivation);
+        }
+        kernel
+            .last_work_ms
+            .insert(path.clone(), self.clock.now().as_millis());
         if let Some(wm) = opts.high_watermark {
             kernel.watermarks.insert(path.clone(), (wm, false));
         }
@@ -1284,6 +1324,10 @@ impl ActorSystemCore {
                 let _ = registry.remove_slot(path);
             }
             kernel.cells.remove(path);
+            // Passivation bookkeeping dies with the actor (a partition set
+            // re-spawn re-registers it via the factory's builder).
+            kernel.passivation.remove(path);
+            kernel.last_work_ms.remove(path);
             for log in kernel.topic_logs.values_mut() {
                 log.unsubscribe(path);
             }
@@ -1970,6 +2014,7 @@ mod tests {
                 mailbox_capacity: 1,
                 mailbox_policy: OverloadPolicy::DropNew,
                 high_watermark: None,
+                passivation: None,
             },
             || vec![Arc::new(TypedEsAdapter::<Counter, Add>::new::<Add>())],
         );
