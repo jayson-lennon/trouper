@@ -71,6 +71,15 @@ pub trait EventSourcedActor: Send + Sync + Serialize + DeserializeOwned + 'stati
         use error_stack::ResultExt;
         serde_json::from_value(snap).change_context(JournalError::Restore)
     }
+
+    /// Graceful-stop hook: runs ONCE after the final inbox drain, with
+    /// the fully folded state, on external stop, self-stop, passivation,
+    /// and the shutdown sweep. NEVER on crash (the instance is poisoned
+    /// mid-panic) or hard [`crate::system::ActorSystem::shutdown`].
+    ///
+    /// Sync and `&self` — the ES tier is pure; there is no context, no
+    /// I/O, no await. Observation only (export a summary, stamp a metric).
+    fn on_stop(&self) {}
 }
 
 /// Typed sugar over the erased dispatch table: a pure decision function for
@@ -106,6 +115,22 @@ pub trait ServiceActor: Send + 'static {
     ) -> impl Future<Output = Result<Self, error_stack::Report<crate::registry::RegistryError>>> + Send
     where
         Self: Sized;
+
+    /// Graceful-stop hook: runs ONCE after the final inbox drain, on
+    /// external stop, self-stop, passivation, and the shutdown sweep.
+    /// NEVER on crash (the instance is poisoned mid-panic) or hard
+    /// [`crate::system::ActorSystem::shutdown`].
+    ///
+    /// Async and `&mut self` — flush buffers, close connections, send
+    /// farewell messages via `ctx` if needed. Keep it bounded: the
+    /// shutdown sweep joins it under the sweep deadline.
+    fn on_stop(
+        &mut self,
+        ctx: &mut crate::context::MsgCtx<'_>,
+    ) -> impl Future<Output = ()> + Send {
+        let _ = ctx;
+        async {}
+    }
 }
 
 /// Typed sugar for service actors, mirroring [`CommandHandler`].
@@ -162,6 +187,10 @@ pub trait DynEsActor: Send {
         snapshot: Option<JsonValue>,
         tail: &[crate::envelope::Event],
     ) -> Result<Box<dyn DynEsActor>, error_stack::Report<JournalError>>;
+
+    /// The erased ES graceful-stop hook: forwards to
+    /// [`EventSourcedActor::on_stop`] over the final folded state.
+    fn on_stop_es(&self);
 }
 
 /// Concrete `DynEsActor` for a typed state `A`.
@@ -203,6 +232,10 @@ impl<A: EventSourcedActor> DynEsActor for TypedEsState<A> {
             fresh.apply(event);
         }
         Ok(Box::new(TypedEsState { state: fresh }))
+    }
+
+    fn on_stop_es(&self) {
+        self.state.on_stop();
     }
 }
 
@@ -346,6 +379,11 @@ impl DynEsActor for ForeignEsState {
         }
         Ok(Box::new(fresh))
     }
+
+    fn on_stop_es(&self) {
+        // The foreign tier has no typed on_stop surface (a JSON state has
+        // no methods); the fold closure family is pure by construction.
+    }
 }
 
 /// The foreign command entry: decodes nothing (JSON passes through) and
@@ -387,7 +425,13 @@ impl CommandEntry for ForeignCommandEntry {
 /// NOT journaled — restart constructs a fresh instance via
 /// [`ServiceActor::start`]. Dispatch runs through a [`MsgEntry`] adapter,
 /// which downcasts the shell and the decoded message by type.
-pub trait DynServiceActor: std::any::Any + Send {}
+pub trait DynServiceActor: std::any::Any + Send {
+    /// The erased graceful-stop hook: forwards to [`ServiceActor::on_stop`].
+    fn on_stop_erased<'a>(
+        &'a mut self,
+        ctx: &'a mut crate::context::MsgCtx<'_>,
+    ) -> std::pin::Pin<Box<dyn Future<Output = ()> + Send + 'a>>;
+}
 
 /// Concrete `DynServiceActor` for a typed service `A`.
 pub struct TypedServiceState<A: ServiceActor> {
@@ -402,7 +446,14 @@ impl<A: ServiceActor> TypedServiceState<A> {
     }
 }
 
-impl<A: ServiceActor> DynServiceActor for TypedServiceState<A> {}
+impl<A: ServiceActor> DynServiceActor for TypedServiceState<A> {
+    fn on_stop_erased<'a>(
+        &'a mut self,
+        ctx: &'a mut crate::context::MsgCtx<'_>,
+    ) -> std::pin::Pin<Box<dyn Future<Output = ()> + Send + 'a>> {
+        Box::pin(self.state.on_stop(ctx))
+    }
+}
 
 /// The object-safe async message dispatch routed by [`SchemaId`].
 pub trait MsgEntry: Send + Sync {

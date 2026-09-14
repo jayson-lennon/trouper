@@ -54,6 +54,11 @@ pub(crate) enum Intent {
     /// Subscribe the handling actor to a topic (performed post-ack, so a
     /// crash before ack never leaves a half-applied subscription).
     Subscribe { path: ActorPath, topic: Topic },
+    /// Terminate the handling actor gracefully after this message
+    /// commits (performed post-ack, so a crash before ack discards the
+    /// stop exactly like any other intent — the actor restarts and
+    /// continues). NEVER journaled: replay never synthesizes a stop.
+    StopSelf,
 }
 
 /// Effects recorded by a handler, flushed by the kernel after ack.
@@ -97,6 +102,13 @@ impl Outbox {
     /// Records a publish intent.
     pub fn push_publish(&mut self, topic: Topic, envelope: Envelope) {
         self.intents.push(Intent::Publish { topic, envelope });
+    }
+
+    /// Records the self-termination intent. Executed post-ack by the
+    /// kernel: intents recorded BEFORE it flush first (in-order), and a
+    /// crash before ack discards it entirely.
+    pub fn push_stop_self(&mut self) {
+        self.intents.push(Intent::StopSelf);
     }
 
     /// Takes every intent, leaving the outbox empty (the flush).
@@ -168,6 +180,11 @@ impl CtxCore<'_> {
     pub fn publish<M: Message>(&mut self, topic: Topic, msg: &M) {
         let payload = serde_json::to_value(msg).expect("schema payload serializes");
         self.publish_json(topic, M::schema_id(), payload);
+    }
+
+    /// Records the self-termination intent (shared by both ctx tiers).
+    pub fn stop_self(&mut self) {
+        self.outbox.push_stop_self();
     }
 
     /// Records a reply to the message's `reply_to`, if the sender asked
@@ -254,6 +271,16 @@ pub struct CmdCtx<'a> {
 }
 
 impl<'a> CmdCtx<'a> {
+    /// Terminate this actor gracefully: records the intent and returns
+    /// immediately — no await semantics, never blocks. The stop executes
+    /// after this message commits (and after any intents recorded before
+    /// it); a crash before the commit discards it. Code after the call in
+    /// the handler still runs; call it last (or `return` after) to make
+    /// "stop now" unambiguous.
+    pub fn stop_self(&mut self) {
+        self.core.stop_self();
+    }
+
     /// Assembles the context for one command dispatch.
     pub(crate) fn new(
         self_path: &'a ActorPath,
@@ -437,6 +464,16 @@ pub struct MsgCtx<'a> {
 }
 
 impl<'a> MsgCtx<'a> {
+    /// Terminate this actor gracefully: records the intent and returns
+    /// immediately — no await semantics, never blocks. The stop executes
+    /// after this message commits (and after any intents recorded before
+    /// it); a crash before the commit discards it. Code after the call in
+    /// the handler still runs; call it last (or `return` after) to make
+    /// "stop now" unambiguous.
+    pub fn stop_self(&mut self) {
+        self.core.stop_self();
+    }
+
     /// Assembles the context for one message dispatch.
     pub(crate) fn new(
         self_path: &'a ActorPath,
@@ -723,7 +760,7 @@ mod tests {
             }
             Intent::Publish { .. } => panic!("expected a send"),
             Intent::Reply { .. } => panic!("expected a send"),
-            Intent::Subscribe { .. } => panic!("expected a send"),
+            Intent::Subscribe { .. } | Intent::StopSelf => panic!("expected a send"),
         }
     }
 
@@ -749,7 +786,7 @@ mod tests {
             Intent::Reply { to, .. } => {
                 assert_eq!(*to, Address::Path(ActorPath::new("client")));
             }
-            Intent::Subscribe { .. } => panic!("expected a reply intent"),
+            Intent::Subscribe { .. } | Intent::StopSelf => panic!("expected a reply intent"),
         }
 
         // When a context without reply-to replies.

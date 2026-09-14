@@ -212,6 +212,11 @@ pub(crate) struct ActorCell {
     /// Wakes the actor loop when work arrives (latency optimization; the
     /// loop's poll backstop is the correctness guarantee).
     pub(crate) work: Arc<Notify>,
+    /// Whether the actor's `on_stop` hook has run. Claimed by whichever
+    /// caller reaches the graceful exit FIRST (the loop's self-stop/
+    /// passivation exit, or the external stop after joining the task) —
+    /// the hook runs exactly once per actor lifetime, never twice.
+    pub(crate) on_stop_done: std::sync::atomic::AtomicBool,
 }
 
 impl ActorCell {
@@ -222,7 +227,15 @@ impl ActorCell {
             inbox: tokio::sync::Mutex::new(inbox),
             handle: tokio::sync::Mutex::new(None),
             work: Arc::new(Notify::new()),
+            on_stop_done: std::sync::atomic::AtomicBool::new(false),
         }
+    }
+
+    /// Claims the right to run `on_stop`: `true` = this caller runs the
+    /// hook; `false` = someone else already ran it.
+    pub(crate) fn claim_on_stop(&self) -> bool {
+        self.on_stop_done
+            .swap(true, std::sync::atomic::Ordering::SeqCst)
     }
 }
 
@@ -678,6 +691,12 @@ pub(crate) async fn es_actor_loop(loop_ctx: EsLoop, mut shutdown: watch::Receive
                 maybe_snapshot_on_idle(&loop_ctx).await;
             }
             Step::Crashed => break, // supervisor (Phase 8) takes over
+            Step::Stop => {
+                // Self-termination: the loop owns its graceful exit (hook
+                // + tables); no task joins itself, so this cannot deadlock.
+                loop_ctx.graceful_exit(crate::actor::StopReason::Normal).await;
+                break;
+            }
         }
         let notified = loop_ctx.cell.work.notified();
         tokio::select! {
@@ -697,6 +716,9 @@ enum Step {
     Idle,
     /// The handler panicked; the loop must stop (state is poisoned).
     Crashed,
+    /// The handler recorded `stop_self` and the message committed; the
+    /// loop must exit through the GRACEFUL path (on_stop + teardown).
+    Stop,
 }
 
 /// THE ATOMIC STEP — spec order, no deviations:
@@ -887,8 +909,10 @@ async fn step_es(ctx: &EsLoop) -> Step {
         }
     }
 
-    // 8. OUTBOX FLUSH (deferred sends/replies, causality-linked).
-    flush_outbox(ctx, outbox).await;
+    // 8. OUTBOX FLUSH (deferred sends/replies, causality-linked). A
+    // StopSelf intent concludes the step with Step::Stop — sends recorded
+    // before it have already flushed (in-order).
+    let stop_self = flush_outbox(ctx, outbox).await;
 
     // 9. EMIT FAN-OUT (events onto the manifest's emit topics; topics land
     // in Phase 6 — the named step exists so the order never changes).
@@ -899,7 +923,11 @@ async fn step_es(ctx: &EsLoop) -> Step {
 
     // 11. FACTS PUMP (recorded facts reach live observers).
     pump_facts(&ctx.kernel, &ctx.registry).await;
-    Step::Work
+    if stop_self {
+        Step::Stop
+    } else {
+        Step::Work
+    }
 }
 
 impl EsLoop {
@@ -912,10 +940,78 @@ impl EsLoop {
             .cloned()
             .expect("es state present for a running loop")
     }
+
+    /// The loop's own graceful exit: run the actor's `on_stop` hook (the
+    /// instance is still alive here — NOT a crash), then hand the table
+    /// teardown to the system facade. The system race is safe: the
+    /// teardown is idempotent (see `ActorSystemCore::teardown_tables`).
+    ///
+    /// The external `stop()` path never calls this — it joins the loop
+    /// task instead. Calling it from inside the loop is exactly what makes
+    /// self-stop and passivation deadlock-free: no task joins itself.
+    pub(crate) async fn graceful_exit(&self, reason: crate::actor::StopReason) {
+        if self.cell.claim_on_stop() {
+            run_on_stop(self).await;
+        }
+        let system = crate::system::ActorSystemCore::loop_facade(self);
+        system.teardown_tables(&self.path, reason).await;
+    }
+}
+
+/// Runs the actor's `on_stop` hook, if its tier has a live instance.
+///
+/// Service actors: async hook with a real `MsgCtx` (sends/publishes
+/// recorded there are flushed after the hook returns). ES actors: sync
+/// hook over the final folded state. A poisoned (crashed) instance never
+/// reaches this — the loop breaks before the graceful path, and the
+/// external stop path only hooks when the instance survives.
+pub(crate) async fn run_on_stop(ctx: &EsLoop) {
+    // Service tier first: the live instance is behind its own mutex, the
+    // hook gets a MsgCtx over a throwaway outbox flushed on completion.
+    let service = {
+        let kernel = ctx.kernel.lock();
+        kernel.services.get(&ctx.path).cloned()
+    };
+    if let Some(service) = service {
+        let ask_port = KernelAskPort {
+            registry: ctx.registry.clone(),
+            kernel: ctx.kernel.clone(),
+            clock: ctx.clock.clone(),
+        };
+        let mut outbox = Outbox::new();
+        let trace = crate::envelope::TraceCtx::root();
+        {
+            let mut svc = service.lock().await;
+            let mut msg_ctx = crate::context::MsgCtx::new(
+                &ctx.path,
+                &trace,
+                None,
+                ctx.view.as_ref(),
+                &mut outbox,
+                Some(&ask_port),
+            );
+            svc.on_stop_erased(&mut msg_ctx).await;
+        }
+        let _ = flush_outbox(ctx, outbox).await;
+        return;
+    }
+    // ES tier: sync hook over the folded state.
+    let state = {
+        let kernel = ctx.kernel.lock();
+        kernel.es_state.get(&ctx.path).cloned()
+    };
+    if let Some(state) = state {
+        let state = state.lock().await;
+        state.on_stop_es();
+    }
 }
 
 /// Flushes the outbox: sends route through the registry; failures dead-letter.
-async fn flush_outbox(ctx: &EsLoop, mut outbox: Outbox) {
+///
+/// Returns `true` when the outbox carried `StopSelf` (the caller's step
+/// must conclude with `Step::Stop` so the loop exits gracefully).
+async fn flush_outbox(ctx: &EsLoop, mut outbox: Outbox) -> bool {
+    let mut stop_self = false;
     for intent in outbox.drain() {
         match intent {
             crate::context::Intent::Send(envelope) => {
@@ -942,8 +1038,10 @@ async fn flush_outbox(ctx: &EsLoop, mut outbox: Outbox) {
             crate::context::Intent::Subscribe { path, topic } => {
                 apply_subscribe(&ctx.kernel, &ctx.registry, &path, &topic);
             }
+            crate::context::Intent::StopSelf => stop_self = true,
         }
     }
+    stop_self
 }
 
 /// Performs one deferred subscription: the actor joins its topic at the
@@ -1352,6 +1450,12 @@ pub(crate) async fn service_actor_loop(loop_ctx: ServiceLoop, mut shutdown: watc
             Step::Work => continue,
             Step::Idle => {}
             Step::Crashed => break,
+            Step::Stop => {
+                // Self-termination: the loop owns its graceful exit (hook
+                // + tables); no task joins itself, so this cannot deadlock.
+                loop_ctx.es.graceful_exit(crate::actor::StopReason::Normal).await;
+                break;
+            }
         }
         let notified = loop_ctx.es.cell.work.notified();
         tokio::select! {
@@ -1491,12 +1595,18 @@ async fn step_service(ctx: &ServiceLoop) -> Step {
         outbox_rx.await.unwrap_or_default()
     };
 
-    // 6. FLUSH deferred effects from the handler.
-    flush_outbox(&ctx.es, outbox).await;
+    // 6. FLUSH deferred effects from the handler. A StopSelf intent
+    // concludes the step with Step::Stop — sends recorded before it have
+    // already flushed (in-order).
+    let stop_self = flush_outbox(&ctx.es, outbox).await;
 
     // 7. FACTS PUMP (recorded facts reach live observers).
     pump_facts(&ctx.es.kernel, &ctx.es.registry).await;
-    Step::Work
+    if stop_self {
+        Step::Stop
+    } else {
+        Step::Work
+    }
 }
 
 /// Restarts a crashed ES actor (spec algorithm):

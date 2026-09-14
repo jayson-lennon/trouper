@@ -140,6 +140,11 @@ pub struct ActorSystemCore {
     child_shutdowns: parking_lot::Mutex<Vec<tokio::sync::watch::Sender<bool>>>,
     /// System-wide mailbox defaults (per-spawn opts override).
     pub(crate) mailbox_defaults: MailboxDefaults,
+    /// Set by the graceful shutdown sweep: new routes dead-letter with
+    /// `ShuttingDown`, partition activation is disabled, supervision
+    /// engines suspend, and passivation stands down (the sweep owns
+    /// termination).
+    pub(crate) shutting_down: std::sync::atomic::AtomicBool,
 }
 
 /// A handle onto one shared actor fabric: the single surface for
@@ -487,6 +492,24 @@ impl ActorSystemCore {
             view,
             child_shutdowns: parking_lot::Mutex::new(Vec::new()),
             mailbox_defaults: config.default_mailbox,
+            shutting_down: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+
+    /// Reassembles a minimal facade handle from a loop context's shared
+    /// Arcs, so the loop's graceful exit can drive the system-owned table
+    /// teardown without a full `ActorSystem` (the clock/view aliases are
+    /// the same Arcs the spawn captured). A loop facade never owns
+    /// supervision shutdown senders and never reports `shutting_down`.
+    pub(crate) fn loop_facade(ctx: &crate::kernel::EsLoop) -> Self {
+        Self {
+            registry: ctx.registry.clone(),
+            kernel: ctx.kernel.clone(),
+            clock: ctx.clock.clone(),
+            view: ctx.view.clone(),
+            child_shutdowns: parking_lot::Mutex::new(Vec::new()),
+            mailbox_defaults: MailboxDefaults::default(),
+            shutting_down: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -1080,8 +1103,10 @@ impl ActorSystemCore {
     /// from the spec's shared factory.
     ///
     /// Senders keep addressing the public path forever; entity paths and
-    /// journals are per key. Entities live until stopped — passivation is
-    /// a declared anti-goal.
+    /// journals are per key. Entities live until stopped — by an explicit
+    /// `stop`, their own `stop_self`, or the passivation config the
+    /// factory's builder declares — and re-activate from the factory on
+    /// the next send to the public path.
     ///
     /// # Errors
     ///
@@ -1142,44 +1167,80 @@ impl ActorSystemCore {
         }
 
         // 2. DRAIN SIGNAL: stop accepting + let the current message finish.
-        // An edge-only path (no cell — e.g. a supervised spec whose actor
-        // never started) still cascades below.
-        let join_task = {
+        // `join_slot` stays None when there is nothing to signal (no cell,
+        // or the loop already exited — e.g. a supervised spec whose actor
+        // never started, or a loop-side self-stop that beat us here).
+        let mut join_slot: Option<tokio::task::JoinHandle<()>> = None;
+        let no_cell = {
             let kernel = self.kernel.lock();
-            let Some(cell) = kernel.cells.get(path) else {
-                // No running instance: drop the spec edge, record the
-                // stop, and finish.
-                drop(kernel);
-                let mut kernel = self.kernel.lock();
-                kernel.specs.remove(path);
-                kernel.record_fact(
-                    self.clock.now(),
-                    crate::tap::FactKind::Stopped {
-                        path: path.clone(),
-                        reason: crate::actor::StopReason::Normal,
-                    },
-                );
-                return;
-            };
-            if let Ok(mut handle) = cell.handle.try_lock() {
-                match handle.take() {
-                    Some(h) => {
-                        let _ = h.shutdown.send(true);
-                        h.task
+            match kernel.cells.get(path) {
+                None => true,
+                Some(cell) => {
+                    if let Ok(mut handle) = cell.handle.try_lock() {
+                        if let Some(h) = handle.take() {
+                            let _ = h.shutdown.send(true);
+                            join_slot = h.task;
+                        }
                     }
-                    None => None,
+                    false
                 }
-            } else {
-                None
             }
         };
+        if no_cell {
+            self.teardown_tables(path, crate::actor::StopReason::Normal).await;
+            return;
+        }
         // 3. AWAIT the loop's exit (current message completes). The loop
         // drains/flushes on stop.
-        if let Some(task) = join_task {
+        if let Some(task) = join_slot.take() {
             let _ = tokio::time::timeout(remaining, task).await;
         }
 
-        // 4. UNDELIVERED → DLQ; then close the inbox.
+        // 4.5 ON_STOP: a graceful stop runs the hook exactly once — unless
+        // the loop already ran it (a self-stop/passivation claimed first).
+        {
+            let cell = {
+                let kernel = self.kernel.lock();
+                kernel.cells.get(path).cloned()
+            };
+            if let Some(cell) = cell
+                && cell.claim_on_stop()
+            {
+                let ctx = crate::kernel::EsLoop {
+                    path: path.clone(),
+                    cell,
+                    registry: self.registry.clone(),
+                    kernel: self.kernel.clone(),
+                    view: self.view.clone(),
+                    clock: self.clock.clone(),
+                };
+                crate::kernel::run_on_stop(&ctx).await;
+            }
+        }
+
+        // 5. UNDELIVERED → DLQ; slot/spec/subscription removal; facts.
+        self.teardown_tables(path, crate::actor::StopReason::Normal).await;
+    }
+
+    /// The table teardown shared by every stop path: the external stop
+    /// above, the loop's own self-stop/passivation exit, and the shutdown
+    /// sweep.
+    ///
+    /// Idempotent: `was_live` is captured BEFORE any mutation — a live
+    /// actor has a cell, an edge-only supervised spec has a spec; a path
+    /// with neither was already fully torn down (the loop-side exit beat
+    /// us, or this is a repeat stop) and re-recording a Stopped fact would
+    /// lie.
+    ///
+    /// Steps: undelivered inbox → DLQ (the cell is about to drop, so
+    /// anything queued would otherwise vanish silently), then slot drop +
+    /// subscription cascade + Stopped fact + parent link notification.
+    pub(crate) async fn teardown_tables(&self, path: &ActorPath, reason: crate::actor::StopReason) {
+        let was_live = {
+            let kernel = self.kernel.lock();
+            kernel.cells.contains_key(path) || kernel.specs.contains_key(path)
+        };
+        // UNDELIVERED → DLQ; then close the inbox.
         let undelivered: Vec<Envelope> = {
             let kernel = self.kernel.lock();
             let mut drained = Vec::new();
@@ -1214,39 +1275,41 @@ impl ActorSystemCore {
             for envelope in undelivered {
                 log.append(envelope);
             }
-        }
 
-        // 5. SLOT DROP + subscription cascade + Stopped fact + parent
-        // link notification (a supervised child stopping notifies its
-        // parent as a tap fact).
-        {
-            let mut registry = self.registry.lock();
-            let _ = registry.remove_slot(path);
-        }
-        {
-            let mut kernel = self.kernel.lock();
+            // SLOT DROP + subscription cascade + Stopped fact + parent
+            // link notification (a supervised child stopping notifies its
+            // parent as a tap fact).
+            {
+                let mut registry = self.registry.lock();
+                let _ = registry.remove_slot(path);
+            }
             kernel.cells.remove(path);
             for log in kernel.topic_logs.values_mut() {
                 log.unsubscribe(path);
             }
             let notified_parent = kernel.specs.get(path).and_then(|s| s.parent.clone());
             kernel.specs.remove(path);
-            kernel.record_fact(
-                self.clock.now(),
-                crate::tap::FactKind::Stopped {
-                    path: path.clone(),
-                    reason: crate::actor::StopReason::Normal,
-                },
-            );
-            if let Some(parent) = notified_parent {
+            if was_live {
                 kernel.record_fact(
                     self.clock.now(),
-                    crate::tap::FactKind::LinkNotified {
-                        parent,
-                        child: path.clone(),
+                    crate::tap::FactKind::Stopped {
+                        path: path.clone(),
+                        reason,
                     },
                 );
+                if let Some(parent) = notified_parent {
+                    kernel.record_fact(
+                        self.clock.now(),
+                        crate::tap::FactKind::LinkNotified {
+                            parent,
+                            child: path.clone(),
+                        },
+                    );
+                }
             }
+        }
+        if !was_live {
+            return;
         }
         // Facts recorded by the stop path (StoppedWithMail DLs, Stopped,
         // LinkNotified) reach live topic subscribers like any other fact.
