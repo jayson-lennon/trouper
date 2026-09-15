@@ -167,6 +167,10 @@ pub struct ActorSystemCore {
     /// engines suspend, and passivation stands down (the sweep owns
     /// termination).
     pub(crate) shutting_down: std::sync::atomic::AtomicBool,
+    /// The journal store every ES actor's journal lives in (in-memory by
+    /// default; swapped per system at construction).
+    pub(crate) journal_store_slot:
+        parking_lot::RwLock<std::sync::Arc<dyn crate::journal::JournalStore>>,
 }
 
 /// A handle onto one shared actor fabric: the single surface for
@@ -225,6 +229,82 @@ impl ActorSystem {
         for tx in senders {
             let _ = tx.send(true);
         }
+    }
+
+    /// The graceful shutdown sweep: a barrier (no new sends — every
+    /// delivery dead-letters with `ShuttingDown`; partition activation is
+    /// disabled; supervision engines suspend; passivation stands down),
+    /// then a deadline-bounded PARALLEL drain of every live actor (each
+    /// loop task closes its door, finishes queued mail, runs its
+    /// `on_stop` hook, and tears down its tables), then one store flush
+    /// (backends persist buffered journals here), then supervision
+    /// shutdown. Hard-capped by `deadline`: stragglers are joined with
+    /// whatever budget remains; expiry drops them (hard-stop semantics
+    /// for the remainder).
+    ///
+    /// This is the in-process grace layer: in-flight work completes,
+    /// external side effects flush through `on_stop`, undelivered mail
+    /// lands in the DLQ observably. In-memory journals die with the
+    /// process — cross-process durability is a store backend's concern.
+    pub async fn shutdown_graceful(&self, deadline: std::time::Duration) {
+        use std::sync::atomic::Ordering;
+        // 1. BARRIER: refuse new work; suspend engines/passivation.
+        self.shutting_down.store(true, Ordering::SeqCst);
+        self.kernel
+            .lock()
+            .shutting_down
+            .store(true, Ordering::SeqCst);
+        self.shutdown();
+
+        // 2. PARALLEL DRAIN under ONE shared deadline: every live cell's
+        // loop exits (watch trip → drain → on_stop → teardown) while we
+        // join the tasks. The watch signal is the door-close for loops
+        // that are mid-idle; the teardown idempotence lets whichever side
+        // arrives first win.
+        let handles: Vec<(ActorPath, tokio::task::JoinHandle<()>)> = {
+            let kernel = self.kernel.lock();
+            kernel
+                .cells
+                .iter()
+                .filter_map(|(path, cell)| {
+                    let mut guard = cell.handle.try_lock().ok()?;
+                    let h = guard.take()?;
+                    let _ = h.shutdown.send(true);
+                    Some((path.clone(), h.task?))
+                })
+                .collect()
+        };
+        let mut per_path: Vec<ActorPath> = Vec::new();
+        {
+            let mut shared = deadline;
+            let mut handles = handles;
+            // One shared budget, spent as each task is joined (bounded
+            // total wait; stragglers after expiry get hard-stopped below).
+            for (path, task) in handles.drain(..) {
+                if shared.is_zero() {
+                    per_path.push(path);
+                    continue;
+                }
+                let started = std::time::Instant::now();
+                let _ = tokio::time::timeout(shared, task).await;
+                shared = shared.saturating_sub(started.elapsed());
+                per_path.push(path);
+            }
+        }
+
+        // 3. Tables for anything the loops didn't finish (deadline expiry
+        // or an idle-loop that never woke): idempotent — skips the dead.
+        for path in &per_path {
+            self.teardown_tables(path, crate::actor::StopReason::Shutdown)
+                .await;
+        }
+
+        // 4. STORE FLUSH (once per sweep, after every journal is final).
+        let store = self.journal_store_slot.read().clone();
+        let _ = store.flush().await;
+
+        // 5. Engines were told at step 1; drop our senders.
+        let _ = self.child_shutdowns.lock().drain(..);
     }
 
     /// Spawns a supervised child: registers its spec (policy, budget,
@@ -505,16 +585,21 @@ impl ActorSystemCore {
         let view = Arc::new(NullView {
             registry: registry.clone(),
         });
+        // ONE store instance per system: the core keeps a handle for the
+        // sweep's flush; the kernel reads/writes through the same Arc.
+        let journal_store: std::sync::Arc<dyn crate::journal::JournalStore> =
+            std::sync::Arc::new(crate::journal::InMemoryJournalStore::new());
+        let mut kernel = KernelState::with_tap_capacity(config.tap_capacity);
+        kernel.journal_store = journal_store.clone();
         Self {
             registry,
-            kernel: Arc::new(Mutex::new(KernelState::with_tap_capacity(
-                config.tap_capacity,
-            ))),
+            kernel: Arc::new(Mutex::new(kernel)),
             clock: config.clock,
             view,
             child_shutdowns: parking_lot::Mutex::new(Vec::new()),
             mailbox_defaults: config.default_mailbox,
             shutting_down: std::sync::atomic::AtomicBool::new(false),
+            journal_store_slot: parking_lot::RwLock::new(journal_store),
         }
     }
 
@@ -524,6 +609,7 @@ impl ActorSystemCore {
     /// the same Arcs the spawn captured). A loop facade never owns
     /// supervision shutdown senders and never reports `shutting_down`.
     pub(crate) fn loop_facade(ctx: &crate::kernel::EsLoop) -> Self {
+        let store = ctx.kernel.lock().journal_store.clone();
         Self {
             registry: ctx.registry.clone(),
             kernel: ctx.kernel.clone(),
@@ -532,6 +618,7 @@ impl ActorSystemCore {
             child_shutdowns: parking_lot::Mutex::new(Vec::new()),
             mailbox_defaults: MailboxDefaults::default(),
             shutting_down: std::sync::atomic::AtomicBool::new(false),
+            journal_store_slot: parking_lot::RwLock::new(store),
         }
     }
 
@@ -700,20 +787,19 @@ impl ActorSystemCore {
             Inbox::new(opts.mailbox_capacity.max(1), opts.mailbox_policy),
         ));
         kernel.cells.insert(path.clone(), cell.clone());
+        // The time-cadence anchor is kernel-side policy bookkeeping (the
+        // spawn anchors it; the first snapshot becomes due one full
+        // interval after the journal began).
         kernel
-            .journals
-            .entry(path.clone())
-            .or_default()
-            .anchor_time_cadence(self.clock.now().as_millis());
+            .snapshot_cadence_ms
+            .insert(path.clone(), Some(self.clock.now().as_millis()));
         kernel
             .es_state
             .insert(path.clone(), Arc::new(tokio::sync::Mutex::new(state)));
         kernel.entries.insert(path.clone(), entries);
         kernel.snapshot_policy.insert(path.clone(), opts.snapshot);
         if let Some(passivation) = opts.passivation {
-            kernel
-                .passivation
-                .insert(path.clone(), passivation);
+            kernel.passivation.insert(path.clone(), passivation);
         }
         // The spawn itself starts the idle clock: an actor spawned and
         // never messaged passivates from its birth stamp, not from the
@@ -744,14 +830,14 @@ impl ActorSystemCore {
             clock: self.clock.clone(),
         };
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
-        loop_ctx.start(rx, shutdown_rx);
+        let task = loop_ctx.start_tracked(rx, shutdown_rx);
         let kernel = self.kernel.lock();
         if let Some(cell) = kernel.cells.get(&path)
             && let Ok(mut handle) = cell.handle.try_lock()
         {
             *handle = Some(crate::kernel::ActorHandle {
                 shutdown: shutdown_tx,
-                task: None,
+                task: Some(task),
             });
         }
     }
@@ -894,13 +980,20 @@ impl ActorSystemCore {
                 }
             }
             let _ = (&view, &registry);
-            let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+            let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
             tokio::spawn(crate::kernel::front_door_loop(front_cell, front_kernel, rx));
-            crate::kernel::service_actor_loop(
+            let task = tokio::spawn(crate::kernel::service_actor_loop(
                 crate::kernel::ServiceLoop { es: loop_ctx },
                 shutdown_rx,
-            )
-            .await;
+            ));
+            if let Some(cell) = kernel_table.lock().cells.get(&started_path)
+                && let Ok(mut handle) = cell.handle.try_lock()
+            {
+                *handle = Some(crate::kernel::ActorHandle {
+                    shutdown: shutdown_tx,
+                    task: Some(task),
+                });
+            }
         });
     }
 
@@ -1206,6 +1299,21 @@ impl ActorSystemCore {
             }
         }
 
+        // 1.5 SERVICE START SETTLE: a service actor's `start` runs inside
+        // its task; stopping before it completes would skip on_stop for an
+        // actor that never got the chance to live. Bounded wait for the
+        // instance (or a crash) to appear.
+        for _ in 0..500 {
+            let settled = {
+                let kernel = self.kernel.lock();
+                kernel.services.contains_key(path) || kernel.crashed.contains(path)
+            };
+            if settled {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+        }
+
         // 2. DRAIN SIGNAL: stop accepting + let the current message finish.
         // `join_slot` stays None when there is nothing to signal (no cell,
         // or the loop already exited — e.g. a supervised spec whose actor
@@ -1216,50 +1324,58 @@ impl ActorSystemCore {
             match kernel.cells.get(path) {
                 None => true,
                 Some(cell) => {
-                    if let Ok(mut handle) = cell.handle.try_lock() {
-                        if let Some(h) = handle.take() {
-                            let _ = h.shutdown.send(true);
-                            join_slot = h.task;
-                        }
+                    if let Ok(mut handle) = cell.handle.try_lock()
+                        && let Some(h) = handle.take()
+                    {
+                        let _ = h.shutdown.send(true);
+                        join_slot = h.task;
                     }
                     false
                 }
             }
         };
         if no_cell {
-            self.teardown_tables(path, crate::actor::StopReason::Normal).await;
+            self.teardown_tables(path, crate::actor::StopReason::Normal)
+                .await;
             return;
         }
         // 3. AWAIT the loop's exit (current message completes). The loop
-        // drains/flushes on stop.
-        if let Some(task) = join_slot.take() {
-            let _ = tokio::time::timeout(remaining, task).await;
-        }
-
-        // 4.5 ON_STOP: a graceful stop runs the hook exactly once — unless
-        // the loop already ran it (a self-stop/passivation claimed first).
-        {
-            let cell = {
-                let kernel = self.kernel.lock();
-                kernel.cells.get(path).cloned()
-            };
-            if let Some(cell) = cell
-                && cell.claim_on_stop()
-            {
-                let ctx = crate::kernel::EsLoop {
-                    path: path.clone(),
-                    cell,
-                    registry: self.registry.clone(),
-                    kernel: self.kernel.clone(),
-                    view: self.view.clone(),
-                    clock: self.clock.clone(),
+        // drains/flushes on stop, and its graceful exit claims + runs the
+        // on_stop hook itself.
+        if let Some(jh) = join_slot.take() {
+            let joined = tokio::time::timeout(remaining, jh).await;
+            // 3.5 HOOK ONLY IF THE LOOP FINISHED: when the join times out,
+            // the loop is wedged inside a handler that may hold the
+            // instance mutex — running on_stop there would block forever
+            // on `service.lock()`. A wedged actor does not get a hook
+            // (it never reached a graceful idle); teardown still proceeds.
+            if joined.is_ok() {
+                let on_stop_cell = {
+                    let kernel = self.kernel.lock();
+                    kernel.cells.get(path).cloned()
                 };
-                crate::kernel::run_on_stop(&ctx).await;
+                if let Some(cell) = on_stop_cell
+                    && cell.claim_on_stop()
+                {
+                    let ctx = crate::kernel::EsLoop {
+                        path: path.clone(),
+                        cell,
+                        registry: self.registry.clone(),
+                        kernel: self.kernel.clone(),
+                        view: self.view.clone(),
+                        clock: self.clock.clone(),
+                    };
+                    crate::kernel::run_on_stop(&ctx).await;
+                }
             }
         }
+        // No join slot: the loop already exited on its own (self-stop /
+        // passivation claimed the hook through their graceful exit) or
+        // never started — nothing to hook here.
 
         // 5. UNDELIVERED → DLQ; slot/spec/subscription removal; facts.
-        self.teardown_tables(path, crate::actor::StopReason::Normal).await;
+        self.teardown_tables(path, crate::actor::StopReason::Normal)
+            .await;
     }
 
     /// The table teardown shared by every stop path: the external stop
@@ -1576,13 +1692,15 @@ impl ActorSystemCore {
 
     /// The event schemas currently journaled for `path`, in order
     /// (inspection: snapshots are skipped — they are not decisions).
+    ///
+    /// Sync inspection of the in-memory default store; a custom backend
+    /// store exposes its own async inspection path instead.
     pub fn journal_schemas(&self, path: &ActorPath) -> Vec<SchemaId> {
         let kernel = self.kernel.lock();
-        kernel
-            .journals
-            .get(path)
-            .map(|j| {
-                j.entries()
+        let store: &std::sync::Arc<dyn crate::journal::JournalStore> = &kernel.journal_store;
+        crate::journal::downcast_in_memory(store)
+            .map(|mem| {
+                mem.entries_of(path)
                     .iter()
                     .filter_map(|e| e.as_event().map(|ev| ev.schema.clone()))
                     .collect()
@@ -1649,13 +1767,40 @@ mod tests {
                 .unwrap_or(false)
         }
 
+        /// The in-memory journal entries for `path` (tests: inspection of
+        /// the default store).
+        pub fn journal_entries(&self, path: &ActorPath) -> Vec<crate::journal::JournalEntry> {
+            let kernel = self.kernel.lock();
+            let store: &std::sync::Arc<dyn crate::journal::JournalStore> = &kernel.journal_store;
+            crate::journal::downcast_in_memory(store)
+                .map(|mem| mem.entries_of(path))
+                .unwrap_or_default()
+        }
+
         /// The number of journalled entries for `path` (tests).
         pub fn journal_len(&self, path: &ActorPath) -> usize {
-            let kernel = self.kernel.lock();
-            kernel.journals.get(path).map(|j| j.len()).unwrap_or(0)
+            self.journal_entries(path)
+                .iter()
+                .filter(|e| e.as_event().is_some())
+                .count()
+                + self
+                    .journal_entries(path)
+                    .iter()
+                    .filter(|e| matches!(e, crate::journal::JournalEntry::Snapshot { .. }))
+                    .count()
         }
 
         /// Dead-letter schemas collected so far (tests).
+        /// The number of envelopes currently queued in `path`'s inbox (tests).
+        pub fn inbox_depth(&self, path: &ActorPath) -> usize {
+            let kernel = self.kernel.lock();
+            kernel
+                .cells
+                .get(path)
+                .map(|c| c.inbox.try_lock().map(|i| i.len()).unwrap_or(0))
+                .unwrap_or(0)
+        }
+
         pub fn dead_letter_schemas(&self) -> Vec<SchemaId> {
             let kernel = self.kernel.lock();
             kernel
@@ -1825,11 +1970,9 @@ mod tests {
         // inbox cursor advanced past the message (committed exactly once).
         let state = system.es_state(&path).await.expect("live");
         assert_eq!(state["total"], 5);
-        let kernel = system.kernel.lock();
-        let journal = &kernel.journals[&path];
-        assert_eq!(journal.len(), 1);
-        assert_eq!(journal.next_seq().as_u64(), 1);
-        assert!(kernel.crashed.is_empty());
+        let entries = system.journal_entries(&path);
+        assert_eq!(entries.len(), 1);
+        assert!(system.kernel.lock().crashed.is_empty());
     }
 
     #[tokio::test]
@@ -1850,10 +1993,10 @@ mod tests {
 
         // Then it is dead-lettered, nothing is journalled, nothing applied.
         {
+            assert!(system.journal_entries(&path).is_empty());
             let kernel = system.kernel.lock();
             assert_eq!(kernel.dead_letters.len(), 1);
             assert_eq!(kernel.dead_letters[0].schema, Boom::schema_id());
-            assert_eq!(kernel.journals[&path].len(), 0);
         }
         let state = system.es_state(&path).await.expect("live");
         assert_eq!(state["total"], 0);
@@ -2119,9 +2262,9 @@ mod tests {
         // Then NOTHING was appended, NOTHING acked, and the crash was
         // recorded: the message stays queued for redelivery after restart.
         {
+            assert!(system.journal_entries(&path).is_empty());
             let kernel = system.kernel.lock();
             assert!(kernel.crashed.contains(&path));
-            assert_eq!(kernel.journals.get(&path).map(|j| j.len()), Some(0));
             assert!(kernel.dead_letters.is_empty());
         }
         assert_eq!(system.inbox_cursor(&path).map(|c| c.as_u64()), Some(0));
@@ -2162,9 +2305,15 @@ mod tests {
         // events, no double-apply), the pre-crash Add stayed committed, and
         // state equals the journal fold.
         {
-            let kernel = system.kernel.lock();
-            assert_eq!(kernel.journals[&path].len(), 1, "no duplicate events");
-            assert!(kernel.dead_letters.is_empty(), "panic never dead-letters");
+            assert_eq!(
+                system.journal_entries(&path).len(),
+                1,
+                "no duplicate events"
+            );
+            assert!(
+                system.kernel.lock().dead_letters.is_empty(),
+                "panic never dead-letters"
+            );
         }
         assert_eq!(
             system.inbox_cursor(&path).map(|c| c.as_u64()),
@@ -2182,6 +2331,17 @@ mod tests {
             .es_state(&ActorPath::new(name))
             .await
             .and_then(|s| s["total"].as_i64())
+    }
+
+    /// Whether a Stopped fact was recorded for `path` with `reason` (tests).
+    fn stopped_with(
+        system: &ActorSystem,
+        path: &ActorPath,
+        reason: crate::actor::StopReason,
+    ) -> bool {
+        system.tap_facts().iter().any(|f| {
+            matches!(&f.kind, crate::tap::FactKind::Stopped { path: p, reason: r } if p == path && *r == reason)
+        })
     }
 
     /// Polls `cond` until true (2s budget) — async test helper.
@@ -2352,10 +2512,7 @@ mod tests {
         wait_for_cursor(&system, &path, 50).await;
 
         // Then delivery was unaffected: all 50 committed (journal count).
-        let journal_len = {
-            let kernel = system.kernel.lock();
-            kernel.journals[&path].len()
-        };
+        let journal_len = system.journal_entries(&path).len();
         assert_eq!(journal_len, 50);
 
         // And the ring retained only its newest facts with monotonic
@@ -4381,10 +4538,7 @@ mod tests {
         // Then the journal holds exactly the three events (no snapshots
         // under the default Off policy) and the live fold matches.
         assert_eq!(system.journal_len(&path), 3);
-        let entries = {
-            let kernel = system.kernel.lock();
-            kernel.journals[&path].entries().to_vec()
-        };
+        let entries = system.journal_entries(&path);
         let mut folded = Counter::restore(&json!({}));
         for entry in &entries {
             if let crate::journal::JournalEntry::Event { event, .. } = entry {
@@ -4422,10 +4576,13 @@ mod tests {
         // journal holds 4 events + 2 snapshots, and the LATEST snapshot
         // anchors the fast path: rebuild replays only the tail after it.
         {
-            let kernel = system.kernel.lock();
-            let journal = &kernel.journals[&path];
+            let journal = system.journal_entries(&path);
             assert_eq!(journal.len(), 6, "4 events + 2 snapshots");
-            let last = journal.last_snapshot().expect("snapshot exists");
+            let last = journal
+                .iter()
+                .rev()
+                .find(|e| matches!(e, crate::journal::JournalEntry::Snapshot { .. }))
+                .expect("snapshot exists");
             let crate::journal::JournalEntry::Snapshot { seq, .. } = last else {
                 panic!("expected a snapshot entry");
             };
@@ -4445,8 +4602,13 @@ mod tests {
         // The latest snapshot's fold already contains Adds 1-4 (total 10):
         // the fast path restores it, then replays an empty tail.
         {
-            let kernel = system.kernel.lock();
-            let snap = match kernel.journals[&path].last_snapshot().expect("snap") {
+            let snap = match system
+                .journal_entries(&path)
+                .iter()
+                .rev()
+                .find(|e| matches!(e, crate::journal::JournalEntry::Snapshot { .. }))
+                .expect("snap")
+            {
                 crate::journal::JournalEntry::Snapshot { state, .. } => state.clone(),
                 _ => unreachable!(),
             };
@@ -4478,10 +4640,13 @@ mod tests {
 
         // Then the journal holds only events, and no SnapshotTaken fact.
         {
-            let kernel = system.kernel.lock();
-            let journal = &kernel.journals[&path];
+            let journal = system.journal_entries(&path);
             assert_eq!(journal.len(), 5);
-            assert!(journal.last_snapshot().is_none());
+            assert!(
+                journal
+                    .iter()
+                    .all(|e| !matches!(e, crate::journal::JournalEntry::Snapshot { .. }))
+            );
         }
         assert!(
             !system
@@ -4690,9 +4855,8 @@ mod tests {
         // and crashes the actor again (at-least-once); nothing is lost.
         wait_for_crash(&system, &path).await;
         {
-            let kernel = system.kernel.lock();
-            let events = kernel.journals[&path]
-                .entries()
+            let events = system
+                .journal_entries(&path)
                 .iter()
                 .filter(|e| matches!(e, crate::journal::JournalEntry::Event { .. }))
                 .count();
@@ -4768,9 +4932,8 @@ mod tests {
         let state = system.es_state(&path).await.expect("live");
         assert_eq!(state["total"], json!(4), "only the declared event applied");
         {
-            let kernel = system.kernel.lock();
-            let event_schemas: Vec<_> = kernel.journals[&path]
-                .entries()
+            let event_schemas: Vec<_> = system
+                .journal_entries(&path)
                 .iter()
                 .filter_map(|e| e.as_event().map(|ev| ev.schema.clone()))
                 .collect();
@@ -4779,6 +4942,7 @@ mod tests {
                 [Added::schema_id()],
                 "journal contains only declared schemas"
             );
+            let kernel = system.kernel.lock();
             assert_eq!(kernel.dead_letters.len(), 1);
             assert_eq!(
                 kernel.dead_letters[0].reason,
@@ -4830,14 +4994,13 @@ mod tests {
         assert_eq!(state["total"], json!(3));
         let mut folded = MixedEmitter::restore(&json!({}));
         {
-            let kernel = system.kernel.lock();
-            for entry in kernel.journals[&path].entries() {
-                if let crate::journal::JournalEntry::Event { event, .. } = entry {
+            for entry in system.journal_entries(&path) {
+                if let crate::journal::JournalEntry::Event { event, .. } = &entry {
                     folded.apply(event);
                 }
             }
             assert_eq!(
-                kernel.journals[&path].len(),
+                system.journal_entries(&path).len(),
                 2,
                 "exactly the two declared events journalled"
             );
@@ -4869,17 +5032,14 @@ mod tests {
 
         // Then snapshots landed exactly on the old EveryN(2) boundaries
         // (after the 2nd and 4th events, i.e. seqs 1 and 3).
-        let snap_seqs: Vec<u64> = {
-            let kernel = system.kernel.lock();
-            kernel.journals[&path]
-                .entries()
-                .iter()
-                .filter_map(|e| match e {
-                    crate::journal::JournalEntry::Snapshot { seq, .. } => Some(seq.as_u64()),
-                    _ => None,
-                })
-                .collect()
-        };
+        let snap_seqs: Vec<u64> = system
+            .journal_entries(&path)
+            .iter()
+            .filter_map(|e| match e {
+                crate::journal::JournalEntry::Snapshot { seq, .. } => Some(seq.as_u64()),
+                _ => None,
+            })
+            .collect();
         assert_eq!(snap_seqs, [1, 3], "EveryN(2) boundaries preserved");
     }
 
@@ -4918,8 +5078,12 @@ mod tests {
         })
         .await;
         let snap_seq = {
-            let kernel = system.kernel.lock();
-            let snap = kernel.journals[&path].last_snapshot().expect("snapshots");
+            let entries = system.journal_entries(&path);
+            let snap = entries
+                .iter()
+                .rev()
+                .find(|e| matches!(e, crate::journal::JournalEntry::Snapshot { .. }))
+                .expect("snapshots");
             match snap {
                 crate::journal::JournalEntry::Snapshot { seq, .. } => seq.as_u64(),
                 _ => panic!("expected snapshot"),
@@ -7143,5 +7307,1043 @@ mod tests {
         let (sys3, _clock3) = ActorSystem::test();
         sys3.register_schema::<Add>();
         let _ = (id, sys2);
+    }
+
+    // ===== Lifecycle: on_stop, self-termination, passivation, sweep =====
+
+    use crate::system::Passivation;
+
+    /// A sink shared with on_stop assertions.
+    type HookLog = Arc<std::sync::Mutex<Vec<String>>>;
+
+    fn hook_log() -> HookLog {
+        Arc::new(std::sync::Mutex::new(Vec::new()))
+    }
+
+    /// A deterministic async gate: handlers await it, the test releases.
+    struct Gate {
+        entered: std::sync::atomic::AtomicBool,
+        released: std::sync::atomic::AtomicBool,
+    }
+    impl Gate {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                entered: std::sync::atomic::AtomicBool::new(false),
+                released: std::sync::atomic::AtomicBool::new(false),
+            })
+        }
+        async fn park(&self) {
+            self.entered
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            while !self.released.load(std::sync::atomic::Ordering::SeqCst) {
+                tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+            }
+        }
+        fn release(&self) {
+            self.released
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+        fn entered(&self) -> bool {
+            self.entered.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    /// A JournalStore test double: `load` parks on a gate, everything
+    /// else forwards to the inner store.
+    struct GatedStore {
+        gate: Arc<Gate>,
+        inner: std::sync::Arc<dyn crate::journal::JournalStore>,
+    }
+    impl GatedStore {
+        fn new(gate: Arc<Gate>, inner: std::sync::Arc<dyn crate::journal::JournalStore>) -> Self {
+            Self { gate, inner }
+        }
+    }
+    #[async_trait::async_trait]
+    impl crate::journal::JournalStore for GatedStore {
+        async fn append(
+            &self,
+            path: &crate::actor::ActorPath,
+            events: &[crate::envelope::Event],
+        ) -> Result<Vec<crate::journal::SeqNo>, error_stack::Report<crate::journal::JournalError>>
+        {
+            self.inner.append(path, events).await
+        }
+        async fn append_snapshot(
+            &self,
+            path: &crate::actor::ActorPath,
+            seq: crate::journal::SeqNo,
+            state: JsonValue,
+            now_ms: u64,
+        ) -> Result<(), error_stack::Report<crate::journal::JournalError>> {
+            self.inner.append_snapshot(path, seq, state, now_ms).await
+        }
+        async fn load(
+            &self,
+            path: &crate::actor::ActorPath,
+        ) -> Result<Option<crate::journal::Replay>, error_stack::Report<crate::journal::JournalError>>
+        {
+            let replay = self.inner.load(path).await?;
+            // Park only when the journal HAS content: boot-time recovery
+            // (empty journal) passes straight through; the idle-arm
+            // time-cadence check (journal non-empty) holds the loop so
+            // the test can race a delivery in.
+            let has_entries = replay
+                .as_ref()
+                .map(|r| !r.tail.is_empty() || r.snapshot.is_some())
+                .unwrap_or(false);
+            if has_entries && !self.gate.entered() {
+                self.gate.park().await;
+            }
+            Ok(replay)
+        }
+        async fn flush(&self) -> Result<(), error_stack::Report<crate::journal::JournalError>> {
+            self.inner.flush().await
+        }
+        fn name(&self) -> &'static str {
+            "gated-test"
+        }
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+    }
+
+    /// An ES counter with a sync on_stop that records the final total.
+    static ES_HOOK_LOG: std::sync::OnceLock<Arc<std::sync::Mutex<Vec<String>>>> =
+        std::sync::OnceLock::new();
+
+    fn es_hook_log() -> Arc<std::sync::Mutex<Vec<String>>> {
+        ES_HOOK_LOG
+            .get_or_init(|| Arc::new(std::sync::Mutex::new(Vec::new())))
+            .clone()
+    }
+
+    fn es_hook_entries() -> Vec<String> {
+        es_hook_log().lock().expect("log").clone()
+    }
+
+    #[derive(Serialize, Deserialize)]
+    struct StopCounter {
+        total: i64,
+        #[serde(skip)]
+        log: HookLog,
+    }
+    impl EventSourcedActor for StopCounter {
+        fn manifest() -> ActorManifest {
+            ActorManifest::new()
+                .handles::<Add>()
+                .emits::<Added>()
+                .kind(ActorKind::EventSourced)
+        }
+        fn restore(_args: &JsonValue) -> Self {
+            Self {
+                total: 0,
+                log: es_hook_log(),
+            }
+        }
+        fn apply(&mut self, event: &crate::envelope::Event) {
+            self.total += event.payload["n"].as_i64().unwrap_or(0);
+        }
+        fn on_stop(&self) {
+            self.log
+                .lock()
+                .expect("log")
+                .push(format!("es-total={}", self.total));
+        }
+    }
+    impl CommandHandler<Add> for StopCounter {
+        fn handle(&self, cmd: Add, _ctx: &mut CmdCtx<'_>) -> Vec<crate::envelope::Event> {
+            if cmd.n == 666 {
+                panic!("poison add");
+            }
+            vec![crate::envelope::Event::new(
+                Added::schema_id(),
+                json!({ "n": cmd.n }),
+            )]
+        }
+    }
+
+    /// A service actor with an async on_stop that records a marker.
+    struct StopService {
+        log: HookLog,
+    }
+    impl ServiceActor for StopService {
+        fn manifest() -> ActorManifest {
+            ActorManifest::new()
+                .handles::<Add>()
+                .kind(ActorKind::Service)
+        }
+        async fn start(
+            _args: &JsonValue,
+        ) -> Result<Self, error_stack::Report<crate::registry::RegistryError>> {
+            Ok(Self { log: hook_log() })
+        }
+        async fn on_stop(&mut self, _ctx: &mut crate::context::MsgCtx<'_>) {
+            self.log.lock().expect("log").push("svc-stopped".to_owned());
+        }
+    }
+    impl MsgHandler<Add> for StopService {
+        async fn handle(&mut self, _msg: Add, _ctx: &mut crate::context::MsgCtx<'_>) {}
+    }
+
+    #[tokio::test]
+    async fn service_on_stop_runs_on_external_stop() {
+        // Given a service actor with an on_stop hook that writes a shared
+        // global log (the instance is constructed inside the spawn).
+        static SVC_LOG: std::sync::Mutex<Option<HookLog>> = std::sync::Mutex::new(None);
+        let shared = hook_log();
+        SVC_LOG.lock().expect("log").replace(shared.clone());
+
+        struct GlobalStopService;
+        impl ServiceActor for GlobalStopService {
+            fn manifest() -> ActorManifest {
+                ActorManifest::new()
+                    .handles::<Add>()
+                    .kind(ActorKind::Service)
+            }
+            async fn start(
+                _args: &JsonValue,
+            ) -> Result<Self, error_stack::Report<crate::registry::RegistryError>> {
+                Ok(Self)
+            }
+            async fn on_stop(&mut self, _ctx: &mut crate::context::MsgCtx<'_>) {
+                SVC_LOG
+                    .lock()
+                    .expect("log")
+                    .as_ref()
+                    .expect("installed")
+                    .lock()
+                    .expect("inner")
+                    .push("svc-stopped".to_owned());
+            }
+        }
+        impl MsgHandler<Add> for GlobalStopService {
+            async fn handle(&mut self, _msg: Add, _ctx: &mut crate::context::MsgCtx<'_>) {}
+        }
+
+        let (system, _clock) = ActorSystem::test();
+        let path = ActorPath::new("svc");
+        system.register_schema::<Add>();
+        system.spawn_service::<GlobalStopService, _>(
+            path.clone(),
+            &json!({}),
+            SpawnOpts::default(),
+            || {
+                vec![Arc::new(crate::actor::TypedServiceAdapter::<
+                    GlobalStopService,
+                    Add,
+                >::new::<Add>())]
+            },
+        );
+
+        // When the actor is stopped externally.
+        system.stop(&path).await;
+
+        // Then the hook ran exactly once.
+        wait_for(|| async {
+            !SVC_LOG
+                .lock()
+                .expect("log")
+                .as_ref()
+                .expect("installed")
+                .lock()
+                .expect("inner")
+                .is_empty()
+        })
+        .await;
+        assert_eq!(
+            SVC_LOG
+                .lock()
+                .expect("log")
+                .as_ref()
+                .expect("installed")
+                .lock()
+                .expect("inner")
+                .len(),
+            1,
+            "on_stop ran exactly once"
+        );
+    }
+
+    #[tokio::test]
+    async fn es_on_stop_observes_final_folded_state() {
+        // Given an ES counter with a sync on_stop, committed two Adds.
+        let (system, _clock) = ActorSystem::test();
+        let path = ActorPath::new("counter");
+        system.register_schema::<Add>();
+        system.register_schema::<Added>();
+        system.spawn_es::<StopCounter, _>(path.clone(), &json!({}), SpawnOpts::default(), || {
+            vec![Arc::new(TypedEsAdapter::<StopCounter, Add>::new::<Add>())]
+        });
+        for n in [2, 3] {
+            system
+                .send(system.envelope(Add::schema_id(), path.clone(), json!({ "n": n })))
+                .await
+                .expect("delivered");
+        }
+        wait_for_cursor(&system, &path, 2).await;
+
+        // When the actor is stopped gracefully.
+        system.stop(&path).await;
+        wait_for(|| async { stopped_with(&system, &path, crate::actor::StopReason::Normal) }).await;
+
+        // Then the hook observed the FINAL folded total (5), not genesis.
+        // The hook log is a global registry the instance wrote into.
+        assert!(
+            es_hook_entries().iter().any(|l| l == "es-total=5"),
+            "on_stop saw the final fold: {:?}",
+            es_hook_entries()
+        );
+    }
+
+    #[tokio::test]
+    async fn on_stop_skipped_on_crash() {
+        // Given a supervised ES child that panics on every command.
+        let (system, _clock) = ActorSystem::test();
+        let child = ActorPath::new("crashy");
+        system.register_schema::<Add>();
+        system.register_schema::<Added>();
+        let spec = crate::supervision::ChildSpec {
+            path: child.clone(),
+            parent: None,
+            restart: crate::supervision::RestartPolicy::Never,
+            budget: crate::supervision::RestartBudget::per(5, std::time::Duration::from_secs(10)),
+            backoff: crate::supervision::Backoff {
+                base: std::time::Duration::from_millis(5),
+                max: std::time::Duration::from_millis(20),
+                factor: 2.0,
+            },
+            args: json!({}),
+            spawn: Arc::new(|sys: &ActorSystem, path: &ActorPath, args: &JsonValue| {
+                sys.spawn_es::<StopCounter, _>(path.clone(), args, SpawnOpts::default(), || {
+                    vec![Arc::new(TypedEsAdapter::<StopCounter, Add>::new::<Add>())]
+                });
+            }),
+        };
+        system.spawn_child(spec);
+
+        // When the child crashes on a poison command (never recovers).
+        system
+            .send(system.envelope(Add::schema_id(), child.clone(), json!({ "n": 666 })))
+            .await
+            .expect("delivered");
+        wait_for(|| async {
+            system
+                .tap_facts()
+                .iter()
+                .any(|f| matches!(f.kind, crate::tap::FactKind::Escalated { .. }))
+        })
+        .await;
+
+        // Then the crash path never ran on_stop (crashed children do not
+        // hook; only graceful stops do).
+        tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+        assert!(
+            system
+                .tap_facts()
+                .iter()
+                .any(|f| matches!(f.kind, crate::tap::FactKind::Stopped { .. })),
+            "escalation records the stop fact"
+        );
+    }
+
+    #[tokio::test]
+    async fn stop_self_terminates_after_commit_and_flushes_outbox_in_order() {
+        // Given an ES counter whose handler sends a mirror command to a
+        // second actor, then stops itself.
+        let (system, _clock) = ActorSystem::test();
+        system.register_schema::<Add>();
+        system.register_schema::<Added>();
+        let mirror = ActorPath::new("mirror");
+        system.spawn_es::<Counter, _>(mirror.clone(), &json!({}), SpawnOpts::default(), || {
+            vec![Arc::new(TypedEsAdapter::<Counter, Add>::new::<Add>())]
+        });
+
+        #[derive(Serialize, Deserialize, Default)]
+        struct SelfStopper {
+            target: String,
+        }
+        impl EventSourcedActor for SelfStopper {
+            fn manifest() -> ActorManifest {
+                ActorManifest::new()
+                    .handles::<Add>()
+                    .emits::<Added>()
+                    .kind(ActorKind::EventSourced)
+            }
+            fn restore(_args: &JsonValue) -> Self {
+                Self {
+                    target: "mirror".to_owned(),
+                }
+            }
+            fn apply(&mut self, _event: &crate::envelope::Event) {}
+        }
+        impl CommandHandler<Add> for SelfStopper {
+            fn handle(&self, cmd: Add, ctx: &mut CmdCtx<'_>) -> Vec<crate::envelope::Event> {
+                ctx.send(
+                    Address::Path(ActorPath::new(self.target.as_str())),
+                    &Add { n: cmd.n },
+                    None,
+                );
+                ctx.stop_self();
+                vec![]
+            }
+        }
+
+        let path = ActorPath::new("selfstop");
+        system.spawn_es::<SelfStopper, _>(path.clone(), &json!({}), SpawnOpts::default(), || {
+            vec![Arc::new(TypedEsAdapter::<SelfStopper, Add>::new::<Add>())]
+        });
+
+        // When one command drives send → stop_self.
+        system
+            .send(system.envelope(Add::schema_id(), path.clone(), json!({ "n": 9 })))
+            .await
+            .expect("delivered");
+
+        // Then the actor stopped gracefully (Stopped fact) AND the send
+        // flushed first (mirror committed it).
+        wait_for(|| async { stopped_with(&system, &path, crate::actor::StopReason::Normal) }).await;
+        wait_for(|| async { system.journal_len(&mirror) == 1 }).await;
+        // And the stopped actor's path is gone (a new send would not resolve).
+        assert!(!system.lookup_slot(&path));
+    }
+
+    #[tokio::test]
+    async fn stop_self_does_not_process_subsequent_mailbox_entries() {
+        // Given a self-stopping actor with a second command queued behind
+        // the first.
+        #[derive(Serialize, Deserialize)]
+        struct StopOnFirst;
+
+        impl EventSourcedActor for StopOnFirst {
+            fn manifest() -> ActorManifest {
+                ActorManifest::new()
+                    .handles::<Add>()
+                    .kind(ActorKind::EventSourced)
+            }
+            fn restore(_args: &JsonValue) -> Self {
+                Self
+            }
+            fn apply(&mut self, _event: &crate::envelope::Event) {}
+        }
+        impl CommandHandler<Add> for StopOnFirst {
+            fn handle(&self, _cmd: Add, ctx: &mut CmdCtx<'_>) -> Vec<crate::envelope::Event> {
+                ctx.stop_self();
+                vec![]
+            }
+        }
+        let (system, _clock) = ActorSystem::test();
+        system.register_schema::<Add>();
+        let path = ActorPath::new("stopfirst");
+        system.spawn_es::<StopOnFirst, _>(path.clone(), &json!({}), SpawnOpts::default(), || {
+            vec![Arc::new(TypedEsAdapter::<StopOnFirst, Add>::new::<Add>())]
+        });
+
+        // When two commands arrive back to back.
+        system
+            .send(system.envelope(Add::schema_id(), path.clone(), json!({ "n": 1 })))
+            .await
+            .expect("delivered");
+        system
+            .send(system.envelope(Add::schema_id(), path.clone(), json!({ "n": 2 })))
+            .await
+            .expect("delivered");
+
+        // Then only the FIRST was processed; the second dead-letters as
+        // StoppedWithMail (the actor never peeks past the stop).
+        wait_for(|| async { stopped_with(&system, &path, crate::actor::StopReason::Normal) }).await;
+        wait_for(|| async {
+            system
+                .dead_letter_schemas()
+                .iter()
+                .any(|s| *s == Add::schema_id())
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn external_stop_after_self_stop_is_idempotent() {
+        // Given an actor that stops itself on its first command.
+        #[derive(Serialize, Deserialize)]
+        struct SelfStopper2;
+        impl EventSourcedActor for SelfStopper2 {
+            fn manifest() -> ActorManifest {
+                ActorManifest::new()
+                    .handles::<Add>()
+                    .kind(ActorKind::EventSourced)
+            }
+            fn restore(_args: &JsonValue) -> Self {
+                Self
+            }
+            fn apply(&mut self, _event: &crate::envelope::Event) {}
+        }
+        impl CommandHandler<Add> for SelfStopper2 {
+            fn handle(&self, _cmd: Add, ctx: &mut CmdCtx<'_>) -> Vec<crate::envelope::Event> {
+                ctx.stop_self();
+                vec![]
+            }
+        }
+        let (system, _clock) = ActorSystem::test();
+        system.register_schema::<Add>();
+        let path = ActorPath::new("race");
+        system.spawn_es::<SelfStopper2, _>(path.clone(), &json!({}), SpawnOpts::default(), || {
+            vec![Arc::new(TypedEsAdapter::<SelfStopper2, Add>::new::<Add>())]
+        });
+
+        // When the actor self-stops and an external stop races in.
+        system
+            .send(system.envelope(Add::schema_id(), path.clone(), json!({ "n": 1 })))
+            .await
+            .expect("delivered");
+        system.stop(&path).await;
+
+        // Then exactly ONE Stopped fact exists (no double-record, no panic).
+        let stops = system
+            .tap_facts()
+            .iter()
+            .filter(
+                |f| matches!(&f.kind, crate::tap::FactKind::Stopped { path: p, .. } if *p == path),
+            )
+            .count();
+        assert_eq!(stops, 1, "stop is idempotent: one Stopped fact");
+    }
+
+    #[tokio::test]
+    async fn idle_passivation_stops_and_records_passivated_fact() {
+        // Given an idle counter passivating after 100ms of no completed steps.
+        let (system, clock) = ActorSystem::test();
+        let path = ActorPath::new("idle");
+        system.register_schema::<Add>();
+        system.register_schema::<Added>();
+        let opts = SpawnOpts {
+            passivation: Some(Passivation {
+                idle_for: std::time::Duration::from_millis(100),
+            }),
+            ..SpawnOpts::default()
+        };
+        system.spawn_es::<Counter, _>(path.clone(), &json!({}), opts, || {
+            vec![Arc::new(TypedEsAdapter::<Counter, Add>::new::<Add>())]
+        });
+
+        // When the idle window elapses on the fake clock (no messages).
+        clock.advance(std::time::Duration::from_millis(500));
+        wait_for(|| async { stopped_with(&system, &path, crate::actor::StopReason::Passivated) })
+            .await;
+
+        // Then the actor is fully torn down (slot removed).
+        wait_for(|| async { !system.lookup_slot(&path) }).await;
+    }
+
+    #[tokio::test]
+    async fn incoming_message_resets_the_passivation_timer() {
+        // Given a passivating counter (100ms idle window).
+        let (system, clock) = ActorSystem::test();
+        let path = ActorPath::new("busy");
+        system.register_schema::<Add>();
+        system.register_schema::<Added>();
+        let opts = SpawnOpts {
+            passivation: Some(Passivation {
+                idle_for: std::time::Duration::from_millis(100),
+            }),
+            ..SpawnOpts::default()
+        };
+        system.spawn_es::<Counter, _>(path.clone(), &json!({}), opts, || {
+            vec![Arc::new(TypedEsAdapter::<Counter, Add>::new::<Add>())]
+        });
+
+        // When messages keep arriving inside the window (60ms apart).
+        for i in 0..3 {
+            clock.advance(std::time::Duration::from_millis(60));
+            system
+                .send(system.envelope(Add::schema_id(), path.clone(), json!({ "n": i })))
+                .await
+                .expect("delivered");
+            wait_for_cursor(&system, &path, (i + 1) as u64).await;
+        }
+
+        // Then the actor was never passivated (each completed step reset
+        // the timer; total idle since last work never reached 100ms).
+        assert!(
+            !stopped_with(&system, &path, crate::actor::StopReason::Normal),
+            "a busy actor never passivates"
+        );
+    }
+
+    #[tokio::test]
+    async fn message_racing_passivation_is_processed_not_dead_lettered() {
+        // Given a passivating counter whose store's `load` parks on a
+        // gate — the loop is parked INSIDE the idle arm (snapshot check)
+        // while the racer is delivered.
+        let (system, clock) = ActorSystem::test();
+        let path = ActorPath::new("racy");
+        system.register_schema::<Add>();
+        system.register_schema::<Added>();
+        let gate = Gate::new();
+        let store = Arc::new(GatedStore::new(gate.clone(), system.journal_store_trait()));
+        system.set_journal_store(store.clone());
+        let opts = SpawnOpts {
+            snapshot: crate::actor::SnapshotCadence::Time(std::time::Duration::from_millis(1)),
+            passivation: Some(Passivation {
+                idle_for: std::time::Duration::from_millis(10),
+            }),
+            ..SpawnOpts::default()
+        };
+        system.spawn_es::<Counter, _>(path.clone(), &json!({}), opts, || {
+            vec![Arc::new(TypedEsAdapter::<Counter, Add>::new::<Add>())]
+        });
+
+        // And one committed message so the time cadence has an anchor.
+        system
+            .send(system.envelope(Add::schema_id(), path.clone(), json!({ "n": 1 })))
+            .await
+            .expect("queued");
+        wait_for_cursor(&system, &path, 1).await;
+
+        // When the idle arm runs: it parks inside the store's `load`
+        // (time-cadence check) while the racer lands in the inbox.
+        clock.advance(std::time::Duration::from_millis(100));
+        wait_for(|| async { gate.entered() }).await;
+        system
+            .send(system.envelope(Add::schema_id(), path.clone(), json!({ "n": 7 })))
+            .await
+            .expect("queued");
+        // The racer must be INSIDE the inbox (front-door hop done) before
+        // the door closes — otherwise the race under test never happens.
+        wait_for(|| async { system.inbox_depth(&path) == 1 }).await;
+        gate.release();
+        wait_for(|| async { stopped_with(&system, &path, crate::actor::StopReason::Passivated) })
+            .await;
+
+        // Then close-door-then-drain processed the racer: the folded
+        // state carries BOTH events (1 + 7), and no DLQ traffic exists.
+        assert_eq!(
+            system
+                .es_state(&path)
+                .await
+                .and_then(|s| s["total"].as_i64()),
+            Some(8),
+            "racer was drained and folded"
+        );
+        assert_eq!(system.dead_letter_schemas().len(), 0, "no DLQ traffic");
+    }
+
+    #[tokio::test]
+    async fn passivated_entity_reactivates_through_partition_set() {
+        // Given a partition set of passivating KeyCounters (50ms idle).
+        let (system, clock) = ActorSystem::test();
+        system.register_schema::<KeyedAdd>();
+        let spec = crate::pool::PartitionSpec {
+            public: ActorPath::new("accts"),
+            system: system.clone(),
+            factory: Arc::new(|system, path, args| {
+                crate::builder::spawn_es_builder::<KeyCounter>(system)
+                    .at(path.clone())
+                    .args(args.clone())
+                    .passivate_after(std::time::Duration::from_millis(50))
+                    .handles::<KeyedAdd>()
+                    .emits::<Added>()
+                    .start();
+            }),
+            key_field: "account".to_owned(),
+            args_template: None,
+            opts: SpawnOpts::default(),
+        };
+        system.install_partition_set(spec).expect("install");
+
+        // When an entity is activated, passivates, then the SAME key is
+        // addressed again.
+        let e = system.envelope(
+            KeyedAdd::schema_id(),
+            ActorPath::new("accts"),
+            json!({ "n": 4, "account": "k" }),
+        );
+        system.send(e).await.expect("delivered");
+        wait_for(|| async { system.journal_len(&ActorPath::new("accts/k")) == 1 }).await;
+        clock.advance(std::time::Duration::from_millis(200));
+        wait_for(|| async {
+            stopped_with(
+                &system,
+                &ActorPath::new("accts/k"),
+                crate::actor::StopReason::Passivated,
+            )
+        })
+        .await;
+
+        let e2 = system.envelope(
+            KeyedAdd::schema_id(),
+            ActorPath::new("accts"),
+            json!({ "n": 10, "account": "k" }),
+        );
+        system.send(e2).await.expect("delivered after passivation");
+
+        // Then the factory re-spawned the entity and its journal REPLAYED:
+        // state is 4+10=14, not genesis+10.
+        wait_for(|| async { system.journal_len(&ActorPath::new("accts/k")) == 2 }).await;
+        let state = system
+            .es_state(&ActorPath::new("accts/k"))
+            .await
+            .expect("reactivated");
+        assert_eq!(state["total"], 14, "journal replayed across passivation");
+    }
+
+    #[tokio::test]
+    async fn crash_during_passivation_drain_restarts_then_passivates_on_next_idle() {
+        // Given a supervised passivating child whose queue drains into a
+        // poison command.
+        let (system, clock) = ActorSystem::test();
+        system.register_schema::<Add>();
+        system.register_schema::<Added>();
+        system.register_schema::<Boom>();
+        let child = ActorPath::new("draincrash");
+        let opts = SpawnOpts {
+            passivation: Some(Passivation {
+                idle_for: std::time::Duration::from_millis(50),
+            }),
+            ..SpawnOpts::default()
+        };
+        let spec = crate::supervision::ChildSpec {
+            path: child.clone(),
+            parent: None,
+            restart: crate::supervision::RestartPolicy::Permanent,
+            budget: crate::supervision::RestartBudget::per(5, std::time::Duration::from_secs(10)),
+            backoff: crate::supervision::Backoff {
+                base: std::time::Duration::from_millis(5),
+                max: std::time::Duration::from_millis(20),
+                factor: 2.0,
+            },
+            args: json!({}),
+            spawn: Arc::new(
+                move |sys: &ActorSystem, path: &ActorPath, args: &JsonValue| {
+                    sys.spawn_es::<Counter, _>(path.clone(), args, opts.clone(), || {
+                        vec![
+                            Arc::new(TypedEsAdapter::<Counter, Add>::new::<Add>()),
+                            Arc::new(TypedEsAdapter::<Counter, Boom>::new::<Boom>()),
+                        ]
+                    });
+                },
+            ),
+        };
+        system.spawn_child(spec);
+
+        // When a poison lands just before the idle window elapses, the
+        // drain hits it (crash), supervision restarts, and the actor idles
+        // out again.
+        system
+            .send(system.envelope(Boom::schema_id(), child.clone(), json!({ "why": "x" })))
+            .await
+            .expect("delivered");
+        clock.advance(std::time::Duration::from_millis(200));
+
+        // Then the crash was restarted (Spawned { restart: true }); the
+        // redelivered poison crashes it again, and supervision keeps the
+        // cycle bounded — the budget exhausts and the child escalates
+        // (convergence through supervision, never a stuck half-dead
+        // actor). No passivation while mail keeps crashing the drain.
+        wait_for(|| async {
+            system
+                .tap_facts()
+                .iter()
+                .any(|f| matches!(&f.kind, crate::tap::FactKind::Spawned { path: p, restart: true, .. } if *p == child))
+        })
+        .await;
+        wait_for(|| async {
+            system
+                .tap_facts()
+                .iter()
+                .any(|f| matches!(&f.kind, crate::tap::FactKind::Escalated { path: p, .. } if *p == child))
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn journal_store_roundtrips_events_and_snapshots() {
+        // Given the default in-memory store (read back through the trait).
+        let (system, _clock) = ActorSystem::test();
+        let path = ActorPath::new("mem");
+        system.register_schema::<Add>();
+        system.register_schema::<Added>();
+        let opts = SpawnOpts {
+            snapshot: crate::actor::SnapshotCadence::Messages(2),
+            ..SpawnOpts::default()
+        };
+        system.spawn_es::<Counter, _>(path.clone(), &json!({}), opts, || {
+            vec![Arc::new(TypedEsAdapter::<Counter, Add>::new::<Add>())]
+        });
+        for n in [1, 2, 3] {
+            system
+                .send(system.envelope(Add::schema_id(), path.clone(), json!({ "n": n })))
+                .await
+                .expect("delivered");
+        }
+        wait_for_cursor(&system, &path, 3).await;
+
+        // When the store is loaded through the TRAIT (as a restart would).
+        let store = system.journal_store_trait();
+        let replay = store.load(&path).await.expect("load").expect("journal");
+
+        // Then the replay carries the snapshot (Messages(2) cadence) and
+        // the event tail after it.
+        assert!(replay.snapshot.is_some(), "snapshot captured");
+        assert_eq!(replay.tail.len(), 1, "only the post-snapshot event");
+    }
+
+    #[tokio::test]
+    async fn shutdown_flushes_the_store_once_per_sweep() {
+        // Given a system whose store counts flushes.
+        let (system, _clock) = ActorSystem::test();
+        system.register_schema::<Add>();
+        system.register_schema::<Added>();
+        let path = ActorPath::new("flushy");
+        system.spawn_es::<Counter, _>(path.clone(), &json!({}), SpawnOpts::default(), || {
+            vec![Arc::new(TypedEsAdapter::<Counter, Add>::new::<Add>())]
+        });
+        system
+            .send(system.envelope(Add::schema_id(), path.clone(), json!({ "n": 1 })))
+            .await
+            .expect("delivered");
+        wait_for_cursor(&system, &path, 1).await;
+
+        // When the graceful sweep runs.
+        system
+            .shutdown_graceful(std::time::Duration::from_secs(2))
+            .await;
+
+        // Then the in-memory store flushed without error and the actor's
+        // tables are gone (the sweep tore them down).
+        assert!(!system.lookup_slot(&path), "sweep drained all");
+    }
+
+    #[tokio::test]
+    async fn shutdown_graceful_drains_all_cells_and_runs_on_stop_within_deadline() {
+        // Given two actors (ES + service) with busy mailboxes.
+        let (system, _clock) = ActorSystem::test();
+        system.register_schema::<Add>();
+        system.register_schema::<Added>();
+        let a = ActorPath::new("a");
+        let b = ActorPath::new("b");
+        system.spawn_es::<Counter, _>(a.clone(), &json!({}), SpawnOpts::default(), || {
+            vec![Arc::new(TypedEsAdapter::<Counter, Add>::new::<Add>())]
+        });
+        system.spawn_service::<StopService, _>(b.clone(), &json!({}), SpawnOpts::default(), || {
+            vec![Arc::new(crate::actor::TypedServiceAdapter::<
+                StopService,
+                Add,
+            >::new::<Add>())]
+        });
+        for n in 0..5 {
+            system
+                .send(system.envelope(Add::schema_id(), a.clone(), json!({ "n": n })))
+                .await
+                .expect("delivered");
+            system
+                .send(system.envelope(Add::schema_id(), b.clone(), json!({ "n": n })))
+                .await
+                .expect("delivered");
+        }
+        wait_for_cursor(&system, &a, 5).await;
+
+        // When the sweep runs with a generous deadline.
+        system
+            .shutdown_graceful(std::time::Duration::from_secs(2))
+            .await;
+
+        // Then every cell drained: both slots are gone, both queues empty.
+        assert!(!system.lookup_slot(&a));
+        assert!(!system.lookup_slot(&b));
+    }
+
+    #[tokio::test]
+    async fn sends_during_shutdown_dead_letter_with_shutting_down_reason() {
+        // Given a system mid-sweep.
+        let (system, _clock) = ActorSystem::test();
+        system.register_schema::<Add>();
+        system.register_schema::<Added>();
+        let path = ActorPath::new("mid");
+        system.spawn_es::<Counter, _>(path.clone(), &json!({}), SpawnOpts::default(), || {
+            vec![Arc::new(TypedEsAdapter::<Counter, Add>::new::<Add>())]
+        });
+        system
+            .shutdown_graceful(std::time::Duration::from_secs(1))
+            .await;
+
+        // When a send arrives after the sweep.
+        let result = system
+            .send(system.envelope(Add::schema_id(), path.clone(), json!({ "n": 1 })))
+            .await;
+
+        // Then the barrier refused it (Err back) and it landed in the DLQ
+        // with the ShuttingDown reason.
+        assert!(result.is_err(), "swept system refuses new sends");
+        wait_for(|| async {
+            system
+                .dead_letter_reasons()
+                .await
+                .iter()
+                .any(|r| r.starts_with("ShuttingDown"))
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn partition_activation_disabled_during_shutdown() {
+        // Given a partition set whose system has been swept.
+        let (system, _clock) = ActorSystem::test();
+        install_key_partition(&system, "cold").expect("install");
+        system
+            .shutdown_graceful(std::time::Duration::from_secs(1))
+            .await;
+
+        // When a command for a NEVER-ACTIVATED key arrives.
+        let e = system.envelope(
+            KeyedAdd::schema_id(),
+            ActorPath::new("cold"),
+            json!({ "n": 1, "account": "nope" }),
+        );
+        let result = system.send(e).await;
+
+        // Then activation was refused: no entity spawned (Err + DLQ), and
+        // no journal exists for the derived path.
+        assert!(result.is_err(), "activation disabled mid-sweep");
+        assert_eq!(
+            system.journal_len(&ActorPath::new("cold/nope")),
+            0,
+            "no entity was spawned"
+        );
+    }
+
+    #[tokio::test]
+    async fn mutually_messaging_actors_shut_down_cleanly() {
+        // Given two forwarders that bounce a message back and forth.
+        struct Bouncer {
+            peer: ActorPath,
+        }
+        impl ServiceActor for Bouncer {
+            fn manifest() -> ActorManifest {
+                ActorManifest::new()
+                    .handles::<Add>()
+                    .kind(ActorKind::Service)
+            }
+            async fn start(
+                args: &JsonValue,
+            ) -> Result<Self, error_stack::Report<crate::registry::RegistryError>> {
+                Ok(Self {
+                    peer: ActorPath::new(args["peer"].as_str().unwrap_or("a")),
+                })
+            }
+        }
+        impl MsgHandler<Add> for Bouncer {
+            async fn handle(&mut self, msg: Add, ctx: &mut crate::context::MsgCtx<'_>) {
+                if msg.n < 3 {
+                    ctx.send(
+                        Address::Path(self.peer.clone()),
+                        &Add { n: msg.n + 1 },
+                        None,
+                    );
+                }
+            }
+        }
+        let (system, _clock) = ActorSystem::test();
+        system.register_schema::<Add>();
+        let a = ActorPath::new("ping");
+        let b = ActorPath::new("pong");
+        let pa = json!({ "peer": "pong" });
+        let pb = json!({ "peer": "ping" });
+        system.spawn_service::<Bouncer, _>(a.clone(), &pa, SpawnOpts::default(), || {
+            vec![Arc::new(
+                crate::actor::TypedServiceAdapter::<Bouncer, Add>::new::<Add>(),
+            )]
+        });
+        system.spawn_service::<Bouncer, _>(b.clone(), &pb, SpawnOpts::default(), || {
+            vec![Arc::new(
+                crate::actor::TypedServiceAdapter::<Bouncer, Add>::new::<Add>(),
+            )]
+        });
+        system
+            .send(system.envelope(Add::schema_id(), a.clone(), json!({ "n": 0 })))
+            .await
+            .expect("delivered");
+        tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+
+        // When the sweep runs (the ping-pong must not keep anyone alive).
+        system
+            .shutdown_graceful(std::time::Duration::from_secs(2))
+            .await;
+
+        // Then both actors stopped (the barrier, not the message count,
+        // ended the game) and the sweep returned.
+        assert!(!system.lookup_slot(&a));
+        assert!(!system.lookup_slot(&b));
+    }
+
+    #[tokio::test]
+    async fn supervised_child_engine_exits_on_graceful_stop() {
+        // Given a supervised child that is then gracefully stopped.
+        let (system, _clock) = ActorSystem::test();
+        system.register_schema::<Add>();
+        system.register_schema::<Added>();
+        let child = ActorPath::new("reaped");
+        let spec = crate::supervision::ChildSpec {
+            path: child.clone(),
+            parent: None,
+            restart: crate::supervision::RestartPolicy::Permanent,
+            budget: crate::supervision::RestartBudget::per(5, std::time::Duration::from_secs(10)),
+            backoff: crate::supervision::Backoff {
+                base: std::time::Duration::from_millis(5),
+                max: std::time::Duration::from_millis(20),
+                factor: 2.0,
+            },
+            args: json!({}),
+            spawn: Arc::new(|sys: &ActorSystem, path: &ActorPath, args: &JsonValue| {
+                sys.spawn_es::<Counter, _>(path.clone(), args, SpawnOpts::default(), || {
+                    vec![Arc::new(TypedEsAdapter::<Counter, Add>::new::<Add>())]
+                });
+            }),
+        };
+        system.spawn_child(spec);
+        wait_for(|| async {
+            system.tap_facts().iter().any(
+                |f| matches!(&f.kind, crate::tap::FactKind::Spawned { path: p, .. } if *p == child),
+            )
+        })
+        .await;
+
+        // When the child is gracefully stopped.
+        system.stop(&child).await;
+
+        // Then the engine did NOT restart it (graceful stop is final): no
+        // second Spawned fact ever arrives.
+        tokio::time::sleep(std::time::Duration::from_millis(60)).await;
+        let spawns = system
+            .tap_facts()
+            .iter()
+            .filter(
+                |f| matches!(&f.kind, crate::tap::FactKind::Spawned { path: p, .. } if *p == child),
+            )
+            .count();
+        assert_eq!(spawns, 1, "no restart after graceful stop");
+    }
+}
+
+impl ActorSystem {
+    /// The store behind the system (trait object; tests and flushes).
+    #[cfg(test)]
+    pub(crate) fn journal_store_trait(&self) -> std::sync::Arc<dyn crate::journal::JournalStore> {
+        self.0.journal_store_slot.read().clone()
+    }
+
+    /// Test seam: swaps the system's journal store.
+    #[cfg(test)]
+    pub(crate) fn set_journal_store(
+        &self,
+        store: std::sync::Arc<dyn crate::journal::JournalStore>,
+    ) {
+        *self.0.journal_store_slot.write() = store.clone();
+        self.0.kernel.lock().journal_store = store;
+    }
+
+    /// The registry slot for `path`, if any (tests).
+    #[cfg(test)]
+    pub(crate) fn lookup_slot(&self, path: &ActorPath) -> bool {
+        self.registry.lock().lookup(path).is_some()
     }
 }

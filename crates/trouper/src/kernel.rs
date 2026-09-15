@@ -29,9 +29,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::actor::{ActorPath, CommandEntry, DynEsActor, DynServiceActor, MsgEntry};
 use crate::context::{CmdCtx, Outbox, RuntimeView};
-use crate::envelope::{Address, Envelope, Event, TraceCtx};
+use crate::envelope::{Address, Envelope, TraceCtx};
 use crate::inbox::Inbox;
-use crate::journal::{Journal, JournalEntry, JournalError, SeqNo};
+use crate::journal::{JournalEntry, JournalError};
 use crate::registry::{Endpoint, Registry};
 use crate::schema::SchemaId;
 
@@ -87,7 +87,12 @@ pub(crate) struct AskFact {
 /// table; restart swaps state + endpoint as one observation).
 pub(crate) struct KernelState {
     pub(crate) cells: HashMap<ActorPath, Arc<ActorCell>>,
-    pub(crate) journals: HashMap<ActorPath, Journal>,
+    /// Where every actor's journal lives (the in-memory store by
+    /// default; a test/backend store rides the same trait).
+    pub(crate) journal_store: Arc<dyn crate::journal::JournalStore>,
+    /// Per-path snapshot-cadence bookkeeping (the time anchor is policy
+    /// state, not storage — it stays kernel-side, off the store).
+    pub(crate) snapshot_cadence_ms: HashMap<ActorPath, Option<u64>>,
     pub(crate) es_state: HashMap<ActorPath, Arc<tokio::sync::Mutex<Box<dyn DynEsActor>>>>,
     pub(crate) entries: HashMap<ActorPath, Vec<Arc<dyn CommandEntry>>>,
     pub(crate) snapshot_policy: HashMap<ActorPath, crate::actor::SnapshotCadence>,
@@ -125,6 +130,11 @@ pub(crate) struct KernelState {
     pub(crate) passivation: HashMap<ActorPath, crate::system::Passivation>,
     /// Injected-clock millis of each actor's last completed message step.
     pub(crate) last_work_ms: HashMap<ActorPath, u64>,
+    /// The graceful-shutdown barrier: set by the sweep, read on every
+    /// route (deliveries dead-letter with `ShuttingDown`), by partition
+    /// activation (refused), by the supervision engines (suspended), and
+    /// by passivation (stands down).
+    pub(crate) shutting_down: std::sync::atomic::AtomicBool,
 }
 
 impl Default for KernelState {
@@ -138,7 +148,8 @@ impl KernelState {
     pub fn with_tap_capacity(tap_capacity: usize) -> Self {
         Self {
             cells: HashMap::new(),
-            journals: HashMap::new(),
+            journal_store: Arc::new(crate::journal::InMemoryJournalStore::new()),
+            snapshot_cadence_ms: HashMap::new(),
             es_state: HashMap::new(),
             entries: HashMap::new(),
             snapshot_policy: HashMap::new(),
@@ -157,6 +168,7 @@ impl KernelState {
             watermarks: HashMap::new(),
             passivation: HashMap::new(),
             last_work_ms: HashMap::new(),
+            shutting_down: std::sync::atomic::AtomicBool::new(false),
         }
     }
 }
@@ -242,7 +254,8 @@ impl ActorCell {
     /// Claims the right to run `on_stop`: `true` = this caller runs the
     /// hook; `false` = someone else already ran it.
     pub(crate) fn claim_on_stop(&self) -> bool {
-        self.on_stop_done
+        !self
+            .on_stop_done
             .swap(true, std::sync::atomic::Ordering::SeqCst)
     }
 }
@@ -265,12 +278,18 @@ pub(crate) struct EsLoop {
 }
 
 impl EsLoop {
-    /// Spawns the front door + the ES loop for this actor.
-    pub fn start(self, rx: mpsc::Receiver<Envelope>, shutdown: watch::Receiver<bool>) {
+    /// Spawns the front door + the ES loop for this actor, returning the
+    /// loop task's join handle (the external stop and the shutdown sweep
+    /// join it: a bounded wait for the current message, then teardown).
+    pub fn start_tracked(
+        self,
+        rx: mpsc::Receiver<Envelope>,
+        shutdown: watch::Receiver<bool>,
+    ) -> tokio::task::JoinHandle<()> {
         let front_cell = self.cell.clone();
         let front_kernel = self.kernel.clone();
         tokio::spawn(front_door_loop(front_cell, front_kernel, rx));
-        tokio::spawn(es_actor_loop(self, shutdown));
+        tokio::spawn(es_actor_loop(self, shutdown))
     }
 }
 
@@ -295,6 +314,23 @@ async fn route_inner(
     kernel: &Mutex<KernelState>,
     envelope: Envelope,
 ) -> Result<ActorPath, Envelope> {
+    // SHUTDOWN BARRIER: once the sweep starts, nothing new is accepted —
+    // every delivery dead-letters with `ShuttingDown` (observably, never
+    // silently). Activation is refused inside resolve_partition.
+    if kernel
+        .lock()
+        .shutting_down
+        .load(std::sync::atomic::Ordering::SeqCst)
+    {
+        dead_letter(
+            kernel,
+            &envelope,
+            crate::kernel::DeadLetterReason::ShuttingDown,
+            "graceful shutdown sweep in progress",
+        );
+        pump_dlq(registry, kernel).await;
+        return Err(envelope);
+    }
     let dest = envelope.dest.clone();
     match dest {
         Address::Path(ref path) => {
@@ -344,7 +380,7 @@ async fn route_inner(
             };
             // PARTITION SETS: a public set path resolves to ONE entity,
             // derived from the payload's shard key (activated on demand).
-            let path = match resolve_partition(registry, &envelope, path.clone()).await {
+            let path = match resolve_partition(registry, kernel, &envelope, path.clone()).await {
                 Ok(Some(entity)) => entity,
                 Ok(None) => path,
                 Err(missing_key_envelope) => {
@@ -456,6 +492,7 @@ async fn route_inner(
 /// same-key race delivers to the winner's entity.
 async fn resolve_partition(
     registry: &Mutex<Registry>,
+    kernel: &Mutex<KernelState>,
     envelope: &Envelope,
     dest: ActorPath,
 ) -> Result<Option<ActorPath>, Envelope> {
@@ -488,7 +525,14 @@ async fn resolve_partition(
     if registry.lock().lookup(&entity_path).is_some() {
         return Ok(Some(entity_path));
     }
-    // ACTIVATE: spawn the entity from the shared factory. The factory's
+    // The sweep disables activation: nothing new may start mid-shutdown.
+    if kernel
+        .lock()
+        .shutting_down
+        .load(std::sync::atomic::Ordering::SeqCst)
+    {
+        return Err(envelope.clone());
+    } // ACTIVATE: spawn the entity from the shared factory. The factory's
     // spawn registers the entity's slot; a concurrent same-key send is
     // serialized by the registry lock inside the spawn, and the loser of
     // a race delivers to the winner's entity (same derived path).
@@ -686,6 +730,11 @@ pub(crate) async fn front_door_loop(
 /// Idles with a notify + short poll backstop; the poll is deliberate — it
 /// bounds wakeup latency without lost-wakeup races.
 pub(crate) async fn es_actor_loop(loop_ctx: EsLoop, mut shutdown: watch::Receiver<bool>) {
+    // SPAWN-TIME RECOVERY: a re-activated entity (partition re-spawn,
+    // or any spawn onto a journaled path) replays its journal before the
+    // first step — passivation is lossless for the ES tier. A fresh
+    // genesis spawn has no journal; the store answers None.
+    recover_at_boot(&loop_ctx).await;
     loop {
         if *shutdown.borrow_and_update() {
             break;
@@ -704,20 +753,67 @@ pub(crate) async fn es_actor_loop(loop_ctx: EsLoop, mut shutdown: watch::Receive
             }
             Step::Crashed => break, // supervisor (Phase 8) takes over
             Step::Stop => {
-                // Self-termination: the loop owns its graceful exit (hook
-                // + tables); no task joins itself, so this cannot deadlock.
-                loop_ctx.graceful_exit(crate::actor::StopReason::Normal).await;
+                loop_ctx
+                    .graceful_exit(crate::actor::StopReason::Normal)
+                    .await;
                 break;
             }
         }
         let notified = loop_ctx.cell.work.notified();
         tokio::select! {
-            _ = shutdown.changed() => {}
             _ = notified => {}
             _ = tokio::time::sleep(std::time::Duration::from_millis(20)) => {}
         }
     }
     drain_inbox_on_stop(&loop_ctx).await;
+}
+
+/// Boot-time journal recovery for an ES actor: rebuilds the live state
+/// from the store's replay (snapshot + tail) when this path has a
+/// journal. Runs BEFORE the first step; no command is processed
+/// unrecovered.
+async fn recover_at_boot(ctx: &EsLoop) {
+    let replay = {
+        let store = ctx.kernel.lock().journal_store.clone();
+        match store.load(&ctx.path).await {
+            Ok(r) => r,
+            Err(_) => return,
+        }
+    };
+    let Some(r) = replay else { return };
+    let (snapshot_state, tail) = (
+        r.snapshot.as_ref().and_then(|e| match e {
+            JournalEntry::Snapshot { state, .. } => Some(state.clone()),
+            _ => None,
+        }),
+        r.tail.clone(),
+    );
+    if snapshot_state.is_none() && tail.is_empty() {
+        return;
+    }
+    let old = {
+        let kernel = ctx.kernel.lock();
+        kernel.es_state.get(&ctx.path).cloned()
+    };
+    let Some(old) = old else { return };
+    let genesis_args = {
+        let kernel = ctx.kernel.lock();
+        kernel
+            .genesis_args
+            .get(&ctx.path)
+            .cloned()
+            .unwrap_or_else(|| serde_json::json!({}))
+    };
+    let fresh = {
+        let old = old.lock().await;
+        old.rebuild(&genesis_args, snapshot_state, &tail).ok()
+    };
+    if let Some(fresh) = fresh {
+        let mut kernel = ctx.kernel.lock();
+        kernel
+            .es_state
+            .insert(ctx.path.clone(), Arc::new(tokio::sync::Mutex::new(fresh)));
+    }
 }
 
 /// What one atomic step concluded.
@@ -886,15 +982,23 @@ async fn step_es(ctx: &EsLoop) -> Step {
         })
         .collect();
 
-    // 5. JOURNAL APPEND (durable record first).
+    // 5. JOURNAL APPEND (durable record first). The store is awaited
+    // OUTSIDE the kernel sync guard — a write-through backend gets
+    // "never ack what isn't journaled"; a failure aborts the step BEFORE
+    // the ack (the message stays queued; supervision treats it as a crash).
+    // NOTE: the declared/undeclared `envelope` binding above was consumed
+    // by the filter; the events own their traces now.
     let seqs = {
-        let mut kernel = ctx.kernel.lock();
-        let journal = kernel.journals.entry(ctx.path.clone()).or_default();
-        let seqs: Vec<_> = events
-            .iter()
-            .map(|ev| journal.append_event(ev.clone()))
-            .collect();
-        (journal.next_seq(), seqs)
+        let store = ctx.kernel.lock().journal_store.clone();
+        let seqs = store.append(&ctx.path, &events).await.map_err(|report| {
+            tracing::error!(actor = %ctx.path, error = ?report, "journal append failed");
+            let mut kernel = ctx.kernel.lock();
+            kernel.crashed.insert(ctx.path.clone());
+        });
+        match seqs {
+            Ok(seqs) => seqs,
+            Err(()) => return Step::Crashed,
+        }
     };
 
     // 6. ACK (the commit point: this message will never redeliver).
@@ -935,11 +1039,7 @@ async fn step_es(ctx: &EsLoop) -> Step {
 
     // 11. FACTS PUMP (recorded facts reach live observers).
     pump_facts(&ctx.kernel, &ctx.registry).await;
-    if stop_self {
-        Step::Stop
-    } else {
-        Step::Work
-    }
+    if stop_self { Step::Stop } else { Step::Work }
 }
 
 impl EsLoop {
@@ -962,7 +1062,8 @@ impl EsLoop {
     /// task instead. Calling it from inside the loop is exactly what makes
     /// self-stop and passivation deadlock-free: no task joins itself.
     pub(crate) async fn graceful_exit(&self, reason: crate::actor::StopReason) {
-        if self.cell.claim_on_stop() {
+        let claimed = self.cell.claim_on_stop();
+        if claimed {
             run_on_stop(self).await;
         }
         let system = crate::system::ActorSystemCore::loop_facade(self);
@@ -980,8 +1081,17 @@ impl EsLoop {
 pub(crate) async fn run_on_stop(ctx: &EsLoop) {
     // Service tier first: the live instance is behind its own mutex, the
     // hook gets a MsgCtx over a throwaway outbox flushed on completion.
+    // STANDS DOWN during the shutdown sweep: the sweep's parallel drain
+    // runs every hook itself (through the same claim), so a loop still
+    // alive under the barrier must not double-run or hang on a dead port.
     let service = {
         let kernel = ctx.kernel.lock();
+        if kernel
+            .shutting_down
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            return;
+        }
         kernel.services.get(&ctx.path).cloned()
     };
     if let Some(service) = service {
@@ -1357,10 +1467,7 @@ async fn fan_out_emits(ctx: &EsLoop, events: &[crate::envelope::Event]) {
 /// Takes a between-messages snapshot if the cadence asks for one: a
 /// message-count cadence snapshots when the last committed event landed on
 /// an n-boundary; a time cadence is checked on the idle path instead.
-async fn maybe_snapshot(
-    ctx: &EsLoop,
-    (next_seq, seqs): (crate::journal::SeqNo, Vec<crate::journal::SeqNo>),
-) {
+async fn maybe_snapshot(ctx: &EsLoop, seqs: Vec<crate::journal::SeqNo>) {
     let cadence = {
         let kernel = ctx.kernel.lock();
         kernel
@@ -1381,26 +1488,40 @@ async fn maybe_snapshot(
         return;
     }
     snapshot_now(ctx, last).await;
-    let _ = next_seq;
 }
 
 /// Writes one snapshot of the live state at `seq` (the shared tail of both
 /// cadence checks; always BETWEEN messages, never mid-step).
 async fn snapshot_now(ctx: &EsLoop, last: crate::journal::SeqNo) {
-    let state = ctx.state().await;
-    let state = state.lock().await;
-    if let Ok(blob) = state.capture_erased() {
+    // Capture the blob under the state lock, then DROP the guard before
+    // the store await (the erased state shell is not Send; no lock may be
+    // held across the store call).
+    let captured = {
+        let state = ctx.state().await;
+        let state = state.lock().await;
+        state.capture_erased().ok()
+    };
+    if let Some(blob) = captured {
         let now = ctx.clock.now();
-        let mut kernel = ctx.kernel.lock();
-        let journal = kernel.journals.entry(ctx.path.clone()).or_default();
-        journal.append_snapshot(last, blob, now.as_millis());
-        kernel.record_fact(
-            now,
-            crate::tap::FactKind::SnapshotTaken {
-                path: ctx.path.clone(),
-                seq: last,
-            },
-        );
+        let store = ctx.kernel.lock().journal_store.clone();
+        if store
+            .append_snapshot(&ctx.path, last, blob, now.as_millis())
+            .await
+            .is_ok()
+        {
+            // The time-cadence anchor is kernel-side policy bookkeeping.
+            let mut kernel = ctx.kernel.lock();
+            kernel
+                .snapshot_cadence_ms
+                .insert(ctx.path.clone(), Some(now.as_millis()));
+            kernel.record_fact(
+                now,
+                crate::tap::FactKind::SnapshotTaken {
+                    path: ctx.path.clone(),
+                    seq: last,
+                },
+            );
+        }
     }
 }
 
@@ -1421,33 +1542,64 @@ async fn maybe_snapshot_on_idle(ctx: &EsLoop) {
     let crate::actor::SnapshotCadence::Time(interval) = cadence else {
         return;
     };
-    let (last_seq, since_snapshot_ms) = {
-        let mut kernel = ctx.kernel.lock();
-        let journal = kernel.journals.entry(ctx.path.clone()).or_default();
-        // An empty journal never snapshots: the anchor seq would be
-        // "genesis", and a later restore would wrongly skip event seq 0.
-        if journal.next_seq().as_u64() == 0 {
-            return;
+    // Anchor + last committed seq: the store's replay (load reflects
+    // buffered state), read WITHOUT holding the kernel sync guard across
+    // the await.
+    let replay = {
+        let store = ctx.kernel.lock().journal_store.clone();
+        match store.load(&ctx.path).await {
+            Ok(replay) => replay,
+            Err(_) => return,
         }
-        let since = journal.since_snapshot_ms(ctx.clock.now());
-        (journal.last_seq(), since)
     };
-    let Some(elapsed) = since_snapshot_ms else {
-        return; // unanchored: not due (safe default)
-    };
-    if elapsed < interval.as_millis() as u64 {
+    // An empty journal never snapshots: the anchor seq would be
+    // "genesis", and a later restore would wrongly skip event seq 0.
+    let Some(r) = replay else { return };
+    if r.tail.is_empty() && r.snapshot.is_none() {
         return;
     }
-    snapshot_now(ctx, last_seq).await;
+    let (anchor_ms, now_ms) = {
+        let kernel = ctx.kernel.lock();
+        (
+            kernel.snapshot_cadence_ms.get(&ctx.path).copied().flatten(),
+            ctx.clock.now().as_millis(),
+        )
+    };
+    let Some(anchor) = anchor_ms else {
+        return; // unanchored: not due (safe default)
+    };
+    if now_ms.saturating_sub(anchor) < interval.as_millis() as u64 {
+        return;
+    }
+    // Anchor at the LAST COMMITTED EVENT's seq: seqs are 0-based, so the
+    // first post-snapshot seq is snap_seq + 1 (or 0 without a snapshot),
+    // and the tail's length lands on the last one.
+    let last = match r.tail.len() {
+        0 => match r.snapshot.as_ref() {
+            Some(snap) => snap.seq(),
+            None => return,
+        },
+        tail_len => {
+            let base = r
+                .snapshot
+                .as_ref()
+                .map(|s| s.seq().as_u64() + 1)
+                .unwrap_or(0);
+            crate::journal::SeqNo::new(base + tail_len as u64 - 1)
+        }
+    };
+    snapshot_now(ctx, last).await;
 }
 
 /// Closes the inbox on stop; Phase 8 flushes undelivered entries to the DLQ.
 async fn drain_inbox_on_stop(ctx: &EsLoop) {
     let mut inbox = ctx.cell.inbox.lock().await;
     inbox.close();
+    inbox.reopen();
     drop(inbox);
-    // Entries stay queued: restart reopens the inbox and redelivery
-    // resumes from the cursor. (Graceful stop flushes to the DLQ — Phase 8.)
+    // Entries stay queued with the door OPEN: a crash-restart resumes
+    // redelivery from the cursor, while an external stop's teardown (or
+    // the sweep) closes the door and flushes the rest to the DLQ.
 }
 
 /// Stamps the injected-clock time of a completed message step. Only a
@@ -1469,6 +1621,13 @@ fn stamp_work(ctx: &EsLoop) {
 async fn maybe_passivate(ctx: &EsLoop) {
     let (idle_for, last_work_ms) = {
         let kernel = ctx.kernel.lock();
+        // The sweep owns termination: passivation stands down.
+        if kernel
+            .shutting_down
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            return;
+        }
         match kernel.passivation.get(&ctx.path) {
             Some(p) => (p.idle_for, kernel.last_work_ms.get(&ctx.path).copied()),
             None => return,
@@ -1504,9 +1663,9 @@ async fn maybe_passivate(ctx: &EsLoop) {
             _ => break,
         }
     }
-    ctx.graceful_exit(crate::actor::StopReason::Passivated).await;
+    ctx.graceful_exit(crate::actor::StopReason::Passivated)
+        .await;
 }
-
 /// The service actor loop: pop → decode → dispatch (async, impure) →
 /// drop the message. No journal, no cursor — service actors are at-most-once
 /// by design (Phase 8 adds supervision around this loop).
@@ -1520,12 +1679,19 @@ pub(crate) async fn service_actor_loop(loop_ctx: ServiceLoop, mut shutdown: watc
                 stamp_work(&loop_ctx.es);
                 continue;
             }
-            Step::Idle => {}
+            Step::Idle => {
+                // Idle window: passivation is checked here (the 20ms
+                // poll arm below is the wake), never mid-step.
+                maybe_passivate(&loop_ctx.es).await;
+            }
             Step::Crashed => break,
             Step::Stop => {
                 // Self-termination: the loop owns its graceful exit (hook
                 // + tables); no task joins itself, so this cannot deadlock.
-                loop_ctx.es.graceful_exit(crate::actor::StopReason::Normal).await;
+                loop_ctx
+                    .es
+                    .graceful_exit(crate::actor::StopReason::Normal)
+                    .await;
                 break;
             }
         }
@@ -1674,11 +1840,7 @@ async fn step_service(ctx: &ServiceLoop) -> Step {
 
     // 7. FACTS PUMP (recorded facts reach live observers).
     pump_facts(&ctx.es.kernel, &ctx.es.registry).await;
-    if stop_self {
-        Step::Stop
-    } else {
-        Step::Work
-    }
+    if stop_self { Step::Stop } else { Step::Work }
 }
 
 /// Restarts a crashed ES actor (spec algorithm):
@@ -1698,19 +1860,21 @@ pub(crate) async fn restart_es(
     ctx: &EsLoop,
     genesis_args: &JsonValue,
 ) -> Result<(), error_stack::Report<JournalError>> {
-    let (snapshot, snap_seq, tail) = {
-        let kernel = ctx.kernel.lock();
-        let Some(journal) = kernel.journals.get(&ctx.path) else {
-            return Ok(());
-        };
-        let snapshot = journal.last_snapshot().cloned();
-        let snap_seq = snapshot.as_ref().map(|entry| entry.seq());
-        let tail: Vec<Event> = journal
-            .after(snap_seq.unwrap_or_else(SeqNo::before_genesis))
-            .filter_map(|entry| entry.as_event().cloned())
-            .collect();
-        (snapshot, snap_seq, tail)
+    // Replay input comes from the STORE (load reflects buffered state).
+    // A supervised child ALWAYS rebuilds: a crash before the first append
+    // (store never saw the path) restarts from genesis, exactly like an
+    // empty journal would.
+    let replay = {
+        let store = ctx.kernel.lock().journal_store.clone();
+        store
+            .load(&ctx.path)
+            .await?
+            .unwrap_or(crate::journal::Replay {
+                snapshot: None,
+                tail: Vec::new(),
+            })
     };
+    let (snapshot, tail) = (replay.snapshot, replay.tail);
 
     // Rebuild through the erased shell: the OLD instance is dropped, the
     // fresh one starts from snapshot-or-genesis plus the replay tail.
@@ -1770,7 +1934,6 @@ pub(crate) async fn restart_es(
     let (_shutdown_tx, shutdown_rx) = watch::channel(false);
     tokio::spawn(front_door_loop(ctx.cell.clone(), ctx.kernel.clone(), rx));
     tokio::spawn(es_actor_loop(ctx.clone(), shutdown_rx));
-    let _ = snap_seq;
     Ok(())
 }
 
@@ -1792,6 +1955,18 @@ pub async fn supervise_child(
         let mut crashed_seen = false;
         let watch = async {
             loop {
+                // Sweep suspension: a graceful shutdown that spawns
+                // restarts fights itself — stand down until the watcher
+                // exits.
+                if system
+                    .kernel
+                    .lock()
+                    .shutting_down
+                    .load(std::sync::atomic::Ordering::SeqCst)
+                {
+                    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                    continue;
+                }
                 let crashed = {
                     let kernel = system.kernel.lock();
                     kernel.crashed.contains(&spec.path)
@@ -1978,6 +2153,9 @@ pub enum DeadLetterReason {
     InboxRefused,
     /// The actor was stopped with undelivered inbox entries.
     StoppedWithMail,
+    /// The system is in its graceful shutdown sweep; the barrier refuses
+    /// all new deliveries.
+    ShuttingDown,
     /// The actor emitted an event whose schema it never declared.
     UndeclaredEvent,
     /// A partition-set command arrived without its shard key.

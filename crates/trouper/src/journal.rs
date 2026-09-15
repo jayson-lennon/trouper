@@ -5,6 +5,7 @@
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
+use std::collections::HashMap;
 
 use crate::envelope::Event;
 
@@ -55,6 +56,194 @@ pub enum JournalError {
     Snapshot,
     /// Restore from a snapshot blob failed (blob not decodable).
     Restore,
+    /// An event append failed (the backing store refused the write).
+    Append,
+    /// A replay load failed (the backing store could not be read).
+    Load,
+}
+
+/// What a replay needs: the latest snapshot (if any) plus the event tail
+/// after it — the exact input [`Journal`]'s restore path consumes.
+#[derive(Debug, Clone)]
+pub struct Replay {
+    /// The latest snapshot, anchored at the seq of the event it folded.
+    pub snapshot: Option<JournalEntry>,
+    /// Every event strictly after the snapshot's seq (all events when no
+    /// snapshot exists).
+    pub tail: Vec<Event>,
+}
+
+/// Where an actor's journal lives.
+///
+/// Contract:
+/// - [`append`](JournalStore::append) is awaited BEFORE the command's
+///   ack — a write-through store therefore gets "never ack what isn't
+///   journaled"; a buffering store persists pending entries in
+///   [`flush`](JournalStore::flush), which the runtime calls ONCE during
+///   the graceful shutdown sweep (after every actor drained, before slot
+///   removal). Between flushes, `load` must reflect BUFFERED state, so
+///   reactivation sees everything appended.
+/// - Per-path sequence assignment belongs to the store: one loop task per
+///   actor path, so per-path appends are already serialized.
+/// - Appends are cheap buffered writes; the sweep-time flush is where a
+///   backing database commits (or a write-through store no-ops).
+#[async_trait::async_trait]
+pub trait JournalStore: Send + Sync {
+    /// Appends events to the actor's journal, returning their seqs.
+    ///
+    /// # Errors
+    ///
+    /// [`JournalError::Append`] when the store refuses the write; the
+    /// kernel aborts the step BEFORE the ack (the message stays queued).
+    async fn append(
+        &self,
+        path: &crate::actor::ActorPath,
+        events: &[Event],
+    ) -> Result<Vec<SeqNo>, error_stack::Report<JournalError>>;
+
+    /// Appends a snapshot of the folded state, anchored at `seq` (the
+    /// last event folded into it), stamped `now_ms` for the time cadence.
+    ///
+    /// # Errors
+    ///
+    /// [`JournalError::Snapshot`] when the store refuses the write.
+    async fn append_snapshot(
+        &self,
+        path: &crate::actor::ActorPath,
+        seq: SeqNo,
+        state: JsonValue,
+        now_ms: u64,
+    ) -> Result<(), error_stack::Report<JournalError>>;
+
+    /// The latest snapshot plus the event tail after it (the replay input
+    /// for restart and spawn-time recovery). `Ok(None)` = no journal.
+    ///
+    /// # Errors
+    ///
+    /// [`JournalError::Load`] when the store cannot be read.
+    async fn load(
+        &self,
+        path: &crate::actor::ActorPath,
+    ) -> Result<Option<Replay>, error_stack::Report<JournalError>>;
+
+    /// Persists everything buffered, for ALL paths. Called once during
+    /// the graceful shutdown sweep; a write-through store no-ops this.
+    ///
+    /// # Errors
+    ///
+    /// Store-specific write failures.
+    async fn flush(&self) -> Result<(), error_stack::Report<JournalError>>;
+
+    /// The backend's name (debug/export).
+    fn name(&self) -> &'static str;
+
+    /// The store as `Any` (downcast seam for the in-memory default).
+    fn as_any(&self) -> &dyn std::any::Any;
+}
+
+/// The default store: today's in-memory [`Journal`] per actor path.
+#[derive(Debug, Default)]
+pub struct InMemoryJournalStore {
+    journals: parking_lot::Mutex<HashMap<crate::actor::ActorPath, Journal>>,
+}
+
+impl InMemoryJournalStore {
+    /// An empty store.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// The number of actors with (possibly empty) journals.
+    pub fn len(&self) -> usize {
+        self.journals.lock().len()
+    }
+
+    /// Whether no actor has journaled anything.
+    pub fn is_empty(&self) -> bool {
+        self.journals.lock().is_empty()
+    }
+
+    /// Sync access to one actor's entries (inspection/tests: the in-memory
+    /// store answers under a short lock; the trait stays async).
+    pub fn entries_of(&self, path: &crate::actor::ActorPath) -> Vec<JournalEntry> {
+        self.journals
+            .lock()
+            .get(path)
+            .map(|j| j.entries().to_vec())
+            .unwrap_or_default()
+    }
+}
+
+/// Downcasts a trait-object store to the in-memory implementation (tests
+/// and inspection only — production code rides the trait).
+pub fn downcast_in_memory(
+    store: &std::sync::Arc<dyn JournalStore>,
+) -> Option<&InMemoryJournalStore> {
+    // `Arc<dyn JournalStore>` is not `Any` at the trait level; the
+    // concrete handle minted at construction is. Comparison by the
+    // concrete address: the kernel keeps the typed Arc alongside.
+    store.as_any().downcast_ref::<InMemoryJournalStore>()
+}
+
+#[async_trait::async_trait]
+impl JournalStore for InMemoryJournalStore {
+    async fn append(
+        &self,
+        path: &crate::actor::ActorPath,
+        events: &[Event],
+    ) -> Result<Vec<SeqNo>, error_stack::Report<JournalError>> {
+        let mut journals = self.journals.lock();
+        let journal = journals.entry(path.clone()).or_default();
+        Ok(events
+            .iter()
+            .map(|ev| journal.append_event(ev.clone()))
+            .collect())
+    }
+
+    async fn append_snapshot(
+        &self,
+        path: &crate::actor::ActorPath,
+        seq: SeqNo,
+        state: JsonValue,
+        now_ms: u64,
+    ) -> Result<(), error_stack::Report<JournalError>> {
+        let mut journals = self.journals.lock();
+        journals
+            .entry(path.clone())
+            .or_default()
+            .append_snapshot(seq, state, now_ms);
+        Ok(())
+    }
+
+    async fn load(
+        &self,
+        path: &crate::actor::ActorPath,
+    ) -> Result<Option<Replay>, error_stack::Report<JournalError>> {
+        let journals = self.journals.lock();
+        let Some(journal) = journals.get(path) else {
+            return Ok(None);
+        };
+        let snapshot = journal.last_snapshot().cloned();
+        let snap_seq = snapshot.as_ref().map(|entry| entry.seq());
+        let tail: Vec<Event> = journal
+            .after(snap_seq.unwrap_or_else(SeqNo::before_genesis))
+            .filter_map(|entry| entry.as_event().cloned())
+            .collect();
+        Ok(Some(Replay { snapshot, tail }))
+    }
+
+    async fn flush(&self) -> Result<(), error_stack::Report<JournalError>> {
+        // In-memory: there is nothing to persist.
+        Ok(())
+    }
+
+    fn name(&self) -> &'static str {
+        "in-memory"
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
 }
 
 /// One actor's in-memory journal: seq-anchored events and snapshots.

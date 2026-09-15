@@ -124,10 +124,7 @@ pub trait ServiceActor: Send + 'static {
     /// Async and `&mut self` — flush buffers, close connections, send
     /// farewell messages via `ctx` if needed. Keep it bounded: the
     /// shutdown sweep joins it under the sweep deadline.
-    fn on_stop(
-        &mut self,
-        ctx: &mut crate::context::MsgCtx<'_>,
-    ) -> impl Future<Output = ()> + Send {
+    fn on_stop(&mut self, ctx: &mut crate::context::MsgCtx<'_>) -> impl Future<Output = ()> + Send {
         let _ = ctx;
         async {}
     }
