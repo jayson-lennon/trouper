@@ -40,7 +40,7 @@ impl Schema for Restock {
     }
 }
 
-#[derive(Deserialize)]
+#[derive(Serialize, Deserialize)]
 struct Restocked {
     #[allow(dead_code)] // folded via raw payload
     sku: String,
@@ -88,7 +88,11 @@ impl CommandHandler<Restock> for Inventory {
     fn handle(&self, cmd: Restock, _ctx: &mut CmdCtx<'_>) -> Vec<Event> {
         vec![Event::new(
             Restocked::schema_id(),
-            json!({ "sku": cmd.sku, "qty": cmd.qty }),
+            serde_json::to_value(Restocked {
+                sku: cmd.sku,
+                qty: cmd.qty,
+            })
+            .unwrap(),
         )]
     }
 }
