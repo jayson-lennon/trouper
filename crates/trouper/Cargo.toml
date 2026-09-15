@@ -2,6 +2,12 @@
 name = "trouper"
 version.workspace = true
 edition.workspace = true
+description = "A single-machine actor runtime: schema registry, journaled event-sourced and service actors, topics, supervision, and partition sets"
+license = "MIT"
+repository = "https://github.com/jayson-lennon/trouper"
+readme = "README.md"
+keywords = ["actor", "actors", "event-sourcing", "runtime", "concurrency"]
+categories = ["concurrency", "asynchronous"]
 
 [dependencies]
 tokio.workspace = true

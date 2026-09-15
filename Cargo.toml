@@ -30,6 +30,7 @@ tracing-subscriber = "0.3"
 name = "trouper-sdk"
 version.workspace = true
 edition.workspace = true
+publish = false
 
 [dependencies]
 trouper.workspace = true
