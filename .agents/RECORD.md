@@ -57,6 +57,16 @@ Entries are added or amended **only with human approval**.
 - (canvas) System state is served and consumed as zenoh messages on the actor-runtime/state key (Config::default()); the canvas CLI queries it and prints the export.
 - (canvas) The canvas GUI consumes the same zenoh state key as the CLI and renders the export as an interactive graph with pan, zoom, and cursor-anchored popups; the runtime serves it no differently than the CLI.
 - (canvas) The canvas GUI lives in its own repo next to the SDK (../actor-canvas) and consumes actor-runtime and state-report by path dependency; this SDK carries no bevy anymore.
-- (runtime) Handler effects are typed: ctx reply/publish/send take Message values (Schema + serde), derive the schema id from the type, and serialize at intent time; raw JSON variants remain as the *_json escape hatch.
+- (runtime) Handler effects are typed: ctx reply/publish/send take Message values (Schema + serde), derive the schema id from the type, and serialize at intent time; raw JSON variants remain as the \*\_json escape hatch.
 - (canvas) A zenoh control plane exists alongside the state key: one key (`actor-runtime/control`) dispatches typed, app-registered `ControlCommand`s over query+reply, and every command gets exactly one reply (result or legible error, never silence); the transport is generic while the command set is an app-side allow-list, with `List` reserved to report the registered names.
 - (canvas) Pool scaling crosses the process boundary as the `ScalePool` command over app-registered `PoolBlueprint`s: the factory/algo/parent/seed/args half is code fixed at app startup, only `workers` travels the wire; scaling a live pool stop-drains the old workers before re-install (worker paths are reused, identities are not), and the canvas CLI reaches the plane via the generic `canvas ctl [<name> [json]]` passthrough.
+- (lifecycle) A trouper actor's on_stop hook runs on graceful stop, self-stop, passivation, and the shutdown sweep; never on crash or hard shutdown.
+- (lifecycle) Service actors receive an async on_stop(&mut self); event-sourced actors receive a sync on_stop(&self).
+- (lifecycle) stop_self() records a deferred intent; the actor stops after the current message commits, flushing pending sends in order.
+- (lifecycle) Passivation is declarative spawn config on the typed builders; the idle timer resets only on completed message steps.
+- (lifecycle) Passivation drains already-queued messages after closing the inbox; external stop and self-stop dead-letter undelivered mail instead.
+- (lifecycle) system.shutdown_graceful(deadline) runs a two-phase sweep: a barrier that refuses new sends and disables activation, restarts, and passivation, then a deadline-bounded parallel drain with on_stop hooks.
+- (journal) All event-sourced journal reads and writes route through the async JournalStore trait; the in-memory store is the default and only implementation.
+- (journal) The JournalStore append is awaited before the command's ack, backends may write through or buffer, and the runtime flushes the store once during the shutdown sweep.
+- (supervision) A supervised child's restart engine exits when the child's spec is removed and stays suspended during the shutdown sweep.
+- (partitions) Partition entities passivate per their factory's builder config and re-spawn on the next send to the public path.
