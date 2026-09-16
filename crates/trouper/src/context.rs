@@ -402,7 +402,9 @@ pub(crate) trait AskPort: Send + Sync {
 #[derive(Debug, wherror::Error)]
 #[error(debug)]
 pub enum AskError {
-    /// The destination did not resolve.
+    /// No handler for the message schema is registered at the
+    /// destination (`SpawnBuilder::handles` was never called for it),
+    /// or nothing is registered at the destination at all.
     Unresolved(String),
 }
 

@@ -1040,8 +1040,10 @@ impl ActorSystemCore {
     ///
     /// # Errors
     ///
-    /// [`crate::context::AskError::Unresolved`] when `dest` does not
-    /// resolve, the ask times out, or the lease dies before the reply.
+    /// [`crate::context::AskError::Unresolved`] when no handler for `C`
+    /// is registered at `dest` via
+    /// [`crate::builder::SpawnBuilder::handles`], when the ask times
+    /// out, or when the lease dies before the reply.
     ///
     /// # Panics
     ///

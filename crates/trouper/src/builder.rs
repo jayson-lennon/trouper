@@ -111,7 +111,9 @@ impl<A: crate::actor::EventSourcedActor> SpawnBuilder<A> {
 
     /// Declares a handled command `C`: registers the schema edge, the
     /// route, and — internally — the erased command adapter. `C` is
-    /// written exactly once.
+    /// written exactly once. Registration here is what makes `C`
+    /// routable to this actor; a command type is deliverable only to
+    /// actors that declared it.
     ///
     /// `C`'s schema descriptor is registered into the schema table here,
     /// at the declaration site — spawning through the builder is all a
@@ -268,6 +270,8 @@ impl<A: ServiceActor> ServiceBuilder<A> {
     }
 
     /// Declares a handled message `M` (schema edge + route + adapter).
+    /// Registration here is what makes `M` routable to this actor; a
+    /// message type is deliverable only to actors that declared it.
     ///
     /// `M`'s schema descriptor is registered into the schema table here,
     /// at the declaration site — mirroring the typed ES builder and the
