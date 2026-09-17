@@ -63,6 +63,7 @@ pub fn spawn_service_builder<A: ServiceActor>(
         start_override: None,
         entries: Vec::new(),
         emits: Vec::new(),
+        observes: Vec::new(),
         opts: SpawnOpts::default(),
         _actor: std::marker::PhantomData,
     }
@@ -224,6 +225,7 @@ pub struct ServiceBuilder<A: ServiceActor> {
     start_override: Option<crate::system::ServiceStart>,
     entries: Vec<Arc<dyn MsgEntry>>,
     emits: Vec<SchemaId>,
+    observes: Vec<SchemaId>,
     opts: SpawnOpts,
     _actor: std::marker::PhantomData<fn(&A)>,
 }
@@ -287,6 +289,26 @@ impl<A: ServiceActor> ServiceBuilder<A> {
         self
     }
 
+    /// Declares an observed message `M`: the kernel copies every routed
+    /// delivery of `M` (path- or schema-addressed) into this actor's
+    /// inbox via the schema's observation topic — at-least-once, after
+    /// the primary delivery, never backpressuring it. Topic-addressed
+    /// sends are not observed.
+    ///
+    /// An observe-only schema does NOT make this actor a primary
+    /// dispatch target for `M` (see [`Self::handles`] for that).
+    pub fn observes<M>(mut self) -> Self
+    where
+        A: crate::actor::MsgHandler<M>,
+        M: Schema + serde::de::DeserializeOwned + Send + 'static,
+    {
+        self.system.register_schema::<M>();
+        self.observes.push(M::schema_id());
+        self.entries
+            .push(Arc::new(TypedServiceAdapter::<A, M>::new::<M>()));
+        self
+    }
+
     /// Declares an emitted message schema for a service actor — a
     /// DECLARED edge (advisory: the service tier is not emit-enforced,
     /// unlike [`SpawnBuilder::emits`]), published in the manifest so the
@@ -332,7 +354,22 @@ impl<A: ServiceActor> ServiceBuilder<A> {
     pub fn start(self) -> ActorPath {
         let path = self.path.clone().expect("builder requires .at(path)");
         let mut manifest = A::manifest();
-        for entry in &self.entries {
+        // Observed schemas first: their adapter entries must NOT leak
+        // into `handles` (an observe-only actor is never a primary
+        // dispatch target), so the merge below is driven by the
+        // explicit-handles remainder only.
+        let explicit_entries: Vec<_> = self
+            .entries
+            .iter()
+            .filter(|e| !self.observes.contains(&e.schema()))
+            .cloned()
+            .collect();
+        for schema in &self.observes {
+            if !manifest.observes.contains(schema) {
+                manifest.observes.push(schema.clone());
+            }
+        }
+        for entry in &explicit_entries {
             let schema = entry.schema();
             if !manifest.handles.contains(&schema) {
                 manifest.handles.push(schema);

@@ -70,3 +70,7 @@ Entries are added or amended **only with human approval**.
 - (journal) The JournalStore append is awaited before the command's ack, backends may write through or buffer, and the runtime flushes the store once during the shutdown sweep.
 - (supervision) A supervised child's restart engine exits when the child's spec is removed and stays suspended during the shutdown sweep.
 - (partitions) Partition entities passivate per their factory's builder config and re-spawn on the next send to the public path.
+- (routing) Observation is topic-backed: an actor spawned with an .observes edge is subscribed to the schema's observation topic, and the kernel publishes a copy of every routed Path or Schema delivery of that schema to it.
+- (routing) Observed copies are at-least-once per observer with per-observer cursors, published after the primary delivery, carrying a fresh causality id under the original's trace id.
+- (routing) Topic-addressed sends are not observed; topic subscribers already receive that traffic natively.
+- (routing) Observe-only actors receive copies but are never selected as primary dispatch targets for the observed schema.

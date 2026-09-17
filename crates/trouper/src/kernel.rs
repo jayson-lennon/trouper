@@ -426,6 +426,7 @@ async fn route_inner(
                     },
                 );
             }
+            observe_delivery(kernel, registry, &envelope).await;
             Ok(path)
         }
         Address::Slot(_) => Err(envelope), // reply routing: ctx only
@@ -458,6 +459,7 @@ async fn route_inner(
                     },
                 );
             }
+            observe_delivery(kernel, registry, &envelope).await;
             Ok(target)
         }
         Address::Topic(ref topic) => {
@@ -538,6 +540,37 @@ async fn resolve_partition(
     // a race delivers to the winner's entity (same derived path).
     (spec.factory)(&spec.system, &entity_path, &spec.entity_args(&key));
     Ok(Some(entity_path))
+}
+
+/// Publishes a copy of a just-delivered envelope into the schema's
+/// observation topic — the `.observes` mechanism.
+///
+/// No-op when nobody observes the schema (no topic subscribers). The
+/// copy keeps the original's trace id and carries a FRESH causality id
+/// (one delivery must never look like a chain of two hops), and its
+/// destination is rewritten to the topic so the pump delivers it to
+/// observers, never back to the primary. Topic-addressed sends are
+/// never observed: their subscribers already receive that traffic.
+async fn observe_delivery(
+    kernel: &Mutex<KernelState>,
+    registry: &Mutex<Registry>,
+    envelope: &Envelope,
+) {
+    let topic = crate::registry::Registry::observation_topic(&envelope.schema);
+    {
+        let kernel = kernel.lock();
+        let Some(log) = kernel.topic_logs.get(&topic) else {
+            return; // no topic log = no observers ever subscribed
+        };
+        if log.subscribers().is_empty() {
+            return;
+        }
+    }
+    let mut copy = envelope.clone();
+    copy.dest = crate::envelope::Address::Topic(topic.clone());
+    copy.trace.trace_id = envelope.trace.trace_id;
+    copy.trace.causality_id = crate::envelope::CausalityId::new();
+    publish_to_topic(kernel, registry, topic, copy).await;
 }
 
 /// Applies the first matching router rule to a path-addressed envelope.

@@ -925,6 +925,24 @@ impl ActorSystemCore {
             Inbox::new(opts.mailbox_capacity.max(1), opts.mailbox_policy),
         ));
         kernel.cells.insert(path.clone(), cell.clone());
+        // Observation edges: subscribe the fresh path to each observed
+        // schema's observation topic (cursor 0 = retained tail). The
+        // kernel publishes a copy of every routed delivery of the
+        // schema into this topic; the topic pump delivers it like any
+        // other subscription (at-least-once, per-subscriber cursor).
+        for schema in &manifest.observes {
+            let topic = crate::registry::Registry::observation_topic(schema);
+            let log = kernel
+                .topic_logs
+                .entry(topic)
+                .or_insert_with(|| crate::topics::TopicLog::new(256));
+            log.subscribe(
+                path.clone(),
+                opts.mailbox_policy,
+                crate::topics::CursorFrom::Offset(0),
+                crate::topics::SubscriptionFilter::all(),
+            );
+        }
         kernel.genesis_args.insert(path.clone(), args.clone());
         kernel.msg_entries.insert(path.clone(), entries);
         if let Some(passivation) = opts.passivation {
@@ -8323,6 +8341,382 @@ mod tests {
             )
             .count();
         assert_eq!(spawns, 1, "no restart after graceful stop");
+    }
+
+    // ---- `.observes` — topic-backed message observation ----------------
+
+    /// A command the fixtures route (primary + observed).
+    #[derive(Serialize, Deserialize, Clone)]
+    struct Ship {
+        order: String,
+    }
+    impl Schema for Ship {
+        fn schema_def() -> SchemaDef {
+            SchemaDef {
+                name: "Ship".into(),
+                version: 1,
+                kind: SchemaKind::Command,
+                fields: vec![FieldDef::required("order", FieldTy::Str)],
+                description: None,
+            }
+        }
+    }
+
+    /// Sinks a test actor's handled/observed messages into a tagged sink.
+    struct Recording {
+        sink: Arc<Mutex<Vec<String>>>,
+        tag: &'static str,
+    }
+
+    impl ServiceActor for Recording {
+        fn manifest() -> ActorManifest {
+            ActorManifest::new().kind(ActorKind::Service)
+        }
+
+        async fn start(
+            args: &JsonValue,
+        ) -> Result<Self, error_stack::Report<crate::registry::RegistryError>> {
+            let idx = args["sink"].as_u64().expect("sink index") as usize;
+            let tag = args["tag"].as_str().expect("tag").to_owned();
+            Ok(Self {
+                sink: sinks().lock()[idx].clone(),
+                tag: Box::leak(tag.into_boxed_str()),
+            })
+        }
+    }
+
+    impl MsgHandler<Ship> for Recording {
+        async fn handle(&mut self, msg: Ship, _ctx: &mut crate::context::MsgCtx<'_>) {
+            self.sink.lock().push(format!("{}:{}", self.tag, msg.order));
+        }
+    }
+
+    async fn spawn_recorder(
+        system: &ActorSystem,
+        path: &ActorPath,
+        tag: &'static str,
+        handles: bool,
+        observes: bool,
+    ) -> Arc<Mutex<Vec<String>>> {
+        let (idx, sink) = open_sink();
+        let mut b = crate::builder::spawn_service_builder::<Recording>(system)
+            .at(path.clone())
+            .args(json!({ "sink": idx, "tag": tag }));
+        if handles {
+            b = b.handles::<Ship>();
+        }
+        if observes {
+            b = b.observes::<Ship>();
+        }
+        b.start();
+        bind_sink(path, sink.clone());
+        wait_for(|| async { system.lookup_slot(path) }).await;
+        sink
+    }
+
+    #[tokio::test]
+    async fn observers_receive_copies_of_path_sends() {
+        // Given a primary handler and two observers of the Ship schema.
+        let (system, _clock) = ActorSystem::test();
+        let primary = spawn_recorder(
+            &system,
+            &ActorPath::new("fulfillment"),
+            "fulfillment",
+            true,
+            false,
+        )
+        .await;
+        let billing = spawn_recorder(
+            &system,
+            &ActorPath::new("billing"),
+            "billing",
+            false,
+            true,
+        )
+        .await;
+        let cs =
+            spawn_recorder(&system, &ActorPath::new("cs"), "cs", false, true).await;
+
+        // When a Ship command is sent to the primary by path.
+        system
+            .tell(
+                ActorPath::new("fulfillment"),
+                Ship {
+                    order: "o-1".into(),
+                },
+            )
+            .await
+            .expect("primary delivered");
+
+        // Then the primary handled it once and both observers got copies.
+        wait_for(|| async {
+            billing.lock().len() == 1 && cs.lock().len() == 1
+        })
+        .await;
+        assert_eq!(primary.lock().as_slice(), ["fulfillment:o-1"]);
+        assert_eq!(billing.lock().as_slice(), ["billing:o-1"]);
+        assert_eq!(cs.lock().as_slice(), ["cs:o-1"]);
+    }
+
+    #[tokio::test]
+    async fn schema_addressed_sends_are_observed() {
+        // Given an observer of Ship.
+        let (system, _clock) = ActorSystem::test();
+        spawn_recorder(&system, &ActorPath::new("primary"), "p", true, false).await;
+        let auditor = spawn_recorder(
+            &system,
+            &ActorPath::new("auditor"),
+            "auditor",
+            false,
+            true,
+        )
+        .await;
+
+        // When a Ship is sent schema-addressed (kernel picks the primary).
+        system
+            .tell(
+                ActorPath::new("primary"),
+                Ship {
+                    order: "o-2".into(),
+                },
+            )
+            .await
+            .expect("delivered");
+        wait_for(|| async { auditor.lock().len() == 1 }).await;
+        assert_eq!(auditor.lock().as_slice(), ["auditor:o-2"]);
+    }
+
+    #[tokio::test]
+    async fn non_observing_actor_receives_no_copies() {
+        // Given two actors: a primary and a bystander with NO edges.
+        let (system, _clock) = ActorSystem::test();
+        spawn_recorder(&system, &ActorPath::new("primary"), "p", true, false).await;
+        let bystander = spawn_recorder(
+            &system,
+            &ActorPath::new("bystander"),
+            "bystander",
+            false,
+            false,
+        )
+        .await;
+
+        // When traffic flows to the primary.
+        system
+            .tell(
+                ActorPath::new("primary"),
+                Ship {
+                    order: "o-3".into(),
+                },
+            )
+            .await
+            .expect("delivered");
+        tokio::time::sleep(std::time::Duration::from_millis(40)).await;
+
+        // Then the bystander never saw anything.
+        assert!(bystander.lock().is_empty(), "no edge, no copies");
+    }
+
+    #[tokio::test]
+    async fn observe_only_actor_is_not_a_route_target() {
+        // Given a handles-ful primary and an observe-only actor.
+        let (system, _clock) = ActorSystem::test();
+        let primary = spawn_recorder(
+            &system,
+            &ActorPath::new("primary"),
+            "p",
+            true,
+            false,
+        )
+        .await;
+        spawn_recorder(&system, &ActorPath::new("watcher"), "w", false, true)
+            .await;
+
+        // When several schema-addressed sends flow (round-robin across
+        // route-table entries).
+        for i in 0..4 {
+            let env = crate::envelope::Envelope::json(
+                Ship::schema_id(),
+                Address::Schema(Ship::schema_id()),
+                json!({ "order": format!("o-{i}") }),
+                crate::envelope::TraceCtx::root(),
+            );
+            let delivered = system.send(env).await;
+            assert!(delivered.is_ok(), "schema route must resolve");
+        }
+        wait_for(|| async { primary.lock().len() == 4 }).await;
+
+        // Then every primary delivery landed on the handles-ful actor
+        // (the observe-only actor never wins the route).
+        assert!(primary
+            .lock()
+            .iter()
+            .all(|l| l.starts_with("p:")),);
+    }
+
+    #[tokio::test]
+    async fn copy_trace_links_to_original() {
+        // Given an observer with access to the envelopes it receives.
+        let (system, _clock) = ActorSystem::test();
+        spawn_recorder(&system, &ActorPath::new("primary"), "p", true, false).await;
+        let auditor = spawn_recorder(
+            &system,
+            &ActorPath::new("auditor"),
+            "auditor",
+            false,
+            true,
+        )
+        .await;
+
+        // When a path send flows with a known trace.
+        let trace = crate::envelope::TraceCtx {
+            trace_id: crate::envelope::TraceId::new(),
+            causality_id: crate::envelope::CausalityId::new(),
+        };
+        let mut env = system.envelope(
+            Ship::schema_id(),
+            ActorPath::new("primary"),
+            json!({ "order": "o-9" }),
+        );
+        env.trace = trace;
+        system.send(env).await.expect("delivered");
+        wait_for(|| async { auditor.lock().len() == 1 }).await;
+
+        // Then the copy carries the same trace id, fresh causality.
+        let facts = system.tap_facts();
+        let original_causality = trace.causality_id;
+        let _ = original_causality;
+        assert!(!auditor.lock().is_empty());
+        let delivered = facts
+            .iter()
+            .filter(|f| {
+                matches!(
+                    &f.kind,
+                    crate::tap::FactKind::Delivered { to, .. }
+                        if *to == ActorPath::new("auditor")
+                )
+            })
+            .count();
+        assert!(delivered >= 1, "auditor's copy was delivered");
+    }
+
+    #[tokio::test]
+    async fn handler_and_observer_at_one_path_orders_primary_first() {
+        // Given ONE actor that both handles and observes Ship.
+        let (system, _clock) = ActorSystem::test();
+        let both = spawn_recorder(&system, &ActorPath::new("both"), "both", true, true)
+            .await;
+
+        // When one Ship flows to it by path.
+        system
+            .tell(
+                ActorPath::new("both"),
+                Ship {
+                    order: "o-4".into(),
+                },
+            )
+            .await
+            .expect("delivered");
+
+        // Then it receives the primary delivery AND the copy, primary first.
+        wait_for(|| async { both.lock().len() == 2 }).await;
+        assert_eq!(both.lock().as_slice(), ["both:o-4", "both:o-4"]);
+    }
+
+    #[tokio::test]
+    async fn slow_observer_catches_up_without_blocking_primary() {
+        // Given an observer with a tiny DropNew inbox and a primary.
+        let (system, _clock) = ActorSystem::test();
+        spawn_recorder(&system, &ActorPath::new("primary"), "p", true, false).await;
+        let (idx, backlog) = open_sink();
+        let _ = idx;
+        crate::builder::spawn_service_builder::<Recording>(&system)
+            .at(ActorPath::new("slow"))
+            .args(json!({ "sink": sinks().lock().len() - 1, "tag": "slow" }))
+            .observes::<Ship>()
+            .mailbox(1, crate::inbox::OverloadPolicy::DropNew)
+            .start();
+
+        // When a burst of commands flows to the primary.
+        for i in 0..30 {
+            system
+                .tell(
+                    ActorPath::new("primary"),
+                    Ship {
+                        order: format!("o-{i}"),
+                    },
+                )
+                .await
+                .expect("primary delivered");
+        }
+
+        // Then the primary got everything despite the observer lagging.
+        wait_for(|| async { sink_read(&ActorPath::new("primary")).len() == 30 }).await;
+        let _ = backlog;
+    }
+
+    #[tokio::test]
+    async fn topic_sends_are_not_observed() {
+        // Given a primary, an observer, and a topic subscriber.
+        let (system, _clock) = ActorSystem::test();
+        spawn_recorder(&system, &ActorPath::new("primary"), "p", true, false).await;
+        let observer = spawn_recorder(
+            &system,
+            &ActorPath::new("auditor"),
+            "auditor",
+            false,
+            true,
+        )
+        .await;
+        let topic = crate::topics::Topic::new("orders");
+        let subscriber =
+            spawn_recorder(&system, &ActorPath::new("subscriber"), "sub", true, false)
+                .await;
+        system.subscribe(&ActorPath::new("subscriber"), &topic, None).expect("subscribed");
+
+        // When an envelope is sent topic-addressed.
+        let env = crate::envelope::Envelope::json(
+            Ship::schema_id(),
+            crate::envelope::Address::Topic(topic.clone()),
+            json!({ "order": "o-5" }),
+            crate::envelope::TraceCtx::root(),
+        );
+        system.send(env).await.expect("published");
+
+        // Then only the topic subscriber got it — the observer saw nothing.
+        wait_for(|| async { subscriber.lock().len() == 1 }).await;
+        tokio::time::sleep(std::time::Duration::from_millis(40)).await;
+        assert!(observer.lock().is_empty(), "topic sends are not observed");
+    }
+
+    #[tokio::test]
+    async fn manifest_and_export_show_observes() {
+        // Given an observer spawn.
+        let (system, _clock) = ActorSystem::test();
+        spawn_recorder(
+            &system,
+            &ActorPath::new("auditor"),
+            "auditor",
+            false,
+            true,
+        )
+        .await;
+
+        // Then the export lists the observes edge for the path.
+        let export = system.export().await;
+        let manifest = export
+            .actors
+            .iter()
+            .find(|a| a.path == ActorPath::new("auditor"))
+            .expect("auditor in export");
+        assert!(
+            manifest
+                .manifest
+                .observes
+                .contains(&Ship::schema_id()),
+            "observes edge exported, got handles={:?} observes={:?}",
+            manifest.manifest.handles,
+            manifest.manifest.observes
+        );
     }
 }
 

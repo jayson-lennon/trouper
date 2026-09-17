@@ -21,6 +21,10 @@ use crate::topics::Topic;
 /// The topic every undeliverable message lands on; created at system boot.
 pub const DEAD_LETTER_TOPIC: &str = "system.deadletters";
 pub const FACTS_TOPIC: &str = "system.facts";
+/// Prefix for per-schema observation topics (`<prefix><schema-name>`):
+/// the kernel publishes a copy of every routed delivery of an observed
+/// schema here; `.observes` subscribers consume it with topic cursors.
+pub const OBSERVED_TOPIC_PREFIX: &str = "system.observed.";
 
 /// The deliverable front door of one running actor endpoint.
 ///
@@ -242,6 +246,13 @@ impl Registry {
     /// The system facts topic (the tap's subscribable mirror).
     pub fn facts_topic() -> Topic {
         Topic::new(FACTS_TOPIC)
+    }
+
+    /// The observation topic for a schema: the kernel publishes a copy
+    /// of every routed delivery of that schema here; actors spawned
+    /// with an `.observes` edge are subscribed to it at spawn.
+    pub fn observation_topic(schema: &SchemaId) -> Topic {
+        Topic::new(format!("{}{}", OBSERVED_TOPIC_PREFIX, schema.name()))
     }
 
     /// Registers a schema descriptor; idempotent per name+version.

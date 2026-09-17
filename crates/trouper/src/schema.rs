@@ -231,6 +231,13 @@ pub struct ActorManifest {
     /// Command/message schemas this actor accepts.
     #[serde(default)]
     pub handles: Vec<SchemaId>,
+    /// Message schemas this actor observes: the kernel copies every
+    /// routed delivery of these schemas into this actor's inbox via the
+    /// schema's observation topic (at-least-once, after the primary
+    /// delivery). Observe-only schemas are NOT routed here as primary
+    /// dispatch targets.
+    #[serde(default)]
+    pub observes: Vec<SchemaId>,
     /// Event schemas this actor emits.
     #[serde(default)]
     pub emits: Vec<SchemaId>,
@@ -256,6 +263,17 @@ impl ActorManifest {
         let id = S::schema_id();
         if !self.handles.contains(&id) {
             self.handles.push(id);
+        }
+        self
+    }
+
+    /// Declares that this actor observes schema `S`: it receives a copy
+    /// of every routed delivery of `S` (at-least-once, after the
+    /// primary delivery) without being a primary dispatch target.
+    pub fn observes<S: Schema>(mut self) -> Self {
+        let id = S::schema_id();
+        if !self.observes.contains(&id) && !self.handles.contains(&id) {
+            self.observes.push(id);
         }
         self
     }
