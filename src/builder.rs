@@ -23,7 +23,6 @@ use crate::actor::{
 use crate::schema::Schema;
 use crate::schema::SchemaId;
 use crate::system::SpawnOpts;
-use crate::topics::Topic;
 
 /// Begins a typed spawn of event-sourced actor `A`.
 ///
@@ -33,7 +32,6 @@ use crate::topics::Topic;
 ///     .args(json!({ "on_hand": 100 }))
 ///     .handles::<ReserveStock>()
 ///     .emits::<StockReserved>()
-///     .emits_on_topic("inventory.events")
 ///     .snapshot(SnapshotCadence::Messages(100))
 ///     .start();
 /// ```
@@ -46,7 +44,6 @@ pub fn spawn_es_builder<A: crate::actor::EventSourcedActor>(
         args: JsonValue::Null,
         entries: Vec::new(),
         emits: Vec::new(),
-        topics: Vec::new(),
         opts: SpawnOpts::default(),
         _actor: std::marker::PhantomData,
     }
@@ -91,7 +88,6 @@ pub struct SpawnBuilder<A: crate::actor::EventSourcedActor> {
     args: JsonValue,
     entries: Vec<Arc<dyn CommandEntry>>,
     emits: Vec<SchemaId>,
-    topics: Vec<Topic>,
     opts: SpawnOpts,
     _actor: std::marker::PhantomData<fn(&A)>,
 }
@@ -149,15 +145,6 @@ impl<A: crate::actor::EventSourcedActor> SpawnBuilder<A> {
         self
     }
 
-    /// Declares a topic committed events are published onto.
-    pub fn emits_on_topic(mut self, topic: impl Into<Topic>) -> Self {
-        let topic = topic.into();
-        if !self.topics.contains(&topic) {
-            self.topics.push(topic);
-        }
-        self
-    }
-
     /// The snapshot cadence (default Off).
     pub fn snapshot(mut self, cadence: crate::actor::SnapshotCadence) -> Self {
         self.opts.snapshot = cadence;
@@ -206,11 +193,6 @@ impl<A: crate::actor::EventSourcedActor> SpawnBuilder<A> {
         for schema in self.emits {
             if !manifest.emits.contains(&schema) {
                 manifest.emits.push(schema);
-            }
-        }
-        for topic in self.topics {
-            if !manifest.emits_on_topics.contains(&topic) {
-                manifest.emits_on_topics.push(topic);
             }
         }
         manifest = manifest.kind(ActorKind::EventSourced);

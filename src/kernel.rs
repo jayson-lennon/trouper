@@ -113,10 +113,6 @@ pub(crate) struct KernelState {
     pub(crate) crashed: HashSet<ActorPath>,
     /// Envelopes that could not be delivered or decoded.
     pub(crate) dead_letters: Vec<DeadLetter>,
-    /// Topic logs: bounded rings with per-subscriber cursors.
-    pub(crate) topic_logs: HashMap<crate::topics::Topic, crate::topics::TopicLog>,
-    /// Topic publish facts (tap consumes in Phase 7).
-    pub(crate) topic_facts: Vec<crate::topics::TopicPublishFact>,
     /// The global observation ring (drop-oldest).
     pub(crate) tap: crate::tap::TapRing,
     /// Supervised children: path → spec.
@@ -163,8 +159,6 @@ impl KernelState {
             genesis_args: HashMap::new(),
             crashed: HashSet::new(),
             dead_letters: Vec::new(),
-            topic_logs: HashMap::new(),
-            topic_facts: Vec::new(),
             tap: crate::tap::TapRing::new(tap_capacity),
             specs: HashMap::new(),
             failures: HashMap::new(),
@@ -177,43 +171,12 @@ impl KernelState {
 }
 
 impl KernelState {
-    /// Records one fact: the tap ring AND (mirrored, at-most-once) the
-    /// `system.facts` topic log. The ring's drop-oldest rule is untouched;
-    /// gaps appear when the RING drops, never in the topic log itself
-    /// (which is bounded separately). Fact offsets make any loss visible.
+    /// Records one fact to the tap ring: the sole observation surface
+    /// (drop-oldest; gaps appear when the RING drops). Fact offsets make
+    /// any loss visible.
     pub fn record_fact(&mut self, ts: crate::clock::Timestamp, kind: crate::tap::FactKind) {
-        // Push a shadow fact with its ring offset into the facts topic,
-        // then the fact itself into the ring (same offset).
-        let shadow = crate::tap::Fact {
-            offset: self.tap.next_offset(),
-            ts,
-            kind: kind.clone(),
-        };
-        let log = self
-            .topic_logs
-            .entry(Registry::facts_topic())
-            .or_insert_with(|| crate::topics::TopicLog::new(4096));
-        log.append(Envelope::json(
-            SchemaId::new("Fact", 1),
-            crate::envelope::Address::Topic(Registry::facts_topic()),
-            shadow.to_json(),
-            TraceCtx::root(),
-        ));
         self.tap.push(ts, kind);
     }
-}
-
-/// Pumps the `system.facts` topic after a record (facts reach live
-/// subscribers as messages, per-subscriber cursors, slow-subscriber
-/// isolation — never touching the ring).
-async fn pump_facts(kernel: &Mutex<KernelState>, registry: &Mutex<Registry>) {
-    pump_topic(kernel, registry, &Registry::facts_topic()).await;
-}
-
-/// Public facts pump for non-route fact sources (e.g. the stop path):
-/// pushes facts already recorded by those paths to live subscribers.
-pub(crate) async fn pump_facts_now(kernel: &Mutex<KernelState>, registry: &Mutex<Registry>) {
-    pump_facts(kernel, registry).await;
 }
 
 /// Kernel-facing handle for one running actor loop.
@@ -299,17 +262,13 @@ impl EsLoop {
 /// Routes an envelope through the registry to its destination.
 ///
 /// Returns the delivered path, or the envelope back for dead-lettering
-/// when the destination does not resolve (slot/topic routing lands in
-/// Phases 5–6).
+/// when the destination does not resolve.
 pub(crate) async fn route(
     registry: &Mutex<Registry>,
     kernel: &Mutex<KernelState>,
     envelope: Envelope,
 ) -> Result<ActorPath, Envelope> {
-    let result = route_inner(registry, kernel, envelope).await;
-    // Facts recorded anywhere on this send path reach live observers.
-    pump_facts(kernel, registry).await;
-    result
+    route_inner(registry, kernel, envelope).await
 }
 
 async fn route_inner(
@@ -331,7 +290,6 @@ async fn route_inner(
             crate::kernel::DeadLetterReason::ShuttingDown,
             "graceful shutdown sweep in progress",
         );
-        pump_dlq(registry, kernel).await;
         return Err(envelope);
     }
     let dest = envelope.dest.clone();
@@ -394,7 +352,6 @@ async fn route_inner(
                         crate::kernel::DeadLetterReason::ShardKeyMissing,
                         "partition command without its shard key",
                     );
-                    pump_dlq(registry, kernel).await;
                     return Ok(path);
                 }
             };
@@ -477,23 +434,6 @@ async fn route_inner(
                 );
             }
             Ok(target)
-        }
-        Address::Topic(ref topic) => {
-            publish_to_topic(kernel, registry, topic.clone(), envelope.clone()).await;
-            {
-                let mut kernel = kernel.lock();
-                kernel.record_fact(
-                    envelope.trace.causality_id.as_millis_ts(),
-                    crate::tap::FactKind::Sent {
-                        from: envelope.from.clone(),
-                        dest: Address::Topic(topic.clone()),
-                        schema: envelope.schema.clone(),
-                        trace: envelope.trace,
-                    },
-                );
-            }
-            let label = format!("topic:{topic}");
-            Ok(ActorPath::new(label.as_str()))
         }
     }
 }
@@ -646,14 +586,6 @@ pub(crate) fn dead_letter(
         trace: envelope.trace,
         envelope: envelope.clone(),
     });
-    // The DLQ is a REAL topic: the envelope is appended to the retained
-    // `system.deadletters` log so a DLQ consumer can subscribe /
-    // reset-cursor and re-consume it later.
-    let log = kernel
-        .topic_logs
-        .entry(Registry::dead_letter_topic())
-        .or_insert_with(|| crate::topics::TopicLog::new(256));
-    log.append(envelope.clone());
     kernel.record_fact(
         envelope.trace.causality_id.as_millis_ts(),
         crate::tap::FactKind::DeadLettered {
@@ -663,12 +595,6 @@ pub(crate) fn dead_letter(
             trace: envelope.trace,
         },
     );
-}
-
-/// Pumps the DLQ topic once: offers every retained entry past each DLQ
-/// subscriber's cursor. Called by the loops after dead-lettering.
-pub(crate) async fn pump_dlq(registry: &Mutex<Registry>, kernel: &Mutex<KernelState>) {
-    pump_topic(kernel, registry, &Registry::dead_letter_topic()).await;
 }
 
 /// Delivers to an endpoint, honoring Block by awaiting capacity.
@@ -892,7 +818,6 @@ async fn step_es(ctx: &EsLoop) -> Step {
             crate::kernel::DeadLetterReason::UnknownSchema,
             "no entry for this schema",
         );
-        pump_dlq(&ctx.registry, &ctx.kernel).await;
         ctx.cell.inbox.lock().await.ack();
         return Step::Work;
     };
@@ -932,7 +857,6 @@ async fn step_es(ctx: &EsLoop) -> Step {
                 crate::kernel::DeadLetterReason::Decode,
                 &reason,
             );
-            pump_dlq(&ctx.registry, &ctx.kernel).await;
             ctx.cell.inbox.lock().await.ack();
             return Step::Work;
         }
@@ -1049,15 +973,14 @@ async fn step_es(ctx: &EsLoop) -> Step {
     // before it have already flushed (in-order).
     let stop_self = flush_outbox(ctx, outbox).await;
 
-    // 9. EMIT FAN-OUT (events onto the manifest's emit topics; topics land
-    // in Phase 6 — the named step exists so the order never changes).
+    // 9. EMIT FAN-OUT (recorded, declared facts broadcast to every actor
+    // that declared .handles — the named step exists so the order never
+    // changes).
     fan_out_emits(ctx, &events).await;
 
     // 10. MAYBE SNAPSHOT (policy-gated, BETWEEN messages).
     maybe_snapshot(ctx, seqs).await;
 
-    // 11. FACTS PUMP (recorded facts reach live observers).
-    pump_facts(&ctx.kernel, &ctx.registry).await;
     if stop_self { Step::Stop } else { Step::Work }
 }
 
@@ -1258,30 +1181,6 @@ impl crate::context::AskPort for KernelAskPort {
     }
 }
 
-/// Publishes one envelope onto a topic: appends to the bounded log,
-/// pumps subscribers (each offered entries past its own cursor), and
-/// records the publish fact. Never blocks on a slow subscriber — its
-/// cursor simply falls behind.
-async fn publish_to_topic(
-    kernel: &Mutex<KernelState>,
-    registry: &Mutex<Registry>,
-    topic: crate::topics::Topic,
-    envelope: Envelope,
-) {
-    // Append + collect subscriber endpoints without holding locks across
-    // delivery; pump_once owns per-subscriber cursor/backlog semantics.
-    let offset = {
-        let mut kernel = kernel.lock();
-        let log = kernel
-            .topic_logs
-            .entry(topic.clone())
-            .or_insert_with(|| crate::topics::TopicLog::new(256));
-        log.append(envelope.clone())
-    };
-    record_publish_facts(kernel, &topic, &envelope, offset);
-    pump_topic(kernel, registry, &topic).await;
-}
-
 /// Broadcasts one published event to EVERY handler of its schema.
 ///
 /// Publish is a sender verb over the one route table: every actor that
@@ -1294,9 +1193,9 @@ async fn publish_to_topic(
 /// Because handlers declared `.handles`, the dispatch entry exists on
 /// their side too — a published copy dispatches exactly like a told one.
 ///
-/// Lock discipline mirrors [`pump_topic`]: one acquisition to snapshot
-/// the (path, endpoint) pairs, deliveries outside the locks. The route
-/// cursor is untouched: publishes never disturb one-of send rotation.
+/// Lock discipline: one acquisition to snapshot the (path, endpoint)
+/// pairs, deliveries outside the locks. The route cursor is untouched:
+/// publishes never disturb one-of send rotation.
 pub(crate) async fn broadcast(
     registry: &Mutex<Registry>,
     kernel: &Mutex<KernelState>,
@@ -1330,64 +1229,6 @@ pub(crate) async fn broadcast(
         // closed endpoint (restart in flight) skips this one delivery.
         let _ = deliver_with_retry(endpoint, envelope.clone()).await;
     }
-}
-
-/// Records the publish facts (topic log fact + tap fact) for one append.
-fn record_publish_facts(
-    kernel: &Mutex<KernelState>,
-    topic: &crate::topics::Topic,
-    envelope: &Envelope,
-    offset: u64,
-) {
-    let mut kernel = kernel.lock();
-    kernel.topic_facts.push(crate::topics::TopicPublishFact {
-        topic: topic.clone(),
-        offset: crate::inbox::InboxOffset::new(offset),
-        schema: envelope.schema.clone(),
-        from: envelope.from.clone(),
-        trace: envelope.trace,
-    });
-    kernel.record_fact(
-        envelope.trace.causality_id.as_millis_ts(),
-        crate::tap::FactKind::TopicPublished {
-            topic: topic.clone(),
-            schema: envelope.schema.clone(),
-            trace: envelope.trace,
-        },
-    );
-}
-
-/// One pump pass over a topic: every subscriber is offered every RETAINED
-/// entry past its own cursor (a reset cursor re-consumes here); only
-/// accepted deliveries advance a cursor — a refused one stays behind
-/// (slow-subscriber isolation, never blocking other subscribers).
-async fn pump_topic(
-    kernel: &Mutex<KernelState>,
-    registry: &Mutex<Registry>,
-    topic: &crate::topics::Topic,
-) {
-    let targets: Vec<(ActorPath, std::sync::Arc<Endpoint>)> = {
-        let kernel = kernel.lock();
-        let registry = registry.lock();
-        kernel
-            .topic_logs
-            .get(topic)
-            .map(|log| log.subscribers())
-            .unwrap_or_default()
-            .into_iter()
-            .filter_map(|path| registry.resolve(&path).map(|endpoint| (path, endpoint)))
-            .collect()
-    };
-    let mut kernel = kernel.lock();
-    let Some(log) = kernel.topic_logs.get_mut(topic) else {
-        return;
-    };
-    let _delivered_skipped = log.pump_once(|path, entry, _policy| {
-        let Some((_, endpoint)) = targets.iter().find(|(p, _)| p == path) else {
-            return false;
-        };
-        endpoint.try_deliver(entry.clone()).is_ok()
-    });
 }
 
 /// Resolves one reply: a slot goes straight to the asker's oneshot (the
@@ -1433,10 +1274,6 @@ async fn resolve_reply(
                     "reply destination unresolved",
                 );
             }
-        }
-        Address::Topic(_) => {
-            // Replying onto a topic is not a reply; treat as a send to a
-            // topic address (Phase 6 wires topic delivery).
         }
     }
 }
@@ -1847,7 +1684,6 @@ async fn step_service(ctx: &ServiceLoop) -> Step {
             crate::kernel::DeadLetterReason::UnknownSchema,
             "no entry for this schema",
         );
-        pump_dlq(&ctx.es.registry, &ctx.es.kernel).await;
         ctx.es.cell.inbox.lock().await.ack();
         return Step::Work;
     };
@@ -1867,7 +1703,6 @@ async fn step_service(ctx: &ServiceLoop) -> Step {
                 crate::kernel::DeadLetterReason::Decode,
                 &reason,
             );
-            pump_dlq(&ctx.es.registry, &ctx.es.kernel).await;
             ctx.es.cell.inbox.lock().await.ack();
             return Step::Work;
         }
@@ -1929,8 +1764,6 @@ async fn step_service(ctx: &ServiceLoop) -> Step {
     // already flushed (in-order).
     let stop_self = flush_outbox(&ctx.es, outbox).await;
 
-    // 7. FACTS PUMP (recorded facts reach live observers).
-    pump_facts(&ctx.es.kernel, &ctx.es.registry).await;
     if stop_self { Step::Stop } else { Step::Work }
 }
 

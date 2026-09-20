@@ -1,12 +1,14 @@
-//! Observers: in-actor consumers of runtime facts.
+//! Observation and the dead-letter queue.
 //!
-//! `system.facts` is a subscribable topic that mirrors the tap ring
-//! (fact JSON, offset included). An ordinary service actor subscribes —
-//! via `subscribe_facts`, the facts feed (not the messaging surface) —
-//! and receives facts as messages with an at-most-once-with-gaps
-//! contract: the ring's drop-oldest pressure shows up as offset gaps,
-//! never as backpressure on the ring. Also demonstrates the DLQ
-//! re-driver (sugar over `system.deadletters` + cursor machinery).
+//! The tap ring is the SOLE observation surface: every waist crossing
+//! (send, deliver, ack, spawn, stop, ask, fail, escalate, dead-letter)
+//! appends a fact to a bounded, drop-oldest ring the host reads directly
+//! (`tap_facts`). Actors observe EVENTS only by declaring `.handles` on
+//! them — there is no facts feed to subscribe to.
+//!
+//! Dead letters are retained in memory WITH their envelopes and are
+//! host-managed: `drain_dead_letters` hands them over for inspection or
+//! deliberate resend; the runtime never redrives automatically.
 //!
 //! Run: `cargo run --example observers`
 
@@ -19,10 +21,9 @@ use tracing::Level;
 use trouper::actor::{CommandHandler, EventSourcedActor, MsgHandler, ServiceActor};
 use trouper::prelude::*;
 use trouper::registry::RegistryError;
+use trouper::tap::FactKind;
 
 static SINK: OnceLock<Mutex<Vec<String>>> = OnceLock::new();
-
-static GAPS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 fn sink() -> &'static Mutex<Vec<String>> {
     SINK.get_or_init(|| Mutex::new(Vec::new()))
@@ -31,62 +32,6 @@ fn sink() -> &'static Mutex<Vec<String>> {
 fn record(line: String) {
     println!("   {line}");
     sink().lock().push(line);
-}
-
-/// The Rust mirror of the runtime's Fact@1 schema (what `system.facts`
-/// delivers to subscribers).
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct FactMsg {
-    kind: String,
-    offset: u64,
-    ts: i64,
-}
-
-impl Schema for FactMsg {
-    fn schema_def() -> SchemaDef {
-        SchemaDef {
-            name: "Fact".into(),
-            version: 1,
-            kind: SchemaKind::Event,
-            fields: vec![
-                FieldDef::required("kind", FieldTy::Str),
-                FieldDef::required("offset", FieldTy::Int),
-                FieldDef::required("ts", FieldTy::Int),
-            ],
-            description: None,
-        }
-    }
-}
-
-/// An ordinary service actor that consumes `system.facts` and detects
-/// offset discontinuities (the documented at-most-once-with-gaps
-/// contract).
-struct Observer {
-    last: Option<u64>,
-}
-
-impl ServiceActor for Observer {
-    async fn start(_args: &serde_json::Value) -> Result<Self, Report<RegistryError>> {
-        Ok(Self { last: None })
-    }
-}
-
-impl MsgHandler<FactMsg> for Observer {
-    async fn handle(&mut self, fact: FactMsg, _ctx: &mut MsgCtx<'_>) {
-        if let Some(last) = self.last
-            && fact.offset > last + 1
-        {
-            GAPS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            if GAPS.load(std::sync::atomic::Ordering::Relaxed) <= 3 {
-                record(format!(
-                    "GAP detected: offsets {} → {} (ring evictions)",
-                    last + 1,
-                    fact.offset
-                ));
-            }
-        }
-        self.last = Some(fact.offset);
-    }
 }
 
 #[derive(Deserialize)]
@@ -145,6 +90,12 @@ impl Schema for StrictOk {
 struct TickBouncer;
 
 impl EventSourcedActor for TickBouncer {
+    fn manifest() -> ActorManifest {
+        ActorManifest::new()
+            .handles::<StrictCmd>()
+            .emits::<StrictOk>()
+            .kind(ActorKind::EventSourced)
+    }
     fn restore(_args: &serde_json::Value) -> Self {
         Self
     }
@@ -174,22 +125,7 @@ async fn main() {
     tracing_subscriber::fmt()
         .with_max_level(Level::ERROR)
         .init();
-    // A small tap ring: floods produce gaps quickly.
-    let system = ActorSystem::test_with_tap(16).0;
-
-    // The observer: a plain service actor + one subscribe_facts call.
-    trouper::builder::spawn_service_builder::<Observer>(&system)
-        .at(ActorPath::new("observer"))
-        .args(json!({}))
-        .handles::<FactMsg>()
-        .mailbox(64, trouper::inbox::OverloadPolicy::DropNew)
-        .start();
-    system
-        .subscribe_facts(
-            &ActorPath::new("observer"),
-            trouper::topics::SubscriptionFilter::all(),
-        )
-        .expect("subscribe");
+    let system = ActorSystem::new(SystemConfig::production());
 
     // The traffic source: a plain actor the demo sends commands to.
     trouper::builder::spawn_service_builder::<Ticker>(&system)
@@ -198,31 +134,35 @@ async fn main() {
         .handles::<Tick>()
         .start();
 
-    // Traffic: 60 commands → hundreds of facts (Sent/Delivered/Acked...)
-    // through a 16-slot ring → eviction → gaps.
-    println!("== system.facts observer ==");
+    // Traffic: 60 commands produce Sent/Delivered/Acked facts on the tap.
+    println!("== tap observation ==");
     for _i in 0..60 {
         let _ = system
             .send(system.envelope(Tick::schema_id(), ActorPath::new("ticker"), json!({})))
             .await;
     }
-    for _ in 0..1_000 {
-        if sink().lock().iter().any(|l| l.starts_with("GAP")) {
-            // Let the pump drain the backlog before reporting.
-            tokio::time::sleep(std::time::Duration::from_millis(150)).await;
-            break;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(2)).await;
-    }
-    let facts_seen = sink().lock().len();
-    let gaps = GAPS.load(std::sync::atomic::Ordering::Relaxed);
-    println!(
-        "   observer consumed {facts_seen} fact messages and detected {gaps} gaps (at-most-once with accounted-for losses; the ring never slowed down)"
-    );
+    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+    let facts = system.tap_facts();
+    let sent = facts
+        .iter()
+        .filter(|f| matches!(f.kind, FactKind::Sent { .. }))
+        .count();
+    let delivered = facts
+        .iter()
+        .filter(|f| matches!(f.kind, FactKind::Delivered { .. }))
+        .count();
+    let acked = facts
+        .iter()
+        .filter(|f| matches!(f.kind, FactKind::Acked { .. }))
+        .count();
+    record(format!(
+        "tap recorded {} facts ({sent} Sent, {delivered} Delivered, {acked} Acked) for 60 commands",
+        facts.len()
+    ));
 
     // Seed one dead letter: a live actor that does not handle the schema
-    // (UnknownSchema → the DLQ topic retains the envelope). The flood's
-    // spawn-race mail may also be in the DLQ; the baseline below absorbs it.
+    // (UnknownSchema → the DLQ retains the envelope).
+    println!("== DLQ drain ==");
     let baseline = system.dead_letter_count().await;
     trouper::builder::spawn_es_builder::<TickBouncer>(&system)
         .at(ActorPath::new("strict"))
@@ -235,19 +175,27 @@ async fn main() {
         .await
         .expect("routed to strict (dead-lettered at the actor)");
     for _ in 0..1_000 {
-        if system.dead_letter_count().await > 0 {
+        if system.dead_letter_count().await > baseline {
             break;
         }
         tokio::time::sleep(std::time::Duration::from_millis(2)).await;
     }
 
-    // The DLQ re-driver: sugar over the deadletters topic + cursors.
-    println!("== DLQ re-driver ==");
-    let seeded = system.dead_letter_count().await - baseline;
-    system.install_dlq_redriver();
-    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+    // Host-managed drain: inspect the retained envelopes, then decide.
+    let drained = system.drain_dead_letters();
+    for letter in &drained {
+        record(format!(
+            "drained: {} → {:?} ({:?}) — envelope schema {}",
+            letter.dest,
+            letter.reason,
+            letter.detail,
+            letter.envelope.schema,
+        ));
+    }
     println!(
-        "   {seeded} dead letter(s) seeded (Tick → 'strict', which only handles StrictCmd); the re-driver re-sent every retained DLQ envelope to its recorded dest — each redrive dead-lettered again ('strict' still refuses Tick), proving the redriver acted as a plain sender"
+        "   {} dead letter(s) drained (Tick → 'strict', which only handles StrictCmd); the queue is empty now ({} retained) — the host chooses whether to resend an envelope deliberately",
+        drained.len(),
+        system.dead_letter_count().await
     );
     println!("observers example complete");
 }

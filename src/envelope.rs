@@ -13,15 +13,12 @@ use crate::actor::ActorPath;
 use crate::clock::Timestamp;
 use crate::reply::LeaseId;
 use crate::schema::SchemaId;
-use crate::topics::Topic;
 
 /// Where a message is headed.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum Address {
     /// A named actor's inbox.
     Path(ActorPath),
-    /// A topic's fan of subscriber inboxes.
-    Topic(Topic),
     /// A reply slot for an in-flight `ask`; a mechanism, dies with the ask.
     Slot(LeaseId),
     /// Any handler of the schema: the kernel picks one per send
@@ -77,7 +74,6 @@ impl std::fmt::Display for Address {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Address::Path(path) => write!(f, "{path}"),
-            Address::Topic(topic) => write!(f, "{topic}"),
             Address::Slot(lease) => write!(f, "slot({lease})"),
             Address::Schema(schema) => write!(f, "schema({schema})"),
         }
@@ -212,7 +208,6 @@ mod tests {
         // Given one address of each variant.
         let addresses = [
             Address::Path(ActorPath::new("inventory.west")),
-            Address::Topic(Topic::new("inventory.events")),
             Address::Slot(LeaseId::new()),
         ];
 

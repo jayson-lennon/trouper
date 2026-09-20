@@ -10,7 +10,6 @@ use parking_lot::Mutex;
 use std::sync::Arc;
 
 use serde_json::Value as JsonValue;
-use serde_json::json;
 
 use crate::actor::ActorPath;
 use crate::actor::{
@@ -24,7 +23,7 @@ use crate::envelope::{Address, Envelope, TraceCtx};
 use crate::inbox::InboxOffset;
 use crate::inbox::{Inbox, OverloadPolicy};
 pub use crate::kernel::DeadLetter;
-use crate::kernel::{ActorCell, EsLoop, KernelState, pump_facts_now, route};
+use crate::kernel::{ActorCell, EsLoop, KernelState, route};
 use crate::registry::{Endpoint, EndpointInfo, Registry};
 use crate::schema::Schema;
 use crate::schema::SchemaId;
@@ -215,11 +214,6 @@ impl ActorSystem {
         (Self(std::sync::Arc::new(core.0)), core.1)
     }
 
-    /// The system dead-letter topic, created at boot.
-    pub fn deadletter_topic() -> crate::topics::Topic {
-        ActorSystemCore::deadletter_topic()
-    }
-
     /// Fires every supervised child's shutdown watcher: each
     /// [`crate::kernel::supervise_child`] loop exits instead of restarting
     /// its child. Idempotent; children spawned after the call are not
@@ -334,35 +328,12 @@ impl ActorSystem {
         ));
     }
 
-    /// Installs the DLQ re-driver: re-sends every dead letter currently
-    /// retained in the `system.deadletters` topic to its recorded dest
-    /// (as a normal sender — `Sent` facts appear; an undeliverable redrive
-    /// simply dead-letters again). Sugar over the topic + cursor
-    /// machinery: subsequent re-drives re-consume by cursor reset.
-    ///
-    /// Lives on the handle (not the core) because the redrive task captures
-    /// a clone of the handle itself.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the kernel lock is poisoned.
-    pub fn install_dlq_redriver(&self) {
-        let mut kernel = self.kernel.lock();
-        let log = match kernel.topic_logs.get_mut(&Registry::dead_letter_topic()) {
-            Some(log) => log,
-            None => return, // no dead letters yet: nothing to redrive
-        };
-        let entries: Vec<Envelope> = log
-            .entries_iter()
-            .map(|(_, envelope)| envelope.clone())
-            .collect();
-        drop(kernel);
-        let system = self.clone();
-        tokio::spawn(async move {
-            for envelope in entries {
-                let _ = system.send(envelope).await; // failure re-dead-letters
-            }
-        });
+    /// Takes every retained dead letter: each comes back with its reason,
+    /// detail, and FULL ENVELOPE; the queue empties. The host decides —
+    /// inspect, log, or deliberately resend (`system.send(letter.envelope)`).
+    /// The runtime never re-drives automatically.
+    pub fn drain_dead_letters(&self) -> Vec<crate::kernel::DeadLetter> {
+        std::mem::take(&mut self.kernel.lock().dead_letters)
     }
 }
 
@@ -390,8 +361,6 @@ pub struct DeclaredEdge {
     pub schema: SchemaId,
     /// The direction: Handles (inbound) or Emits (outbound).
     pub direction: EdgeDirection,
-    /// The topic, when the edge is a topic edge.
-    pub topic: Option<crate::topics::Topic>,
 }
 
 /// The direction of a declared edge.
@@ -401,8 +370,6 @@ pub enum EdgeDirection {
     Handles,
     /// The actor produces this schema.
     Emits,
-    /// The actor subscribes to this topic.
-    Subscribes,
 }
 
 /// One observed edge: aggregated send traffic from the tap.
@@ -410,7 +377,7 @@ pub enum EdgeDirection {
 pub struct ObservedEdge {
     /// The sending path (absent for system-entry sends).
     pub from: Option<String>,
-    /// The destination ("path:<p>" or "topic:<t>").
+    /// The destination ("path:<p>" or "schema:<s>").
     pub to: String,
     /// The schema that flowed.
     pub schema: SchemaId,
@@ -463,11 +430,6 @@ pub struct SystemExport {
 }
 
 impl ActorSystemCore {
-    /// The system dead-letter topic, created at boot.
-    pub(crate) fn deadletter_topic() -> crate::topics::Topic {
-        crate::topics::Topic::new("system.deadletters")
-    }
-
     /// Spawns a foreign (no-Rust-types) event-sourced actor: the schema,
     /// state fold, and command decision are all runtime JSON data. This is
     /// the seam the port tier will reuse.
@@ -649,23 +611,6 @@ impl ActorSystemCore {
         opts: SpawnOpts,
         args: &JsonValue,
     ) {
-        // The `Fact` schema (facts mirror into `system.facts` as messages;
-        // observers declare a subscription filter against it). First
-        // registration wins — test-local FactMsg may already have it.
-        {
-            let mut registry = self.registry.lock();
-            registry
-                .register_schema_json(json!({
-                    "name": "Fact", "version": 1, "kind": "event",
-                    "fields": [
-                        { "name": "kind", "ty": "str", "required": true },
-                        { "name": "offset", "ty": "int", "required": true },
-                        { "name": "ts", "ty": "int", "required": true }
-                    ],
-                    "description": "A runtime fact mirrored from the tap ring."
-                }))
-                .ok();
-        }
         let opts = self.resolve_opts(opts);
         let (tx, rx) = tokio::sync::mpsc::channel::<Envelope>(opts.mailbox_capacity.max(1) * 2);
         // The manifest is the union of what the actor type declares and
@@ -805,23 +750,6 @@ impl ActorSystemCore {
         // `A::start` is async (I/O allowed); block briefly on a runtime
         // thread is not done — spawn the start inside the actor task and
         // register the slot immediately so senders never see a gap.
-        // The `Fact` schema (facts mirror into `system.facts` as messages;
-        // observers declare a subscription filter against it). First
-        // registration wins — test-local FactMsg may already have it.
-        {
-            let mut registry = self.registry.lock();
-            registry
-                .register_schema_json(json!({
-                    "name": "Fact", "version": 1, "kind": "event",
-                    "fields": [
-                        { "name": "kind", "ty": "str", "required": true },
-                        { "name": "offset", "ty": "int", "required": true },
-                        { "name": "ts", "ty": "int", "required": true }
-                    ],
-                    "description": "A runtime fact mirrored from the tap ring."
-                }))
-                .ok();
-        }
         let opts = self.resolve_opts(opts);
         let (tx, rx) = tokio::sync::mpsc::channel::<Envelope>(opts.mailbox_capacity.max(1) * 2);
         {
@@ -1154,68 +1082,6 @@ impl ActorSystemCore {
         crate::kernel::restart_es(&ctx, genesis_args).await
     }
 
-    /// Re-points a subscriber's topic cursor; the next publish pumps the
-    pub fn reset_topic_cursor(
-        &self,
-        path: &ActorPath,
-        topic: &crate::topics::Topic,
-        to: u64,
-    ) -> Result<u64, u64> {
-        let mut kernel = self.kernel.lock();
-        let Some(log) = kernel.topic_logs.get_mut(topic) else {
-            return Err(to);
-        };
-        log.reset_cursor(path, to)
-    }
-
-    /// Subscribes `path` to the FACTS topic: the tap ring's mirror, so a
-    /// service actor can observe runtime facts (Spawned, Stopped, Sent,
-    /// DeadLettered, ...) as ordinary messages. This is the ONLY
-    /// user-facing topic subscription — the facts feed is a runtime
-    /// diagnostic, not a routing mechanism. Events between actors use
-    /// `.handles::<M>()` + `publish` instead.
-    ///
-    /// # Errors
-    ///
-    /// [`crate::registry::RegistryError::UnknownPath`] when the
-    /// subscriber has no live cell (spawn it first).
-    pub fn subscribe_facts(
-        &self,
-        path: &ActorPath,
-        filter: crate::topics::SubscriptionFilter,
-    ) -> Result<u64, error_stack::Report<crate::registry::RegistryError>> {
-        use error_stack::IntoReport;
-        let mut kernel = self.kernel.lock();
-        let registry = self.registry.lock();
-        if !kernel.cells.contains_key(path) {
-            return Err(crate::registry::RegistryError::UnknownPath(path.clone())
-                .into_report()
-                .attach(format!("subscribing {path} to facts")));
-        }
-        let policy = registry.inbox_policy(path);
-        let log = kernel
-            .topic_logs
-            .entry(Registry::facts_topic())
-            .or_insert_with(|| crate::topics::TopicLog::new(256));
-        Ok(log.subscribe(
-            path.clone(),
-            policy,
-            crate::topics::CursorFrom::Latest,
-            filter,
-        ))
-    }
-
-    /// Re-points a subscriber's topic cursor; the next publish pumps the
-    /// retained range back into its inbox (at-least-once re-consume).
-    ///
-    /// # Errors
-    ///
-    /// Unknown topic or path not subscribed.
-    pub fn topic_range(&self, topic: &crate::topics::Topic) -> Option<(u64, u64)> {
-        let kernel = self.kernel.lock();
-        kernel.topic_logs.get(topic).map(|log| log.retained())
-    }
-
     /// A snapshot of tap facts from an offset (inspection/tests).
     pub fn tap_facts_from(&self, from: u64) -> Vec<crate::tap::Fact> {
         let kernel = self.kernel.lock();
@@ -1230,7 +1096,7 @@ impl ActorSystemCore {
     /// Gracefully stops the actor at `path`: children stop first
     /// (recursive, timeout-bounded), the drain signal lets the current
     /// message finish, undelivered inbox entries go to the DLQ, and the
-    /// slot + topic subscriptions are removed. Emits a Stopped fact.
+    /// slot is removed. Emits a Stopped fact.
     pub async fn stop(&self, path: &ActorPath) {
         const STOP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
         self.stop_bounded(path, STOP_TIMEOUT).await;
@@ -1434,14 +1300,7 @@ impl ActorSystemCore {
                 });
             }
             kernel.dead_letters.extend(letters);
-            // The DLQ is a real topic: retained for re-consumption.
-            let log = kernel
-                .topic_logs
-                .entry(Registry::dead_letter_topic())
-                .or_insert_with(|| crate::topics::TopicLog::new(256));
-            for envelope in undelivered {
-                log.append(envelope);
-            }
+            drop(undelivered);
 
             // SLOT DROP + route cascade + Stopped fact + parent link
             // notification (a supervised child stopping notifies its
@@ -1458,9 +1317,6 @@ impl ActorSystemCore {
             // re-spawn re-registers it via the factory's builder).
             kernel.passivation.remove(path);
             kernel.last_work_ms.remove(path);
-            for log in kernel.topic_logs.values_mut() {
-                log.unsubscribe(path);
-            }
             let notified_parent = kernel.specs.get(path).and_then(|s| s.parent.clone());
             kernel.specs.remove(path);
             if was_live {
@@ -1482,12 +1338,7 @@ impl ActorSystemCore {
                 }
             }
         }
-        if !was_live {
-            return;
-        }
-        // Facts recorded by the stop path (StoppedWithMail DLs, Stopped,
-        // LinkNotified) reach live topic subscribers like any other fact.
-        pump_facts_now(&self.kernel, &self.registry).await;
+        let _ = was_live;
     }
 
     /// Exports the system: schemas, live actors (ES state included),
@@ -1544,32 +1395,8 @@ impl ActorSystemCore {
             });
         }
 
-        // Runtime topic subscriptions (subscribe calls) are declared
-        // edges too: read them from the topic logs.
-        let runtime_subscriptions: Vec<(ActorPath, crate::topics::Topic)> = {
-            let kernel = self.kernel.lock();
-            kernel
-                .topic_logs
-                .iter()
-                .flat_map(|(topic, log)| {
-                    log.subscribers()
-                        .into_iter()
-                        .map(move |p| (p, topic.clone()))
-                })
-                .collect()
-        };
-        let subscription_edges: Vec<DeclaredEdge> = runtime_subscriptions
-            .into_iter()
-            .map(|(actor, topic)| DeclaredEdge {
-                actor,
-                schema: SchemaId::new("Any", 1),
-                direction: EdgeDirection::Subscribes,
-                topic: Some(topic),
-            })
-            .collect();
-
         // Declared edges straight from the manifests above (handles and
-        // emits; topic subscriptions come from the topic logs below).
+        // emits — the actor's complete declared surface).
         let declared_edges: Vec<DeclaredEdge> = actors
             .iter()
             .flat_map(|a| {
@@ -1577,23 +1404,14 @@ impl ActorSystemCore {
                     actor: a.path.clone(),
                     schema: s.clone(),
                     direction: EdgeDirection::Handles,
-                    topic: None,
                 });
                 let emits = a.manifest.emits.iter().map(|s| DeclaredEdge {
                     actor: a.path.clone(),
                     schema: s.clone(),
                     direction: EdgeDirection::Emits,
-                    topic: None,
                 });
-                let emits_topics = a.manifest.emits_on_topics.iter().map(|t| DeclaredEdge {
-                    actor: a.path.clone(),
-                    schema: SchemaId::new("Any", 1),
-                    direction: EdgeDirection::Emits,
-                    topic: Some(t.clone()),
-                });
-                handles.chain(emits).chain(emits_topics).collect::<Vec<_>>()
+                handles.chain(emits).collect::<Vec<_>>()
             })
-            .chain(subscription_edges)
             .collect();
 
         // Observed edges: aggregate Sent facts from the tap.
@@ -1761,16 +1579,6 @@ impl Default for ActorSystem {
 mod tests {
     use rstest::rstest;
     impl ActorSystem {
-        /// Whether the "aud" test actor subscribes to `topic` (tests).
-        pub fn topic_has_subscriber(&self, topic: &crate::topics::Topic) -> bool {
-            let kernel = self.kernel.lock();
-            kernel
-                .topic_logs
-                .get(topic)
-                .map(|log| log.subscribers().contains(&ActorPath::new("aud")))
-                .unwrap_or(false)
-        }
-
         /// The in-memory journal entries for `path` (tests: inspection of
         /// the default store).
         pub fn journal_entries(&self, path: &ActorPath) -> Vec<crate::journal::JournalEntry> {
@@ -1909,7 +1717,6 @@ mod tests {
             ActorManifest::new()
                 .handles::<Add>()
                 .emits::<Added>()
-                .emits_on_topic(crate::topics::Topic::new("counter.events"))
                 .kind(ActorKind::EventSourced)
         }
         fn restore(_args: &JsonValue) -> Self {
@@ -2096,14 +1903,20 @@ mod tests {
         );
         drop(kernel);
 
-        // And the DLQ topic log holds them for re-consumption.
-        let dlq_entries = system
-            .topic_range(&Registry::dead_letter_topic())
-            .map(|(lo, hi)| hi - lo)
-            .unwrap_or(0);
+        // And the retained letters carry their full envelopes (host-drainable).
+        let drained = system.drain_dead_letters();
+        let with_mail: Vec<_> = drained
+            .iter()
+            .filter(|l| l.reason == crate::kernel::DeadLetterReason::StoppedWithMail)
+            .collect();
         assert!(
-            dlq_entries >= 2,
-            "DLQ holds the flushed mail: {dlq_entries}"
+            with_mail.len() >= 2,
+            "DLQ holds the flushed mail: {}",
+            with_mail.len()
+        );
+        assert!(
+            with_mail.iter().all(|l| l.envelope.schema == Add::schema_id()),
+            "retained letters carry the original envelopes"
         );
     }
 
@@ -2149,62 +1962,15 @@ mod tests {
             "front-door refusal recorded: {reasons:?}"
         );
 
-        // And the DLQ topic retained the refused envelope.
-        let dlq = Registry::dead_letter_topic();
-        let (lo, hi) = system.topic_range(&dlq).expect("dlq log exists");
-        assert!(hi > lo, "DLQ holds the refused envelope: ({lo}, {hi})");
-    }
-
-    #[tokio::test]
-    async fn dlq_topic_is_subscribable_and_reconsumable() {
-        // Given a spawned actor that handles only Add.
-        let (system, _clock) = ActorSystem::test();
-        let path = ActorPath::new("counter");
-        system.spawn_es::<Counter, _>(path.clone(), &json!({}), SpawnOpts::default(), || {
-            vec![Arc::new(TypedEsAdapter::<Counter, Add>::new::<Add>())]
-        });
-
-        // And a DLQ consumer subscribed to the dead-letter topic BEFORE
-        // any dead letters exist, decoding the Boom payload shape.
-        let dlq = Registry::dead_letter_topic();
-        let (sub_idx, sub_sink) = open_sink();
-        bind_sink(&ActorPath::new("dlq-watcher"), sub_sink);
-        system.spawn_service::<DlqWatcher, _>(
-            ActorPath::new("dlq-watcher"),
-            &json!({ "sink": sub_idx }),
-            SpawnOpts::default(),
-            || {
-                vec![Arc::new(TypedServiceAdapter::<DlqWatcher, BoomMsg>::new::<
-                    BoomMsg,
-                >())]
-            },
+        // And the refused envelope is retained host-drainable.
+        let drained = system.drain_dead_letters();
+        assert!(
+            drained
+                .iter()
+                .any(|l| l.reason == crate::kernel::DeadLetterReason::InboxRefused
+                    && l.envelope.schema == Add::schema_id()),
+            "DLQ retains the refused envelope"
         );
-        system
-            .subscribe_topic_test(&ActorPath::new("dlq-watcher"), &dlq)
-            .expect("subscribe to dlq");
-
-        // When a message with an unhandled schema arrives.
-        system
-            .send(system.envelope(Boom::schema_id(), path.clone(), json!({ "why": "x" })))
-            .await
-            .expect("delivered");
-        wait_for_cursor(&system, &path, 1).await;
-
-        // Then the DLQ consumer received the dead-lettered envelope.
-        wait_for(|| async { sink_read(&ActorPath::new("dlq-watcher")).len() == 1 }).await;
-
-        // And the retained DLQ log holds the entry for re-consumption.
-        let (lo, hi) = system.topic_range(&dlq).expect("dlq log exists");
-        assert_eq!((lo, hi), (0, 1));
-
-        // When the cursor is reset to 0, the retained entry's range is
-        // still reported (re-consumption is possible from the log).
-        system
-            .reset_topic_cursor(&ActorPath::new("dlq-watcher"), &dlq, 0)
-            .expect("reset");
-        let (lo, hi) = system.topic_range(&dlq).expect("dlq log exists");
-        assert_eq!((lo, hi), (0, 1));
-        assert!(!sink_read(&ActorPath::new("dlq-watcher")).is_empty());
     }
 
     #[tokio::test]
@@ -3087,48 +2853,6 @@ mod tests {
     impl MsgHandler<Add> for Auditor {
         async fn handle(&mut self, msg: Add, _ctx: &mut crate::context::MsgCtx<'_>) {
             self.sink.lock().push(format!("n={}", msg.n));
-        }
-    }
-
-    /// A message shape mirroring the Boom payload (DLQ consumers must
-    /// decode dead-lettered payloads by their schema).
-    #[derive(Debug, Clone, Serialize, Deserialize)]
-    struct BoomMsg {
-        why: String,
-    }
-    impl Schema for BoomMsg {
-        fn schema_def() -> SchemaDef {
-            SchemaDef {
-                name: "Boom".into(),
-                version: 1,
-                kind: SchemaKind::Command,
-                fields: vec![FieldDef::required("why", FieldTy::Str)],
-                description: None,
-            }
-        }
-    }
-
-    /// A service actor that observes dead letters.
-    struct DlqWatcher {
-        sink: Arc<Mutex<Vec<String>>>,
-    }
-    impl ServiceActor for DlqWatcher {
-        fn manifest() -> ActorManifest {
-            ActorManifest::new()
-                .handles::<BoomMsg>()
-                .kind(ActorKind::Service)
-        }
-        async fn start(
-            args: &JsonValue,
-        ) -> Result<Self, error_stack::Report<crate::registry::RegistryError>> {
-            let idx = args["sink"].as_u64().expect("sink index") as usize;
-            let sink = sinks().lock()[idx].clone();
-            Ok(Self { sink })
-        }
-    }
-    impl MsgHandler<BoomMsg> for DlqWatcher {
-        async fn handle(&mut self, msg: BoomMsg, _ctx: &mut crate::context::MsgCtx<'_>) {
-            self.sink.lock().push(format!("dead letter: {}", msg.why));
         }
     }
 
@@ -5982,236 +5706,6 @@ mod tests {
         assert_eq!(spawns, 1, "the race yielded a single activation");
     }
 
-    /// The Rust-side mirror of the runtime's `Fact@1` schema (facts are
-    /// mirrored into `system.facts` with this JSON shape).
-    #[derive(Debug, Clone, Serialize, Deserialize)]
-    struct FactMsg {
-        kind: String,
-        offset: u64,
-        ts: i64,
-    }
-    impl Schema for FactMsg {
-        fn schema_def() -> SchemaDef {
-            SchemaDef {
-                name: "Fact".into(),
-                version: 1,
-                kind: SchemaKind::Event,
-                fields: vec![
-                    FieldDef::required("kind", FieldTy::Str),
-                    FieldDef::required("offset", FieldTy::Int),
-                    FieldDef::required("ts", FieldTy::Int),
-                ],
-                description: None,
-            }
-        }
-    }
-
-    /// A facts observer: a plain service actor recording raw Fact JSON
-    /// (kind@offset) into the shared sink. Gaps and slow-subscriber
-    /// behavior fall out of the offset stream it observes.
-    struct FactsObserver {
-        sink: Arc<Mutex<Vec<String>>>,
-        last: Option<u64>,
-    }
-    impl ServiceActor for FactsObserver {
-        fn manifest() -> ActorManifest {
-            ActorManifest::new()
-                .handles::<FactMsg>()
-                .kind(ActorKind::Service)
-        }
-        async fn start(
-            args: &JsonValue,
-        ) -> Result<Self, error_stack::Report<crate::registry::RegistryError>> {
-            let sink = sinks().lock()[args["sink"].as_u64().expect("sink index") as usize].clone();
-            Ok(Self { sink, last: None })
-        }
-    }
-    impl MsgHandler<FactMsg> for FactsObserver {
-        async fn handle(&mut self, fact: FactMsg, _ctx: &mut crate::context::MsgCtx<'_>) {
-            let mut sink = self.sink.lock();
-            if let Some(last) = self.last
-                && fact.offset > last + 1
-            {
-                sink.push(format!("gap:{}->{}", last, fact.offset));
-            }
-            sink.push(format!("{}@{}", fact.kind, fact.offset));
-            self.last = Some(fact.offset);
-        }
-    }
-
-    /// Spawns a FactsObserver at `path` subscribed to the facts topic
-    /// with the given subscription filter (pass-through when `None`).
-    async fn spawn_facts_observer_filtered(
-        system: &ActorSystem,
-        path: &str,
-        filter: Option<crate::topics::SubscriptionFilter>,
-    ) -> usize {
-        system.register_schema::<FactMsg>();
-        let (sink, sink_ref) = open_sink();
-        crate::builder::spawn_service_builder::<FactsObserver>(&system.clone())
-            .at(ActorPath::new(path))
-            .args(json!({ "sink": sink }))
-            .handles::<FactMsg>()
-            .mailbox(4, crate::inbox::OverloadPolicy::DropNew)
-            .start();
-        assert!(system.schema(&FactMsg::schema_id()).is_some());
-        let subscription = system.subscribe_facts(
-            &ActorPath::new(path),
-            filter.unwrap_or_else(crate::topics::SubscriptionFilter::all),
-        );
-        subscription.expect("subscribed");
-        let _ = sink_ref;
-        sink
-    }
-
-    /// Spawns a FactsObserver at `path` subscribed to the facts topic.
-    async fn spawn_facts_observer(system: &ActorSystem, path: &str) -> usize {
-        spawn_facts_observer_filtered(system, path, None).await
-    }
-
-    #[tokio::test]
-    async fn facts_subscriber_receives_and_detects_gap_under_pressure() {
-        // Given a facts observer subscribed to `system.facts` and a tiny
-        // ring (5 facts before drop-oldest).
-        let (system, _clock) = ActorSystem::test_with_tap(5);
-        let sink0 = spawn_facts_observer(&system, "obs").await;
-        install_key_partition(&system, "counters").expect("partition install");
-
-        // When many facts flood the RING (small ring capacity: the system
-        // test fixture's tap ring holds a handful before dropping). Sends
-        // target a LIVE actor: only completed sends record facts.
-        for i in 0..40 {
-            let e = system.envelope(
-                KeyedAdd::schema_id(),
-                ActorPath::new("counters"),
-                json!({ "n": i, "account": "x" }),
-            );
-            let _ = system.send(e).await;
-        }
-        wait_for(|| async {
-            sinks().lock()[sink0]
-                .lock()
-                .iter()
-                .any(|s| s.starts_with("gap:"))
-        })
-        .await;
-
-        // Then the observer SAW facts AND an offset gap (ring evictions
-        // made loss visible — the documented at-most-once-with-gaps
-        // contract).
-        let sink = sinks().lock()[sink0].lock().clone();
-        assert!(
-            sink.len() > 1,
-            "the observer received facts as messages: {sink:?}"
-        );
-        assert!(
-            sink.iter().any(|s| s.starts_with("gap:")),
-            "the offset discontinuity was detected: {sink:?}"
-        );
-    }
-
-    #[tokio::test]
-    async fn subscribe_filtered_hides_non_matching_facts() {
-        // Given a facts observer subscribed to `system.facts` with a
-        // filter that only admits Stopped facts.
-        let (system, _clock) = ActorSystem::test();
-        system.register_schema::<Add>();
-        let sink0 = spawn_facts_observer_filtered(
-            &system,
-            "filtered-obs",
-            Some(crate::topics::SubscriptionFilter {
-                kind: Some("stopped".into()),
-                ..crate::topics::SubscriptionFilter::default()
-            }),
-        )
-        .await;
-
-        // When a command is sent (Sent/Delivered/Acked facts flow) and
-        // the target actor is then stopped (a Stopped fact flows).
-        let counter = ActorPath::new("fc");
-        system.spawn_es::<BareCounter, _>(
-            counter.clone(),
-            &json!({}),
-            SpawnOpts::default(),
-            || vec![Arc::new(TypedEsAdapter::<BareCounter, Add>::new::<Add>())],
-        );
-        system
-            .send(system.envelope(Add::schema_id(), counter.clone(), json!({ "n": 1 })))
-            .await
-            .expect("delivered");
-        wait_for_cursor(&system, &counter, 1).await;
-        system.stop(&counter).await;
-
-        // Then the observer received ONLY the Stopped fact — every other
-        // fact kind was hidden by the filter.
-        wait_for(|| async { !sinks().lock()[sink0].lock().is_empty() }).await;
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        let sink = sinks().lock()[sink0].lock().clone();
-        assert_eq!(sink.len(), 1, "only the Stopped fact passed: {sink:?}");
-        assert!(sink[0].starts_with("stopped"), "got: {sink:?}");
-    }
-
-    #[tokio::test]
-    async fn slow_facts_subscriber_never_stalls_ring() {
-        // Given a facts observer subscribed to `system.facts`.
-        let (system, _clock) = ActorSystem::test();
-        let sink0 = spawn_facts_observer(&system, "obs").await;
-        install_key_partition(&system, "counters").expect("partition install");
-
-        // When many sends happen (facts are mirrored + pumped; the
-        // dest is a live actor — unroutable sends record no facts).
-        for i in 0..30 {
-            let e = system.envelope(
-                KeyedAdd::schema_id(),
-                ActorPath::new("counters"),
-                json!({ "n": i, "account": "x" }),
-            );
-            let _ = system.send(e).await;
-        }
-        wait_for(|| async { !sinks().lock()[sink0].lock().is_empty() }).await;
-
-        // Then the ring kept recording facts (none lost to the observer's
-        // backlog — delivery pressure never touches the ring).
-        let facts = system.tap_facts().len();
-        assert!(
-            facts >= 30,
-            "the ring recorded every fact despite the stalled subscriber: {facts}"
-        );
-    }
-
-    #[tokio::test]
-    async fn dlq_redriver_resends_dead_letters() {
-        // Given a system with one dead letter (a command the target does
-        // not handle — the DLQ topic retains the envelope).
-        let (system, _clock) = ActorSystem::test();
-        system.register_schema::<Add>();
-        system.register_schema::<KeyedAdd>();
-        crate::builder::spawn_es_builder::<BareCounter>(&system)
-            .at(ActorPath::new("counter"))
-            .args(json!({ "total": 0 }))
-            .handles::<Add>()
-            .emits::<Added>()
-            .start();
-        let e = system.envelope(
-            KeyedAdd::schema_id(),
-            ActorPath::new("counter"),
-            json!({ "n": 6, "account": "x" }),
-        );
-        let _ = system.send(e).await;
-        wait_for(|| async { !system.dead_letter_reasons().await.is_empty() }).await;
-        assert!(
-            !system.dead_letter_reasons().await.is_empty(),
-            "seed dead letter"
-        );
-
-        // When the redriver is installed (it re-sends the dead letter).
-        system.install_dlq_redriver();
-
-        // Then the redrive hit the recorded dest ("counter") again — a
-        // SECOND dead letter proves the redriver acted as a sender.
-        wait_for(|| async { system.dead_letter_reasons().await.len() >= 2 }).await;
-    }
-
     #[tokio::test]
     async fn tee_rule_copies_without_touching_delivery() {
         // Given a primary ES counter and a Tee observer, with a Tee rule:
@@ -8807,36 +8301,6 @@ mod tests {
 }
 
 impl ActorSystem {
-    /// Subscribes `path` to `topic` (test-only seam): the DLQ topic and
-    /// the facts topic are kernel-internal feeds; production event
-    /// distribution is schema-addressed publish/subscribe. Used by tests
-    /// that prove the DLQ topic is consumable.
-    #[cfg(test)]
-    pub(crate) fn subscribe_topic_test(
-        &self,
-        path: &ActorPath,
-        topic: &crate::topics::Topic,
-    ) -> Result<u64, error_stack::Report<crate::registry::RegistryError>> {
-        use error_stack::IntoReport;
-        let mut kernel = self.kernel.lock();
-        let registry = self.registry.lock();
-        if !kernel.cells.contains_key(path) {
-            return Err(crate::registry::RegistryError::UnknownPath(path.clone())
-                .into_report()
-                .attach(format!("subscribing {path}")));
-        }
-        let policy = registry.inbox_policy(path);
-        let log = kernel
-            .topic_logs
-            .entry(topic.clone())
-            .or_insert_with(|| crate::topics::TopicLog::new(256));
-        Ok(log.subscribe(
-            path.clone(),
-            policy,
-            crate::topics::CursorFrom::Latest,
-            crate::topics::SubscriptionFilter::all(),
-        ))
-    }
 
     /// The store behind the system (trait object; tests and flushes).
     #[cfg(test)]

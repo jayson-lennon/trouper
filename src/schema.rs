@@ -219,9 +219,9 @@ pub trait Schema {
 pub trait Message: Schema + Serialize + DeserializeOwned {}
 impl<T: Schema + Serialize + DeserializeOwned> Message for T {}
 
-/// An actor's declared edges: which schemas it handles, which it emits, and
-/// which topics it emits to or subscribes (facts/topic feeds only —
-/// schema-level receive is exclusively `handles`).
+/// An actor's declared edges: which schemas it handles and which it
+/// emits (the complete outbound message surface — `.emits` is enforced
+/// at flush time on every outbound message).
 ///
 /// Manifest entries reference [`SchemaId`]s only — Rust-registered and
 /// JSON-registered schemas are indistinguishable here, which is what makes
@@ -234,15 +234,11 @@ pub struct ActorManifest {
     /// arrives via tell, send_to_any, or publish is invisible here.
     #[serde(default)]
     pub handles: Vec<SchemaId>,
-    /// Event schemas this actor emits.
+    /// Event schemas this actor emits. THE outbound declaration: every
+    /// message an actor sends, publishes, or replies with must appear
+    /// here or the kernel drops it at flush (UndeclaredEmit).
     #[serde(default)]
     pub emits: Vec<SchemaId>,
-    /// Topics this actor publishes on.
-    #[serde(default)]
-    pub emits_on_topics: Vec<crate::topics::Topic>,
-    /// Topics this actor subscribes to.
-    #[serde(default)]
-    pub subscribes: Vec<crate::topics::Topic>,
     /// Which actor contract this actor implements.
     #[serde(default)]
     pub kind: Option<crate::actor::ActorKind>,
@@ -284,22 +280,6 @@ impl ActorManifest {
     pub fn emits_id(mut self, id: SchemaId) -> Self {
         if !self.emits.contains(&id) {
             self.emits.push(id);
-        }
-        self
-    }
-
-    /// Declares that this actor publishes on `topic`.
-    pub fn emits_on_topic(mut self, topic: crate::topics::Topic) -> Self {
-        if !self.emits_on_topics.contains(&topic) {
-            self.emits_on_topics.push(topic);
-        }
-        self
-    }
-
-    /// Declares that this actor subscribes to `topic`.
-    pub fn subscribes(mut self, topic: crate::topics::Topic) -> Self {
-        if !self.subscribes.contains(&topic) {
-            self.subscribes.push(topic);
         }
         self
     }
@@ -490,16 +470,10 @@ mod tests {
         // Given a manifest declaring the same schema twice.
         let manifest = ActorManifest::new()
             .handles::<ReserveStock>()
-            .handles::<ReserveStock>()
-            .emits_on_topic(crate::topics::Topic::new("inventory.events"))
-            .emits_on_topic(crate::topics::Topic::new("inventory.events"));
+            .handles::<ReserveStock>();
 
         // Then each edge is declared exactly once.
         assert_eq!(manifest.handles, [SchemaId::new("ReserveStock", 1)]);
-        assert_eq!(
-            manifest.emits_on_topics,
-            [crate::topics::Topic::new("inventory.events")]
-        );
     }
 
     #[test]
@@ -508,8 +482,6 @@ mod tests {
         let manifest = ActorManifest::new()
             .handles::<ReserveStock>()
             .emits::<TickDone>()
-            .emits_on_topic(crate::topics::Topic::new("inventory.events"))
-            .subscribes(crate::topics::Topic::new("commands.audit"))
             .kind(crate::actor::ActorKind::Service);
 
         // When round-tripping through JSON.
@@ -522,17 +494,17 @@ mod tests {
 
     #[test]
     fn manifest_renders_declared_edges_for_export() {
-        // Given a manifest with handles and a subscription.
+        // Given a manifest with handles and emits.
         let manifest = ActorManifest::new()
             .handles_id(SchemaId::new("ForeignPing", 4))
-            .subscribes(crate::topics::Topic::new("inventory.events"));
+            .emits_id(SchemaId::new("ForeignPong", 4));
 
         // When serializing it.
         let json = serde_json::to_value(&manifest).expect("ser");
 
         // Then declared edges are visible as data.
         assert_eq!(json["handles"][0], "ForeignPing@4");
-        assert_eq!(json["subscribes"][0], "inventory.events");
+        assert_eq!(json["emits"][0], "ForeignPong@4");
     }
 
     struct TickDone;

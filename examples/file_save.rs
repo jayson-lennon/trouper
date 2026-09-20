@@ -12,9 +12,10 @@
 //!   dropped: nobody asked);
 //! - `ask` — save & confirm (the lease-backed reply comes back);
 //! - failed ask — a `SaveFailed` REPLY names the reason (point-to-point);
-//! - failed tell — the same failure PUBLISHED on the `fs.events` topic,
-//!   observed by the `fs.audit` subscriber (a tell has no asker: the reply
-//!   channel is gone, the fact channel is not).
+//! - failed tell — the same failure PUBLISHED as an event, observed by
+//!   the audit subscriber that declared `.handles::<SaveFailed>()` (a
+//!   tell has no asker: the reply channel is gone, the fact channel is
+//!   not).
 //!
 //! Run it: `cargo run --example file_save`
 
@@ -112,8 +113,8 @@ struct SaveError {
     kind: std::io::ErrorKind,
 }
 
-/// The failure fact: published on the audit topic (and replied to an
-/// asker) whenever a save is declined. This is the recorded decision —
+/// The failure fact: published (and replied to an asker) whenever a
+/// save is declined. This is the recorded decision —
 /// domain outcomes (including failures) are facts, not ok-flags.
 #[derive(Serialize, Deserialize, Clone)]
 struct SaveFailed {
@@ -198,8 +199,8 @@ impl<S: FileStore + Default> MsgHandler<SaveFile> for FileSaver<S> {
 
 /// The audit sink: every published `SaveFailed` fact lands here. A static
 /// because the fact travels through the runtime to another ACTOR — the
-/// main flow only polls it (topics are at-most-once mirrors: poll, never
-/// assume ordering with the reply).
+/// main flow only polls it (broadcast copies are at-least-once per
+/// delivery; never assume ordering with the reply).
 static AUDIT: parking_lot::Mutex<Vec<String>> = parking_lot::Mutex::new(Vec::new());
 
 /// The audit subscriber: an ordinary service actor that handles
@@ -574,7 +575,7 @@ mod tests {
             .expect("told");
 
         // Then the failure still surfaces — as a published fact at the
-        // audit subscriber. Never a broadcast reply; a topic publish.
+        // audit subscriber. Never a broadcast reply; an event publish.
         wait(|| async { AUDIT.lock().len() > baseline }).await;
         let seen = AUDIT.lock();
         assert!(

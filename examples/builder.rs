@@ -2,7 +2,7 @@
 //! exactly once.
 //!
 //! - Typed: `spawn_es_builder::<Inventory>()` with `.handles::<C>()` /
-//!   `.emits::<E>()` / `.emits_on_topic()` / `.snapshot()` / `.mailbox()`.
+//!   `.emits::<E>()` / `.snapshot()` / `.mailbox()`.
 //!   The builder constructs the erased adapters internally.
 //! - Foreign: `spawn_foreign()` with named `handle`/`apply` closures —
 //!   the same event-sourced contract with no Rust actor types.
@@ -111,7 +111,6 @@ async fn main() {
         .args(json!({}))
         .handles::<Restock>()
         .emits::<Restocked>()
-        .emits_on_topic(Topic::new("inventory.events"))
         .snapshot(SnapshotCadence::Messages(50))
         .mailbox(64, trouper::inbox::OverloadPolicy::Block)
         .start();

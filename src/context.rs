@@ -211,7 +211,7 @@ impl CtxCore<'_> {
     ///
     /// A reply without a `reply_to` is dropped silently: the asker is gone,
     /// so the fact is unobservable by definition. It is NEVER a broadcast —
-    /// use [`CtxCore::publish`] for topics.
+    /// use [`CtxCore::publish`] for events.
     pub fn reply<M: Message>(&mut self, msg: M) {
         let payload = serde_json::to_value(&msg).expect("schema payload serializes");
         self.reply_json(M::schema_id(), payload);
@@ -1033,7 +1033,7 @@ mod tests {
         }
     }
 
-    /// Same equivalence for publish: topic, derived schema id, payload.
+    /// Same equivalence for publish: event broadcast, derived schema id, payload.
     #[test]
     fn typed_publish_records_the_same_intent_as_the_raw_variant() {
         // Given two identical contexts.

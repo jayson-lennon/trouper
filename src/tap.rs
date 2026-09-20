@@ -17,7 +17,6 @@ use crate::journal::SeqNo;
 use crate::kernel::AskOutcome;
 use crate::kernel::DeadLetterReason;
 use crate::schema::SchemaId;
-use crate::topics::Topic;
 
 /// One observed runtime fact.
 #[derive(Debug, Clone)]
@@ -73,12 +72,6 @@ pub enum FactKind {
     Stopped { path: ActorPath, reason: StopReason },
     /// A handler failed (panic or dispatch error).
     Failed { path: ActorPath, error: String },
-    /// An envelope was published onto a topic.
-    TopicPublished {
-        topic: Topic,
-        schema: SchemaId,
-        trace: TraceCtx,
-    },
     /// An ES actor took a snapshot at a journal seq.
     SnapshotTaken { path: ActorPath, seq: SeqNo },
     /// A restart budget was exhausted; escalation to the parent.
@@ -171,17 +164,6 @@ impl Fact {
                 "kind": "failed",
                 "path": path.to_string(),
                 "error": error,
-            }),
-            FactKind::TopicPublished {
-                topic,
-                schema,
-                trace,
-            } => json!({
-                "kind": "topic_published",
-                "topic": topic.to_string(),
-                "schema": schema.to_string(),
-                "trace_id": trace.trace_id.to_string(),
-                "causality_id": trace.causality_id.to_string(),
             }),
             FactKind::SnapshotTaken { path, seq } => json!({
                 "kind": "snapshot_taken",

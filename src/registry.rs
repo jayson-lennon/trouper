@@ -2,10 +2,9 @@
 //!
 //! Bootstrap paradox resolved by construction: the registry must never
 //! deadlock and must survive every actor restart, so it is plain kernel data.
-//! It holds four tables — path→endpoint slots, the schema table,
-//! schema→handler routes, and topic→subscribers (kernel-internal: facts,
-//! DLQ). Actor identity is its registered path; handles survive restarts
-//! because slots are swapped, never invalidated.
+//! It holds three tables — path→endpoint slots, the schema table, and
+//! schema→handler routes. Actor identity is its registered path; handles
+//! survive restarts because slots are swapped, never invalidated.
 
 use std::collections::{BTreeMap, HashMap};
 
@@ -16,11 +15,6 @@ use crate::actor::{ActorKind, ActorPath};
 use crate::envelope::Envelope;
 use crate::schema::SchemaId;
 use crate::schema::{ActorManifest, Schema, SchemaDef, SchemaError};
-use crate::topics::Topic;
-
-/// The topic every undeliverable message lands on; created at system boot.
-pub const DEAD_LETTER_TOPIC: &str = "system.deadletters";
-pub const FACTS_TOPIC: &str = "system.facts";
 
 /// The deliverable front door of one running actor endpoint.
 ///
@@ -75,8 +69,7 @@ pub(crate) struct Slot {
     pub(crate) manifest: ActorManifest,
     /// The running endpoint; `None` while stopped (between restarts).
     pub(crate) endpoint: arc_swap::ArcSwapOption<Endpoint>,
-    /// The inbox overload policy this actor spawned with (topic pumps
-    /// consult it when delivering published envelopes).
+    /// The inbox overload policy this actor spawned with.
     pub(crate) inbox_policy: crate::inbox::OverloadPolicy,
 }
 
@@ -235,16 +228,6 @@ pub struct Registry {
 }
 
 impl Registry {
-    /// The dead-letter topic (created at boot, always valid).
-    pub fn dead_letter_topic() -> Topic {
-        Topic::new(DEAD_LETTER_TOPIC)
-    }
-
-    /// The system facts topic (the tap's subscribable mirror).
-    pub fn facts_topic() -> Topic {
-        Topic::new(FACTS_TOPIC)
-    }
-
     /// Registers a schema descriptor; idempotent per name+version.
     pub fn register_schema(&mut self, def: SchemaDef) -> SchemaId {
         self.schemas.register(def)
@@ -379,8 +362,7 @@ impl Registry {
         Ok(())
     }
 
-    /// Removes a slot entirely; returns its manifest (topics phase uses the
-    /// subscriptions for cascade removal).
+    /// Removes a slot entirely; returns its manifest.
     ///
     /// # Errors
     ///
@@ -483,7 +465,7 @@ impl Registry {
         self.slots.get(path)?.endpoint.load_full()
     }
 
-    /// The inbox policy a path spawned with (topic pump delivery).
+    /// The inbox policy a path spawned with.
     pub fn inbox_policy(&self, path: &ActorPath) -> crate::inbox::OverloadPolicy {
         self.slots
             .get(path)
@@ -795,9 +777,7 @@ mod tests {
         let mut registry = Registry::default();
         let path = ActorPath::new("inventory.west");
         let (ep_manifest, _rx, ep) = {
-            let m = ActorManifest::new()
-                .kind(ActorKind::EventSourced)
-                .emits_on_topic(Topic::new("inventory.events"));
+            let m = ActorManifest::new().kind(ActorKind::EventSourced);
             let (rx, ep) = endpoint(1);
             (m, rx, ep)
         };
@@ -813,12 +793,8 @@ mod tests {
         // When looking the path up.
         let info = registry.lookup(&path).expect("info");
 
-        // Then kind and topic edges are visible.
+        // Then the kind is visible.
         assert_eq!(info.kind, ActorKind::EventSourced);
-        assert_eq!(
-            info.manifest.emits_on_topics,
-            [Topic::new("inventory.events")]
-        );
     }
 
     #[test]
@@ -947,9 +923,8 @@ mod tests {
         let resolved = registry.resolve(&ActorPath::new("ghost"));
 
         // Then resolution is None — the kernel turns this into a
-        // DeadLettered fact on the dead-letter topic.
+        // DeadLettered fact.
         assert!(resolved.is_none());
-        assert_eq!(Registry::dead_letter_topic().as_str(), DEAD_LETTER_TOPIC);
     }
 
     fn versioned_schema(version: u32) -> SchemaDef {

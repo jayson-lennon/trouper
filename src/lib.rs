@@ -2,8 +2,8 @@
 //!
 //! A single-machine actor runtime whose product is the communication fabric:
 //! a runtime-level schema registry, envelope/trace metadata, a tap stream of
-//! facts, journal-backed event-sourced actors, topics with per-subscriber
-//! cursors, declarative supervision, and dynamic add/remove of actors.
+//! facts, journal-backed event-sourced actors, declarative supervision, and
+//! dynamic add/remove of actors.
 //!
 //! See `.plans/actor-runtime-core/plan.md` for the authoritative spec.
 
@@ -25,7 +25,6 @@ pub mod state_report;
 pub mod supervision;
 pub mod system;
 pub mod tap;
-pub mod topics;
 
 /// Everything a typical actor author needs.
 pub mod prelude {
@@ -41,5 +40,4 @@ pub mod prelude {
     pub use crate::schema::*;
     pub use crate::state_report::{ReportState, StateReported, StateReporter};
     pub use crate::system::*;
-    pub use crate::topics::Topic;
 }

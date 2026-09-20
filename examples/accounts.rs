@@ -19,14 +19,12 @@
 //!
 //! Run: `cargo run --example accounts`
 
-use error_stack::Report;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::sync::{Arc, OnceLock};
 use tracing::Level;
-use trouper::actor::{CommandHandler, EventSourcedActor, MsgHandler, ServiceActor};
+use trouper::actor::{CommandHandler, EventSourcedActor};
 use trouper::prelude::*;
-use trouper::registry::RegistryError;
 use trouper::tap::FactKind;
 
 // -- Commands -------------------------------------------------------------
@@ -218,57 +216,6 @@ fn tell(line: String) {
     lines().lock().push(line);
 }
 
-/// The Rust mirror of the runtime's `Fact@1` schema (what `system.facts`
-/// delivers to subscribers).
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct FactMsg {
-    kind: String,
-    offset: u64,
-    ts: i64,
-}
-
-impl Schema for FactMsg {
-    fn schema_def() -> SchemaDef {
-        SchemaDef {
-            name: "Fact".into(),
-            version: 1,
-            kind: SchemaKind::Event,
-            fields: vec![
-                FieldDef::required("kind", FieldTy::Str),
-                FieldDef::required("offset", FieldTy::Int),
-                FieldDef::required("ts", FieldTy::Int),
-            ],
-            description: None,
-        }
-    }
-}
-
-/// A story observer: subscribed to `system.facts` with a filter that only
-/// admits `failed` and `spawned` facts — the crash/restart slice.
-struct StoryObserver;
-
-impl ServiceActor for StoryObserver {
-    async fn start(_args: &serde_json::Value) -> Result<Self, Report<RegistryError>> {
-        Ok(Self)
-    }
-}
-
-impl MsgHandler<FactMsg> for StoryObserver {
-    async fn handle(&mut self, fact: FactMsg, ctx: &mut MsgCtx<'_>) {
-        if ctx.self_path().as_str() == "story2" {
-            tell(format!(
-                "spawn fact seen (offset {}) — initial spawn or supervised restart",
-                fact.offset
-            ));
-        } else {
-            tell(format!(
-                "CRASH fact seen (offset {}) — handler panicked",
-                fact.offset
-            ));
-        }
-    }
-}
-
 #[tokio::main]
 async fn main() {
     tracing_subscriber::fmt()
@@ -276,25 +223,7 @@ async fn main() {
         .init();
     let system = ActorSystem::new(SystemConfig::production());
 
-    // The story observer: one subscription, filtered to failed/spawned.
-    trouper::builder::spawn_service_builder::<StoryObserver>(&system)
-        .at(ActorPath::new("story"))
-        .args(json!({}))
-        .handles::<FactMsg>()
-        .mailbox(64, trouper::inbox::OverloadPolicy::DropNew)
-        .start();
-    system
-        .subscribe_facts(
-            &ActorPath::new("story"),
-            trouper::topics::SubscriptionFilter {
-                kind: Some("failed".into()),
-                ..trouper::topics::SubscriptionFilter::default()
-            },
-        )
-        .expect("subscribe");
-    add_spawn_filter(&system);
     println!("== account demo ==");
-    println!("   observers subscribed: failures ('story') + restarts ('story2')");
 
     // The account lives under supervision (restart budget 3 per 10s).
     let account = ActorPath::new("account");
@@ -359,7 +288,12 @@ async fn main() {
             .any(|f| matches!(&f.kind, FactKind::Failed { path, .. } if *path == account))
     })
     .await;
-    println!("   handler panicked → Failed fact → supervision restarts");
+    let failed = system
+        .tap_facts()
+        .iter()
+        .filter(|f| matches!(&f.kind, FactKind::Failed { path, .. } if *path == account))
+        .count();
+    tell(format!("tap fact seen: Failed×{failed} — handler panicked (supervision restarts)"));
 
     // -- 4. Life after restart ----------------------------------------------
     println!("== 4. after restart ==");
@@ -369,8 +303,10 @@ async fn main() {
     let restarted = system
         .tap_facts()
         .iter()
-        .any(|f| matches!(&f.kind, FactKind::Spawned { restart: true, .. }));
-    assert!(restarted, "supervision emitted Spawned{{restart:true}}");
+        .filter(|f| matches!(&f.kind, FactKind::Spawned { restart: true, .. }))
+        .count();
+    assert!(restarted > 0, "supervision emitted Spawned{{restart:true}}");
+    tell(format!("tap fact seen: Spawned{{restart}}×{restarted} — journal replay rebuilt the actor"));
     println!("   replay + redelivery → balance 80 (the crash never lost state or mail)");
 
     // -- 5. The journal tells the whole story -------------------------------
@@ -383,27 +319,6 @@ async fn main() {
     println!("   {schemas:?}");
     println!("   (WithdrawFailed is a first-class journal entry — replay reproduces it)");
     println!("accounts example complete");
-}
-
-/// Adds a SECOND filtered subscription admitting spawned facts (a second
-/// StoryObserver instance on the same path is illegal, so this installs a
-/// second observer "story2").
-fn add_spawn_filter(system: &ActorSystem) {
-    trouper::builder::spawn_service_builder::<StoryObserver>(&system.clone())
-        .at(ActorPath::new("story2"))
-        .args(json!({}))
-        .handles::<FactMsg>()
-        .mailbox(64, trouper::inbox::OverloadPolicy::DropNew)
-        .start();
-    system
-        .subscribe_facts(
-            &ActorPath::new("story2"),
-            trouper::topics::SubscriptionFilter {
-                kind: Some("spawned".into()),
-                ..trouper::topics::SubscriptionFilter::default()
-            },
-        )
-        .expect("subscribe");
 }
 
 /// Sends one command with an int payload `{"n": n}` (Poison uses n as its
