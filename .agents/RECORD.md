@@ -34,7 +34,7 @@ Entries are added or amended **only with human approval**.
 - (identity) trouper is a single-crate Rust repository (edition 2024); the `trouper` package is the single-machine actor runtime and the only crate.
 - (runtime) All actor communication is mediated by the runtime: actors never hold channels directly; every send is routed by path or schema through the registry and emits a tap fact.
 - (runtime) Event-sourced actors are pure decision functions (sync `handle(&self)` returning events) with a single `apply` used for both live state application and replay; all other actors may perform side effects and use `ask`.
-- (runtime) The registry is kernel code, not an actor: path→endpoint slots, schema, type→handler, and topic→subscriber tables persist across actor restarts; actor identity is its registered path.
+- (runtime) The registry is kernel code, not an actor: path→endpoint slots, schema, type→handler, partition specs, and router rule tables persist across actor restarts; actor identity is its registered path.
 - (runtime) Message schemas are runtime data: Rust types and external JSON descriptors register into the same schema table; payloads cross the runtime boundary as JSON.
 - (runtime) Event-sourced journals are in-memory, seq-anchored lists of `Event` and `Snapshot` entries; restart restores from the latest snapshot plus the tail, and command redelivery is independent of snapshots.
 - (runtime) Actor spawning is builder-based: typed actors declare `handles`/`emits` inline; foreign actors supply JSON schema plus handle/apply closures; positional spawn functions remain as alternative entry points.
@@ -42,20 +42,21 @@ Entries are added or amended **only with human approval**.
 - (runtime) Actor `manifest()` defaults to an empty manifest; builders supply the contract kind and edges, making builder declarations the single source of an actor's declared surface.
 - (runtime) The ActorSystem exposes typed `tell` and `ask` entry points; ask is lease-backed with a mandatory timeout and settles with the same Replied/Timeout/Failed facts as in-actor asks.
 - (runtime) Event emission is declaration-filtered: the kernel drops events whose schema the actor has not declared, before journal append, with a dead-letter fact and a tracing error; journals therefore contain only declared schemas.
+- (runtime) Outbound actor messages are declaration-enforced: every intent an actor records (send, publish, send_to_any, reply) is gated at flush against the actor's .emits, and undeclared messages drop with an UndeclaredEmit dead letter plus a tracing error.
 - (runtime) Partition sets are declarative specs resolved by the kernel at route time: senders keep addressing the public path; per-entity paths derive from a schema-declared shard key and entities activate on demand.
 - (runtime) Service-actor asks are lease-backed: every ask carries a mandatory timeout, the reply slot is a runtime lease that dies with the ask, and outcomes (Replied/Timeout/Failed) are tap facts.
 - (tap) The tap is a global bounded drop-oldest ring of facts that may drop under pressure; it is observation only — delivery never flows through it, and JSON projection happens only at the tap boundary (`Fact::to_json`).
 - (tap) Each tap fact carries a monotonic `offset`; the ring exposes its retained `[floor, next)` range, and offset gaps signal eviction.
-- (tap) The `system.facts` topic is a subscribable mirror of the tap; facts are pumped to it after each record, and per-subscriber cursors detect gaps (at-most-once delivery of teed copies).
+- (tap) The tap ring is the sole observation surface: facts are recorded to the bounded ring and read by the host; actors observe events only by declaring .handles on them.
 - (runtime) `tracing` is the developer-diagnostic channel; the tap is the product fact stream.
 - (runtime) `system.export()` returns a JSON-serializable `SystemExport` of the live system: schemas, actors (with ES state and inbox cursor), declared edges, observed edges, pools, partitions, and router rules; `SystemExport` round-trips through JSON losslessly.
 - (runtime) A ReportState command makes a StateReporter actor emit a journaled StateReported event whose payload is the JSON SystemExport document.
 - (runtime) Domain outcomes are events journaled like any other event; technical failures are handler panics, which supervision converts into restarts and `Failed`/`Escalated` tap facts.
 - (runtime) All synchronous mutexes are parking_lot: lock() cannot fail, there is no poisoning, and a panic under a lock never wedges later lockers.
-- (runtime) Replies are point-to-point: a reply with no reply_to is dropped silently, never broadcast; failures that must reach non-asking observers travel as published events on topics.
+- (runtime) Replies are point-to-point: a reply with no reply_to is dropped silently, never broadcast; every outbound actor message requires a declared .emits and is dropped with an UndeclaredEmit dead letter otherwise.
 - (runtime) Handler contexts (CmdCtx/MsgCtx) expose only tier-curated methods; the outbox, trace, and ask port are crate-private plumbing.
 - (runtime) Handler effects are typed: ctx reply/publish/send take Message values (Schema + serde), derive the schema id from the type, and serialize at intent time; raw JSON variants remain as the \*\_json escape hatch.
-- (contexts) MsgCtx exposes typed tell/publish/send_to_any/ask/reply; CmdCtx (event-sourced) exposes only sync intents — no ask, because a decision function cannot await.
+- (contexts) MsgCtx exposes typed send/publish/send_to_any/ask/reply/stop_self, all emits-gated at flush; CmdCtx is pure introspection — an event-sourced entity announces only by returning facts from its decision.
 - (lifecycle) A trouper actor's on_stop hook runs on graceful stop, self-stop, passivation, and the shutdown sweep; never on crash or hard shutdown.
 - (lifecycle) Service actors receive an async on_stop(&mut self); event-sourced actors receive a sync on_stop(&self).
 - (lifecycle) stop_self() records a deferred intent; the actor stops after the current message commits, flushing pending sends in order.
@@ -67,7 +68,10 @@ Entries are added or amended **only with human approval**.
 - (supervision) A supervised child's restart engine exits when the child's spec is removed and stays suspended during the shutdown sweep.
 - (supervision) Restart-budget exhaustion stops the child and delivers an Escalated message to its declared parent path; the parent is an ordinary actor whose handler owns the response.
 - (partitions) Partition entities passivate per their factory's builder config and re-spawn on the next send to the public path.
-- (routing) system.publish and ctx.publish deliver one copy to every actor that declared .handles for the schema; zero handlers is a silent no-op.
+- (routing) A recorded, declared event-sourced fact is broadcast by the kernel to every actor that declared .handles for it; zero handlers is a silent no-op.
 - (routing) system.tell delivers one copy to the addressed path; system.send_to_any delivers one copy to one handler of the schema (round-robin); how a message arrived is invisible to the receiver's dispatch.
 - (routing) deliver_schema_value uses the schema's declared kind as the erased bridge's default transport: Event schemas broadcast, Command schemas route to one handler.
 - (routing) A re-spawned partition entity re-declares its handled schemas.
+- (events) Event-sourced actors do not answer asks: system.ask to an ES path fails fast with AskError::Unresolved; consumers listen for facts.
+- (journal) Journals accept only declared schemas: an undeclared recorded event dead-letters UndeclaredEvent before append. Dead letters retain their envelopes and are host-managed via drain_dead_letters; the runtime never redrives automatically.
+- (supervision) An event-sourced entity owns no lifecycle intents: only passivation, external stop, or supervision ends one.
