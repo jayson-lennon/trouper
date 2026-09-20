@@ -117,7 +117,7 @@ pub(crate) struct KernelState {
     /// The global observation ring (drop-oldest).
     pub(crate) tap: crate::tap::TapRing,
     /// Supervised children: path → spec.
-    pub(crate) specs: HashMap<ActorPath, crate::supervision::ChildSpec>,
+    pub(crate) specs: HashMap<ActorPath, crate::supervision::ActorSpec>,
     /// Sliding-window failure records: path → window.
     pub(crate) failures: HashMap<ActorPath, crate::supervision::FailureWindow>,
     /// Per-actor backpressure watermarks: path → (high watermark, fired).
@@ -395,24 +395,39 @@ async fn route_inner(
                     return Ok(path);
                 }
             };
-            // POOLS: a public pool path resolves to ONE worker (algo pick).
-            let path = {
-                let reg = registry.lock();
-                match reg.pools.get(&path) {
-                    Some(pool) => {
-                        let idx = pool.algo.pick(pool.workers.len(), &pool.next);
-                        pool.workers[idx].clone()
-                    }
-                    None => path,
-                }
-            };
             let endpoint = {
                 let registry = registry.lock();
                 registry.resolve(&path)
             };
-            match endpoint {
-                Some(endpoint) => deliver_with_retry(&endpoint, envelope.clone()).await?,
+            let endpoint = match endpoint {
+                Some(endpoint) => endpoint,
                 None => return Err(envelope),
+            };
+            // The activation fast-path can lose a race against the
+            // entity's passivation drain (the inbox closes between
+            // `resolve_partition` and this delivery): the refused
+            // envelope RETRIES the whole arm once — this time the entity
+            // is absent, so it is re-activated from the factory and the
+            // journal replays. Converges: the second attempt cannot hit
+            // a second drain (a just-activated actor is not idle).
+            if deliver_with_retry(&endpoint, envelope.clone())
+                .await
+                .is_err()
+            {
+                let retry_path =
+                    match resolve_partition(registry, kernel, &envelope, path.clone()).await {
+                        Ok(Some(entity)) => entity,
+                        _ => path.clone(),
+                    };
+                let retry_endpoint = {
+                    let registry = registry.lock();
+                    registry.resolve(&retry_path)
+                };
+                let Some(retry_endpoint) = retry_endpoint else {
+                    return Err(envelope);
+                };
+                deliver_with_retry(&retry_endpoint, envelope.clone()).await?;
+                return Ok(retry_path);
             }
             {
                 let mut kernel = kernel.lock();
@@ -1304,16 +1319,21 @@ async fn publish_to_topic(
     pump_topic(kernel, registry, &topic).await;
 }
 
-/// Broadcasts one published event to EVERY subscriber of its schema.
+/// Broadcasts one published event to EVERY handler of its schema.
 ///
-/// The event transport (vs `send`, the command transport): subscribers
-/// are copied in registry insertion order — no round-robin, no
-/// dead-lettering. A dead subscriber (stopped mid-flight) is skipped
-/// silently: events are news, not work orders, and one gone reader never
-/// fails the others' delivery. Zero subscribers ⇒ a no-op.
+/// Publish is a sender verb over the one route table: every actor that
+/// declared `.handles::<M>()` receives exactly one copy, in registration
+/// order — no round-robin, no dead-lettering. A handler whose endpoint is
+/// closed (stopped or mid-restart) is skipped silently: events are news,
+/// not work orders, and one gone reader never fails the others. Zero
+/// handlers ⇒ a silent no-op (one Sent fact, no deliveries, no DLQ).
+///
+/// Because handlers declared `.handles`, the dispatch entry exists on
+/// their side too — a published copy dispatches exactly like a told one.
 ///
 /// Lock discipline mirrors [`pump_topic`]: one acquisition to snapshot
-/// the (path, endpoint) pairs, deliveries outside the locks.
+/// the (path, endpoint) pairs, deliveries outside the locks. The route
+/// cursor is untouched: publishes never disturb one-of send rotation.
 pub(crate) async fn broadcast(
     registry: &Mutex<Registry>,
     kernel: &Mutex<KernelState>,
@@ -1322,7 +1342,7 @@ pub(crate) async fn broadcast(
 ) {
     let targets: Vec<(ActorPath, Arc<Endpoint>)> = {
         let reg = registry.lock();
-        reg.subscribers_of(&schema)
+        reg.handlers_of(&schema)
             .into_iter()
             .filter_map(|path| reg.resolve(&path).map(|endpoint| (path, endpoint)))
             .collect()
@@ -1970,7 +1990,7 @@ fn capacity_hint() -> usize {
 /// restart, or stop + escalate.
 pub async fn supervise_child(
     system: crate::system::ActorSystem,
-    spec: crate::supervision::ChildSpec,
+    spec: crate::supervision::ActorSpec,
     mut shutdown: tokio::sync::watch::Receiver<bool>,
 ) {
     loop {
@@ -2120,7 +2140,7 @@ fn system_is_es_child(system: &crate::system::ActorSystem, path: &ActorPath) -> 
 /// Escalated fact.
 async fn escalate(
     system: &crate::system::ActorSystem,
-    spec: &crate::supervision::ChildSpec,
+    spec: &crate::supervision::ActorSpec,
     reason: &str,
     stop_reason: crate::actor::StopReason,
 ) {

@@ -264,7 +264,6 @@ async fn run_demo() -> Result<(), Box<dyn std::error::Error>> {
     spawn_service_builder::<SaveAudit>(&system)
         .at(ActorPath::new("fs.audit"))
         .handles::<SaveFailed>()
-        .subscribe::<SaveFailed>()
         .start();
 
     // --- tell: fire-and-forget, confirmed only by looking at the disk ---
@@ -480,7 +479,7 @@ mod tests {
     // ---- adapter tests: the shim over a REAL ActorSystem ----
 
     /// Spawns `FileSaver<MemFs>` + `SaveAudit` on a fresh test system; the
-    /// audit subscribes to the `SaveFailed` event.
+    /// audit handles the `SaveFailed` event.
     async fn demo_system() -> (ActorSystem, ActorPath, ActorPath) {
         let system = ActorSystem::new(SystemConfig::production());
         let saver = trouper::builder::spawn_service_builder::<FileSaver<MemFs>>(&system)
@@ -493,7 +492,7 @@ mod tests {
         let audit = trouper::builder::spawn_service_builder::<SaveAudit>(&system)
             .at(ActorPath::new("test.audit"))
             .args(json!({}))
-            .subscribe::<SaveFailed>()
+            .handles::<SaveFailed>()
             .start();
         wait(|| async {
             system.inbox_cursor(&saver).is_some() && system.inbox_cursor(&audit).is_some()

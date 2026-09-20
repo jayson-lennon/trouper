@@ -220,7 +220,8 @@ pub trait Message: Schema + Serialize + DeserializeOwned {}
 impl<T: Schema + Serialize + DeserializeOwned> Message for T {}
 
 /// An actor's declared edges: which schemas it handles, which it emits, and
-/// which topics it emits to or subscribes.
+/// which topics it emits to or subscribes (facts/topic feeds only —
+/// schema-level receive is exclusively `handles`).
 ///
 /// Manifest entries reference [`SchemaId`]s only — Rust-registered and
 /// JSON-registered schemas are indistinguishable here, which is what makes
@@ -228,22 +229,11 @@ impl<T: Schema + Serialize + DeserializeOwned> Message for T {}
 /// builder at spawn; the kernel registers routes from it.
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 pub struct ActorManifest {
-    /// Command/message schemas this actor accepts.
+    /// Schemas this actor accepts — the one receive declaration. `.handles`
+    /// installs both the route and the dispatch entry; whether a message
+    /// arrives via tell, send_to_any, or publish is invisible here.
     #[serde(default)]
     pub handles: Vec<SchemaId>,
-    /// Message schemas this actor observes: the kernel copies every
-    /// routed delivery of these schemas into this actor's inbox via the
-    /// schema's observation topic (at-least-once, after the primary
-    /// delivery). Observe-only schemas are NOT routed here as primary
-    /// dispatch targets.
-    #[serde(default)]
-    pub observes: Vec<SchemaId>,
-    /// Event schemas this actor SUBSCRIBES to: the kernel copies every
-    /// published event of these schemas into this actor's inbox. Disjoint
-    /// from `handles` — subscribing never makes the actor a command
-    /// target, and handling never subscribes it to broadcasts.
-    #[serde(default)]
-    pub subscribed: Vec<SchemaId>,
     /// Event schemas this actor emits.
     #[serde(default)]
     pub emits: Vec<SchemaId>,
@@ -269,29 +259,6 @@ impl ActorManifest {
         let id = S::schema_id();
         if !self.handles.contains(&id) {
             self.handles.push(id);
-        }
-        self
-    }
-
-    /// Declares that this actor observes schema `S`: it receives a copy
-    /// of every routed delivery of `S` (at-least-once, after the
-    /// primary delivery) without being a primary dispatch target.
-    pub fn observes<S: Schema>(mut self) -> Self {
-        let id = S::schema_id();
-        if !self.observes.contains(&id) && !self.handles.contains(&id) {
-            self.observes.push(id);
-        }
-        self
-    }
-
-    /// Declares that this actor SUBSCRIBES to schema `S`: it receives a
-    /// copy of every published event of `S` (insertion order, no
-    /// round-robin). Subscribing never makes this actor a dispatch
-    /// target for `S`; handle commands with `handles` instead.
-    pub fn subscribes_to<S: Schema>(mut self) -> Self {
-        let id = S::schema_id();
-        if !self.subscribed.contains(&id) {
-            self.subscribed.push(id);
         }
         self
     }

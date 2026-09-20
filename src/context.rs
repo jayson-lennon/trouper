@@ -26,7 +26,7 @@ pub(crate) trait RuntimeView: Send + Sync {
     fn lookup(&self, path: &ActorPath) -> Option<crate::registry::EndpointInfo>;
 
     /// Every path registered as a handler for a schema.
-    fn who_handles(&self, schema: &SchemaId) -> Vec<ActorPath>;
+    fn handlers_of(&self, schema: &SchemaId) -> Vec<ActorPath>;
 
     /// The current time from the injected clock.
     fn now(&self) -> Timestamp;
@@ -169,11 +169,22 @@ impl CtxCore<'_> {
 
     /// Records an event broadcast (typed: the schema id comes from the
     /// message type, the payload from serde). Deferred; the kernel fans
-    /// it out to every `.subscribe`ed actor post-ack. Zero subscribers ⇒
-    /// silent no-op: events are news, not work orders.
+    /// it out to every actor that declared `.handles::<M>()` post-ack.
+    /// Zero handlers ⇒ silent no-op: events are news, not work orders.
     pub fn publish<M: Message>(&mut self, msg: &M) {
         let payload = serde_json::to_value(msg).expect("schema payload serializes");
         self.publish_json(M::schema_id(), payload);
+    }
+
+    /// Records a ONE-OF send (typed): the kernel routes exactly one copy
+    /// to one actor that declared `.handles::<M>()`, round-robin through
+    /// the route table. Deferred; flushed post-ack. Zero handlers ⇒ the
+    /// envelope dead-letters on flush. From the receiver's side this is
+    /// indistinguishable from a direct [`CtxCore::send`].
+    pub fn send_to_any<M: Message>(&mut self, msg: &M) {
+        let payload = serde_json::to_value(msg).expect("schema payload serializes");
+        let schema = M::schema_id();
+        self.send_json(Address::Schema(schema.clone()), schema, payload, None);
     }
 
     /// Records the self-termination intent (shared by both ctx tiers).
@@ -238,8 +249,8 @@ impl CtxCore<'_> {
     }
 
     /// Every path registered as a handler for a schema.
-    pub fn who_handles(&self, schema: &SchemaId) -> Vec<ActorPath> {
-        self.view.who_handles(schema)
+    pub fn handlers_of(&self, schema: &SchemaId) -> Vec<ActorPath> {
+        self.view.handlers_of(schema)
     }
 
     /// The time the message was received (injected clock = deterministic).
@@ -257,8 +268,11 @@ impl CtxCore<'_> {
 
 /// Context for event-sourced handlers: sync, pure, deferred effects only.
 ///
-/// There is deliberately no `ask` here: the handler is sync and cannot
-/// await, and no I/O sneaks into a decision function.
+/// The tier rule, by construction: `ask` is exclusive to [`MsgCtx`] —
+/// a decision function is sync and CANNOT await, so no ask can even
+/// compile here, and no I/O sneaks into a decision. Send effects
+/// ([`CmdCtx::send`], [`CmdCtx::publish`], [`CmdCtx::send_to_any`]) are
+/// deferred intents the kernel flushes after the commit.
 ///
 /// The constructor is crate-private: only the kernel assembles contexts.
 pub struct CmdCtx<'a> {
@@ -302,10 +316,17 @@ impl<'a> CmdCtx<'a> {
     }
 
     /// Records an event broadcast (deferred; flushed post-ack). Typed:
-    /// the schema id comes from the message type. Zero subscribers ⇒
+    /// the schema id comes from the message type. Zero handlers ⇒
     /// silent no-op: events are news, not work orders.
     pub fn publish<M: Message>(&mut self, msg: &M) {
         self.core.publish(msg);
+    }
+
+    /// Records a ONE-OF send (typed): exactly one copy goes to ONE actor
+    /// that declared `.handles::<M>()`, round-robin through the route
+    /// table (deferred; flushed post-ack).
+    pub fn send_to_any<M: Message>(&mut self, msg: &M) {
+        self.core.send_to_any(msg);
     }
 
     /// Records a reply to the message's `reply_to`, if the sender asked.
@@ -346,8 +367,8 @@ impl<'a> CmdCtx<'a> {
     }
 
     /// Every path registered as a handler for a schema.
-    pub fn who_handles(&self, schema: &SchemaId) -> Vec<ActorPath> {
-        self.core.who_handles(schema)
+    pub fn handlers_of(&self, schema: &SchemaId) -> Vec<ActorPath> {
+        self.core.handlers_of(schema)
     }
 
     /// The time the message was received (injected clock = deterministic).
@@ -499,7 +520,7 @@ impl<'a> MsgCtx<'a> {
     ///
     /// The timeout produces an [`AskOutcome::Timeout`] fact; the reply
     /// lease dies with it, so a late reply lands nowhere.
-    pub async fn ask(
+    pub async fn ask_json(
         &mut self,
         dest: Address,
         schema: SchemaId,
@@ -508,6 +529,43 @@ impl<'a> MsgCtx<'a> {
     ) -> Result<JsonValue, error_stack::Report<AskError>> {
         let port = self.port.expect("ask requires a port (service tier)");
         ask_via_port(port, dest, schema, payload, timeout, *self.core.trace).await
+    }
+
+    /// Typed ask: the request's schema id and payload come from the
+    /// message type — the typed sibling of [`MsgCtx::ask_json`]. Same
+    /// MANDATORY-timeout lease, same tier exclusivity (`ask` awaits, so a
+    /// sync ES decision function has none; see [`CmdCtx`]).
+    ///
+    /// The reply arrives as raw JSON this pass, matching
+    /// [`crate::system::ActorSystem::ask`]'s return; decode it with the
+    /// reply schema's type when the contract is known.
+    ///
+    /// # Errors
+    ///
+    /// [`AskError::Unresolved`] when the destination does not resolve,
+    /// the ask times out, or the lease dies before the reply.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the request cannot serialize — a programmer error
+    /// (serde only fails on pathological map keys), not a domain outcome.
+    pub async fn ask<M: Message>(
+        &mut self,
+        dest: Address,
+        req: &M,
+        timeout: std::time::Duration,
+    ) -> Result<JsonValue, error_stack::Report<AskError>> {
+        let payload = serde_json::to_value(req).expect("schema payload serializes");
+        self.ask_json(dest, M::schema_id(), payload, timeout).await
+    }
+
+    /// Records a ONE-OF send (typed): exactly one copy goes to ONE actor
+    /// that declared `.handles::<M>()`, round-robin through the route
+    /// table (deferred; flushed post-ack). The typed sibling of
+    /// [`MsgCtx::publish`] — news (publish) reaches everyone, work
+    /// (send_to_any) reaches one. Zero handlers ⇒ dead-letter on flush.
+    pub fn send_to_any<M: Message>(&mut self, msg: &M) {
+        self.core.send_to_any(msg);
     }
 
     /// Records a send to `dest` (deferred; the kernel flushes post-ack).
@@ -549,6 +607,13 @@ impl<'a> MsgCtx<'a> {
         self.core.publish_json(schema, payload);
     }
 
+    /// Escape hatch: ONE-OF send with an explicit schema id and hand-built
+    /// payload. Routes one copy to one handler of `schema`, round-robin.
+    pub fn send_to_any_json(&mut self, schema: SchemaId, payload: JsonValue) {
+        self.core
+            .send_json(Address::Schema(schema.clone()), schema, payload, None);
+    }
+
     /// Escape hatch: reply with an explicit schema id and hand-built
     /// payload. Same silent-drop contract as [`MsgCtx::reply`].
     pub fn reply_json(&mut self, schema: SchemaId, payload: JsonValue) {
@@ -561,8 +626,8 @@ impl<'a> MsgCtx<'a> {
     }
 
     /// Every path registered as a handler for a schema.
-    pub fn who_handles(&self, schema: &SchemaId) -> Vec<ActorPath> {
-        self.core.who_handles(schema)
+    pub fn handlers_of(&self, schema: &SchemaId) -> Vec<ActorPath> {
+        self.core.handlers_of(schema)
     }
 
     /// The time the message was received (injected clock = deterministic).
@@ -705,7 +770,7 @@ mod tests {
                 })
         }
 
-        fn who_handles(&self, schema: &SchemaId) -> Vec<ActorPath> {
+        fn handlers_of(&self, schema: &SchemaId) -> Vec<ActorPath> {
             self.handlers
                 .iter()
                 .filter(|(s, _)| s == schema)
@@ -818,10 +883,10 @@ mod tests {
         let path = ActorPath::new("someone");
         let ctx = CmdCtx::new(&path, &trace, None, &view, &mut outbox);
 
-        // When querying lookups, who_handles, and the receive timestamp.
+        // When querying lookups, handlers_of, and the receive timestamp.
         let info = ctx.lookup(&ActorPath::new("auditor"));
         let missing = ctx.lookup(&ActorPath::new("ghost"));
-        let handlers = ctx.who_handles(&SchemaId::new("ReserveStock", 1));
+        let handlers = ctx.handlers_of(&SchemaId::new("ReserveStock", 1));
         let ts = ctx.recv_ts();
 
         // Then the view's answers come through, including the clock's.

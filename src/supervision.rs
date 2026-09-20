@@ -1,10 +1,11 @@
 //! Declarative supervision: restart policies, budgets, and backoff as
 //! plain data interpreted by the restart engine.
 //!
-//! A [`ChildSpec`] says WHAT to do when a child fails; the engine
+//! An [`ActorSpec`] says WHAT to do when a child fails; the engine
 //! (kernel) decides WHEN it may happen. Failures inside the budget
 //! restart the child after a backoff delay; exhausting the budget stops
-//! the child and escalates a control message to the parent.
+//! the child and escalates a control message (an ordinary message the
+//! parent handles) to the parent.
 
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -76,9 +77,9 @@ impl Default for Backoff {
     }
 }
 
-/// One supervised child: what to spawn, when to restart it, and how hard.
+/// One supervised actor: what to spawn, when to restart it, and how hard.
 #[derive(Clone)]
-pub struct ChildSpec {
+pub struct ActorSpec {
     /// The child's path (its identity across restarts).
     pub path: crate::actor::ActorPath,
     /// The child's parent (escalation target); `None` = the system itself.
@@ -101,9 +102,9 @@ pub struct ChildSpec {
     >,
 }
 
-impl std::fmt::Debug for ChildSpec {
+impl std::fmt::Debug for ActorSpec {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("ChildSpec")
+        f.debug_struct("ActorSpec")
             .field("path", &self.path)
             .field("parent", &self.parent)
             .field("restart", &self.restart)
@@ -113,7 +114,7 @@ impl std::fmt::Debug for ChildSpec {
     }
 }
 
-impl ChildSpec {
+impl ActorSpec {
     /// The JSON control envelope the engine escalates to the parent.
     pub fn escalation_message(&self, reason: &str) -> serde_json::Value {
         json!({

@@ -1,7 +1,8 @@
 //! Observers: in-actor consumers of runtime facts.
 //!
 //! `system.facts` is a subscribable topic that mirrors the tap ring
-//! (fact JSON, offset included). An ordinary service actor subscribes
+//! (fact JSON, offset included). An ordinary service actor subscribes —
+//! via `subscribe_facts`, the facts feed (not the messaging surface) —
 //! and receives facts as messages with an at-most-once-with-gaps
 //! contract: the ring's drop-oldest pressure shows up as offset gaps,
 //! never as backpressure on the ring. Also demonstrates the DLQ
@@ -176,7 +177,7 @@ async fn main() {
     // A small tap ring: floods produce gaps quickly.
     let system = ActorSystem::test_with_tap(16).0;
 
-    // The observer: a plain service actor + one subscribe call.
+    // The observer: a plain service actor + one subscribe_facts call.
     trouper::builder::spawn_service_builder::<Observer>(&system)
         .at(ActorPath::new("observer"))
         .args(json!({}))

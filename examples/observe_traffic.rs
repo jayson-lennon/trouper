@@ -1,20 +1,19 @@
-//! Event announcements vs command dispatch: `publish`/`subscribe` vs
-//! `handles`/`tell`.
+//! One declaration, three sender verbs: `tell`, `send_to_any`, `publish`.
 //!
-//! Two transports, two questions:
-//! - **Commands** ("who should DO this?"): `handles::<M>()` + `tell`/
-//!   schema-addressed send. Point-to-point; a second handler for the
-//!   same schema makes the route round-robin.
-//! - **Events** ("who wants to HEAR about this?"): the sender calls
-//!   `ctx.publish(&msg)` (or `system.publish(&msg)` from outside);
-//!   every actor that declared `.subscribe::<M>()` receives a copy —
-//!   insertion order, no round-robin. Zero subscribers ⇒ no-op: events
-//!   are news, not work orders.
+//! The sender chooses topology; the receiver just processes. `Auditor`
+//! declares `.handles::<Ship>()` — the one receive declaration — and
+//! CANNOT tell whether a copy arrived as a tell, a one-of send, or a
+//! publish fan-out:
+//! - **`tell`** ("give this to that actor"): one copy to one path.
+//! - **`send_to_any`** ("give this to ONE of the willing"): one copy to
+//!   one handler of the schema, round-robin.
+//! - **`publish`** ("announce this"): one copy to EVERY handler of the
+//!   schema. Zero handlers ⇒ silent no-op: news, not work orders.
 //!
-//! The two declaration tables are disjoint: `billing` handles `Shipped`
-//! AND subscribes to it (both deliver), while `auditor` subscribes to
-//! `Ship` without handling it (never a dispatch target — the command
-//! goes only to `fulfillment`).
+//! Here `fulfillment` tells, a schema-addressed send races nothing (the
+//! route table picks), and a `Shipped` announcement fans out to every
+//! declarant — `billing` (work: invoice it) and the second observer
+//! (news: record it) both receive copies from the SAME declaration.
 //!
 //! Run: `cargo run --example observe_traffic`
 
@@ -83,14 +82,14 @@ impl ServiceActor for Fulfillment {
 impl MsgHandler<Ship> for Fulfillment {
     async fn handle(&mut self, msg: Ship, ctx: &mut MsgCtx<'_>) {
         log(format!("[fulfillment] shipped {}", msg.order));
-        // The announcement: every subscriber of the EVENT gets a copy.
+        // The announcement: every handler of the EVENT gets a copy.
         ctx.publish(&Shipped { order: msg.order });
     }
 }
 
-/// The announcement consumer: billing handles AND subscribes to
-/// `Shipped` — the tables are independent, so it receives both the
-/// broadcasts and (point-to-point) sends.
+/// The work consumer: billing declared `.handles::<Shipped>()` — a
+/// published copy is indistinguishable from a sent one, and it treats
+/// the announcement as WORK (invoice it).
 struct Billing;
 
 impl ServiceActor for Billing {
@@ -112,8 +111,9 @@ impl MsgHandler<Shipped> for Billing {
     }
 }
 
-/// The audit subscriber: subscribes to the Ship COMMAND without
-/// handling it — it observes traffic and is never a dispatch target.
+/// A second observer: the SAME declaration, different meaning — this
+/// one treats the announcement as NEWS. News and work differ only at
+/// the handler; the fabric carries both identically.
 struct Auditor;
 
 impl ServiceActor for Auditor {
@@ -126,9 +126,9 @@ impl ServiceActor for Auditor {
     }
 }
 
-impl MsgHandler<Ship> for Auditor {
-    async fn handle(&mut self, msg: Ship, _ctx: &mut MsgCtx<'_>) {
-        log(format!("[auditor] recorded Ship({}) traffic", msg.order));
+impl MsgHandler<Shipped> for Auditor {
+    async fn handle(&mut self, msg: Shipped, _ctx: &mut MsgCtx<'_>) {
+        log(format!("[auditor] recorded Shipped({})", msg.order));
     }
 }
 
@@ -136,22 +136,22 @@ impl MsgHandler<Ship> for Auditor {
 async fn main() {
     let system = ActorSystem::new(SystemConfig::production());
 
-    // The primary (handles Ship), the auditor (subscribes to Ship
-    // traffic), and billing (subscribes to the Shipped announcement).
+    // The primary (handles Ship), billing (work on Shipped), and a
+    // second observer (news on Shipped) — all the same declaration.
     spawn_service_builder::<Fulfillment>(&system)
         .at(ActorPath::new("fulfillment"))
         .handles::<Ship>()
         .start();
-    spawn_service_builder::<Auditor>(&system)
-        .at(ActorPath::new("auditor"))
-        .subscribe::<Ship>()
-        .start();
     spawn_service_builder::<Billing>(&system)
         .at(ActorPath::new("billing"))
-        .subscribe::<Shipped>()
+        .handles::<Shipped>()
+        .start();
+    spawn_service_builder::<Auditor>(&system)
+        .at(ActorPath::new("auditor"))
+        .handles::<Shipped>()
         .start();
 
-    // 1. A path-addressed Ship command (the usual dispatch).
+    // 1. A path-addressed Ship (the usual dispatch).
     system
         .tell(
             ActorPath::new("fulfillment"),
@@ -162,9 +162,7 @@ async fn main() {
         .await
         .expect("delivered");
 
-    // 2. A schema-addressed Ship (the kernel picks the handler). The
-    //    command still routes ONLY to fulfillment — subscribers are
-    //    never dispatch targets.
+    // 2. A schema-addressed Ship (the route table picks the handler).
     let env = Envelope::json(
         Ship::schema_id(),
         Address::Schema(Ship::schema_id()),
@@ -174,14 +172,14 @@ async fn main() {
     system.send(env).await.expect("schema delivery");
 
     // 3. A direct announcement from outside the system (no actor in
-    //    the middle): billing gets it, fulfillment does not.
+    //    the middle): billing AND the auditor each get one copy.
     system
         .publish(&Shipped {
             order: "ord-3".into(),
         })
         .await;
 
-    // Let the broadcasts drain, then tell the story.
+    // Let the deliveries drain, then tell the story.
     tokio::time::sleep(std::time::Duration::from_millis(300)).await;
     println!("--- traffic report ---");
     let lines = LINES
@@ -189,18 +187,18 @@ async fn main() {
         .map(|l| l.lock().expect("lines lock").clone())
         .unwrap_or_default();
     let shipped_by_fulfillment = lines.iter().filter(|l| l.contains("fulfillment")).count();
-    let ships_seen_by_auditor = lines.iter().filter(|l| l.contains("auditor")).count();
     let announcements = lines.iter().filter(|l| l.contains("billing")).count();
+    let news = lines.iter().filter(|l| l.contains("auditor")).count();
     println!("  Ship commands dispatched to fulfillment: {shipped_by_fulfillment}");
-    println!("  Ship commands observed by the auditor: {ships_seen_by_auditor}");
-    println!("  Shipped announcements invoiced by billing: {announcements}");
+    println!("  Shipped copies invoiced by billing (work): {announcements}");
+    println!("  Shipped copies recorded by the auditor (news): {news}");
     assert_eq!(shipped_by_fulfillment, 2, "commands went to the handler");
-    assert_eq!(ships_seen_by_auditor, 2, "the auditor saw BOTH Ship events");
     assert_eq!(
         announcements, 3,
-        "billing invoiced both shipments + the direct announcement"
+        "billing invoiced both shipment announcements + the direct one"
     );
+    assert_eq!(news, 3, "the auditor saw every Shipped copy too");
     println!(
-        "\npublish/subscribe = events to every subscriber; handles/tell = commands to one handler."
+        "\nOne declaration (.handles); tell/send_to_any/publish are sender choices the\nreceiver cannot observe."
     );
 }

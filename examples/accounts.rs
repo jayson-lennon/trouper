@@ -6,7 +6,7 @@
 //! - An overdraft is a DOMAIN outcome: it journals `WithdrawFailed`
 //!   (requested + balance at the time) — a fact as real as the
 //!   withdrawal. No crash, no error channel; the event stream is the
-//!   answer, and any projection can subscribe to it.
+//!   answer, and any projection can handle it.
 //! - The `Poison` command is a TECHNICAL failure: the handler panics,
 //!   `catch_unwind` marks the actor crashed, and supervision restarts
 //!   it — journal replay restores the balance (including the declines),
@@ -298,7 +298,7 @@ async fn main() {
 
     // The account lives under supervision (restart budget 3 per 10s).
     let account = ActorPath::new("account");
-    let spec = trouper::supervision::ChildSpec {
+    let spec = trouper::supervision::ActorSpec {
         path: account.clone(),
         parent: None,
         restart: trouper::supervision::RestartPolicy::Permanent,
@@ -324,7 +324,7 @@ async fn main() {
             },
         ),
     };
-    system.spawn_child(spec);
+    system.spawn(spec);
     wait(|| async { system.inbox_cursor(&account).is_some() }).await;
     println!("   account spawned under supervision at '{account}'");
 

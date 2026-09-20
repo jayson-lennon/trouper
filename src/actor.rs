@@ -706,7 +706,7 @@ mod tests {
             fn lookup(&self, _path: &ActorPath) -> Option<crate::registry::EndpointInfo> {
                 None
             }
-            fn who_handles(&self, _schema: &SchemaId) -> Vec<ActorPath> {
+            fn handlers_of(&self, _schema: &SchemaId) -> Vec<ActorPath> {
                 Vec::new()
             }
             fn now(&self) -> crate::clock::Timestamp {
@@ -752,7 +752,7 @@ mod tests {
             fn lookup(&self, _path: &ActorPath) -> Option<crate::registry::EndpointInfo> {
                 None
             }
-            fn who_handles(&self, _schema: &SchemaId) -> Vec<ActorPath> {
+            fn handlers_of(&self, _schema: &SchemaId) -> Vec<ActorPath> {
                 Vec::new()
             }
             fn now(&self) -> crate::clock::Timestamp {
@@ -796,7 +796,7 @@ mod tests {
             fn lookup(&self, _path: &ActorPath) -> Option<crate::registry::EndpointInfo> {
                 None
             }
-            fn who_handles(&self, _schema: &SchemaId) -> Vec<ActorPath> {
+            fn handlers_of(&self, _schema: &SchemaId) -> Vec<ActorPath> {
                 Vec::new()
             }
             fn now(&self) -> crate::clock::Timestamp {

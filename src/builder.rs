@@ -63,7 +63,6 @@ pub fn spawn_service_builder<A: ServiceActor>(
         start_override: None,
         entries: Vec::new(),
         emits: Vec::new(),
-        subscribed: Vec::new(),
         opts: SpawnOpts::default(),
         _actor: std::marker::PhantomData,
     }
@@ -110,11 +109,11 @@ impl<A: crate::actor::EventSourcedActor> SpawnBuilder<A> {
         self
     }
 
-    /// Declares a handled command `C`: registers the schema edge, the
-    /// route, and — internally — the erased command adapter. `C` is
-    /// written exactly once. Registration here is what makes `C`
-    /// routable to this actor; a command type is deliverable only to
-    /// actors that declared it.
+    /// Declares a handled command `C` — the one receive declaration. It
+    /// installs the route AND the dispatch entry together: whether a copy
+    /// arrives via `tell`, `send_to_any`, or `publish` is invisible to the
+    /// receiver. `C` is written exactly once; registration here is what
+    /// makes `C` deliverable to this actor.
     ///
     /// `C`'s schema descriptor is registered into the schema table here,
     /// at the declaration site — spawning through the builder is all a
@@ -125,8 +124,13 @@ impl<A: crate::actor::EventSourcedActor> SpawnBuilder<A> {
         C: Schema + serde::de::DeserializeOwned + Send + 'static,
     {
         self.system.register_schema::<C>();
-        self.entries
-            .push(Arc::new(TypedEsAdapter::<A, C>::new::<C>()));
+        let id = C::schema_id();
+        // Dedup per schema: a repeated declaration must never push a
+        // second adapter (a double adapter would double-dispatch).
+        if !self.entries.iter().any(|e| e.schema() == id) {
+            self.entries
+                .push(Arc::new(TypedEsAdapter::<A, C>::new::<C>()));
+        }
         self
     }
 
@@ -211,8 +215,14 @@ impl<A: crate::actor::EventSourcedActor> SpawnBuilder<A> {
         }
         manifest = manifest.kind(ActorKind::EventSourced);
         let state = Box::new(crate::actor::TypedEsState::<A>::new(A::restore(&self.args)));
-        self.system
-            .spawn_es_erased(path.clone(), manifest, state, self.entries, self.opts);
+        self.system.spawn_es_erased(
+            path.clone(),
+            manifest,
+            state,
+            self.entries,
+            self.opts,
+            &self.args,
+        );
         path
     }
 }
@@ -225,7 +235,6 @@ pub struct ServiceBuilder<A: ServiceActor> {
     start_override: Option<crate::system::ServiceStart>,
     entries: Vec<Arc<dyn MsgEntry>>,
     emits: Vec<SchemaId>,
-    subscribed: Vec<SchemaId>,
     opts: SpawnOpts,
     _actor: std::marker::PhantomData<fn(&A)>,
 }
@@ -271,9 +280,11 @@ impl<A: ServiceActor> ServiceBuilder<A> {
         self
     }
 
-    /// Declares a handled message `M` (schema edge + route + adapter).
-    /// Registration here is what makes `M` routable to this actor; a
-    /// message type is deliverable only to actors that declared it.
+    /// Declares a handled message `M` — the one receive declaration. It
+    /// installs the route AND the dispatch entry together: whether a copy
+    /// arrives via `tell`, `send_to_any`, or `publish` is invisible to the
+    /// receiver. `M` is written exactly once; registration here is what
+    /// makes `M` deliverable to this actor.
     ///
     /// `M`'s schema descriptor is registered into the schema table here,
     /// at the declaration site — mirroring the typed ES builder and the
@@ -284,30 +295,12 @@ impl<A: ServiceActor> ServiceBuilder<A> {
         M: Schema + serde::de::DeserializeOwned + Send + 'static,
     {
         self.system.register_schema::<M>();
-        self.entries
-            .push(Arc::new(TypedServiceAdapter::<A, M>::new::<M>()));
-        self
-    }
-
-    /// Declares a SUBSCRIPTION to event schema `M`: every event publish
-    /// of `M` (see [`ActorSystem::publish`]) is copied into this actor's
-    /// inbox — insertion order, no round-robin. Subscribing never makes
-    /// this actor a dispatch target for `M` (no route, no handler entry);
-    /// a `.handles::<M>()` declaration is independent (commands route to
-    /// handlers, events fan out to subscribers). To RECEIVE the event the
-    /// actor must also handle its type — declare both.
-    ///
-    /// `M`'s schema descriptor is registered into the schema table here,
-    /// at the declaration site. Zero subscribers ⇒ publish is a no-op:
-    /// events are news, not work orders.
-    pub fn subscribe<M>(mut self) -> Self
-    where
-        M: Schema + serde::de::DeserializeOwned + Send + 'static,
-    {
-        self.system.register_schema::<M>();
         let id = M::schema_id();
-        if !self.subscribed.contains(&id) {
-            self.subscribed.push(id);
+        // Dedup per schema: a repeated declaration must never push a
+        // second adapter (a double adapter would double-dispatch).
+        if !self.entries.iter().any(|e| e.schema() == id) {
+            self.entries
+                .push(Arc::new(TypedServiceAdapter::<A, M>::new::<M>()));
         }
         self
     }
@@ -357,11 +350,6 @@ impl<A: ServiceActor> ServiceBuilder<A> {
     pub fn start(self) -> ActorPath {
         let path = self.path.clone().expect("builder requires .at(path)");
         let mut manifest = A::manifest();
-        for schema in &self.subscribed {
-            if !manifest.subscribed.contains(schema) {
-                manifest.subscribed.push(schema.clone());
-            }
-        }
         for entry in &self.entries {
             let schema = entry.schema();
             if !manifest.handles.contains(&schema) {
@@ -480,7 +468,7 @@ impl ForeignBuilder {
             .system
             .register_schema_json(schema_json)
             .change_context(crate::schema::SchemaError::InvalidDescriptor)?;
-        let state = Box::new(ForeignEsState::new(self.genesis, fold));
+        let state = Box::new(ForeignEsState::new(self.genesis.clone(), fold));
         let mut manifest = crate::schema::ActorManifest::new()
             .handles_id(schema_id.clone())
             .kind(ActorKind::EventSourced);
@@ -489,8 +477,14 @@ impl ForeignBuilder {
         }
         let entries: Vec<Arc<dyn CommandEntry>> =
             vec![Arc::new(ForeignCommandEntry::new(schema_id, decision))];
-        self.system
-            .spawn_es_erased(path.clone(), manifest, state, entries, self.opts);
+        self.system.spawn_es_erased(
+            path.clone(),
+            manifest,
+            state,
+            entries,
+            self.opts,
+            &self.genesis,
+        );
         Ok(path)
     }
 }

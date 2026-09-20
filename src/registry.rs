@@ -2,11 +2,10 @@
 //!
 //! Bootstrap paradox resolved by construction: the registry must never
 //! deadlock and must survive every actor restart, so it is plain kernel data.
-//! It holds five tables — path→endpoint slots, the schema table,
-//! schema→handler routes, schema→subscribers (the event fan-out list), and
-//! topic→subscribers (kernel-internal: facts, DLQ). Actor identity is its
-//! registered path; handles survive restarts because slots are swapped,
-//! never invalidated.
+//! It holds four tables — path→endpoint slots, the schema table,
+//! schema→handler routes, and topic→subscribers (kernel-internal: facts,
+//! DLQ). Actor identity is its registered path; handles survive restarts
+//! because slots are swapped, never invalidated.
 
 use std::collections::{BTreeMap, HashMap};
 
@@ -22,9 +21,6 @@ use crate::topics::Topic;
 /// The topic every undeliverable message lands on; created at system boot.
 pub const DEAD_LETTER_TOPIC: &str = "system.deadletters";
 pub const FACTS_TOPIC: &str = "system.facts";
-/// Prefix for per-schema observation topics (`<prefix><schema-name>`):
-/// the kernel publishes a copy of every routed delivery of an observed
-/// schema here; `.observes` subscribers consume it with topic cursors.
 
 /// The deliverable front door of one running actor endpoint.
 ///
@@ -221,21 +217,16 @@ pub enum RegistryError {
     InvalidSpec,
 }
 
-/// All kernel tables: slots, schemas, routes, subscribers, pools/partitions,
-/// and rules.
+/// All kernel tables: slots, schemas, routes, pools/partitions, and rules.
 #[derive(Debug, Default)]
 pub struct Registry {
     schemas: SchemaTable,
     slots: HashMap<ActorPath, Slot>,
+    /// The one receive table: schema → handler paths. A declaration via
+    /// `.handles::<M>()` lands here — whether the sender says tell,
+    /// send_to_any, or publish is invisible to the receiver.
     routes: HashMap<SchemaId, RoutePolicy>,
     route_cursor: usize,
-    /// Event fan-out: schema → subscriber paths in subscription order.
-    /// Disjoint from `routes`: a subscriber receives a COPY of every
-    /// published event of the schema; a handler receives point-to-point
-    /// sends. One actor may appear in both tables for the same schema.
-    subscribers: HashMap<SchemaId, Vec<ActorPath>>,
-    /// Stateless pools by PUBLIC path (workers own the real slots).
-    pub(crate) pools: HashMap<ActorPath, crate::pool::PoolEntry>,
     /// Partition sets by PUBLIC path (entities own the real slots, derived
     /// from the set's path on demand).
     pub(crate) partitions: HashMap<ActorPath, crate::pool::PartitionSpec>,
@@ -290,25 +281,14 @@ impl Registry {
             .collect()
     }
 
-    /// The declared pool/partition/rule topology (for export). Entities
-    /// are the live slots derived from each set's public path.
+    /// The declared partition/rule topology (for export). Entities are the
+    /// live slots derived from each set's public path.
     pub fn topology(
         &self,
     ) -> (
-        Vec<crate::system::PoolExport>,
         Vec<crate::system::PartitionExport>,
         Vec<crate::system::RuleExport>,
     ) {
-        let pools = self
-            .pools
-            .iter()
-            .map(|(path, pool)| crate::system::PoolExport {
-                path: path.clone(),
-                algo: pool.algo.name().to_owned(),
-                workers: pool.workers.clone(),
-                spec_parent: pool.spec_parent.clone(),
-            })
-            .collect();
         let partitions = self
             .partitions
             .iter()
@@ -341,7 +321,7 @@ impl Registry {
                 },
             })
             .collect();
-        (pools, partitions, rules)
+        (partitions, rules)
     }
 
     pub fn schemas(&self) -> &SchemaTable {
@@ -440,35 +420,6 @@ impl Registry {
         if !slot.manifest.emits.contains(&schema) {
             slot.manifest.emits.push(schema);
         }
-        Ok(())
-    }
-
-    /// Installs a stateless pool over `public`: the pool owns the routing
-    /// decision for the public name; workers own the deliverable slots.
-    ///
-    /// # Errors
-    ///
-    /// [`RegistryError::InvalidSpec`] when the worker list is empty or any
-    /// worker has no slot (spawn workers BEFORE installing the pool).
-    pub fn install_pool(
-        &mut self,
-        public: ActorPath,
-        entry: crate::pool::PoolEntry,
-    ) -> Result<(), error_stack::Report<RegistryError>> {
-        use error_stack::IntoReport;
-        if entry.workers.is_empty() {
-            return Err(RegistryError::InvalidSpec
-                .into_report()
-                .attach(format!("pool {public} has no workers")));
-        }
-        for worker in &entry.workers {
-            if !self.slots.contains_key(worker) {
-                return Err(RegistryError::InvalidSpec
-                    .into_report()
-                    .attach(format!("pool worker {worker} has no slot")));
-            }
-        }
-        self.pools.insert(public, entry);
         Ok(())
     }
 
@@ -601,38 +552,14 @@ impl Registry {
         });
     }
 
-    /// Every path registered as a handler for `schema`, for `ctx.who_handles`.
-    pub fn who_handles(&self, schema: &SchemaId) -> Vec<ActorPath> {
+    /// Every actor that declared `.handles::<M>()` for `schema`, in
+    /// registration order — the full target set for publish fan-out.
+    pub fn handlers_of(&self, schema: &SchemaId) -> Vec<ActorPath> {
         match self.routes.get(schema) {
             Some(RoutePolicy::Single(path)) => vec![path.clone()],
             Some(RoutePolicy::RoundRobin(paths)) => paths.clone(),
             None => Vec::new(),
         }
-    }
-
-    /// Declares `path` a subscriber of `schema`: every event publish of
-    /// the schema is copied into its inbox (insertion order, no
-    /// round-robin). Idempotent per (schema, path) — a duplicate
-    /// declaration never double-delivers.
-    pub fn add_subscriber(&mut self, schema: SchemaId, path: ActorPath) {
-        let subs = self.subscribers.entry(schema).or_default();
-        if !subs.contains(&path) {
-            subs.push(path);
-        }
-    }
-
-    /// Every subscriber of `schema`, in subscription order.
-    pub fn subscribers_of(&self, schema: &SchemaId) -> Vec<ActorPath> {
-        self.subscribers.get(schema).cloned().unwrap_or_default()
-    }
-
-    /// Drops `path` from every subscriber list (slot removal cascade);
-    /// lists left empty are removed. Mirrors [`Registry::drop_routes_of`].
-    pub fn drop_subscribers_of(&mut self, path: &ActorPath) {
-        self.subscribers.retain(|_, subs| {
-            subs.retain(|p| p != path);
-            !subs.is_empty()
-        });
     }
 }
 
@@ -938,7 +865,7 @@ mod tests {
     }
 
     #[test]
-    fn who_handles_lists_every_handler_of_a_schema() {
+    fn handlers_of_lists_every_handler_of_a_schema() {
         // Given a schema routed to two handlers.
         let mut registry = Registry::default();
         let schema = SchemaId::new("Ping", 1);
@@ -946,7 +873,7 @@ mod tests {
         registry.add_route(schema.clone(), ActorPath::new("b"));
 
         // When asking who handles it.
-        let handlers = registry.who_handles(&schema);
+        let handlers = registry.handlers_of(&schema);
 
         // Then both paths are listed.
         assert_eq!(handlers.len(), 2);
@@ -966,40 +893,25 @@ mod tests {
         registry.drop_routes_of(&gone);
 
         // Then `kept` still handles Ping and Pong is unrouted.
-        assert_eq!(registry.who_handles(&SchemaId::new("Ping", 1)), [kept]);
-        assert!(registry.who_handles(&SchemaId::new("Pong", 1)).is_empty());
+        assert_eq!(registry.handlers_of(&SchemaId::new("Ping", 1)), [kept]);
+        assert!(registry.handlers_of(&SchemaId::new("Pong", 1)).is_empty());
     }
 
     #[test]
-    fn add_subscriber_is_idempotent_per_schema_and_path() {
-        // Given a registry where `a` subscribes to Ping.
-        let mut registry = Registry::default();
-        let a = ActorPath::new("a");
-        let schema = SchemaId::new("Ping", 1);
-        registry.add_subscriber(schema.clone(), a.clone());
-
-        // When `a` subscribes again.
-        registry.add_subscriber(schema.clone(), a.clone());
-
-        // Then the subscriber list still holds exactly one entry, in order.
-        assert_eq!(registry.subscribers_of(&schema), [a]);
-    }
-
-    #[test]
-    fn subscribers_of_preserves_subscription_order() {
-        // Given three subscribers registered out of alphabetical order.
+    fn duplicate_route_declaration_keeps_registration_order() {
+        // Given a schema routed to three handlers in non-alphabetical order.
         let mut registry = Registry::default();
         let schema = SchemaId::new("Ping", 1);
-        registry.add_subscriber(schema.clone(), ActorPath::new("c"));
-        registry.add_subscriber(schema.clone(), ActorPath::new("a"));
-        registry.add_subscriber(schema.clone(), ActorPath::new("b"));
+        registry.add_route(schema.clone(), ActorPath::new("c"));
+        registry.add_route(schema.clone(), ActorPath::new("a"));
+        registry.add_route(schema.clone(), ActorPath::new("b"));
 
-        // When listing the subscribers.
-        let subs = registry.subscribers_of(&schema);
+        // When listing the handlers.
+        let handlers = registry.handlers_of(&schema);
 
-        // Then they come back in subscription order, not sorted order.
+        // Then they come back in registration order, not sorted order.
         assert_eq!(
-            subs,
+            handlers,
             [
                 ActorPath::new("c"),
                 ActorPath::new("a"),
@@ -1009,43 +921,21 @@ mod tests {
     }
 
     #[test]
-    fn drop_subscribers_of_removes_only_the_removed_path() {
-        // Given `gone` subscribed to two schemas, `kept` to one.
+    fn drop_routes_of_cleans_empty_round_robin_entries() {
+        // Given `gone` handling two schemas, `kept` handling one of them.
         let mut registry = Registry::default();
         let gone = ActorPath::new("gone");
         let kept = ActorPath::new("kept");
-        registry.add_subscriber(SchemaId::new("Ping", 1), gone.clone());
-        registry.add_subscriber(SchemaId::new("Ping", 1), kept.clone());
-        registry.add_subscriber(SchemaId::new("Pong", 1), gone.clone());
+        registry.add_route(SchemaId::new("Ping", 1), gone.clone());
+        registry.add_route(SchemaId::new("Ping", 1), kept.clone());
+        registry.add_route(SchemaId::new("Pong", 1), gone.clone());
 
-        // When dropping subscribers of `gone`.
-        registry.drop_subscribers_of(&gone);
+        // When dropping routes of `gone`.
+        registry.drop_routes_of(&gone);
 
-        // Then `kept` still subscribes Ping and Pong has no subscribers.
-        assert_eq!(registry.subscribers_of(&SchemaId::new("Ping", 1)), [kept]);
-        assert!(
-            registry
-                .subscribers_of(&SchemaId::new("Pong", 1))
-                .is_empty()
-        );
-    }
-
-    #[test]
-    fn subscriber_and_route_tables_are_independent() {
-        // Given `a` both handles and subscribes to Ping, `b` only subscribes.
-        let mut registry = Registry::default();
-        let schema = SchemaId::new("Ping", 1);
-        registry.add_route(schema.clone(), ActorPath::new("a"));
-        registry.add_subscriber(schema.clone(), ActorPath::new("a"));
-        registry.add_subscriber(schema.clone(), ActorPath::new("b"));
-
-        // When reading both tables.
-        let handlers = registry.who_handles(&schema);
-        let subs = registry.subscribers_of(&schema);
-
-        // Then each table reports only its own declarations.
-        assert_eq!(handlers, [ActorPath::new("a")]);
-        assert_eq!(subs, [ActorPath::new("a"), ActorPath::new("b")]);
+        // Then `kept` still handles Ping and Pong is unrouted.
+        assert_eq!(registry.handlers_of(&SchemaId::new("Ping", 1)), [kept]);
+        assert!(registry.handlers_of(&SchemaId::new("Pong", 1)).is_empty());
     }
 
     #[test]
