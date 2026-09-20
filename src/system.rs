@@ -459,8 +459,10 @@ impl ActorSystemCore {
     /// Creates the fabric from a config.
     pub(crate) fn new(config: SystemConfig) -> Self {
         let registry = Arc::new(Mutex::new(Registry::default()));
+        let clock = config.clock.clone();
         let view = Arc::new(NullView {
             registry: registry.clone(),
+            clock,
         });
         // ONE store instance per system: the core keeps a handle for the
         // sweep's flush; the kernel reads/writes through the same Arc.
@@ -1535,6 +1537,10 @@ impl ActorSystemCore {
 /// lookups through a brief lock; they can never mutate anything.
 struct NullView {
     registry: Arc<Mutex<Registry>>,
+    /// The system's clock (the injected/fake clock in tests, the real one
+    /// in production) — handler contexts read the CURRENT time through
+    /// the same source the kernel stamps with.
+    clock: ClockService,
 }
 
 impl RuntimeView for NullView {
@@ -1549,7 +1555,7 @@ impl RuntimeView for NullView {
     }
 
     fn now(&self) -> Timestamp {
-        Timestamp::from_millis(0)
+        self.clock.now()
     }
 }
 
@@ -8317,3 +8323,5 @@ impl ActorSystem {
         self.registry.lock().lookup(path).is_some()
     }
 }
+
+

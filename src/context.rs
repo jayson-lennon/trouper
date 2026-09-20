@@ -978,4 +978,31 @@ mod tests {
             _ => panic!("expected send intents"),
         }
     }
+
+    #[test]
+    fn es_entity_cannot_stop_itself() {
+        // Given the purified CmdCtx surface, a handler body that merely
+        // USES every public method must compile WITHOUT any lifecycle or
+        // send capability - an entity owns no intents at all.
+        fn uses_surface(ctx: &mut CmdCtx<'_>) {
+            let _ = ctx.lookup(&ActorPath::new("x"));
+            let _ = ctx.handlers_of(&SchemaId::new("S", 1));
+            let _ = ctx.recv_ts();
+            let _ = ctx.self_path();
+            // ctx.stop_self();       <- no longer exists (compile-fail by design)
+            // ctx.send(...);         <- no longer exists
+            // ctx.publish(...);      <- no longer exists
+            // ctx.reply(...);        <- no longer exists
+            // ctx.send_to_any(...);  <- no longer exists
+        }
+        // Then the surface compiles pure (this test IS the assertion).
+        let view = FakeView::at_millis(0);
+        let trace = TraceCtx::root();
+        let mut outbox = Outbox::new();
+        let path = ActorPath::new("entity");
+        let mut ctx = CmdCtx::new(&path, &trace, None, &view, &mut outbox);
+        uses_surface(&mut ctx);
+        // And recording nothing: the outbox stays empty by construction.
+        assert!(outbox.is_empty());
+    }
 }

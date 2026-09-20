@@ -287,10 +287,12 @@ impl<A: ServiceActor> ServiceBuilder<A> {
         self
     }
 
-    /// Declares an emitted message schema for a service actor — a
-    /// DECLARED edge (advisory: the service tier is not emit-enforced,
-    /// unlike [`SpawnBuilder::emits`]), published in the manifest so the
-    /// export/GUI shows the actor's outputs.
+    /// Declares an emitted message schema for a service actor. Since
+    /// v0.5.0 this is UNIFORM: the flush-time gate drops every outbound
+    /// message whose schema is not declared here (an `UndeclaredEmit`
+    /// dead letter) — a service actor publishing undeclared schemas no
+    /// longer silently delivers. Declared edges are published in the
+    /// manifest so the export/GUI shows the actor's outputs.
     ///
     /// `E`'s schema descriptor is registered into the schema table here,
     /// at the declaration site.
