@@ -1113,11 +1113,18 @@ impl ActorSystemCore {
     /// events are news, not work orders. Trace root is the entry point,
     /// matching [`ActorSystem::send`].
     ///
+    /// Serialization is eager; the returned future borrows only `self`,
+    /// so callers' spawned futures stay `Send` without an `M: Sync`
+    /// bound.
+    ///
     /// # Panics
     ///
     /// Panics when `M` cannot serialize — a programmer error (serde only
     /// fails on pathological map keys), not a domain outcome.
-    pub async fn publish<M>(&self, value: &M)
+    pub fn publish<M>(
+        &self,
+        value: &M,
+    ) -> impl std::future::Future<Output = ()> + Send + '_
     where
         M: Schema + serde::Serialize,
     {
@@ -1129,7 +1136,9 @@ impl ActorSystemCore {
             payload,
             TraceCtx::root(),
         );
-        crate::kernel::broadcast(&self.registry, &self.kernel, schema, envelope).await;
+        async move {
+            crate::kernel::broadcast(&self.registry, &self.kernel, schema, envelope).await;
+        }
     }
 
     /// Untyped event broadcast from outside the system: the caller has
