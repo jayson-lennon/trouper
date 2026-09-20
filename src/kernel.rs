@@ -38,7 +38,8 @@ use crate::schema::SchemaId;
 /// An envelope the runtime could not deliver or decode.
 ///
 /// Kept inspectable — dropped messages must stay observable, never silently
-/// vanish. (Phase 6/7 redirect this onto the DLQ topic + tap facts.)
+/// vanish. `drain_dead_letters` hands retained envelopes to the host; the
+/// tap facts are the live observation surface.
 #[derive(Debug, Clone)]
 pub struct DeadLetter {
     /// The undeliverable payload's schema.
@@ -51,6 +52,8 @@ pub struct DeadLetter {
     pub detail: String,
     /// The trace of the hop that failed.
     pub trace: TraceCtx,
+    /// The full envelope, retained for host inspection / deliberate resend.
+    pub envelope: Envelope,
 }
 
 /// An ask lifecycle event (tap facts from Phase 7 read these).
@@ -641,6 +644,7 @@ pub(crate) fn dead_letter(
         reason: reason.clone(),
         detail: detail.to_owned(),
         trace: envelope.trace,
+        envelope: envelope.clone(),
     });
     // The DLQ is a REAL topic: the envelope is appended to the retained
     // `system.deadletters` log so a DLQ consumer can subscribe /
@@ -1143,47 +1147,6 @@ pub(crate) async fn run_on_stop(ctx: &EsLoop) {
     }
 }
 
-/// Flushes the outbox: sends route through the registry; failures dead-letter.
-///
-/// Returns `true` when the outbox carried `StopSelf` (the caller's step
-/// must conclude with `Step::Stop` so the loop exits gracefully).
-async fn flush_outbox(ctx: &EsLoop, mut outbox: Outbox) -> bool {
-    let mut stop_self = false;
-    for intent in outbox.drain() {
-        match intent {
-            crate::context::Intent::Send(envelope) => {
-                if let Err(undeliverable) = route(&ctx.registry, &ctx.kernel, envelope).await {
-                    dead_letter(
-                        &ctx.kernel,
-                        &undeliverable,
-                        crate::kernel::DeadLetterReason::Unresolvable,
-                        "destination unresolved",
-                    );
-                }
-            }
-            crate::context::Intent::Broadcast(envelope) => {
-                broadcast(
-                    &ctx.registry,
-                    &ctx.kernel,
-                    envelope.schema.clone(),
-                    envelope,
-                )
-                .await;
-            }
-            crate::context::Intent::Reply {
-                to,
-                schema,
-                payload,
-                trace,
-            } => {
-                resolve_reply(&ctx.kernel, &ctx.registry, to, schema, payload, trace).await;
-            }
-            crate::context::Intent::StopSelf => stop_self = true,
-        }
-    }
-    stop_self
-}
-
 /// The kernel's ask port: opens leases, routes request envelopes,
 /// records ask facts. Handed to service contexts at dispatch time.
 #[derive(Clone)]
@@ -1478,33 +1441,118 @@ async fn resolve_reply(
     }
 }
 
-/// Fans the committed events out to the manifest's emit topics. Position
-/// in the atomic order is AFTER ack — replay never re-runs this (a
-/// restart must not duplicate topic deliveries).
+/// Fans the committed, declared events out as ordinary messages: every
+/// actor that declared `.handles` for the event's schema receives exactly
+/// one copy (the same `broadcast` path `ctx.publish` uses). Position in
+/// the atomic order is AFTER ack — replay never re-runs this (a restart
+/// must not duplicate broadcasts). A recorded fact with zero handlers is
+/// a silent no-op (one Sent fact, no deliveries, no DLQ); an entity that
+/// `.handles` its own fact legally delivers a copy to itself.
 async fn fan_out_emits(ctx: &EsLoop, events: &[crate::envelope::Event]) {
-    let topics = {
-        let registry = ctx.registry.lock();
-        let Some(info) = registry.lookup(&ctx.path) else {
-            return;
-        };
-        info.manifest.emits_on_topics.clone()
-    };
-    if topics.is_empty() {
-        return;
-    }
     let cause = crate::envelope::TraceCtx::root();
-    for topic in &topics {
-        for event in events {
-            let envelope = Envelope::json(
-                event.schema.clone(),
-                Address::Topic(topic.clone()),
-                event.payload.clone(),
-                cause,
-            )
-            .from(ctx.path.clone());
-            publish_to_topic(&ctx.kernel, &ctx.registry, topic.clone(), envelope).await;
+    for event in events {
+        let envelope = Envelope::json(
+            event.schema.clone(),
+            crate::envelope::Address::Schema(event.schema.clone()),
+            event.payload.clone(),
+            cause,
+        )
+        .from(ctx.path.clone());
+        broadcast(&ctx.registry, &ctx.kernel, event.schema.clone(), envelope).await;
+    }
+}
+
+/// The ONE flush-time gate for outbound actor messages: every intent an
+/// actor recorded must declare its schema in the actor's `.emits`.
+/// Undeclared intents drop at flush — dead-lettered as `UndeclaredEmit`
+/// with the envelope retained, plus a tracing error — and never route.
+/// The declared remainder dispatches normally, in order.
+///
+/// The gate sits at flush time (not record time) so there is exactly one
+/// choke point next to the routing it guards; observably the message
+/// leaves the actor at send time, so nothing else may see the intent.
+/// Returns `true` when the outbox carried `StopSelf` (the caller's step
+/// concludes with `Step::Stop`).
+async fn flush_outbox(ctx: &EsLoop, mut outbox: Outbox) -> bool {
+    let declared = {
+        let registry = ctx.registry.lock();
+        registry
+            .lookup(&ctx.path)
+            .map(|info| info.manifest.emits)
+            .unwrap_or_default()
+    };
+    let mut stop_self = false;
+    for intent in outbox.drain() {
+        // THE GATE: every outbound message declares itself. StopSelf is
+        // not a message — it passes untouched.
+        let gated = match intent.emitted_schema() {
+            Some(schema) if !declared.contains(schema) => {
+                tracing::error!(
+                    actor = %ctx.path,
+                    schema = %schema,
+                    "undeclared emit dropped at flush (add .emits::<M>() at the spawn site)"
+                );
+                dead_letter_schema(ctx, &intent, schema);
+                continue;
+            }
+            _ => intent,
+        };
+        match gated {
+            crate::context::Intent::Send(envelope) => {
+                if let Err(undeliverable) = route(&ctx.registry, &ctx.kernel, envelope).await {
+                    dead_letter(
+                        &ctx.kernel,
+                        &undeliverable,
+                        crate::kernel::DeadLetterReason::Unresolvable,
+                        "destination unresolved",
+                    );
+                }
+            }
+            crate::context::Intent::Broadcast(envelope) => {
+                broadcast(
+                    &ctx.registry,
+                    &ctx.kernel,
+                    envelope.schema.clone(),
+                    envelope,
+                )
+                .await;
+            }
+            crate::context::Intent::Reply {
+                to,
+                schema,
+                payload,
+                trace,
+            } => {
+                resolve_reply(&ctx.kernel, &ctx.registry, to, schema, payload, trace).await;
+            }
+            crate::context::Intent::StopSelf => stop_self = true,
         }
     }
+    stop_self
+}
+
+/// Dead-letters one gated-out intent: the intent's MESSAGE is what died,
+/// rebuilt as an envelope addressed to its own destination (same trace, so
+/// the drop stays causally linked to the command that caused it).
+fn dead_letter_schema(ctx: &EsLoop, intent: &crate::context::Intent, schema: &SchemaId) {
+    let envelope = match intent {
+        crate::context::Intent::Send(envelope) | crate::context::Intent::Broadcast(envelope) => {
+            envelope.clone()
+        }
+        crate::context::Intent::Reply {
+            to,
+            payload,
+            trace,
+            ..
+        } => Envelope::json(schema.clone(), to.clone(), payload.clone(), *trace),
+        crate::context::Intent::StopSelf => return,
+    };
+    dead_letter(
+        &ctx.kernel,
+        &envelope,
+        crate::kernel::DeadLetterReason::UndeclaredEmit,
+        "undeclared emit (add .emits::<M>() at the spawn site)",
+    );
 }
 
 /// Takes a between-messages snapshot if the cadence asks for one: a
@@ -2199,8 +2247,12 @@ pub enum DeadLetterReason {
     /// The system is in its graceful shutdown sweep; the barrier refuses
     /// all new deliveries.
     ShuttingDown,
-    /// The actor emitted an event whose schema it never declared.
+    /// The actor emitted an event whose schema it never declared (the
+    /// pre-journal filter: the journal guard).
     UndeclaredEvent,
+    /// The actor recorded an outbound effect whose schema it never
+    /// declared in `.emits` (the flush-time gate: the wire guard).
+    UndeclaredEmit,
     /// A partition-set command arrived without its shard key.
     ShardKeyMissing,
 }

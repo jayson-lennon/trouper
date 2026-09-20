@@ -1430,6 +1430,7 @@ impl ActorSystemCore {
                     reason: crate::kernel::DeadLetterReason::StoppedWithMail,
                     detail: "stopped with a non-empty inbox".to_owned(),
                     trace: envelope.trace,
+                    envelope: envelope.clone(),
                 });
             }
             kernel.dead_letters.extend(letters);
@@ -2356,21 +2357,22 @@ mod tests {
 
         #[derive(Serialize, Deserialize, Default)]
         struct Forwarder;
-        impl EventSourcedActor for Forwarder {
+        impl ServiceActor for Forwarder {
             fn manifest() -> ActorManifest {
                 ActorManifest::new()
                     .handles::<Add>()
-                    .kind(ActorKind::EventSourced)
+                    .emits::<Ping>()
+                    .kind(ActorKind::Service)
             }
-            fn restore(_args: &JsonValue) -> Self {
-                Self
+            async fn start(
+                _args: &JsonValue,
+            ) -> Result<Self, error_stack::Report<crate::registry::RegistryError>> {
+                Ok(Self)
             }
-            fn apply(&mut self, _event: &crate::envelope::Event) {}
         }
-        impl CommandHandler<Add> for Forwarder {
-            fn handle(&self, _cmd: Add, ctx: &mut CmdCtx<'_>) -> Vec<crate::envelope::Event> {
+        impl MsgHandler<Add> for Forwarder {
+            async fn handle(&mut self, _cmd: Add, ctx: &mut crate::context::MsgCtx<'_>) {
                 ctx.send(Address::Path(ActorPath::new("echo")), &Ping { n: 0 }, None);
-                Vec::new()
             }
         }
 
@@ -2392,11 +2394,11 @@ mod tests {
         }
 
         let (system, _clock) = ActorSystem::test();
-        system.spawn_es::<Forwarder, _>(
+        system.spawn_service::<Forwarder, _>(
             ActorPath::new("a"),
             &json!({}),
             SpawnOpts::default(),
-            || vec![Arc::new(TypedEsAdapter::<Forwarder, Add>::new::<Add>())],
+            || vec![Arc::new(TypedServiceAdapter::<Forwarder, Add>::new::<Add>())],
         );
         system.spawn_service::<Echo, _>(
             ActorPath::new("echo"),
@@ -3181,6 +3183,7 @@ mod tests {
             fn manifest() -> ActorManifest {
                 ActorManifest::new()
                     .handles::<Add>()
+                    .emits::<Add>()
                     .kind(ActorKind::Service)
             }
             async fn start(
@@ -3723,7 +3726,20 @@ mod tests {
                 ]
             }))
             .expect("valid");
-        let schema_for_actor = schema.clone();
+        // A DISTINCT fact schema for the decision's announce: emitting the
+        // command's own schema would re-deliver it to the handling actor
+        // under the automatic fact broadcast (a self-feedback loop).
+        let fact = system
+            .register_schema_json(json!({
+                "name": "tallied", "version": 1, "kind": "event",
+                "fields": [
+                    {"name": "delta", "ty": "int"}
+                ]
+            }))
+            .expect("valid");
+        let fact_for_actor = fact.clone();
+        let fact_for_fold = fact.clone();
+        let fact_for_emit = fact.clone();
         system.spawn_es_foreign(
             ActorPath::new("tally-actor"),
             schema.clone(),
@@ -3731,15 +3747,17 @@ mod tests {
             Arc::new(move |_state, cmd, _ctx| {
                 let delta = cmd["delta"].as_i64().unwrap_or(0);
                 vec![crate::envelope::Event::new(
-                    schema_for_actor.clone(),
+                    fact_for_actor.clone(),
                     json!({ "delta": delta }),
                 )]
             }),
-            Arc::new(|state: &mut JsonValue, ev: &crate::envelope::Event| {
-                state["total"] = json!(
-                    state["total"].as_i64().unwrap_or(0)
-                        + ev.payload["delta"].as_i64().unwrap_or(0)
-                );
+            Arc::new(move |state: &mut JsonValue, ev: &crate::envelope::Event| {
+                if ev.schema == fact_for_fold {
+                    state["total"] = json!(
+                        state["total"].as_i64().unwrap_or(0)
+                            + ev.payload["delta"].as_i64().unwrap_or(0)
+                    );
+                }
             }),
             SpawnOpts::default(),
         );
@@ -3748,7 +3766,7 @@ mod tests {
         {
             let mut registry = system.registry.lock();
             registry
-                .declare_emits(&ActorPath::new("tally-actor"), schema.clone())
+                .declare_emits(&ActorPath::new("tally-actor"), fact_for_emit)
                 .expect("live slot");
         }
 
@@ -5041,23 +5059,37 @@ mod tests {
                 "fields": [{ "name": "delta", "ty": "int" }]
             }))
             .expect("valid");
+        // A DISTINCT fact schema: emitting the command's own schema would
+        // loop back to the handler under the automatic fact broadcast.
+        let fact = system
+            .register_schema_json(json!({
+                "name": "tallied2", "version": 1, "kind": "event",
+                "fields": [{ "name": "delta", "ty": "int" }]
+            }))
+            .expect("valid");
 
         let decision: crate::actor::ForeignDecision = {
-            let s = schema.clone();
+            let f = fact.clone();
             Arc::new(move |_state, cmd, _ctx| {
                 vec![crate::envelope::Event::new(
-                    s.clone(),
+                    f.clone(),
                     json!({ "delta": cmd["delta"].as_i64().unwrap_or(0) }),
                 )]
             })
         };
-        let fold: crate::actor::ForeignFold =
-            Arc::new(|state: &mut JsonValue, ev: &crate::envelope::Event| {
-                state["total"] = json!(
-                    state["total"].as_i64().unwrap_or(0)
-                        + ev.payload["delta"].as_i64().unwrap_or(0)
-                );
-            });
+        let fold: crate::actor::ForeignFold = {
+            let f = fact.clone();
+            Arc::new(
+                move |state: &mut JsonValue, ev: &crate::envelope::Event| {
+                    if ev.schema == f {
+                        state["total"] = json!(
+                            state["total"].as_i64().unwrap_or(0)
+                                + ev.payload["delta"].as_i64().unwrap_or(0)
+                        );
+                    }
+                },
+            )
+        };
         system.spawn_es_foreign(
             ActorPath::new("t-pos"),
             schema.clone(),
@@ -5071,17 +5103,30 @@ mod tests {
         {
             let mut registry = system.registry.lock();
             registry
-                .declare_emits(&ActorPath::new("t-pos"), schema.clone())
+                .declare_emits(&ActorPath::new("t-pos"), fact.clone())
                 .expect("live slot");
         }
         let built_decision: crate::actor::ForeignDecision = {
-            let s = schema.clone();
+            let f = fact.clone();
             Arc::new(move |_state, cmd, _ctx| {
                 vec![crate::envelope::Event::new(
-                    s.clone(),
+                    f.clone(),
                     json!({ "delta": cmd["delta"].as_i64().unwrap_or(0) }),
                 )]
             })
+        };
+        let built_fold: crate::actor::ForeignFold = {
+            let f = fact.clone();
+            Arc::new(
+                move |state: &mut JsonValue, ev: &crate::envelope::Event| {
+                    if ev.schema == f {
+                        state["total"] = json!(
+                            state["total"].as_i64().unwrap_or(0)
+                                + ev.payload["delta"].as_i64().unwrap_or(0)
+                        );
+                    }
+                },
+            )
         };
         crate::builder::spawn_foreign(&system)
             .at(ActorPath::new("t-built"))
@@ -5091,8 +5136,8 @@ mod tests {
             }))
             .args(json!({ "total": 0 }))
             .handle(built_decision)
-            .apply(fold)
-            .emits_id(SchemaId::new("tally2", 1))
+            .apply(built_fold)
+            .emits_id(fact)
             .start()
             .expect("foreign builder starts");
 
@@ -5368,6 +5413,7 @@ mod tests {
         crate::builder::spawn_service_builder::<Echo>(&system)
             .at(ActorPath::new("sys-echo"))
             .handles::<Add>()
+            .emits::<Add>()
             .start();
         wait_for(|| async { system.inbox_cursor(&ActorPath::new("sys-echo")).is_some() }).await;
 
@@ -5589,29 +5635,42 @@ mod tests {
                 "fields": [{ "name": "delta", "ty": "int" }]
             }))
             .expect("valid");
+        // A DISTINCT fact schema: emitting the command's own schema would
+        // loop back to the handler under the automatic fact broadcast.
+        let fact = system
+            .register_schema_json(json!({
+                "name": "depdone", "version": 1, "kind": "event",
+                "fields": [{ "name": "delta", "ty": "int" }]
+            }))
+            .expect("valid");
         {
-            let s = schema.clone();
+            let f_decision = fact.clone();
+            let f_fold = fact.clone();
             system.spawn_es_foreign(
                 foreign_path.clone(),
                 schema,
                 json!({ "total": 0 }),
                 Arc::new(move |_st, cmd, _ctx| {
                     vec![crate::envelope::Event::new(
-                        s.clone(),
+                        f_decision.clone(),
                         json!({ "delta": cmd["delta"].as_i64().unwrap_or(0) }),
                     )]
                 }),
-                Arc::new(|state: &mut JsonValue, ev: &crate::envelope::Event| {
-                    state["total"] = json!(
-                        state["total"].as_i64().unwrap_or(0)
-                            + ev.payload["delta"].as_i64().unwrap_or(0)
-                    );
-                }),
+                Arc::new(
+                    move |state: &mut JsonValue, ev: &crate::envelope::Event| {
+                        if ev.schema == f_fold {
+                            state["total"] = json!(
+                                state["total"].as_i64().unwrap_or(0)
+                                    + ev.payload["delta"].as_i64().unwrap_or(0)
+                            );
+                        }
+                    },
+                ),
                 SpawnOpts::default(),
             );
             let mut registry = system.registry.lock();
             registry
-                .declare_emits(&foreign_path, SchemaId::new("depcmd", 1))
+                .declare_emits(&foreign_path, fact)
                 .expect("declare");
         }
 
@@ -6245,7 +6304,7 @@ mod tests {
         }
         impl ServiceActor for Forwarder {
             fn manifest() -> ActorManifest {
-                ActorManifest::new().kind(ActorKind::Service)
+                ActorManifest::new().handles::<Add>().emits::<Add>().kind(ActorKind::Service)
             }
             async fn start(
                 args: &JsonValue,
@@ -6938,8 +6997,10 @@ mod tests {
 
     #[tokio::test]
     async fn stop_self_terminates_after_commit_and_flushes_outbox_in_order() {
-        // Given an ES counter whose handler sends a mirror command to a
-        // second actor, then stops itself.
+        // Given a service actor whose handler sends a mirror command to a
+        // second actor, then stops itself. (An event-sourced entity has no
+        // send verb — it announces by returning facts; the send+stop
+        // outbox contract lives on the service tier.)
         let (system, _clock) = ActorSystem::test();
         system.register_schema::<Add>();
         system.register_schema::<Added>();
@@ -6952,36 +7013,39 @@ mod tests {
         struct SelfStopper {
             target: String,
         }
-        impl EventSourcedActor for SelfStopper {
+        impl ServiceActor for SelfStopper {
             fn manifest() -> ActorManifest {
                 ActorManifest::new()
                     .handles::<Add>()
-                    .emits::<Added>()
-                    .kind(ActorKind::EventSourced)
+                    .emits::<Add>()
+                    .kind(ActorKind::Service)
             }
-            fn restore(_args: &JsonValue) -> Self {
-                Self {
+            async fn start(
+                _args: &JsonValue,
+            ) -> Result<Self, error_stack::Report<crate::registry::RegistryError>> {
+                Ok(Self {
                     target: "mirror".to_owned(),
-                }
+                })
             }
-            fn apply(&mut self, _event: &crate::envelope::Event) {}
         }
-        impl CommandHandler<Add> for SelfStopper {
-            fn handle(&self, cmd: Add, ctx: &mut CmdCtx<'_>) -> Vec<crate::envelope::Event> {
+        impl MsgHandler<Add> for SelfStopper {
+            async fn handle(&mut self, cmd: Add, ctx: &mut crate::context::MsgCtx<'_>) {
                 ctx.send(
                     Address::Path(ActorPath::new(self.target.as_str())),
                     &Add { n: cmd.n },
                     None,
                 );
                 ctx.stop_self();
-                vec![]
             }
         }
 
         let path = ActorPath::new("selfstop");
-        system.spawn_es::<SelfStopper, _>(path.clone(), &json!({}), SpawnOpts::default(), || {
-            vec![Arc::new(TypedEsAdapter::<SelfStopper, Add>::new::<Add>())]
-        });
+        system.spawn_service::<SelfStopper, _>(
+            path.clone(),
+            &json!({}),
+            SpawnOpts::default(),
+            || vec![Arc::new(TypedServiceAdapter::<SelfStopper, Add>::new::<Add>())],
+        );
 
         // When one command drives send → stop_self.
         system
@@ -7004,29 +7068,30 @@ mod tests {
         #[derive(Serialize, Deserialize)]
         struct StopOnFirst;
 
-        impl EventSourcedActor for StopOnFirst {
+        impl ServiceActor for StopOnFirst {
             fn manifest() -> ActorManifest {
-                ActorManifest::new()
-                    .handles::<Add>()
-                    .kind(ActorKind::EventSourced)
+                ActorManifest::new().handles::<Add>().kind(ActorKind::Service)
             }
-            fn restore(_args: &JsonValue) -> Self {
-                Self
+            async fn start(
+                _args: &JsonValue,
+            ) -> Result<Self, error_stack::Report<crate::registry::RegistryError>> {
+                Ok(Self)
             }
-            fn apply(&mut self, _event: &crate::envelope::Event) {}
         }
-        impl CommandHandler<Add> for StopOnFirst {
-            fn handle(&self, _cmd: Add, ctx: &mut CmdCtx<'_>) -> Vec<crate::envelope::Event> {
+        impl MsgHandler<Add> for StopOnFirst {
+            async fn handle(&mut self, _cmd: Add, ctx: &mut crate::context::MsgCtx<'_>) {
                 ctx.stop_self();
-                vec![]
             }
         }
         let (system, _clock) = ActorSystem::test();
         system.register_schema::<Add>();
         let path = ActorPath::new("stopfirst");
-        system.spawn_es::<StopOnFirst, _>(path.clone(), &json!({}), SpawnOpts::default(), || {
-            vec![Arc::new(TypedEsAdapter::<StopOnFirst, Add>::new::<Add>())]
-        });
+        system.spawn_service::<StopOnFirst, _>(
+            path.clone(),
+            &json!({}),
+            SpawnOpts::default(),
+            || vec![Arc::new(TypedServiceAdapter::<StopOnFirst, Add>::new::<Add>())],
+        );
 
         // When two commands arrive back to back.
         system
@@ -7055,29 +7120,30 @@ mod tests {
         // Given an actor that stops itself on its first command.
         #[derive(Serialize, Deserialize)]
         struct SelfStopper2;
-        impl EventSourcedActor for SelfStopper2 {
+        impl ServiceActor for SelfStopper2 {
             fn manifest() -> ActorManifest {
-                ActorManifest::new()
-                    .handles::<Add>()
-                    .kind(ActorKind::EventSourced)
+                ActorManifest::new().handles::<Add>().kind(ActorKind::Service)
             }
-            fn restore(_args: &JsonValue) -> Self {
-                Self
+            async fn start(
+                _args: &JsonValue,
+            ) -> Result<Self, error_stack::Report<crate::registry::RegistryError>> {
+                Ok(Self)
             }
-            fn apply(&mut self, _event: &crate::envelope::Event) {}
         }
-        impl CommandHandler<Add> for SelfStopper2 {
-            fn handle(&self, _cmd: Add, ctx: &mut CmdCtx<'_>) -> Vec<crate::envelope::Event> {
+        impl MsgHandler<Add> for SelfStopper2 {
+            async fn handle(&mut self, _cmd: Add, ctx: &mut crate::context::MsgCtx<'_>) {
                 ctx.stop_self();
-                vec![]
             }
         }
         let (system, _clock) = ActorSystem::test();
         system.register_schema::<Add>();
         let path = ActorPath::new("race");
-        system.spawn_es::<SelfStopper2, _>(path.clone(), &json!({}), SpawnOpts::default(), || {
-            vec![Arc::new(TypedEsAdapter::<SelfStopper2, Add>::new::<Add>())]
-        });
+        system.spawn_service::<SelfStopper2, _>(
+            path.clone(),
+            &json!({}),
+            SpawnOpts::default(),
+            || vec![Arc::new(TypedServiceAdapter::<SelfStopper2, Add>::new::<Add>())],
+        );
 
         // When the actor self-stops and an external stop races in.
         system
@@ -7892,7 +7958,10 @@ mod tests {
         let (idx, sink) = open_sink();
         let mut b = crate::builder::spawn_service_builder::<Edged>(system)
             .at(ActorPath::new(path))
-            .args(json!({ "sink": idx, "tag": tag, "stall_ms": stall_ms }));
+            .args(json!({ "sink": idx, "tag": tag, "stall_ms": stall_ms }))
+            // The Pack handler announces Shipped: the emit edge is part of
+            // the actor's declared surface.
+            .emits::<Shipped>();
         if handles_pack {
             b = b.handles::<Pack>();
         }
@@ -8163,6 +8232,7 @@ mod tests {
             fn manifest() -> ActorManifest {
                 ActorManifest::new()
                     .handles::<AskReq>()
+                    .emits::<AskRes>()
                     .kind(ActorKind::Service)
             }
             async fn start(

@@ -57,6 +57,20 @@ pub(crate) enum Intent {
     StopSelf,
 }
 
+impl Intent {
+    /// The schema this intent would emit, if any (`StopSelf` emits
+    /// nothing). The flush-time emit gate reads this: an intent whose
+    /// schema the actor never declared in `.emits` is dropped, never
+    /// routed.
+    pub(crate) fn emitted_schema(&self) -> Option<&SchemaId> {
+        match self {
+            Intent::Send(envelope) | Intent::Broadcast(envelope) => Some(&envelope.schema),
+            Intent::Reply { schema, .. } => Some(schema),
+            Intent::StopSelf => None,
+        }
+    }
+}
+
 /// Effects recorded by a handler, flushed by the kernel after ack.
 #[derive(Debug, Default)]
 pub(crate) struct Outbox {
