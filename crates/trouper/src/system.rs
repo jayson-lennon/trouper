@@ -688,6 +688,29 @@ impl ActorSystemCore {
         registry.register_schema_of::<S>()
     }
 
+    /// Declares `path` a subscriber of `M` after spawn — the registry
+    /// entry a builder `.subscribe::<M>()` would have recorded, for
+    /// runtime-spawned or externally-wired actors. Idempotent.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::registry::RegistryError::UnknownPath`] when the
+    /// path has no live slot — declare after spawn.
+    pub fn declare_subscriber<M: Schema>(
+        &self,
+        path: &ActorPath,
+    ) -> Result<(), error_stack::Report<crate::registry::RegistryError>> {
+        let mut registry = self.registry.lock();
+        registry.register_schema_of::<M>();
+        if !registry.is_registered(path) {
+            return Err(error_stack::Report::new(crate::registry::RegistryError::UnknownPath(
+                path.clone(),
+            )));
+        }
+        registry.add_subscriber(M::schema_id(), path.clone());
+        Ok(())
+    }
+
     /// Registers a schema from a JSON descriptor — the foreign flavor, for
     /// schemas defined outside Rust.
     ///
@@ -8226,6 +8249,40 @@ mod tests {
         // is a Broadcast intent, not a point-to-point send).
         wait_for(|| async { sub.lock().len() == 1 }).await;
         assert_eq!(sub.lock().as_slice(), ["sub:shipped:o-2"]);
+    }
+
+    #[tokio::test]
+    async fn declare_subscriber_after_spawn_receives_publish() {
+        // Given an actor spawned WITHOUT a subscribe declaration, then
+        // one registered post-spawn via `declare_subscriber`.
+        let (system, _clock) = ActorSystem::test();
+        let late = spawn_edged(&system, "late", "late", false, false).await;
+        system
+            .declare_subscriber::<Shipped>(&ActorPath::new("late"))
+            .expect("declare after spawn");
+
+        // When an event is published from outside the system.
+        system
+            .publish(&Shipped {
+                order: "o-9".into(),
+            })
+            .await;
+
+        // Then the late-declared subscriber receives it like any other.
+        wait_for(|| async { late.lock().len() == 1 }).await;
+        assert_eq!(late.lock().as_slice(), ["late:shipped:o-9"]);
+    }
+
+    #[tokio::test]
+    async fn declare_subscriber_rejects_unspawned_path() {
+        // Given a system where no actor was spawned.
+        let (system, _clock) = ActorSystem::test();
+
+        // When declaring a subscription for a path with no slot.
+        let result = system.declare_subscriber::<Shipped>(&ActorPath::new("ghost"));
+
+        // Then the declaration fails with UnknownPath.
+        assert!(result.is_err());
     }
 
     #[tokio::test]
