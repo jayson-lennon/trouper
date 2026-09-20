@@ -1321,11 +1321,9 @@ pub(crate) async fn broadcast(
             .filter_map(|path| reg.resolve(&path).map(|endpoint| (path, endpoint)))
             .collect()
     };
-    for (_path, endpoint) in &targets {
-        // Block backpressure: a full inbox stalls the publisher (loss is
-        // unrepresentable; sizing mailboxes is the spawner's call). A
-        // closed endpoint (restart in flight) skips this one delivery.
-        let _ = deliver_with_retry(endpoint, envelope.clone()).await;
+    // ONE Sent fact per publish (not per delivery): the broadcast itself is
+    // the observable event — a zero-subscriber publish still happened.
+    {
         let mut kernel = kernel.lock();
         kernel.record_fact(
             envelope.trace.causality_id.as_millis_ts(),
@@ -1336,6 +1334,12 @@ pub(crate) async fn broadcast(
                 trace: envelope.trace.clone(),
             },
         );
+    }
+    for (_path, endpoint) in &targets {
+        // Block backpressure: a full inbox stalls the publisher (loss is
+        // unrepresentable; sizing mailboxes is the spawner's call). A
+        // closed endpoint (restart in flight) skips this one delivery.
+        let _ = deliver_with_retry(endpoint, envelope.clone()).await;
     }
 }
 
