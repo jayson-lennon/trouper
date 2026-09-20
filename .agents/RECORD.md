@@ -31,7 +31,7 @@ Entries are added or amended **only with human approval**.
 
 ---
 
-- (identity) **actor-canvas** is a Rust workspace (edition 2024) whose `actor-runtime` crate is a single-machine actor runtime; the root `actor-canvas` package re-exports it.
+- (identity) trouper is a single-crate Rust repository (edition 2024); the `trouper` package is the single-machine actor runtime and the only crate.
 - (runtime) All actor communication is mediated by the runtime: actors never hold channels directly; every send is routed by path or schema through the registry and emits a tap fact.
 - (runtime) Event-sourced actors are pure decision functions (sync `handle(&self)` returning events) with a single `apply` used for both live state application and replay; all other actors may perform side effects and use `ask`.
 - (runtime) The registry is kernel code, not an actor: path→endpoint slots, schema, type→handler, and topic→subscriber tables persist across actor restarts; actor identity is its registered path.
@@ -54,12 +54,7 @@ Entries are added or amended **only with human approval**.
 - (runtime) All synchronous mutexes are parking_lot: lock() cannot fail, there is no poisoning, and a panic under a lock never wedges later lockers.
 - (runtime) Replies are point-to-point: a reply with no reply_to is dropped silently, never broadcast; failures that must reach non-asking observers travel as published events on topics.
 - (runtime) Handler contexts (CmdCtx/MsgCtx) expose only tier-curated methods; the outbox, trace, and ask port are crate-private plumbing.
-- (canvas) System state is served and consumed as zenoh messages on the actor-runtime/state key (Config::default()); the canvas CLI queries it and prints the export.
-- (canvas) The canvas GUI consumes the same zenoh state key as the CLI and renders the export as an interactive graph with pan, zoom, and cursor-anchored popups; the runtime serves it no differently than the CLI.
-- (canvas) The canvas GUI lives in its own repo next to the SDK (../actor-canvas) and consumes actor-runtime and state-report by path dependency; this SDK carries no bevy anymore.
 - (runtime) Handler effects are typed: ctx reply/publish/send take Message values (Schema + serde), derive the schema id from the type, and serialize at intent time; raw JSON variants remain as the \*\_json escape hatch.
-- (canvas) A zenoh control plane exists alongside the state key: one key (`actor-runtime/control`) dispatches typed, app-registered `ControlCommand`s over query+reply, and every command gets exactly one reply (result or legible error, never silence); the transport is generic while the command set is an app-side allow-list, with `List` reserved to report the registered names.
-- (canvas) Pool scaling crosses the process boundary as the `ScalePool` command over app-registered `PoolBlueprint`s: the factory/algo/parent/seed/args half is code fixed at app startup, only `workers` travels the wire; scaling a live pool stop-drains the old workers before re-install (worker paths are reused, identities are not), and the canvas CLI reaches the plane via the generic `canvas ctl [<name> [json]]` passthrough.
 - (lifecycle) A trouper actor's on_stop hook runs on graceful stop, self-stop, passivation, and the shutdown sweep; never on crash or hard shutdown.
 - (lifecycle) Service actors receive an async on_stop(&mut self); event-sourced actors receive a sync on_stop(&self).
 - (lifecycle) stop_self() records a deferred intent; the actor stops after the current message commits, flushing pending sends in order.
