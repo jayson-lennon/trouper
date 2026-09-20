@@ -623,10 +623,7 @@ impl Registry {
 
     /// Every subscriber of `schema`, in subscription order.
     pub fn subscribers_of(&self, schema: &SchemaId) -> Vec<ActorPath> {
-        self.subscribers
-            .get(schema)
-            .cloned()
-            .unwrap_or_default()
+        self.subscribers.get(schema).cloned().unwrap_or_default()
     }
 
     /// Drops `path` from every subscriber list (slot removal cascade);
@@ -1025,13 +1022,12 @@ mod tests {
         registry.drop_subscribers_of(&gone);
 
         // Then `kept` still subscribes Ping and Pong has no subscribers.
-        assert_eq!(
-            registry.subscribers_of(&SchemaId::new("Ping", 1)),
-            [kept]
+        assert_eq!(registry.subscribers_of(&SchemaId::new("Ping", 1)), [kept]);
+        assert!(
+            registry
+                .subscribers_of(&SchemaId::new("Pong", 1))
+                .is_empty()
         );
-        assert!(registry
-            .subscribers_of(&SchemaId::new("Pong", 1))
-            .is_empty());
     }
 
     #[test]
@@ -1049,10 +1045,7 @@ mod tests {
 
         // Then each table reports only its own declarations.
         assert_eq!(handlers, [ActorPath::new("a")]);
-        assert_eq!(
-            subs,
-            [ActorPath::new("a"), ActorPath::new("b")]
-        );
+        assert_eq!(subs, [ActorPath::new("a"), ActorPath::new("b")]);
     }
 
     #[test]

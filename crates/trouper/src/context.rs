@@ -969,10 +969,7 @@ mod tests {
         }
         {
             let mut raw = CmdCtx::new(&path, &trace, None, &view, &mut raw_outbox);
-            raw.publish_json(
-                StockReserved::schema_id(),
-                serde_json::json!({ "qty": 2 }),
-            );
+            raw.publish_json(StockReserved::schema_id(), serde_json::json!({ "qty": 2 }));
         }
 
         // Then the broadcast intents are identical.

@@ -213,7 +213,7 @@ checksum = "fc652a48c352aef3ea3aed32080501cf3ef6ed5da78602a020c991775b0aff04"
 
 [[package]]
 name = "canvas"
-version = "0.3.6"
+version = "0.3.7"
 dependencies = [
  "error-stack",
  "futures",
@@ -2706,7 +2706,7 @@ checksum = "6ce2be8dc25455e1f91df71bfa12ad37d7af1092ae736f3a6cd0e37bc7810596"
 
 [[package]]
 name = "state-report"
-version = "0.3.6"
+version = "0.3.7"
 dependencies = [
  "error-stack",
  "futures",
@@ -3070,7 +3070,7 @@ dependencies = [
 
 [[package]]
 name = "trouper"
-version = "0.3.6"
+version = "0.3.7"
 dependencies = [
  "arc-swap",
  "async-trait",
@@ -3089,7 +3089,7 @@ dependencies = [
 
 [[package]]
 name = "trouper-sdk"
-version = "0.3.6"
+version = "0.3.7"
 dependencies = [
  "error-stack",
  "parking_lot",

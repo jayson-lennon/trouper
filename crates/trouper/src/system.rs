@@ -703,9 +703,9 @@ impl ActorSystemCore {
         let mut registry = self.registry.lock();
         registry.register_schema_of::<M>();
         if !registry.is_registered(path) {
-            return Err(error_stack::Report::new(crate::registry::RegistryError::UnknownPath(
-                path.clone(),
-            )));
+            return Err(error_stack::Report::new(
+                crate::registry::RegistryError::UnknownPath(path.clone()),
+            ));
         }
         registry.add_subscriber(M::schema_id(), path.clone());
         Ok(())
@@ -1121,10 +1121,7 @@ impl ActorSystemCore {
     ///
     /// Panics when `M` cannot serialize — a programmer error (serde only
     /// fails on pathological map keys), not a domain outcome.
-    pub fn publish<M>(
-        &self,
-        value: &M,
-    ) -> impl std::future::Future<Output = ()> + Send + '_
+    pub fn publish<M>(&self, value: &M) -> impl std::future::Future<Output = ()> + Send + '_
     where
         M: Schema + serde::Serialize,
     {
@@ -1180,12 +1177,8 @@ impl ActorSystemCore {
                 };
                 match dest {
                     Some(path) => {
-                        let envelope = Envelope::json(
-                            schema,
-                            Address::Path(path),
-                            payload,
-                            TraceCtx::root(),
-                        );
+                        let envelope =
+                            Envelope::json(schema, Address::Path(path), payload, TraceCtx::root());
                         let _ = self.send(envelope).await;
                     }
                     // Unrouted command: nothing to do (the caller's
@@ -1280,7 +1273,12 @@ impl ActorSystemCore {
             .topic_logs
             .entry(Registry::facts_topic())
             .or_insert_with(|| crate::topics::TopicLog::new(256));
-        Ok(log.subscribe(path.clone(), policy, crate::topics::CursorFrom::Latest, filter))
+        Ok(log.subscribe(
+            path.clone(),
+            policy,
+            crate::topics::CursorFrom::Latest,
+            filter,
+        ))
     }
 
     /// Re-points a subscriber's topic cursor; the next publish pumps the
@@ -3970,7 +3968,10 @@ mod tests {
             .iter()
             .find(|e| e.to == format!("schema({})", Shipped::schema_id()))
             .expect("observed schema edge");
-        assert!(observed.count >= 1, "at least the one publish: {observed:?}");
+        assert!(
+            observed.count >= 1,
+            "at least the one publish: {observed:?}"
+        );
     }
 
     #[tokio::test]
@@ -7808,7 +7809,9 @@ mod tests {
         // Drop the pre-passivation lines, then re-address the same key
         // until the entity responds again (the stop sweep may still be
         // tearing the old slot down when the first send lands).
-        sink_table().lock().remove(&ActorPath::new("accts/k").to_string());
+        sink_table()
+            .lock()
+            .remove(&ActorPath::new("accts/k").to_string());
         for _ in 0..200 {
             let e2 = system.envelope(
                 KeyedAdd::schema_id(),
@@ -7827,7 +7830,6 @@ mod tests {
             lines.iter().any(|l| l.ends_with(":keyed:10")),
             "reactivation delivered: {lines:?}"
         );
-
 
         // Then the re-spawned entity still receives broadcasts: its
         // subscription was re-declared by the factory's builder.
@@ -8308,18 +8310,20 @@ mod tests {
 
     impl MsgHandler<Pack> for Edged {
         async fn handle(&mut self, msg: Pack, ctx: &mut crate::context::MsgCtx<'_>) {
-            self.sink.lock().push(format!("{}:pack:{}", self.tag, msg.order));
+            self.sink
+                .lock()
+                .push(format!("{}:pack:{}", self.tag, msg.order));
             // Announce the outcome as an event: every Shipped subscriber
             // gets a copy (the outbox-intent broadcast path).
-            ctx.publish(&Shipped {
-                order: msg.order,
-            });
+            ctx.publish(&Shipped { order: msg.order });
         }
     }
 
     impl MsgHandler<KeyedAdd> for Edged {
         async fn handle(&mut self, msg: KeyedAdd, _ctx: &mut crate::context::MsgCtx<'_>) {
-            self.sink.lock().push(format!("{}:keyed:{}", self.tag, msg.n));
+            self.sink
+                .lock()
+                .push(format!("{}:keyed:{}", self.tag, msg.n));
         }
     }
 
@@ -8430,8 +8434,7 @@ mod tests {
         // subscription at spawn; the subscription is added post-spawn
         // via `declare_subscriber`.
         let (system, _clock) = ActorSystem::test();
-        let late =
-            spawn_edged_with(&system, "late", "late", false, true, false).await;
+        let late = spawn_edged_with(&system, "late", "late", false, true, false).await;
         system
             .declare_subscriber::<Shipped>(&ActorPath::new("late"))
             .expect("declare after spawn");
@@ -8470,17 +8473,11 @@ mod tests {
 
         // When a command payload is delivered schema-addressed.
         system
-            .deliver_schema_value(
-                Pack::schema_id(),
-                json!({ "order": "o-cmd" }),
-            )
+            .deliver_schema_value(Pack::schema_id(), json!({ "order": "o-cmd" }))
             .await;
         // ... and an event payload likewise.
         system
-            .deliver_schema_value(
-                Shipped::schema_id(),
-                json!({ "order": "o-evt" }),
-            )
+            .deliver_schema_value(Shipped::schema_id(), json!({ "order": "o-evt" }))
             .await;
 
         // Then the command reached the HANDLER (route, not broadcast)...
@@ -8507,10 +8504,7 @@ mod tests {
 
         // When the command payload is delivered schema-addressed.
         system
-            .deliver_schema_value(
-                Pack::schema_id(),
-                json!({ "order": "o-lost" }),
-            )
+            .deliver_schema_value(Pack::schema_id(), json!({ "order": "o-lost" }))
             .await;
 
         // Then nothing dead-lettered (fire-and-forget contract).
@@ -8720,10 +8714,7 @@ mod tests {
 
         // Then the manifest and declared edges carry the subscription.
         assert!(
-            manifest
-                .manifest
-                .subscribed
-                .contains(&Shipped::schema_id()),
+            manifest.manifest.subscribed.contains(&Shipped::schema_id()),
             "subscribed edge exported, got handles={:?} subscribed={:?}",
             manifest.manifest.handles,
             manifest.manifest.subscribed

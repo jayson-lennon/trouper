@@ -1147,7 +1147,13 @@ async fn flush_outbox(ctx: &EsLoop, mut outbox: Outbox) -> bool {
                 }
             }
             crate::context::Intent::Broadcast(envelope) => {
-                broadcast(&ctx.registry, &ctx.kernel, envelope.schema.clone(), envelope).await;
+                broadcast(
+                    &ctx.registry,
+                    &ctx.kernel,
+                    envelope.schema.clone(),
+                    envelope,
+                )
+                .await;
             }
             crate::context::Intent::Reply {
                 to,

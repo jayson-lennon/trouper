@@ -75,9 +75,7 @@ impl ServiceActor for Fulfillment {
         ActorManifest::new().kind(ActorKind::Service)
     }
 
-    async fn start(
-        _args: &serde_json::Value,
-    ) -> Result<Self, error_stack::Report<RegistryError>> {
+    async fn start(_args: &serde_json::Value) -> Result<Self, error_stack::Report<RegistryError>> {
         Ok(Self)
     }
 }
@@ -100,16 +98,17 @@ impl ServiceActor for Billing {
         ActorManifest::new().kind(ActorKind::Service)
     }
 
-    async fn start(
-        _args: &serde_json::Value,
-    ) -> Result<Self, error_stack::Report<RegistryError>> {
+    async fn start(_args: &serde_json::Value) -> Result<Self, error_stack::Report<RegistryError>> {
         Ok(Self)
     }
 }
 
 impl MsgHandler<Shipped> for Billing {
     async fn handle(&mut self, msg: Shipped, _ctx: &mut MsgCtx<'_>) {
-        log(format!("[billing] invoiced {} (from the announcement)", msg.order));
+        log(format!(
+            "[billing] invoiced {} (from the announcement)",
+            msg.order
+        ));
     }
 }
 
@@ -122,9 +121,7 @@ impl ServiceActor for Auditor {
         ActorManifest::new().kind(ActorKind::Service)
     }
 
-    async fn start(
-        _args: &serde_json::Value,
-    ) -> Result<Self, error_stack::Report<RegistryError>> {
+    async fn start(_args: &serde_json::Value) -> Result<Self, error_stack::Report<RegistryError>> {
         Ok(Self)
     }
 }
@@ -191,10 +188,7 @@ async fn main() {
         .get()
         .map(|l| l.lock().expect("lines lock").clone())
         .unwrap_or_default();
-    let shipped_by_fulfillment = lines
-        .iter()
-        .filter(|l| l.contains("fulfillment"))
-        .count();
+    let shipped_by_fulfillment = lines.iter().filter(|l| l.contains("fulfillment")).count();
     let ships_seen_by_auditor = lines.iter().filter(|l| l.contains("auditor")).count();
     let announcements = lines.iter().filter(|l| l.contains("billing")).count();
     println!("  Ship commands dispatched to fulfillment: {shipped_by_fulfillment}");
@@ -206,5 +200,7 @@ async fn main() {
         announcements, 3,
         "billing invoiced both shipments + the direct announcement"
     );
-    println!("\npublish/subscribe = events to every subscriber; handles/tell = commands to one handler.");
+    println!(
+        "\npublish/subscribe = events to every subscriber; handles/tell = commands to one handler."
+    );
 }
