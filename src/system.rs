@@ -1029,15 +1029,12 @@ impl ActorSystemCore {
                     let mut reg = self.registry.lock();
                     reg.route(&schema)
                 };
-                match dest {
-                    Some(path) => {
-                        let envelope =
-                            Envelope::json(schema, Address::Path(path), payload, TraceCtx::root());
-                        let _ = self.send(envelope).await;
-                    }
-                    // Unrouted command: nothing to do (the caller's
-                    // contract is fire-and-forget).
-                    None => {}
+                // Unrouted command: nothing to do (the caller's contract
+                // is fire-and-forget).
+                if let Some(path) = dest {
+                    let envelope =
+                        Envelope::json(schema, Address::Path(path), payload, TraceCtx::root());
+                    let _ = self.send(envelope).await;
                 }
             }
         }
@@ -1578,6 +1575,30 @@ impl RuntimeView for ActorSystem {
 impl Default for ActorSystem {
     fn default() -> Self {
         Self::new(SystemConfig::production())
+    }
+}
+
+impl ActorSystem {
+    /// The store behind the system (trait object; tests and flushes).
+    #[cfg(test)]
+    pub(crate) fn journal_store_trait(&self) -> std::sync::Arc<dyn crate::journal::JournalStore> {
+        self.0.journal_store_slot.read().clone()
+    }
+
+    /// Test seam: swaps the system's journal store.
+    #[cfg(test)]
+    pub(crate) fn set_journal_store(
+        &self,
+        store: std::sync::Arc<dyn crate::journal::JournalStore>,
+    ) {
+        *self.0.journal_store_slot.write() = store.clone();
+        self.0.kernel.lock().journal_store = store;
+    }
+
+    /// The registry slot for `path`, if any (tests).
+    #[cfg(test)]
+    pub(crate) fn lookup_slot(&self, path: &ActorPath) -> bool {
+        self.registry.lock().lookup(path).is_some()
     }
 }
 
@@ -3340,7 +3361,7 @@ mod tests {
             ActorPath::new("counter"),
             json!({ "n": 5 }),
         );
-        envelope.reply_to = Some(Address::Path(ActorPath::new("collector")));
+        envelope.reply_to = Some(Box::new(Address::Path(ActorPath::new("collector"))));
         envelope.from = Some(ActorPath::new("collector"));
         system.send(envelope).await.expect("delivered");
 
@@ -7727,10 +7748,10 @@ mod tests {
                         std::time::Duration::from_secs(2),
                     )
                     .await;
-                if let Ok(value) = reply {
-                    if let Some(n) = value["n"].as_i64() {
-                        SINK_CALLER.lock().unwrap().push(format!("replied:{n}"));
-                    }
+                if let Ok(value) = reply
+                    && let Some(n) = value["n"].as_i64()
+                {
+                    SINK_CALLER.lock().unwrap().push(format!("replied:{n}"));
                 }
             }
         }
@@ -8223,7 +8244,7 @@ mod tests {
             })
             .expect("command Sent fact recorded");
         let cmd_trace = match &cmd_sent.kind {
-            crate::tap::FactKind::Sent { trace, .. } => trace.clone(),
+            crate::tap::FactKind::Sent { trace, .. } => *trace,
             _ => unreachable!(),
         };
         let evt_sent = facts
@@ -8237,7 +8258,7 @@ mod tests {
             })
             .expect("broadcast Sent fact recorded");
         let (evt_dest, evt_trace) = match &evt_sent.kind {
-            crate::tap::FactKind::Sent { dest, trace, .. } => (dest.clone(), trace.clone()),
+            crate::tap::FactKind::Sent { dest, trace, .. } => (dest.clone(), *trace),
             _ => unreachable!(),
         };
         assert_eq!(evt_dest, Address::Schema(Shipped::schema_id()));
@@ -8311,29 +8332,5 @@ mod tests {
                 && e.schema == Shipped::schema_id()
                 && e.direction == crate::system::EdgeDirection::Handles
         }));
-    }
-}
-
-impl ActorSystem {
-    /// The store behind the system (trait object; tests and flushes).
-    #[cfg(test)]
-    pub(crate) fn journal_store_trait(&self) -> std::sync::Arc<dyn crate::journal::JournalStore> {
-        self.0.journal_store_slot.read().clone()
-    }
-
-    /// Test seam: swaps the system's journal store.
-    #[cfg(test)]
-    pub(crate) fn set_journal_store(
-        &self,
-        store: std::sync::Arc<dyn crate::journal::JournalStore>,
-    ) {
-        *self.0.journal_store_slot.write() = store.clone();
-        self.0.kernel.lock().journal_store = store;
-    }
-
-    /// The registry slot for `path`, if any (tests).
-    #[cfg(test)]
-    pub(crate) fn lookup_slot(&self, path: &ActorPath) -> bool {
-        self.registry.lock().lookup(path).is_some()
     }
 }

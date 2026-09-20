@@ -19,8 +19,10 @@ use crate::schema::SchemaId;
 pub enum Address {
     /// A named actor's inbox.
     Path(ActorPath),
-    /// A reply slot for an in-flight `ask`; a mechanism, dies with the ask.
-    Slot(LeaseId),
+    /// A reply slot for an in-flight `ask`; a mechanism, dies with the
+    /// ask. Boxed: the envelope rides `Result::Err` back to senders on
+    /// failed delivery, so every arm stays small.
+    Slot(Box<LeaseId>),
     /// Any handler of the schema: the kernel picks one per send
     /// (RoundRobin across registered handlers; Single while only one).
     Schema(SchemaId),
@@ -64,10 +66,13 @@ pub enum Payload {
     /// every runtime boundary is JSON today (the "JSON waist" decision),
     /// so no adapter constructs this arm yet. Kept as the seam for a
     /// future zero-copy path; downstream code must still handle it (see
-    /// [`Payload::into_json`] treating it as an error).
+    /// [`Payload::into_json`] treating it as an error). Boxed to keep the
+    /// variant (and therefore `Envelope`, which rides `Result::Err` back
+    /// to senders on failed delivery) small.
     Typed(std::sync::Arc<dyn std::any::Any + Send + Sync>),
-    /// The waist representation: plain JSON.
-    Json(JsonValue),
+    /// The waist representation: plain JSON. Boxed so a failed send can
+    /// return the envelope by value without inflating every `Result`.
+    Json(Box<JsonValue>),
 }
 
 impl std::fmt::Display for Address {
@@ -117,8 +122,10 @@ pub struct Envelope {
     /// The logical sending path, when the sender is an actor.
     pub from: Option<ActorPath>,
     /// Where a reply should go: a durable [`Address::Path`] or a mechanism
-    /// [`Address::Slot`].
-    pub reply_to: Option<Address>,
+    /// [`Address::Slot`]. Boxed inside the option: `Envelope` rides
+    /// `Result::Err` back to senders on failed delivery, so it must stay
+    /// small (`Option<Box<Address>>` keeps it a niche-optimized word).
+    pub reply_to: Option<Box<Address>>,
     /// Trace metadata of this hop.
     pub trace: TraceCtx,
     /// The message body.
@@ -134,7 +141,7 @@ impl Envelope {
             from: None,
             reply_to: None,
             trace,
-            payload: Payload::Json(payload),
+            payload: Payload::Json(Box::new(payload)),
         }
     }
 
@@ -174,7 +181,7 @@ impl Envelope {
 
     /// Sets the reply destination.
     pub fn reply_to(mut self, reply_to: Address) -> Self {
-        self.reply_to = Some(reply_to);
+        self.reply_to = Some(Box::new(reply_to));
         self
     }
 
@@ -192,7 +199,7 @@ impl Envelope {
     /// single encode point for the fast path.
     pub fn into_json(self) -> Result<JsonValue, Payload> {
         match self.payload {
-            Payload::Json(value) => Ok(value),
+            Payload::Json(value) => Ok(*value),
             typed @ Payload::Typed(_) => Err(typed),
         }
     }
@@ -206,9 +213,10 @@ mod tests {
     #[test]
     fn address_survives_serde_roundtrip_for_each_variant() {
         // Given one address of each variant.
+        let lease = LeaseId::new();
         let addresses = [
             Address::Path(ActorPath::new("inventory.west")),
-            Address::Slot(LeaseId::new()),
+            Address::Slot(Box::new(lease)),
         ];
 
         for address in addresses {
@@ -270,7 +278,7 @@ mod tests {
         );
         assert_eq!(
             envelope.reply_to,
-            Some(Address::Path(ActorPath::new("storefront")))
+            Some(Box::new(Address::Path(ActorPath::new("storefront"))))
         );
         assert_eq!(payload["sku"], "widget");
     }
