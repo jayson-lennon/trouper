@@ -108,9 +108,8 @@ impl Inbox {
     /// Returns the refused envelope ([`InboxError::Full`]) under Block/
     /// DropNew when full, and [`InboxError::Closed`] once draining.
     // The refused envelope travels back by value on purpose: the kernel
-    // dead-letters exactly what was refused. Boxing it would allocate on
-    // the hot push path to satisfy a lint.
-    #[allow(clippy::result_large_err)]
+    // dead-letters exactly what was refused (allowed workspace-wide in
+    // Cargo.toml).
     pub fn push(&mut self, envelope: Envelope) -> Result<InboxOffset, Refused> {
         if !self.open {
             return Err(Refused::Closed(envelope));

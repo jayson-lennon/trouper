@@ -3361,7 +3361,7 @@ mod tests {
             ActorPath::new("counter"),
             json!({ "n": 5 }),
         );
-        envelope.reply_to = Some(Box::new(Address::Path(ActorPath::new("collector"))));
+        envelope.reply_to = Some(Address::Path(ActorPath::new("collector")));
         envelope.from = Some(ActorPath::new("collector"));
         system.send(envelope).await.expect("delivered");
 

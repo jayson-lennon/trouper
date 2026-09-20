@@ -835,7 +835,7 @@ async fn step_es(ctx: &EsLoop) -> Step {
         let mut cmd_ctx = CmdCtx::new(
             &ctx.path,
             &envelope.trace,
-            envelope.reply_to.as_deref(),
+            envelope.reply_to.as_ref(),
             ctx.view.as_ref(),
             &mut outbox,
         );
@@ -1160,8 +1160,8 @@ impl crate::context::AskPort for KernelAskPort {
                 (lease, receiver)
             };
             let trace = crate::envelope::TraceCtx::root();
-            let envelope = Envelope::json(schema, dest.clone(), payload, trace)
-                .reply_to(Address::Slot(Box::new(lease)));
+            let envelope =
+                Envelope::json(schema, dest.clone(), payload, trace).reply_to(Address::Slot(lease));
             match deliver_with_retry(&endpoint, envelope).await {
                 Ok(()) => Ok((lease, receiver)),
                 Err(_) => Err(error_stack::Report::new(
@@ -1752,7 +1752,7 @@ async fn step_service(ctx: &ServiceLoop) -> Step {
         let mut msg_ctx = crate::context::MsgCtx::new(
             &path,
             &trace,
-            reply_to.as_deref(),
+            reply_to.as_ref(),
             view.as_ref(),
             &mut outbox,
             Some(&ask_port),

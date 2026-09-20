@@ -40,8 +40,7 @@ impl Endpoint {
     /// Fails when the front door is full (`try_send`) or the endpoint is
     /// gone (receiver dropped mid-restart).
     // Large Err is deliberate: the caller recovers the undeliverable
-    // envelope for dead-lettering (same rationale as `Inbox::push`).
-    #[allow(clippy::result_large_err)]
+    // envelope for dead-lettering (allowed workspace-wide in Cargo.toml).
     pub fn try_deliver(
         &self,
         envelope: Envelope,
