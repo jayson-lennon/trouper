@@ -1109,6 +1109,21 @@ impl ActorSystemCore {
         crate::kernel::broadcast(&self.registry, &self.kernel, schema, envelope).await;
     }
 
+    /// Untyped event broadcast from outside the system: the caller has
+    /// already serialized the payload under `schema`. Same fan-out
+    /// contract as [`ActorSystem::publish`] — every `.subscribe`
+    /// declarant of the schema, zero ⇒ no-op. The erased bridge
+    /// closure's publish surface.
+    pub async fn publish_value(&self, schema: SchemaId, payload: JsonValue) {
+        let envelope = Envelope::json(
+            schema.clone(),
+            Address::Schema(schema.clone()),
+            payload,
+            TraceCtx::root(),
+        );
+        crate::kernel::broadcast(&self.registry, &self.kernel, schema, envelope).await;
+    }
+
     pub fn envelope(&self, schema: SchemaId, dest: ActorPath, payload: JsonValue) -> Envelope {
         Envelope::json(schema, Address::Path(dest), payload, TraceCtx::root())
     }
