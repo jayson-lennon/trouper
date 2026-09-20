@@ -167,7 +167,7 @@ runtime scheduler exists — buildable today with zero runtime code:
 
 1. Service actor holds `HashMap<ReqId, Pending>` (in-flight requests).
 2. It `.handles` the completion fact (`DepositCompleted`) and removes the entry.
-3. A ticker — a service actor publishing `Tick` on a tokio loop, or the host ��� gives it
+3. A ticker — a service actor publishing `Tick` on a tokio loop, or the host itself, gives it
    time-as-messages; on `Tick` it sweeps expired entries.
 
 Why no `system.schedule(path, msg, delay)` yet: cancellation is inherently racy under

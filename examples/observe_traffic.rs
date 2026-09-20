@@ -141,6 +141,7 @@ async fn main() {
     spawn_service_builder::<Fulfillment>(&system)
         .at(ActorPath::new("fulfillment"))
         .handles::<Ship>()
+        .emits::<Shipped>()
         .start();
     spawn_service_builder::<Billing>(&system)
         .at(ActorPath::new("billing"))

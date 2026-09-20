@@ -262,10 +262,6 @@ async fn run_demo() -> Result<(), Box<dyn std::error::Error>> {
         .handles::<SaveFailed>()
         .start();
     wait(|| async { system.inbox_cursor(&audit).is_some() }).await;
-    spawn_service_builder::<SaveAudit>(&system)
-        .at(ActorPath::new("fs.audit"))
-        .handles::<SaveFailed>()
-        .start();
 
     // --- tell: fire-and-forget, confirmed only by looking at the disk ---
     let tell_path = std::env::temp_dir().join("trouper-sdk-file-save-tell.txt");

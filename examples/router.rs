@@ -161,6 +161,7 @@ async fn main() {
     spawn_service_builder::<ParseRouter>(&system)
         .at(ActorPath::new("parse.router"))
         .handles::<DocumentSaved>()
+        .emits::<ParseDocument>()
         .start();
     spawn_service_builder::<MetricsRecorder>(&system)
         .at(ActorPath::new("metrics"))
@@ -213,6 +214,7 @@ async fn main() {
     trouper::builder::spawn_service_builder::<Saver>(&system)
         .at(ActorPath::new("saver"))
         .handles::<SaveCmd>()
+        .emits::<DocumentSaved>()
         .start();
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
