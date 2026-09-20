@@ -1156,6 +1156,46 @@ impl ActorSystemCore {
         crate::kernel::broadcast(&self.registry, &self.kernel, schema, envelope).await;
     }
 
+    /// Untyped schema-kind dispatch from outside the system: the erased
+    /// bridge's publish surface for messages whose COMMAND/EVENT role the
+    /// caller may not know statically. Commands route to the schema's
+    /// declared handler (tell semantics, dead-letter when unrouted);
+    /// events broadcast to every subscriber (zero ⇒ no-op). The
+    /// declaration site decides — callers never choose a transport.
+    pub async fn deliver_schema_value(&self, schema: SchemaId, payload: JsonValue) {
+        let kind = {
+            let reg = self.registry.lock();
+            reg.schema(&schema).map(|def| def.kind)
+        };
+        match kind {
+            Some(crate::schema::SchemaKind::Event) => {
+                self.publish_value(schema, payload).await;
+            }
+            _ => {
+                // Command (or undeclared — treat as command, the default
+                // inbound role): resolve the handler route and send there.
+                let dest: Option<ActorPath> = {
+                    let mut reg = self.registry.lock();
+                    reg.route(&schema)
+                };
+                match dest {
+                    Some(path) => {
+                        let envelope = Envelope::json(
+                            schema,
+                            Address::Path(path),
+                            payload,
+                            TraceCtx::root(),
+                        );
+                        let _ = self.send(envelope).await;
+                    }
+                    // Unrouted command: nothing to do (the caller's
+                    // contract is fire-and-forget).
+                    None => {}
+                }
+            }
+        }
+    }
+
     pub fn envelope(&self, schema: SchemaId, dest: ActorPath, payload: JsonValue) -> Envelope {
         Envelope::json(schema, Address::Path(dest), payload, TraceCtx::root())
     }
@@ -8418,6 +8458,63 @@ mod tests {
 
         // Then the declaration fails with UnknownPath.
         assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn deliver_schema_value_routes_commands_and_broadcasts_events() {
+        // Given a handler for Pack (a COMMAND schema) and a subscriber to
+        // Shipped (an EVENT schema), both recording to their sinks.
+        let (system, _clock) = ActorSystem::test();
+        let handler_sink = spawn_edged(&system, "handler", "handler", true, false).await;
+        let sub_sink = spawn_edged(&system, "sub", "sub", false, true).await;
+
+        // When a command payload is delivered schema-addressed.
+        system
+            .deliver_schema_value(
+                Pack::schema_id(),
+                json!({ "order": "o-cmd" }),
+            )
+            .await;
+        // ... and an event payload likewise.
+        system
+            .deliver_schema_value(
+                Shipped::schema_id(),
+                json!({ "order": "o-evt" }),
+            )
+            .await;
+
+        // Then the command reached the HANDLER (route, not broadcast)...
+        wait_for(|| async { !handler_sink.lock().is_empty() }).await;
+        assert_eq!(handler_sink.lock().as_slice(), ["handler:pack:o-cmd"]);
+        // ...and the event reached the SUBSCRIBER (broadcast, no route).
+        // The handler's Pack side effect publishes Shipped{o-cmd}, so the
+        // subscriber observes BOTH the command's emitted event and the
+        // direct event — proving the two transports stayed disjoint.
+        // (Delivery order between the two independent dispatches races.)
+        wait_for(|| async { sub_sink.lock().len() == 2 }).await;
+        let mut sub_lines = sub_sink.lock().clone();
+        sub_lines.sort();
+        assert_eq!(sub_lines, ["sub:shipped:o-cmd", "sub:shipped:o-evt"]);
+        // And the handler never received the event broadcast (its sink has
+        // only the pack line; a broadcast copy would append a shipped line).
+        assert_eq!(handler_sink.lock().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn deliver_schema_value_unrouted_command_is_silent_noop() {
+        // Given a system where NO actor handles the command schema.
+        let (system, _clock) = ActorSystem::test();
+
+        // When the command payload is delivered schema-addressed.
+        system
+            .deliver_schema_value(
+                Pack::schema_id(),
+                json!({ "order": "o-lost" }),
+            )
+            .await;
+
+        // Then nothing dead-lettered (fire-and-forget contract).
+        assert_eq!(system.dead_letter_count().await, 0);
     }
 
     #[tokio::test]
