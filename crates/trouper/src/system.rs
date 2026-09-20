@@ -8189,6 +8189,27 @@ mod tests {
         handles_pack: bool,
         subscribes_shipped: bool,
     ) -> Arc<Mutex<Vec<String>>> {
+        spawn_edged_with(
+            system,
+            path,
+            tag,
+            handles_pack,
+            subscribes_shipped,
+            subscribes_shipped,
+        )
+        .await
+    }
+
+    /// Full-control variant: handler edge and subscription edge are
+    /// declared independently (the two tables are disjoint by design).
+    async fn spawn_edged_with(
+        system: &ActorSystem,
+        path: &str,
+        tag: &str,
+        handles_pack: bool,
+        handles_shipped: bool,
+        subscribes_shipped: bool,
+    ) -> Arc<Mutex<Vec<String>>> {
         let (idx, sink) = open_sink();
         let mut b = crate::builder::spawn_service_builder::<Edged>(system)
             .at(ActorPath::new(path))
@@ -8196,9 +8217,11 @@ mod tests {
         if handles_pack {
             b = b.handles::<Pack>();
         }
+        if handles_shipped {
+            b = b.handles::<Shipped>();
+        }
         if subscribes_shipped {
-            b = b.handles::<Shipped>()
-                .subscribe::<Shipped>();
+            b = b.subscribe::<Shipped>();
         }
         b.start();
         bind_sink(&ActorPath::new(path), sink.clone());
@@ -8253,10 +8276,12 @@ mod tests {
 
     #[tokio::test]
     async fn declare_subscriber_after_spawn_receives_publish() {
-        // Given an actor spawned WITHOUT a subscribe declaration, then
-        // one registered post-spawn via `declare_subscriber`.
+        // Given an actor that HANDLES Shipped but declared no
+        // subscription at spawn; the subscription is added post-spawn
+        // via `declare_subscriber`.
         let (system, _clock) = ActorSystem::test();
-        let late = spawn_edged(&system, "late", "late", false, false).await;
+        let late =
+            spawn_edged_with(&system, "late", "late", false, true, false).await;
         system
             .declare_subscriber::<Shipped>(&ActorPath::new("late"))
             .expect("declare after spawn");
