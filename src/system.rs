@@ -3240,8 +3240,10 @@ mod tests {
 
     #[tokio::test]
     async fn ask_over_a_durable_path_continues_as_an_ordinary_message() {
-        // Given an ES counter whose Add handler REPLIES to a reply-to
+        // Given a service actor whose Add handler REPLIES to a reply-to
         // PATH (not a slot): the reply continues as a normal envelope.
+        // (An event-sourced entity never replies — it returns facts; the
+        // durable-path continuation contract lives on the service tier.)
         let (system, _clock) = ActorSystem::test();
         system.register_schema::<Add>();
         system.register_schema::<Added>();
@@ -3271,28 +3273,23 @@ mod tests {
             }
         }
 
-        #[derive(Serialize, Deserialize)]
-        struct Counter {
-            total: i64,
-        }
-        impl EventSourcedActor for Counter {
+        #[derive(Serialize, Deserialize, Default)]
+        struct Responder;
+        impl ServiceActor for Responder {
             fn manifest() -> ActorManifest {
                 ActorManifest::new()
                     .handles::<Add>()
                     .emits::<Added>()
-                    .kind(ActorKind::EventSourced)
+                    .kind(ActorKind::Service)
             }
-            fn restore(_args: &JsonValue) -> Self {
-                Self { total: 0 }
-            }
-            fn apply(&mut self, event: &crate::envelope::Event) {
-                if event.schema.as_str() == "Added@1" {
-                    self.total += event.payload["n"].as_i64().unwrap_or(0);
-                }
+            async fn start(
+                _args: &JsonValue,
+            ) -> Result<Self, error_stack::Report<crate::registry::RegistryError>> {
+                Ok(Self)
             }
         }
-        impl CommandHandler<Add> for Counter {
-            fn handle(&self, cmd: Add, ctx: &mut CmdCtx<'_>) -> Vec<crate::envelope::Event> {
+        impl MsgHandler<Add> for Responder {
+            async fn handle(&mut self, cmd: Add, ctx: &mut crate::context::MsgCtx<'_>) {
                 let dest: crate::envelope::Address = ctx
                     .reply_dest()
                     .unwrap_or_else(|| crate::envelope::Address::Path(ctx.self_path().clone()));
@@ -3301,10 +3298,6 @@ mod tests {
                     &Added { n: cmd.n },
                     Some(crate::envelope::Address::Path(ctx.self_path().clone())),
                 );
-                vec![crate::envelope::Event::new(
-                    Added::schema_id(),
-                    json!({ "n": cmd.n }),
-                )]
             }
         }
 
@@ -3318,11 +3311,11 @@ mod tests {
                 >())]
             },
         );
-        system.spawn_es::<Counter, _>(
+        system.spawn_service::<Responder, _>(
             ActorPath::new("counter"),
             &json!({}),
             SpawnOpts::default(),
-            || vec![Arc::new(TypedEsAdapter::<Counter, Add>::new::<Add>())],
+            || vec![Arc::new(TypedServiceAdapter::<Responder, Add>::new::<Add>())],
         );
         wait_for(|| async {
             system

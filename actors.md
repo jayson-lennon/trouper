@@ -28,13 +28,13 @@ Every property of trouper's messaging derives from that division:
 The north-star sketch (from the original design conversations):
 
 ```rust
-actor1.send(path, msg);                      // sender: fire it somewhere
+system.tell(ActorPath::new("worker"), Kick {}).await?;   // sender: fire it somewhere
 
-impl MsgHandler<FooMsg> for Actor2 {         // receiver: process by type
-    async fn handle(&mut self, m: FooMsg, ctx: &mut MsgCtx) { /* whatever */ }
+impl MsgHandler<Kick> for Worker {           // receiver: process by type
+    async fn handle(&mut self, m: Kick, ctx: &mut MsgCtx) { /* whatever */ }
 }
 
-// Actor2 does not know — and must not be able to find out — whether the
+// Worker does not know — and must not be able to find out — whether the
 // message came from a tell, a send_to_any, or a publish.
 ```
 
@@ -82,7 +82,7 @@ mechanism and there are no per-message flags.
 | `tell(path, m)` / `ctx.send(Address::Path(p), &m, …)` | a path | that one path (what's behind it: an actor, or a partition-set public path) | envelope returns `Err` / dead-letters |
 | `ctx.send_to_any(&m)` / `system.send_to_any::<M>(&m)` | the schema `M` | **one** of the actors that declared `.handles::<M>()` — round-robin; the fabric picks | dead-letters |
 | `ctx.publish(&m)` / `system.publish(&m)` | the schema `M` (broadcast) | **every** actor that declared `.handles::<M>()`, one copy each | silent no-op — nothing delivered, nothing dead-lettered (a `Sent` fact records that the publish happened) |
-| `ctx.ask::<R>(&req, dest, timeout)` / `system.ask(…)` | a path | that path, plus a reply lease | error on the await |
+| `ctx.ask(dest, &req, timeout)` / `system.ask(dest, req, timeout)` | a path | that path, plus a reply lease | error on the await |
 
 ```rust
 // system-level (host code, tests, examples)
@@ -117,6 +117,8 @@ on `MsgCtx`:
 - Outcomes (`Replied` / `Timeout` / `Failed`) are tap facts, observable like everything else.
 - A reply without an ask behind it (`reply_to` absent) is dropped — a reply is **never**
   broadcast. Publish is the news channel; reply is the answer channel.
+- `ask` is typed on the request side: the schema id comes from `M`. The reply resolves as
+  raw JSON — decoding it into a reply type is the caller's concern.
 
 **Tier rule:** `ask` exists on `MsgCtx` (service actors) and not on `CmdCtx`
 (event-sourced actors). This is not an omission: an ES decision function is a *sync,
@@ -176,9 +178,7 @@ differ only in what the envelope's destination says:
 
 `send_to_any` is nothing new under the hood: it is the typed wrapper over the existing
 schema-addressed send. The kernel resolves it through the route table — `Single` while
-one actor handles M, round-robin over a cursor once several do. The cursor is shared by
-tell-type schema sends and publishes, so interleaved traffic stays fair over the same
-handler set.
+one actor handles M, rotating across the handler set once several do.
 
 Receiver-side purity holds: the envelope is identical in shape, the handler is the same
 code, and nothing in the message says which verb sent it.
@@ -226,16 +226,23 @@ next message round-robins to a live one. Domain translation in, assignment out.
 ### Supervisor — "I own children and answer for them" (lifecycle-only)
 
 ```rust
-struct JobSupervisor { system: ActorSystem, restarts: HashMap<ActorPath, usize> }
+// Domain types: the escalation message is an ordinary schema the engine
+// SENDS to the declared parent when a child's budget exhausts — payload:
+// { "escalated": <child path>, "reason": <why> }. `WorkerRetired` is
+// plain domain code, not a runtime type.
+#[derive(Debug, Deserialize)]
+struct Escalated { escalated: String }
+
+struct JobSupervisor { system: ActorSystem, restarts: HashMap<String, usize> }
 
 impl MsgHandler<Escalated> for JobSupervisor {
     async fn handle(&mut self, e: Escalated, ctx: &mut MsgCtx) {
         // A child exhausted its restart budget. Domain decision:
-        let n = self.restarts.entry(e.child.clone()).and_modify(|n| *n += 1).or_insert(1);
+        let n = self.restarts.entry(e.escalated.clone()).and_modify(|n| *n += 1).or_insert(1);
         if *n < 3 {
-            self.system.spawn(worker_spec(&e.child, self.path.clone())); // re-arm
+            self.system.spawn(worker_spec(&e.escalated, self.path.clone())); // re-arm
         } else {
-            ctx.publish(&WorkerRetired { path: e.child.clone() });       // news for the org
+            ctx.publish(&WorkerRetired { path: e.escalated.clone() });       // news for the org
         }
     }
 }
@@ -249,7 +256,10 @@ system.spawn(ActorSpec {
     backoff: Backoff::default(),
     args: json!({}),
     spawn: Arc::new(|sys, path, args| {
-        spawn_service_builder::<JobSupervisor>(sys).at(path.clone()).args(args.clone()).start();
+        spawn_service_builder::<JobSupervisor>(sys).at(path.clone()).args(args.clone())
+            .handles::<Escalated>()
+            .emits::<WorkerRetired>()
+            .start();
     }),
 });
 
@@ -286,8 +296,8 @@ front of workers is a scalability problem.** That fear comes from distributed-sy
 literature, where a hop is a network round-trip with serialization on both ends.
 
 In trouper, a hop through a router is: dequeue an envelope from one in-memory `tokio`
-mpsc, run a handler that constructs a new envelope (payload is an already-built
-`serde_json::Value` — cloned by reference count, not re-encoded), enqueue into another
+mpsc, run a handler that constructs a new envelope (the payload is an already-built
+`serde_json::Value` — copied in memory, never re-encoded), enqueue into another
 in-memory mpsc. Microseconds. For any workload a single-process host application can
 generate, the router is nowhere near the wall. The actual costs in this runtime are
 handler work and mailbox contention — which exist with or without the router.
@@ -365,6 +375,7 @@ actor can do that; only route-time interception can.
 ```rust
 system.install_partition_set(PartitionSpec {
     public: ActorPath::new("accounts"),     // senders address ONLY this, forever
+    system: system.clone(),                 // the set activates entities through it
     key_field: "account",                   // Credit's schema field marked ShardKey
     factory: Arc::new(|sys, path, args| {
         spawn_es_builder::<Account>(sys).at(path.clone()).args(args.clone())
@@ -372,7 +383,8 @@ system.install_partition_set(PartitionSpec {
             .passivate_after(Duration::from_secs(30))
             .start();
     }),
-    /* args template, spawn opts, .. */
+    args_template: None,                    // or a JSON seed merged with the shard key
+    opts: SpawnOpts::default(),
 })?;
 ```
 
@@ -395,16 +407,15 @@ Lifecycle of `accounts/acc-1`:
 
 Sharding ("same key → same entity, always") and memory-boundedness ("idle state leaves
 the heap") fall out of this one mechanism. A **standalone** (non-partition) actor that
-passivates simply stops — automatic re-activation for non-partition actors is parked
-(§12), by design, until a real need appears.
+passivates simply stops — automatic re-activation for non-partition actors is parked,
+by design, until a real need appears.
 
 ---
 
 ## 9. Persistence: the backend owns durability
 
 - The default journal store is **in-memory**. Swapping backends means implementing the
-  `JournalStore` trait (`append`, `append_snapshot`, `load`, `flush`) and installing it
-  at boot. Nothing else changes.
+  `JournalStore` trait and installing it at boot. Nothing else changes.
 - **Append-before-ack:** every ES step awaits `store.append(path, &events)` — one batch
   per processed message — before the message is acknowledged. A backend may write
   through (durable immediately) or buffer in memory and assign seqs optimistically; the
@@ -514,8 +525,17 @@ make sense over a network. If a suggestion below sounds reasonable, it is reason
    `Sent` fact to confirm the publish happened.
 3. Was the target mid-restart (one skipped copy) or stopped? Tap facts say so
    (`Stopped`, `Spawned { restart: true }`).
-4. Check the DLQ (`dead_letter_count` / reasons) — `UnknownSchema`, `Unresolvable`,
-   `InboxRefused`, `ShuttingDown` each name their cause.
+4. Check the DLQ (`dead_letter_count` / reasons). Every dead letter carries one of
+   exactly eight typed reasons:
+   - `Unresolvable` — no slot or route resolved (also what a zero-handler
+     `send_to_any`/tell produces: no route to pick);
+   - `UnknownSchema` — no handler registered for the payload's schema;
+   - `Decode` — the payload did not decode against its registered schema;
+   - `InboxRefused` — the destination inbox refused the envelope (overload/closed);
+   - `StoppedWithMail` — the actor was stopped with undelivered inbox entries;
+   - `ShuttingDown` — the graceful-shutdown barrier refused all new deliveries;
+   - `UndeclaredEvent` — an ES actor recorded an event it never declared in `.emits`;
+   - `ShardKeyMissing` — a partition-set command arrived without its shard key.
 5. Only after all of the above: suspect the fabric. It will almost never be the fabric.
 
 ---

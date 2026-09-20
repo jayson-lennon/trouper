@@ -84,17 +84,17 @@ impl Outbox {
     }
 
     /// Records a send intent.
-    pub fn push_send(&mut self, envelope: Envelope) {
+    pub(crate) fn push_send(&mut self, envelope: Envelope) {
         self.intents.push(Intent::Send(envelope));
     }
 
     /// Records a broadcast intent (performed by the kernel post-ack).
-    pub fn push_broadcast(&mut self, envelope: Envelope) {
+    pub(crate) fn push_broadcast(&mut self, envelope: Envelope) {
         self.intents.push(Intent::Broadcast(envelope));
     }
 
     /// Records a reply intent (resolved by the kernel at flush time).
-    pub fn push_reply(
+    pub(crate) fn push_reply(
         &mut self,
         to: Address,
         schema: SchemaId,
@@ -112,7 +112,7 @@ impl Outbox {
     /// Records the self-termination intent. Executed post-ack by the
     /// kernel: intents recorded BEFORE it flush first (in-order), and a
     /// crash before ack discards it entirely.
-    pub fn push_stop_self(&mut self) {
+    pub(crate) fn push_stop_self(&mut self) {
         self.intents.push(Intent::StopSelf);
     }
 
@@ -170,91 +170,14 @@ pub(crate) struct CtxCore<'a> {
 impl CtxCore<'_> {
     /// The trace metadata for a hop caused by this message: same
     /// `trace_id`, fresh `causality_id`.
-    fn child_trace(&self) -> TraceCtx {
+    pub(crate) fn child_trace(&self) -> TraceCtx {
         self.trace.caused()
     }
 
-    /// Records a send to `dest` (typed: the schema id comes from the
-    /// message type, the payload from serde).
-    pub fn send<M: Message>(&mut self, dest: Address, msg: &M, reply_to: Option<Address>) {
-        let payload = serde_json::to_value(msg).expect("schema payload serializes");
-        self.send_json(dest, M::schema_id(), payload, reply_to);
-    }
-
-    /// Records an event broadcast (typed: the schema id comes from the
-    /// message type, the payload from serde). Deferred; the kernel fans
-    /// it out to every actor that declared `.handles::<M>()` post-ack.
-    /// Zero handlers ⇒ silent no-op: events are news, not work orders.
-    pub fn publish<M: Message>(&mut self, msg: &M) {
-        let payload = serde_json::to_value(msg).expect("schema payload serializes");
-        self.publish_json(M::schema_id(), payload);
-    }
-
-    /// Records a ONE-OF send (typed): the kernel routes exactly one copy
-    /// to one actor that declared `.handles::<M>()`, round-robin through
-    /// the route table. Deferred; flushed post-ack. Zero handlers ⇒ the
-    /// envelope dead-letters on flush. From the receiver's side this is
-    /// indistinguishable from a direct [`CtxCore::send`].
-    pub fn send_to_any<M: Message>(&mut self, msg: &M) {
-        let payload = serde_json::to_value(msg).expect("schema payload serializes");
-        let schema = M::schema_id();
-        self.send_json(Address::Schema(schema.clone()), schema, payload, None);
-    }
-
-    /// Records the self-termination intent (shared by both ctx tiers).
-    pub fn stop_self(&mut self) {
-        self.outbox.push_stop_self();
-    }
-
-    /// Records a reply to the message's `reply_to`, if the sender asked
-    /// (typed).
-    ///
-    /// A reply without a `reply_to` is dropped silently: the asker is gone,
-    /// so the fact is unobservable by definition. It is NEVER a broadcast —
-    /// use [`CtxCore::publish`] for events.
-    pub fn reply<M: Message>(&mut self, msg: M) {
-        let payload = serde_json::to_value(&msg).expect("schema payload serializes");
-        self.reply_json(M::schema_id(), payload);
-    }
-
-    /// Escape hatch: records a send with an explicit schema id and
-    /// hand-built payload.
-    pub fn send_json(
-        &mut self,
-        dest: Address,
-        schema: SchemaId,
-        payload: JsonValue,
-        reply_to: Option<Address>,
-    ) {
-        let mut envelope =
-            Envelope::json(schema, dest, payload, self.child_trace()).from(self.self_path.clone());
-        if let Some(reply_to) = reply_to {
-            envelope = envelope.reply_to(reply_to);
-        }
-        self.outbox.push_send(envelope);
-    }
-
-    /// Escape hatch: records a broadcast with an explicit schema id and
-    /// hand-built payload. The envelope's destination is the schema
-    /// address itself — the trace's `dest` reads as the fan-out target.
-    pub fn publish_json(&mut self, schema: SchemaId, payload: JsonValue) {
-        let envelope = Envelope::json(
-            schema.clone(),
-            Address::Schema(schema),
-            payload,
-            self.child_trace(),
-        )
-        .from(self.self_path.clone());
-        self.outbox.push_broadcast(envelope);
-    }
-
-    /// Escape hatch: records a reply with an explicit schema id and
-    /// hand-built payload. Same silent-drop contract as [`CtxCore::reply`].
-    pub fn reply_json(&mut self, schema: SchemaId, payload: JsonValue) {
-        if let Some(reply_to) = self.reply_to {
-            self.outbox
-                .push_reply(reply_to.clone(), schema, payload, self.child_trace());
-        }
+    /// The incoming message's reply address, if the sender asked for one
+    /// (the service tier's `reply` reads it).
+    pub(crate) fn reply_to(&self) -> Option<&Address> {
+        self.reply_to
     }
 
     /// Snapshot info about a path.
@@ -271,22 +194,16 @@ impl CtxCore<'_> {
     pub fn recv_ts(&self) -> Timestamp {
         self.view.now()
     }
-
-    /// The incoming message's reply address, if the sender asked for a
-    /// reply. Handlers usually want [`CtxCore::reply`] instead; this is for
-    /// routing continuations to a durable path.
-    pub fn reply_dest(&self) -> Option<Address> {
-        self.reply_to.cloned()
-    }
 }
 
-/// Context for event-sourced handlers: sync, pure, deferred effects only.
+/// Context for event-sourced handlers: PURE INTROSPECTION.
 ///
-/// The tier rule, by construction: `ask` is exclusive to [`MsgCtx`] —
-/// a decision function is sync and CANNOT await, so no ask can even
-/// compile here, and no I/O sneaks into a decision. Send effects
-/// ([`CmdCtx::send`], [`CmdCtx::publish`], [`CmdCtx::send_to_any`]) are
-/// deferred intents the kernel flushes after the commit.
+/// An entity announces only by RETURNING FACTS from its decision — the
+/// kernel appends, applies, and broadcasts them. [`CmdCtx`] exposes no
+/// effects: no send, no publish, no send_to_any, no reply, no stop_self
+/// (an entity owns no lifecycle intents — only passivation, external
+/// stop, or supervision ends one). It cannot `ask` either: a decision
+/// function is sync and CANNOT await, so no ask can even compile.
 ///
 /// The constructor is crate-private: only the kernel assembles contexts.
 pub struct CmdCtx<'a> {
@@ -294,21 +211,11 @@ pub struct CmdCtx<'a> {
 }
 
 impl<'a> CmdCtx<'a> {
-    /// Terminate this actor gracefully: records the intent and returns
-    /// immediately — no await semantics, never blocks. The stop executes
-    /// after this message commits (and after any intents recorded before
-    /// it); a crash before the commit discards it. Code after the call in
-    /// the handler still runs; call it last (or `return` after) to make
-    /// "stop now" unambiguous.
-    pub fn stop_self(&mut self) {
-        self.core.stop_self();
-    }
-
     /// Assembles the context for one command dispatch.
     pub(crate) fn new(
         self_path: &'a ActorPath,
         trace: &'a TraceCtx,
-        reply_to: Option<&'a Address>,
+        #[allow(unused_variables)] reply_to: Option<&'a Address>,
         view: &'a dyn RuntimeView,
         outbox: &'a mut Outbox,
     ) -> CmdCtx<'a> {
@@ -316,63 +223,12 @@ impl<'a> CmdCtx<'a> {
             core: CtxCore {
                 self_path,
                 trace,
-                reply_to,
+                // Entities never reply: the field stays None by construction.
+                reply_to: None,
                 view,
                 outbox,
             },
         }
-    }
-
-    /// Records a send to `dest` (deferred; the kernel flushes post-ack).
-    /// Typed: the schema id comes from the message type.
-    pub fn send<M: Message>(&mut self, dest: Address, msg: &M, reply_to: Option<Address>) {
-        self.core.send(dest, msg, reply_to);
-    }
-
-    /// Records an event broadcast (deferred; flushed post-ack). Typed:
-    /// the schema id comes from the message type. Zero handlers ⇒
-    /// silent no-op: events are news, not work orders.
-    pub fn publish<M: Message>(&mut self, msg: &M) {
-        self.core.publish(msg);
-    }
-
-    /// Records a ONE-OF send (typed): exactly one copy goes to ONE actor
-    /// that declared `.handles::<M>()`, round-robin through the route
-    /// table (deferred; flushed post-ack).
-    pub fn send_to_any<M: Message>(&mut self, msg: &M) {
-        self.core.send_to_any(msg);
-    }
-
-    /// Records a reply to the message's `reply_to`, if the sender asked.
-    ///
-    /// A reply without a `reply_to` is dropped silently: the asker is gone,
-    /// so the fact is unobservable by definition. It is NEVER a broadcast —
-    /// use [`CmdCtx::publish`] for events.
-    pub fn reply<M: Message>(&mut self, msg: M) {
-        self.core.reply(msg);
-    }
-
-    /// Escape hatch: send with an explicit schema id and hand-built payload.
-    pub fn send_json(
-        &mut self,
-        dest: Address,
-        schema: SchemaId,
-        payload: JsonValue,
-        reply_to: Option<Address>,
-    ) {
-        self.core.send_json(dest, schema, payload, reply_to);
-    }
-
-    /// Escape hatch: broadcast with an explicit schema id and hand-built
-    /// payload.
-    pub fn publish_json(&mut self, schema: SchemaId, payload: JsonValue) {
-        self.core.publish_json(schema, payload);
-    }
-
-    /// Escape hatch: reply with an explicit schema id and hand-built
-    /// payload. Same silent-drop contract as [`CmdCtx::reply`].
-    pub fn reply_json(&mut self, schema: SchemaId, payload: JsonValue) {
-        self.core.reply_json(schema, payload);
     }
 
     /// Snapshot info about a path.
@@ -393,13 +249,6 @@ impl<'a> CmdCtx<'a> {
     /// The processing actor's registered path.
     pub fn self_path(&self) -> &ActorPath {
         self.core.self_path
-    }
-
-    /// The incoming message's reply address, if the sender asked for a
-    /// reply. Handlers usually want `reply` instead; this is for routing
-    /// continuations to a durable path.
-    pub fn reply_dest(&self) -> Option<Address> {
-        self.core.reply_dest()
     }
 }
 
@@ -504,7 +353,48 @@ impl<'a> MsgCtx<'a> {
     /// the handler still runs; call it last (or `return` after) to make
     /// "stop now" unambiguous.
     pub fn stop_self(&mut self) {
-        self.core.stop_self();
+        self.core.outbox.push_stop_self();
+    }
+
+    /// Records a send to `dest` (typed: the schema id comes from the
+    /// message type, the payload from serde).
+    pub(crate) fn send_json(
+        &mut self,
+        dest: Address,
+        schema: SchemaId,
+        payload: JsonValue,
+        reply_to: Option<Address>,
+    ) {
+        let mut envelope = Envelope::json(schema, dest, payload, self.core.child_trace())
+            .from(self.core.self_path.clone());
+        if let Some(reply_to) = reply_to {
+            envelope = envelope.reply_to(reply_to);
+        }
+        self.core.outbox.push_send(envelope);
+    }
+
+    /// Escape hatch: records a broadcast with an explicit schema id and
+    /// hand-built payload. The envelope's destination is the schema
+    /// address itself — the trace's `dest` reads as the fan-out target.
+    pub(crate) fn publish_json(&mut self, schema: SchemaId, payload: JsonValue) {
+        let envelope = Envelope::json(
+            schema.clone(),
+            Address::Schema(schema),
+            payload,
+            self.core.child_trace(),
+        )
+        .from(self.core.self_path.clone());
+        self.core.outbox.push_broadcast(envelope);
+    }
+
+    /// Records a reply with an explicit schema id and hand-built payload.
+    /// Same silent-drop contract as [`MsgCtx::reply`].
+    pub(crate) fn reply_json(&mut self, schema: SchemaId, payload: JsonValue) {
+        if let Some(reply_to) = self.core.reply_to() {
+            self.core
+                .outbox
+                .push_reply(reply_to.clone(), schema, payload, self.core.child_trace());
+        }
     }
 
     /// Assembles the context for one message dispatch.
@@ -579,20 +469,24 @@ impl<'a> MsgCtx<'a> {
     /// [`MsgCtx::publish`] — news (publish) reaches everyone, work
     /// (send_to_any) reaches one. Zero handlers ⇒ dead-letter on flush.
     pub fn send_to_any<M: Message>(&mut self, msg: &M) {
-        self.core.send_to_any(msg);
+        let payload = serde_json::to_value(msg).expect("schema payload serializes");
+        let schema = M::schema_id();
+        self.send_json(Address::Schema(schema.clone()), schema, payload, None);
     }
 
     /// Records a send to `dest` (deferred; the kernel flushes post-ack).
     /// Typed: the schema id comes from the message type.
     pub fn send<M: Message>(&mut self, dest: Address, msg: &M, reply_to: Option<Address>) {
-        self.core.send(dest, msg, reply_to);
+        let payload = serde_json::to_value(msg).expect("schema payload serializes");
+        self.send_json(dest, M::schema_id(), payload, reply_to);
     }
 
     /// Records an event broadcast (deferred; flushed post-ack). Typed:
     /// the schema id comes from the message type. Zero subscribers ⇒
     /// silent no-op: events are news, not work orders.
     pub fn publish<M: Message>(&mut self, msg: &M) {
-        self.core.publish(msg);
+        let payload = serde_json::to_value(msg).expect("schema payload serializes");
+        self.publish_json(M::schema_id(), payload);
     }
 
     /// Records a reply to the message's `reply_to`, if the sender asked.
@@ -601,37 +495,8 @@ impl<'a> MsgCtx<'a> {
     /// so the fact is unobservable by definition. It is NEVER a broadcast —
     /// use [`MsgCtx::publish`] for events.
     pub fn reply<M: Message>(&mut self, msg: M) {
-        self.core.reply(msg);
-    }
-
-    /// Escape hatch: send with an explicit schema id and hand-built payload.
-    pub fn send_json(
-        &mut self,
-        dest: Address,
-        schema: SchemaId,
-        payload: JsonValue,
-        reply_to: Option<Address>,
-    ) {
-        self.core.send_json(dest, schema, payload, reply_to);
-    }
-
-    /// Escape hatch: broadcast with an explicit schema id and hand-built
-    /// payload.
-    pub fn publish_json(&mut self, schema: SchemaId, payload: JsonValue) {
-        self.core.publish_json(schema, payload);
-    }
-
-    /// Escape hatch: ONE-OF send with an explicit schema id and hand-built
-    /// payload. Routes one copy to one handler of `schema`, round-robin.
-    pub fn send_to_any_json(&mut self, schema: SchemaId, payload: JsonValue) {
-        self.core
-            .send_json(Address::Schema(schema.clone()), schema, payload, None);
-    }
-
-    /// Escape hatch: reply with an explicit schema id and hand-built
-    /// payload. Same silent-drop contract as [`MsgCtx::reply`].
-    pub fn reply_json(&mut self, schema: SchemaId, payload: JsonValue) {
-        self.core.reply_json(schema, payload);
+        let payload = serde_json::to_value(&msg).expect("schema payload serializes");
+        self.reply_json(M::schema_id(), payload);
     }
 
     /// Snapshot info about a path.
@@ -658,7 +523,7 @@ impl<'a> MsgCtx<'a> {
     /// reply. Handlers usually want `reply` instead; this is for routing
     /// continuations to a durable path.
     pub fn reply_dest(&self) -> Option<Address> {
-        self.core.reply_dest()
+        self.core.reply_to().cloned()
     }
 }
 
@@ -804,7 +669,7 @@ mod tests {
         let parent = TraceCtx::root();
         let mut outbox = Outbox::new();
         let path = ActorPath::new("storefront");
-        let mut ctx = CmdCtx::new(&path, &parent, None, &view, &mut outbox);
+        let mut ctx = MsgCtx::new(&path, &parent, None, &view, &mut outbox, None);
 
         // When sending a command.
         ctx.send(
@@ -841,7 +706,7 @@ mod tests {
         let mut outbox = Outbox::new();
         let path = ActorPath::new("server");
         let reply_to = Address::Path(ActorPath::new("client"));
-        let mut ctx = CmdCtx::new(&path, &trace, Some(&reply_to), view, &mut outbox);
+        let mut ctx = MsgCtx::new(&path, &trace, Some(&reply_to), view, &mut outbox, None);
 
         // When replying.
         ctx.reply(Reserved { ok: true });
@@ -858,7 +723,7 @@ mod tests {
 
         // When a context without reply-to replies.
         let mut silent_outbox = Outbox::new();
-        let mut silent = CmdCtx::new(&path, &trace, None, view, &mut silent_outbox);
+        let mut silent = MsgCtx::new(&path, &trace, None, view, &mut silent_outbox, None);
         silent.reply(Reserved { ok: false });
 
         // Then nothing is recorded.
@@ -872,7 +737,7 @@ mod tests {
         let trace = TraceCtx::root();
         let mut outbox = Outbox::new();
         let path = ActorPath::new("inventory.west");
-        let mut ctx = CmdCtx::new(&path, &trace, None, &view, &mut outbox);
+        let mut ctx = MsgCtx::new(&path, &trace, None, &view, &mut outbox, None);
 
         // When publishing an event.
         ctx.publish(&StockReserved { qty: 2 });
@@ -917,7 +782,7 @@ mod tests {
         let trace = TraceCtx::root();
         let mut outbox = Outbox::new();
         let path = ActorPath::new("a");
-        let mut ctx = CmdCtx::new(&path, &trace, None, &view, &mut outbox);
+        let mut ctx = MsgCtx::new(&path, &trace, None, &view, &mut outbox, None);
         ctx.send(Address::Path(ActorPath::new("b")), &Ping, None);
         ctx.send(Address::Path(ActorPath::new("c")), &Pong, None);
 
@@ -995,8 +860,8 @@ mod tests {
         let mut typed_outbox = Outbox::new();
         let mut raw_outbox = Outbox::new();
         {
-            let mut typed = CmdCtx::new(&path, &trace, Some(&reply_to), &view, &mut typed_outbox);
-            let mut raw = CmdCtx::new(&path, &trace, Some(&reply_to), &view, &mut raw_outbox);
+            let mut typed = MsgCtx::new(&path, &trace, Some(&reply_to), &view, &mut typed_outbox, None);
+            let mut raw = MsgCtx::new(&path, &trace, Some(&reply_to), &view, &mut raw_outbox, None);
 
             // When replying the same outcome both ways.
             typed.reply(Reserved { ok: true });
@@ -1043,11 +908,11 @@ mod tests {
         let mut typed_outbox = Outbox::new();
         let mut raw_outbox = Outbox::new();
         {
-            let mut typed = CmdCtx::new(&path, &trace, None, &view, &mut typed_outbox);
+            let mut typed = MsgCtx::new(&path, &trace, None, &view, &mut typed_outbox, None);
             typed.publish(&StockReserved { qty: 2 });
         }
         {
-            let mut raw = CmdCtx::new(&path, &trace, None, &view, &mut raw_outbox);
+            let mut raw = MsgCtx::new(&path, &trace, None, &view, &mut raw_outbox, None);
             raw.publish_json(StockReserved::schema_id(), serde_json::json!({ "qty": 2 }));
         }
 
@@ -1079,7 +944,7 @@ mod tests {
         let mut typed_outbox = Outbox::new();
         let mut raw_outbox = Outbox::new();
         {
-            let mut typed = CmdCtx::new(&path, &trace, None, &view, &mut typed_outbox);
+            let mut typed = MsgCtx::new(&path, &trace, None, &view, &mut typed_outbox, None);
             typed.send(
                 Address::Path(ActorPath::new("inventory")),
                 &ReserveStock { qty: 2 },
@@ -1087,7 +952,7 @@ mod tests {
             );
         }
         {
-            let mut raw = CmdCtx::new(&path, &trace, None, &view, &mut raw_outbox);
+            let mut raw = MsgCtx::new(&path, &trace, None, &view, &mut raw_outbox, None);
             raw.send_json(
                 Address::Path(ActorPath::new("inventory")),
                 ReserveStock::schema_id(),

@@ -1106,6 +1106,20 @@ impl crate::context::AskPort for KernelAskPort {
         let kernel = self.kernel.clone();
         let clock = self.clock.clone();
         Box::pin(async move {
+            // ENTITIES DO NOT ANSWER ASKS: a request aimed at an
+            // event-sourced actor fails fast with the named error —
+            // before any lease opens, before any AskOpened fact — so the
+            // asker learns the contract violation immediately instead of
+            // burning its mandatory timeout. Consumers of entities LISTEN
+            // FOR THE FACT (a declared `.handles` on the entity's emits).
+            if let Address::Path(path) = &dest
+                && registry.lock().lookup(path).map(|i| i.kind)
+                    == Some(crate::actor::ActorKind::EventSourced)
+            {
+                return Err(error_stack::Report::new(crate::context::AskError::Unresolved(
+                    "event-sourced actors do not answer asks — listen for the fact".to_owned(),
+                )));
+            }
             // Resolve the destination FIRST: an unresolvable ask fails fast.
             let endpoint = {
                 let Address::Path(path) = &dest else {
