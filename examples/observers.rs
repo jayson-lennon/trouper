@@ -184,10 +184,9 @@ async fn main() {
         .mailbox(64, trouper::inbox::OverloadPolicy::DropNew)
         .start();
     system
-        .subscribe(
+        .subscribe_facts(
             &ActorPath::new("observer"),
-            &trouper::registry::Registry::facts_topic(),
-            None,
+            trouper::topics::SubscriptionFilter::all(),
         )
         .expect("subscribe");
 

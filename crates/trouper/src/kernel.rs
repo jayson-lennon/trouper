@@ -426,7 +426,6 @@ async fn route_inner(
                     },
                 );
             }
-            observe_delivery(kernel, registry, &envelope).await;
             Ok(path)
         }
         Address::Slot(_) => Err(envelope), // reply routing: ctx only
@@ -459,7 +458,6 @@ async fn route_inner(
                     },
                 );
             }
-            observe_delivery(kernel, registry, &envelope).await;
             Ok(target)
         }
         Address::Topic(ref topic) => {
@@ -540,37 +538,6 @@ async fn resolve_partition(
     // a race delivers to the winner's entity (same derived path).
     (spec.factory)(&spec.system, &entity_path, &spec.entity_args(&key));
     Ok(Some(entity_path))
-}
-
-/// Publishes a copy of a just-delivered envelope into the schema's
-/// observation topic — the `.observes` mechanism.
-///
-/// No-op when nobody observes the schema (no topic subscribers). The
-/// copy keeps the original's trace id and carries a FRESH causality id
-/// (one delivery must never look like a chain of two hops), and its
-/// destination is rewritten to the topic so the pump delivers it to
-/// observers, never back to the primary. Topic-addressed sends are
-/// never observed: their subscribers already receive that traffic.
-async fn observe_delivery(
-    kernel: &Mutex<KernelState>,
-    registry: &Mutex<Registry>,
-    envelope: &Envelope,
-) {
-    let topic = crate::registry::Registry::observation_topic(&envelope.schema);
-    {
-        let kernel = kernel.lock();
-        let Some(log) = kernel.topic_logs.get(&topic) else {
-            return; // no topic log = no observers ever subscribed
-        };
-        if log.subscribers().is_empty() {
-            return;
-        }
-    }
-    let mut copy = envelope.clone();
-    copy.dest = crate::envelope::Address::Topic(topic.clone());
-    copy.trace.trace_id = envelope.trace.trace_id;
-    copy.trace.causality_id = crate::envelope::CausalityId::new();
-    publish_to_topic(kernel, registry, topic, copy).await;
 }
 
 /// Applies the first matching router rule to a path-addressed envelope.
@@ -1179,8 +1146,8 @@ async fn flush_outbox(ctx: &EsLoop, mut outbox: Outbox) -> bool {
                     );
                 }
             }
-            crate::context::Intent::Publish { topic, envelope } => {
-                publish_to_topic(&ctx.kernel, &ctx.registry, topic, envelope).await;
+            crate::context::Intent::Broadcast(envelope) => {
+                broadcast(&ctx.registry, &ctx.kernel, envelope.schema.clone(), envelope).await;
             }
             crate::context::Intent::Reply {
                 to,
@@ -1190,38 +1157,10 @@ async fn flush_outbox(ctx: &EsLoop, mut outbox: Outbox) -> bool {
             } => {
                 resolve_reply(&ctx.kernel, &ctx.registry, to, schema, payload, trace).await;
             }
-            crate::context::Intent::Subscribe { path, topic } => {
-                apply_subscribe(&ctx.kernel, &ctx.registry, &path, &topic);
-            }
             crate::context::Intent::StopSelf => stop_self = true,
         }
     }
     stop_self
-}
-
-/// Performs one deferred subscription: the actor joins its topic at the
-/// next offset ( Latest); the topic log is created on demand.
-fn apply_subscribe(
-    kernel: &Mutex<KernelState>,
-    registry: &Mutex<Registry>,
-    path: &ActorPath,
-    topic: &crate::topics::Topic,
-) {
-    let policy = {
-        let registry = registry.lock();
-        registry.inbox_policy(path)
-    };
-    let mut kernel = kernel.lock();
-    let log = kernel
-        .topic_logs
-        .entry(topic.clone())
-        .or_insert_with(|| crate::topics::TopicLog::new(256));
-    log.subscribe(
-        path.clone(),
-        policy,
-        crate::topics::CursorFrom::Latest,
-        crate::topics::SubscriptionFilter::all(),
-    );
 }
 
 /// The kernel's ask port: opens leases, routes request envelopes,
@@ -1357,6 +1296,47 @@ async fn publish_to_topic(
     };
     record_publish_facts(kernel, &topic, &envelope, offset);
     pump_topic(kernel, registry, &topic).await;
+}
+
+/// Broadcasts one published event to EVERY subscriber of its schema.
+///
+/// The event transport (vs `send`, the command transport): subscribers
+/// are copied in registry insertion order — no round-robin, no
+/// dead-lettering. A dead subscriber (stopped mid-flight) is skipped
+/// silently: events are news, not work orders, and one gone reader never
+/// fails the others' delivery. Zero subscribers ⇒ a no-op.
+///
+/// Lock discipline mirrors [`pump_topic`]: one acquisition to snapshot
+/// the (path, endpoint) pairs, deliveries outside the locks.
+pub(crate) async fn broadcast(
+    registry: &Mutex<Registry>,
+    kernel: &Mutex<KernelState>,
+    schema: SchemaId,
+    envelope: Envelope,
+) {
+    let targets: Vec<(ActorPath, Arc<Endpoint>)> = {
+        let reg = registry.lock();
+        reg.subscribers_of(&schema)
+            .into_iter()
+            .filter_map(|path| reg.resolve(&path).map(|endpoint| (path, endpoint)))
+            .collect()
+    };
+    for (_path, endpoint) in &targets {
+        // Block backpressure: a full inbox stalls the publisher (loss is
+        // unrepresentable; sizing mailboxes is the spawner's call). A
+        // closed endpoint (restart in flight) skips this one delivery.
+        let _ = deliver_with_retry(endpoint, envelope.clone()).await;
+        let mut kernel = kernel.lock();
+        kernel.record_fact(
+            envelope.trace.causality_id.as_millis_ts(),
+            crate::tap::FactKind::Sent {
+                from: envelope.from.clone(),
+                dest: crate::envelope::Address::Schema(schema.clone()),
+                schema: schema.clone(),
+                trace: envelope.trace.clone(),
+            },
+        );
+    }
 }
 
 /// Records the publish facts (topic log fact + tap fact) for one append.

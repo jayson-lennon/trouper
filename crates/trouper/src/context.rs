@@ -3,8 +3,8 @@
 //! Event-sourced handlers are pure — [`CmdCtx`] records *intents* into an
 //! [`Outbox`] and performs nothing; the kernel flushes the outbox AFTER
 //! journal-append + ack, so a crash before ack never duplicates a send.
-//! Service handlers get [`MsgCtx`], a superset; its `ask`/`subscribe`
-//! methods arrive with the reply-lease and topic machinery (Phases 5–6).
+//! Service handlers get [`MsgCtx`], a superset; its `ask` method arrives
+//! with the reply-lease machinery (Phase 5).
 //!
 //! Contexts touch the registry only through [`RuntimeView`], a read-only
 //! view — user code never holds the registry lock, so lookups from inside a
@@ -16,7 +16,6 @@ use crate::envelope::{Address, Envelope, TraceCtx};
 use crate::kernel::AskOutcome;
 use crate::schema::Message;
 use crate::schema::SchemaId;
-use crate::topics::Topic;
 use serde_json::Value as JsonValue;
 
 /// Read-only runtime view for handlers: registry lookups plus the clock.
@@ -38,8 +37,8 @@ pub(crate) trait RuntimeView: Send + Sync {
 pub(crate) enum Intent {
     /// A point-to-point send to an address.
     Send(Envelope),
-    /// A publish onto a topic.
-    Publish { topic: Topic, envelope: Envelope },
+    /// An event broadcast: fanned out to every subscriber of the schema.
+    Broadcast(Envelope),
     /// A reply to the message being handled (address = its reply_to).
     Reply {
         /// The reply address copied from the incoming envelope.
@@ -51,9 +50,6 @@ pub(crate) enum Intent {
         /// The trace of the message being replied to (causality links).
         trace: TraceCtx,
     },
-    /// Subscribe the handling actor to a topic (performed post-ack, so a
-    /// crash before ack never leaves a half-applied subscription).
-    Subscribe { path: ActorPath, topic: Topic },
     /// Terminate the handling actor gracefully after this message
     /// commits (performed post-ack, so a crash before ack discards the
     /// stop exactly like any other intent — the actor restarts and
@@ -78,6 +74,11 @@ impl Outbox {
         self.intents.push(Intent::Send(envelope));
     }
 
+    /// Records a broadcast intent (performed by the kernel post-ack).
+    pub fn push_broadcast(&mut self, envelope: Envelope) {
+        self.intents.push(Intent::Broadcast(envelope));
+    }
+
     /// Records a reply intent (resolved by the kernel at flush time).
     pub fn push_reply(
         &mut self,
@@ -92,16 +93,6 @@ impl Outbox {
             payload,
             trace,
         });
-    }
-
-    /// Records a subscription intent (performed by the kernel post-ack).
-    pub fn push_subscribe(&mut self, path: ActorPath, topic: Topic) {
-        self.intents.push(Intent::Subscribe { path, topic });
-    }
-
-    /// Records a publish intent.
-    pub fn push_publish(&mut self, topic: Topic, envelope: Envelope) {
-        self.intents.push(Intent::Publish { topic, envelope });
     }
 
     /// Records the self-termination intent. Executed post-ack by the
@@ -176,10 +167,13 @@ impl CtxCore<'_> {
         self.send_json(dest, M::schema_id(), payload, reply_to);
     }
 
-    /// Records a publish onto `topic` (typed).
-    pub fn publish<M: Message>(&mut self, topic: Topic, msg: &M) {
+    /// Records an event broadcast (typed: the schema id comes from the
+    /// message type, the payload from serde). Deferred; the kernel fans
+    /// it out to every `.subscribe`ed actor post-ack. Zero subscribers ⇒
+    /// silent no-op: events are news, not work orders.
+    pub fn publish<M: Message>(&mut self, msg: &M) {
         let payload = serde_json::to_value(msg).expect("schema payload serializes");
-        self.publish_json(topic, M::schema_id(), payload);
+        self.publish_json(M::schema_id(), payload);
     }
 
     /// Records the self-termination intent (shared by both ctx tiers).
@@ -215,17 +209,18 @@ impl CtxCore<'_> {
         self.outbox.push_send(envelope);
     }
 
-    /// Escape hatch: records a publish with an explicit schema id and
-    /// hand-built payload.
-    pub fn publish_json(&mut self, topic: Topic, schema: SchemaId, payload: JsonValue) {
+    /// Escape hatch: records a broadcast with an explicit schema id and
+    /// hand-built payload. The envelope's destination is the schema
+    /// address itself — the trace's `dest` reads as the fan-out target.
+    pub fn publish_json(&mut self, schema: SchemaId, payload: JsonValue) {
         let envelope = Envelope::json(
-            schema,
-            Address::Topic(topic.clone()),
+            schema.clone(),
+            Address::Schema(schema),
             payload,
             self.child_trace(),
         )
         .from(self.self_path.clone());
-        self.outbox.push_publish(topic, envelope);
+        self.outbox.push_broadcast(envelope);
     }
 
     /// Escape hatch: records a reply with an explicit schema id and
@@ -306,17 +301,18 @@ impl<'a> CmdCtx<'a> {
         self.core.send(dest, msg, reply_to);
     }
 
-    /// Records a publish onto `topic` (deferred; flushed post-ack). Typed:
-    /// the schema id comes from the message type.
-    pub fn publish<M: Message>(&mut self, topic: Topic, msg: &M) {
-        self.core.publish(topic, msg);
+    /// Records an event broadcast (deferred; flushed post-ack). Typed:
+    /// the schema id comes from the message type. Zero subscribers ⇒
+    /// silent no-op: events are news, not work orders.
+    pub fn publish<M: Message>(&mut self, msg: &M) {
+        self.core.publish(msg);
     }
 
     /// Records a reply to the message's `reply_to`, if the sender asked.
     ///
     /// A reply without a `reply_to` is dropped silently: the asker is gone,
     /// so the fact is unobservable by definition. It is NEVER a broadcast —
-    /// use [`CmdCtx::publish`] for topics.
+    /// use [`CmdCtx::publish`] for events.
     pub fn reply<M: Message>(&mut self, msg: M) {
         self.core.reply(msg);
     }
@@ -332,10 +328,10 @@ impl<'a> CmdCtx<'a> {
         self.core.send_json(dest, schema, payload, reply_to);
     }
 
-    /// Escape hatch: publish with an explicit schema id and hand-built
+    /// Escape hatch: broadcast with an explicit schema id and hand-built
     /// payload.
-    pub fn publish_json(&mut self, topic: Topic, schema: SchemaId, payload: JsonValue) {
-        self.core.publish_json(topic, schema, payload);
+    pub fn publish_json(&mut self, schema: SchemaId, payload: JsonValue) {
+        self.core.publish_json(schema, payload);
     }
 
     /// Escape hatch: reply with an explicit schema id and hand-built
@@ -497,15 +493,6 @@ impl<'a> MsgCtx<'a> {
         }
     }
 
-    /// Subscribes the handling actor to `topic`. Recorded as a deferred
-    /// intent and performed by the kernel after the message is acked
-    /// (subscription starts at the topic's next offset).
-    pub fn subscribe(&mut self, topic: Topic) {
-        self.core
-            .outbox
-            .push_subscribe(self.core.self_path.clone(), topic);
-    }
-
     /// THE ask: send a request and await its reply, with a MANDATORY
     /// timeout. Exclusive to service actors — an ES decision function is
     /// sync and cannot await (AC5).
@@ -529,17 +516,18 @@ impl<'a> MsgCtx<'a> {
         self.core.send(dest, msg, reply_to);
     }
 
-    /// Records a publish onto `topic` (deferred; flushed post-ack). Typed:
-    /// the schema id comes from the message type.
-    pub fn publish<M: Message>(&mut self, topic: Topic, msg: &M) {
-        self.core.publish(topic, msg);
+    /// Records an event broadcast (deferred; flushed post-ack). Typed:
+    /// the schema id comes from the message type. Zero subscribers ⇒
+    /// silent no-op: events are news, not work orders.
+    pub fn publish<M: Message>(&mut self, msg: &M) {
+        self.core.publish(msg);
     }
 
     /// Records a reply to the message's `reply_to`, if the sender asked.
     ///
     /// A reply without a `reply_to` is dropped silently: the asker is gone,
     /// so the fact is unobservable by definition. It is NEVER a broadcast —
-    /// use [`MsgCtx::publish`] for topics.
+    /// use [`MsgCtx::publish`] for events.
     pub fn reply<M: Message>(&mut self, msg: M) {
         self.core.reply(msg);
     }
@@ -555,10 +543,10 @@ impl<'a> MsgCtx<'a> {
         self.core.send_json(dest, schema, payload, reply_to);
     }
 
-    /// Escape hatch: publish with an explicit schema id and hand-built
+    /// Escape hatch: broadcast with an explicit schema id and hand-built
     /// payload.
-    pub fn publish_json(&mut self, topic: Topic, schema: SchemaId, payload: JsonValue) {
-        self.core.publish_json(topic, schema, payload);
+    pub fn publish_json(&mut self, schema: SchemaId, payload: JsonValue) {
+        self.core.publish_json(schema, payload);
     }
 
     /// Escape hatch: reply with an explicit schema id and hand-built
@@ -760,9 +748,8 @@ mod tests {
                 assert_ne!(envelope.trace.causality_id, parent.causality_id);
                 assert_eq!(envelope.schema.as_str(), "ReserveStock@1");
             }
-            Intent::Publish { .. } => panic!("expected a send"),
             Intent::Reply { .. } => panic!("expected a send"),
-            Intent::Subscribe { .. } | Intent::StopSelf => panic!("expected a send"),
+            Intent::Broadcast(_) | Intent::StopSelf => panic!("expected a send"),
         }
     }
 
@@ -784,11 +771,10 @@ mod tests {
         let drained: Vec<_> = outbox.drain().collect();
         match &drained[0] {
             Intent::Send(_) => panic!("expected a reply intent"),
-            Intent::Publish { .. } => panic!("expected a reply intent"),
             Intent::Reply { to, .. } => {
                 assert_eq!(*to, Address::Path(ActorPath::new("client")));
             }
-            Intent::Subscribe { .. } | Intent::StopSelf => panic!("expected a reply intent"),
+            Intent::Broadcast(_) | Intent::StopSelf => panic!("expected a reply intent"),
         }
 
         // When a context without reply-to replies.
@@ -801,7 +787,7 @@ mod tests {
     }
 
     #[test]
-    fn publish_records_a_topic_intent() {
+    fn publish_records_a_broadcast_intent() {
         // Given a context.
         let view = FakeView::at_millis(0);
         let trace = TraceCtx::root();
@@ -809,17 +795,17 @@ mod tests {
         let path = ActorPath::new("inventory.west");
         let mut ctx = CmdCtx::new(&path, &trace, None, &view, &mut outbox);
 
-        // When publishing an event onto a topic.
-        ctx.publish(Topic::new("inventory.events"), &StockReserved { qty: 2 });
+        // When publishing an event.
+        ctx.publish(&StockReserved { qty: 2 });
 
-        // Then a publish intent is pending for that topic.
+        // Then a broadcast intent is pending, addressed to the schema.
         let drained: Vec<_> = outbox.drain().collect();
         match &drained[0] {
-            Intent::Publish { topic, envelope } => {
-                assert_eq!(topic.as_str(), "inventory.events");
+            Intent::Broadcast(envelope) => {
+                assert_eq!(envelope.schema, StockReserved::schema_id());
                 assert_eq!(envelope.trace.trace_id, trace.trace_id);
             }
-            _ => panic!("expected a publish"),
+            _ => panic!("expected a broadcast"),
         }
     }
 
@@ -979,40 +965,30 @@ mod tests {
         let mut raw_outbox = Outbox::new();
         {
             let mut typed = CmdCtx::new(&path, &trace, None, &view, &mut typed_outbox);
-            typed.publish(Topic::new("inventory.events"), &StockReserved { qty: 2 });
+            typed.publish(&StockReserved { qty: 2 });
         }
         {
             let mut raw = CmdCtx::new(&path, &trace, None, &view, &mut raw_outbox);
             raw.publish_json(
-                Topic::new("inventory.events"),
                 StockReserved::schema_id(),
                 serde_json::json!({ "qty": 2 }),
             );
         }
 
-        // Then the publish intents are identical.
+        // Then the broadcast intents are identical.
         let typed: Vec<_> = typed_outbox.drain().collect();
         let raw: Vec<_> = raw_outbox.drain().collect();
         match (&typed[0], &raw[0]) {
-            (
-                Intent::Publish {
-                    topic: ta,
-                    envelope: ea,
-                },
-                Intent::Publish {
-                    topic: tb,
-                    envelope: eb,
-                },
-            ) => {
-                assert_eq!(ta, tb);
+            (Intent::Broadcast(ea), Intent::Broadcast(eb)) => {
                 assert_eq!(ea.schema, eb.schema);
                 assert_eq!(ea.schema, StockReserved::schema_id());
+                assert_eq!(ea.dest, eb.dest);
                 assert_eq!(
                     ea.clone().into_json().expect("json"),
                     eb.clone().into_json().expect("json")
                 );
             }
-            _ => panic!("expected publish intents"),
+            _ => panic!("expected broadcast intents"),
         }
     }
 

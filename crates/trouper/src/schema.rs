@@ -238,6 +238,12 @@ pub struct ActorManifest {
     /// dispatch targets.
     #[serde(default)]
     pub observes: Vec<SchemaId>,
+    /// Event schemas this actor SUBSCRIBES to: the kernel copies every
+    /// published event of these schemas into this actor's inbox. Disjoint
+    /// from `handles` — subscribing never makes the actor a command
+    /// target, and handling never subscribes it to broadcasts.
+    #[serde(default)]
+    pub subscribed: Vec<SchemaId>,
     /// Event schemas this actor emits.
     #[serde(default)]
     pub emits: Vec<SchemaId>,
@@ -274,6 +280,18 @@ impl ActorManifest {
         let id = S::schema_id();
         if !self.observes.contains(&id) && !self.handles.contains(&id) {
             self.observes.push(id);
+        }
+        self
+    }
+
+    /// Declares that this actor SUBSCRIBES to schema `S`: it receives a
+    /// copy of every published event of `S` (insertion order, no
+    /// round-robin). Subscribing never makes this actor a dispatch
+    /// target for `S`; handle commands with `handles` instead.
+    pub fn subscribes_to<S: Schema>(mut self) -> Self {
+        let id = S::schema_id();
+        if !self.subscribed.contains(&id) {
+            self.subscribed.push(id);
         }
         self
     }

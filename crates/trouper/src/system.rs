@@ -773,9 +773,13 @@ impl ActorSystemCore {
             .expect("path free at spawn");
         // Declared edges become routes: each handled schema is routable
         // to this path (adding a second actor for a schema converts the
-        // route to round-robin).
+        // route to round-robin). Subscription edges fan event publishes
+        // out to this path in declaration order.
         for schema in manifest.handles.clone() {
             registry.add_route(schema, path.clone());
+        }
+        for schema in manifest.subscribed.clone() {
+            registry.add_subscriber(schema, path.clone());
         }
         // Emit edges are ENFORCED against the manifest (the kernel drops
         // undeclared schemas pre-append) — the builder/foreign paths feed
@@ -918,6 +922,11 @@ impl ActorSystemCore {
             for schema in manifest.handles.clone() {
                 registry.add_route(schema, path.clone());
             }
+            // Subscription edges: each subscribed schema fans every event
+            // publish out to this path (insertion order, no round-robin).
+            for schema in manifest.subscribed.clone() {
+                registry.add_subscriber(schema, path.clone());
+            }
         }
         let mut kernel = self.kernel.lock();
         let cell = Arc::new(ActorCell::new(
@@ -925,24 +934,6 @@ impl ActorSystemCore {
             Inbox::new(opts.mailbox_capacity.max(1), opts.mailbox_policy),
         ));
         kernel.cells.insert(path.clone(), cell.clone());
-        // Observation edges: subscribe the fresh path to each observed
-        // schema's observation topic (cursor 0 = retained tail). The
-        // kernel publishes a copy of every routed delivery of the
-        // schema into this topic; the topic pump delivers it like any
-        // other subscription (at-least-once, per-subscriber cursor).
-        for schema in &manifest.observes {
-            let topic = crate::registry::Registry::observation_topic(schema);
-            let log = kernel
-                .topic_logs
-                .entry(topic)
-                .or_insert_with(|| crate::topics::TopicLog::new(256));
-            log.subscribe(
-                path.clone(),
-                opts.mailbox_policy,
-                crate::topics::CursorFrom::Offset(0),
-                crate::topics::SubscriptionFilter::all(),
-            );
-        }
         kernel.genesis_args.insert(path.clone(), args.clone());
         kernel.msg_entries.insert(path.clone(), entries);
         if let Some(passivation) = opts.passivation {
@@ -1092,18 +1083,30 @@ impl ActorSystemCore {
         )
         .await
     }
-    /// Builds a topic-addressed envelope (system root as sender).
-    pub fn envelope_to_topic(
-        &self,
-        event: crate::envelope::Event,
-        topic: crate::topics::Topic,
-    ) -> Envelope {
-        Envelope::json(
-            event.schema,
-            crate::envelope::Address::Topic(topic),
-            event.payload,
+
+    /// Typed event broadcast from outside the system: serializes `value`
+    /// under `M`'s schema and fans it out to EVERY actor that declared
+    /// `.subscribe::<M>()` at spawn. Zero subscribers ⇒ silent no-op:
+    /// events are news, not work orders. Trace root is the entry point,
+    /// matching [`ActorSystem::send`].
+    ///
+    /// # Panics
+    ///
+    /// Panics when `M` cannot serialize — a programmer error (serde only
+    /// fails on pathological map keys), not a domain outcome.
+    pub async fn publish<M>(&self, value: &M)
+    where
+        M: Schema + serde::Serialize,
+    {
+        let payload = serde_json::to_value(value).expect("schema payload serializes");
+        let schema = M::schema_id();
+        let envelope = Envelope::json(
+            schema.clone(),
+            Address::Schema(schema.clone()),
+            payload,
             TraceCtx::root(),
-        )
+        );
+        crate::kernel::broadcast(&self.registry, &self.kernel, schema, envelope).await;
     }
 
     pub fn envelope(&self, schema: SchemaId, dest: ActorPath, payload: JsonValue) -> Envelope {
@@ -1147,71 +1150,7 @@ impl ActorSystemCore {
         crate::kernel::restart_es(&ctx, genesis_args).await
     }
 
-    /// Subscribes an actor to a topic: its cursor starts at Latest (or
-    /// `offset` to re-consume); every later publish is pumped to its
-    /// inbox. The actor must already exist (its inbox policy is reused).
-    ///
-    /// # Errors
-    ///
-    /// Unknown path.
-    pub fn subscribe(
-        &self,
-        path: &ActorPath,
-        topic: &crate::topics::Topic,
-        offset: Option<u64>,
-    ) -> Result<u64, error_stack::Report<crate::registry::RegistryError>> {
-        self.subscribe_filtered(
-            path,
-            topic,
-            offset,
-            crate::topics::SubscriptionFilter::all(),
-        )
-    }
-
-    /// Subscribes `path` to `topic` with an entry FILTER: only envelopes
-    /// passing the filter are offered to the actor's inbox; filtered-out
-    /// entries are skipped silently (the cursor moves past them — a
-    /// filter hides entries, it does not queue them). Use this to build
-    /// observers that care about one slice of a busy topic (e.g. only
-    /// `DeadLettered` facts on `system.facts`).
-    ///
-    /// # Errors
-    ///
-    /// [`crate::registry::RegistryError::UnknownPath`] when the
-    /// subscriber has no live cell (spawn it first).
-    pub fn subscribe_filtered(
-        &self,
-        path: &ActorPath,
-        topic: &crate::topics::Topic,
-        offset: Option<u64>,
-        filter: crate::topics::SubscriptionFilter,
-    ) -> Result<u64, error_stack::Report<crate::registry::RegistryError>> {
-        use error_stack::IntoReport;
-        let mut kernel = self.kernel.lock();
-        let registry = self.registry.lock();
-        if !kernel.cells.contains_key(path) {
-            return Err(crate::registry::RegistryError::UnknownPath(path.clone())
-                .into_report()
-                .attach(format!("subscribing {path}")));
-        }
-        let policy = registry.inbox_policy(path);
-        let from = match offset {
-            Some(o) => crate::topics::CursorFrom::Offset(o),
-            None => crate::topics::CursorFrom::Latest,
-        };
-        let log = kernel
-            .topic_logs
-            .entry(topic.clone())
-            .or_insert_with(|| crate::topics::TopicLog::new(256));
-        Ok(log.subscribe(path.clone(), policy, from, filter))
-    }
-
     /// Re-points a subscriber's topic cursor; the next publish pumps the
-    /// retained range back into its inbox (at-least-once re-consume).
-    ///
-    /// # Errors
-    ///
-    /// Unknown topic or path not subscribed.
     pub fn reset_topic_cursor(
         &self,
         path: &ActorPath,
@@ -1225,7 +1164,44 @@ impl ActorSystemCore {
         log.reset_cursor(path, to)
     }
 
-    /// The topic log's retained offset range (inspection).
+    /// Subscribes `path` to the FACTS topic: the tap ring's mirror, so a
+    /// service actor can observe runtime facts (Spawned, Stopped, Sent,
+    /// DeadLettered, ...) as ordinary messages. This is the ONLY
+    /// user-facing topic subscription — the facts feed is a runtime
+    /// diagnostic, not a routing mechanism. Events between actors use
+    /// `.subscribe::<M>()` + `publish` instead.
+    ///
+    /// # Errors
+    ///
+    /// [`crate::registry::RegistryError::UnknownPath`] when the
+    /// subscriber has no live cell (spawn it first).
+    pub fn subscribe_facts(
+        &self,
+        path: &ActorPath,
+        filter: crate::topics::SubscriptionFilter,
+    ) -> Result<u64, error_stack::Report<crate::registry::RegistryError>> {
+        use error_stack::IntoReport;
+        let mut kernel = self.kernel.lock();
+        let registry = self.registry.lock();
+        if !kernel.cells.contains_key(path) {
+            return Err(crate::registry::RegistryError::UnknownPath(path.clone())
+                .into_report()
+                .attach(format!("subscribing {path} to facts")));
+        }
+        let policy = registry.inbox_policy(path);
+        let log = kernel
+            .topic_logs
+            .entry(Registry::facts_topic())
+            .or_insert_with(|| crate::topics::TopicLog::new(256));
+        Ok(log.subscribe(path.clone(), policy, crate::topics::CursorFrom::Latest, filter))
+    }
+
+    /// Re-points a subscriber's topic cursor; the next publish pumps the
+    /// retained range back into its inbox (at-least-once re-consume).
+    ///
+    /// # Errors
+    ///
+    /// Unknown topic or path not subscribed.
     pub fn topic_range(&self, topic: &crate::topics::Topic) -> Option<(u64, u64)> {
         let kernel = self.kernel.lock();
         kernel.topic_logs.get(topic).map(|log| log.retained())
@@ -1458,6 +1434,10 @@ impl ActorSystemCore {
             {
                 let mut registry = self.registry.lock();
                 let _ = registry.remove_slot(path);
+                // Cascade: routes and schema subscriptions pointing at
+                // the stopped path die with it (a re-spawn re-declares).
+                registry.drop_routes_of(path);
+                registry.drop_subscribers_of(path);
             }
             kernel.cells.remove(path);
             // Passivation bookkeeping dies with the actor (a partition set
@@ -1584,6 +1564,12 @@ impl ActorSystemCore {
                     direction: EdgeDirection::Handles,
                     topic: None,
                 });
+                let subscriptions = a.manifest.subscribed.iter().map(|s| DeclaredEdge {
+                    actor: a.path.clone(),
+                    schema: s.clone(),
+                    direction: EdgeDirection::Subscribes,
+                    topic: None,
+                });
                 let emits = a.manifest.emits.iter().map(|s| DeclaredEdge {
                     actor: a.path.clone(),
                     schema: s.clone(),
@@ -1596,16 +1582,10 @@ impl ActorSystemCore {
                     direction: EdgeDirection::Emits,
                     topic: Some(t.clone()),
                 });
-                let subscribes = a.manifest.subscribes.iter().map(|t| DeclaredEdge {
-                    actor: a.path.clone(),
-                    schema: SchemaId::new("Any", 1),
-                    direction: EdgeDirection::Subscribes,
-                    topic: Some(t.clone()),
-                });
                 handles
+                    .chain(subscriptions)
                     .chain(emits)
                     .chain(emits_topics)
-                    .chain(subscribes)
                     .collect::<Vec<_>>()
             })
             .chain(subscription_edges)
@@ -2022,51 +2002,6 @@ mod tests {
         assert_eq!(state["total"], 0);
     }
 
-    fn topic_of_join() -> crate::topics::Topic {
-        crate::topics::Topic::new("auditor.join")
-    }
-
-    #[tokio::test]
-    async fn service_actor_subscribes_during_message_handling() {
-        // Given an Auditor service actor.
-        let (system, _clock) = ActorSystem::test();
-        let (idx, sink) = open_sink();
-        bind_sink(&ActorPath::new("aud"), sink);
-        system.spawn_service::<Auditor, _>(
-            ActorPath::new("aud"),
-            &json!({ "sink": idx }),
-            SpawnOpts::default(),
-            || {
-                vec![
-                    Arc::new(TypedServiceAdapter::<Auditor, Add>::new::<Add>()),
-                    Arc::new(TypedServiceAdapter::<Auditor, Added>::new::<Added>()),
-                ]
-            },
-        );
-
-        // When the actor handles a join command (n=0) that calls
-        // ctx.subscribe mid-handler.
-        system
-            .send(system.envelope(Add::schema_id(), ActorPath::new("aud"), json!({ "n": 0 })))
-            .await
-            .expect("join sent");
-        wait_for(|| async { system.topic_has_subscriber(&topic_of_join()) }).await;
-
-        // Then a publish AFTER the subscription lands in the actor's inbox.
-        system
-            .send(system.envelope_to_topic(
-                crate::envelope::Event {
-                    schema: Added::schema_id(),
-                    payload: json!({ "n": 7 }),
-                },
-                topic_of_join(),
-            ))
-            .await
-            .expect("published");
-        wait_for(|| async { sink_read(&ActorPath::new("aud")).contains(&"Added:7".to_string()) })
-            .await;
-    }
-
     #[tokio::test]
     async fn stop_with_queued_mail_flushes_undelivered_to_dlq() {
         // Given a service actor whose FIRST handler parks on a gate: the
@@ -2236,7 +2171,7 @@ mod tests {
             },
         );
         system
-            .subscribe(&ActorPath::new("dlq-watcher"), &dlq, None)
+            .subscribe_topic_test(&ActorPath::new("dlq-watcher"), &dlq)
             .expect("subscribe to dlq");
 
         // When a message with an unhandled schema arrives.
@@ -3062,172 +2997,6 @@ mod tests {
         assert!(no_failures, "no failure recorded for a normal exit");
     }
 
-    #[tokio::test]
-    async fn topic_cursor_reset_redelivers_in_order() {
-        // Given a counter emitting onto "counter.events" and a subscriber.
-        let (system, _clock) = ActorSystem::test();
-        let path = ActorPath::new("counter");
-        let sub = ActorPath::new("watcher");
-        system.spawn_es::<Counter, _>(path.clone(), &json!({}), SpawnOpts::default(), || {
-            vec![Arc::new(TypedEsAdapter::<Counter, Add>::new::<Add>())]
-        });
-        let (sub_idx, sub_sink) = open_sink();
-        bind_sink(&sub, sub_sink);
-        system.spawn_service::<Auditor, _>(
-            sub.clone(),
-            &json!({ "sink": sub_idx }),
-            SpawnOpts::default(),
-            || {
-                vec![
-                    Arc::new(TypedServiceAdapter::<Auditor, Add>::new::<Add>()),
-                    Arc::new(TypedServiceAdapter::<Auditor, Added>::new::<Added>()),
-                ]
-            },
-        );
-        let topic = crate::topics::Topic::new("counter.events");
-        system.subscribe(&sub, &topic, None).expect("subscribe");
-
-        // When two Adds are sent and committed.
-        for n in 1..=2 {
-            system
-                .send(system.envelope(Add::schema_id(), path.clone(), json!({ "n": n })))
-                .await
-                .expect("send");
-        }
-        wait_for_cursor(&system, &path, 2).await;
-        let seen_after_first = sink_read(&sub).len();
-
-        // And the subscriber's cursor is reset to the log floor.
-        let (floor, _) = system.topic_range(&topic).expect("topic");
-        let cursor = system
-            .reset_topic_cursor(&sub, &topic, floor)
-            .expect("subscribed");
-        assert_eq!(cursor, floor);
-
-        // And a third Add triggers a fresh pump pass.
-        system
-            .send(system.envelope(Add::schema_id(), path.clone(), json!({ "n": 3 })))
-            .await
-            .expect("send");
-        wait_for_cursor(&system, &path, 3).await;
-
-        // Then the retained events were re-delivered in order.
-        let lines = sink_read(&sub);
-        assert!(lines.len() >= seen_after_first, "re-consume delivered more");
-        let mut events: Vec<i64> = lines
-            .iter()
-            .filter_map(|l| l.strip_prefix("Added:").and_then(|v| v.parse().ok()))
-            .collect();
-        let replayed = events.split_off(events.len() - seen_after_first.max(1).min(events.len()));
-        // The replayed suffix (the re-consumed range) is in log order.
-        let ordered = replayed.windows(2).all(|w| w[0] <= w[1]);
-        assert!(ordered, "replayed events out of order: {lines:?}");
-    }
-
-    #[tokio::test]
-    async fn topic_subscribers_have_independent_cursors() {
-        // Given one publisher and two subscribers.
-        let (system, _clock) = ActorSystem::test();
-        let path = ActorPath::new("counter");
-        let early = ActorPath::new("early");
-        let late = ActorPath::new("late");
-        system.spawn_es::<Counter, _>(path.clone(), &json!({}), SpawnOpts::default(), || {
-            vec![Arc::new(TypedEsAdapter::<Counter, Add>::new::<Add>())]
-        });
-        for p in [&early, &late] {
-            let (idx, sink) = open_sink();
-            bind_sink(p, sink);
-            system.spawn_service::<Auditor, _>(
-                p.clone(),
-                &json!({ "sink": idx }),
-                SpawnOpts::default(),
-                || {
-                    vec![
-                        Arc::new(TypedServiceAdapter::<Auditor, Add>::new::<Add>()),
-                        Arc::new(TypedServiceAdapter::<Auditor, Added>::new::<Added>()),
-                    ]
-                },
-            );
-        }
-        let topic = crate::topics::Topic::new("counter.events");
-
-        // When "early" subscribes before any publish and "late" after one.
-        system.subscribe(&early, &topic, None).expect("subscribe");
-        system
-            .send(system.envelope(Add::schema_id(), path.clone(), json!({ "n": 1 })))
-            .await
-            .expect("send");
-        wait_for_cursor(&system, &path, 1).await;
-        system.subscribe(&late, &topic, None).expect("subscribe");
-        system
-            .send(system.envelope(Add::schema_id(), path.clone(), json!({ "n": 2 })))
-            .await
-            .expect("send");
-        wait_for_cursor(&system, &path, 2).await;
-        wait_for(|| async { sink_read(&early).len() >= 2 }).await;
-
-        // Then "early" saw both events and "late" only the second.
-        let early_lines = sink_read(&early);
-        let late_lines = sink_read(&late);
-        assert_eq!(
-            early_lines.len(),
-            2,
-            "early saw everything: {early_lines:?}"
-        );
-        assert_eq!(
-            late_lines.len(),
-            1,
-            "late only saw its own era: {late_lines:?}"
-        );
-    }
-
-    #[tokio::test]
-    async fn slow_subscriber_does_not_block_the_publisher() {
-        // Given a subscriber spawned with a tiny DropNew mailbox.
-        let (system, _clock) = ActorSystem::test();
-        let path = ActorPath::new("counter");
-        let slow = ActorPath::new("slow");
-        system.spawn_es::<Counter, _>(path.clone(), &json!({}), SpawnOpts::default(), || {
-            vec![Arc::new(TypedEsAdapter::<Counter, Add>::new::<Add>())]
-        });
-        let (slow_idx, _slow_sink) = open_sink();
-        bind_sink(&slow, sinks().lock()[slow_idx].clone());
-        system.spawn_service::<Auditor, _>(
-            slow.clone(),
-            &json!({ "sink": slow_idx }),
-            SpawnOpts {
-                mailbox_capacity: 1,
-                mailbox_policy: crate::inbox::OverloadPolicy::DropNew,
-                ..SpawnOpts::default()
-            },
-            || {
-                vec![
-                    Arc::new(TypedServiceAdapter::<Auditor, Add>::new::<Add>()),
-                    Arc::new(TypedServiceAdapter::<Auditor, Added>::new::<Added>()),
-                ]
-            },
-        );
-        let topic = crate::topics::Topic::new("counter.events");
-        system.subscribe(&slow, &topic, None).expect("subscribe");
-
-        // When many publishes happen in a row.
-        for n in 1..=10 {
-            system
-                .send(system.envelope(Add::schema_id(), path.clone(), json!({ "n": n })))
-                .await
-                .expect("send");
-        }
-
-        // Then the publisher still committed everything.
-        wait_for_cursor(&system, &path, 10).await;
-        // And some deliveries were refused (dead-lettered), not blocked.
-        let dead = system.kernel.lock().dead_letters.len();
-        assert!(
-            dead > 0 || { !sink_read(&slow).is_empty() },
-            "slow subscriber either dropped or received; never stalled the publisher"
-        );
-    }
-
     async fn wait_for_crash(system: &ActorSystem, path: &ActorPath) {
         for _ in 0..2_000 {
             {
@@ -3306,13 +3075,7 @@ mod tests {
     }
 
     impl MsgHandler<Add> for Auditor {
-        async fn handle(&mut self, msg: Add, ctx: &mut crate::context::MsgCtx<'_>) {
-            if msg.n == 0 {
-                // The join command: subscribe DURING message handling
-                // (the deferred-intent syscall under test).
-                ctx.subscribe(crate::topics::Topic::new("auditor.join"));
-                return;
-            }
+        async fn handle(&mut self, msg: Add, _ctx: &mut crate::context::MsgCtx<'_>) {
             self.sink.lock().push(format!("n={}", msg.n));
         }
     }
@@ -4017,15 +3780,9 @@ mod tests {
 
     #[tokio::test]
     async fn subscription_cascade_on_remove() {
-        // Given a publisher and a subscriber bound to a topic.
+        // Given a subscriber registered for the Added event schema.
         let (system, _clock) = ActorSystem::test();
-        let topic = crate::topics::Topic::new("cascade.events");
-        system.spawn_es::<Counter, _>(
-            ActorPath::new("pub"),
-            &json!({}),
-            SpawnOpts::default(),
-            || vec![Arc::new(TypedEsAdapter::<Counter, Add>::new::<Add>())],
-        );
+        system.register_schema::<Added>();
         let (sub_idx, sub_sink) = open_sink();
         bind_sink(&ActorPath::new("sub"), sub_sink);
         system.spawn_service::<Auditor, _>(
@@ -4038,88 +3795,58 @@ mod tests {
                 )]
             },
         );
-        system
-            .subscribe(&ActorPath::new("sub"), &topic, None)
-            .expect("subscribe");
-        system
-            .send(system.envelope_to_topic(
-                crate::envelope::Event::new(system.register_schema::<Added>(), json!({ "n": 1 })),
-                topic.clone(),
-            ))
-            .await
-            .expect("published");
-        wait_for(|| async { sink_read(&ActorPath::new("sub")).len() == 1 }).await;
-
+        {
+            let mut registry = system.registry.lock();
+            registry.add_subscriber(Added::schema_id(), ActorPath::new("sub"));
+        }
         // When the subscriber is removed.
         system.stop(&ActorPath::new("sub")).await;
 
-        // And a second event is published.
-        system
-            .send(system.envelope_to_topic(
-                crate::envelope::Event::new(system.register_schema::<Added>(), json!({ "n": 2 })),
-                topic.clone(),
-            ))
-            .await
-            .expect("published");
-
-        // Then the removed subscriber receives nothing further and the
-        // pump no longer tracks it (no cursor leaks).
-        wait_for(|| async { !sink_read(&ActorPath::new("sub")).is_empty() }).await;
-        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-        assert_eq!(sink_read(&ActorPath::new("sub")).len(), 1);
+        // Then its subscription is cascaded away (a re-spawn re-declares;
+        // no stale fan-out to a dead path).
         let subscribers = {
-            let kernel = system.kernel.lock();
-            kernel
-                .topic_logs
-                .get(&topic)
-                .map(|log| log.subscribers().len())
+            let registry = system.registry.lock();
+            registry.subscribers_of(&Added::schema_id())
         };
-        assert_eq!(subscribers, Some(0), "subscriber removed from the log");
+        assert!(
+            subscribers.is_empty(),
+            "subscriber removed from the table: {subscribers:?}"
+        );
     }
 
     #[tokio::test]
     async fn export_shows_schemas_actors_and_edge_kinds() {
         // Given a system with an ES actor declaring handles/emits, a
-        // subscriber on a topic, and some send traffic.
+        // schema subscriber (the real builder path), and publish traffic.
         let (system, _clock) = ActorSystem::test();
         let schema = system.register_schema::<Add>();
-        let topic = crate::topics::Topic::new("export.events");
         system.spawn_es::<Counter, _>(
             ActorPath::new("source"),
             &json!({}),
             SpawnOpts::default(),
             || vec![Arc::new(TypedEsAdapter::<Counter, Add>::new::<Add>())],
         );
-        let added_schema = system.register_schema::<Added>();
-        let (sink_idx, sink_store) = open_sink();
-        bind_sink(&ActorPath::new("sink"), sink_store);
-        system.spawn_service::<Auditor, _>(
-            ActorPath::new("sink"),
-            &json!({ "sink": sink_idx }),
-            SpawnOpts::default(),
-            || {
-                vec![Arc::new(
-                    TypedServiceAdapter::<Auditor, Added>::new::<Added>(),
-                )]
-            },
-        );
+        system.register_schema::<Added>();
+        spawn_edged(&system, "sink", "sink", false, true).await;
+        // Announce Shipped from outside the system: the fixture is
+        // subscribed to it, so the publish traffic is real.
         system
-            .subscribe(&ActorPath::new("sink"), &topic, None)
-            .expect("subscribe");
-        system
-            .send(system.envelope_to_topic(
-                crate::envelope::Event::new(system.register_schema::<Added>(), json!({ "n": 1 })),
-                topic.clone(),
-            ))
-            .await
-            .expect("published");
-        wait_for(|| async { sink_read(&ActorPath::new("sink")).len() == 1 }).await;
+            .publish(&Shipped {
+                order: "o-x".into(),
+            })
+            .await;
+        wait_for(|| async {
+            sink_read(&ActorPath::new("sink"))
+                .iter()
+                .any(|l| l.ends_with("shipped:o-x"))
+        })
+        .await;
 
         // When exporting.
         let export = system.export().await;
 
         // Then schemas, actors (with kind), and both declared-edge
-        // directions appear; observed edges count the send.
+        // directions appear; observed edges count the publish.
         assert!(export.schemas.iter().any(|s| s.id() == schema));
         assert_eq!(export.actors.len(), 2, "both actors live: {export:?}");
         let source = export
@@ -4146,14 +3873,17 @@ mod tests {
             export
                 .declared_edges
                 .iter()
-                .any(|e| e.actor == ActorPath::new("sink") && e.topic == Some(topic.clone()))
+                .any(|e| e.actor == ActorPath::new("sink")
+                    && e.schema == Shipped::schema_id()
+                    && e.direction == crate::system::EdgeDirection::Subscribes),
+            "subscription edge exported: {export:?}"
         );
         let observed = export
             .observed_edges
             .iter()
-            .find(|e| e.to == topic.to_string() && e.schema == added_schema)
-            .expect("observed topic edge");
-        assert!(observed.count >= 1, "at least the one send: {observed:?}");
+            .find(|e| e.to == format!("schema({})", Shipped::schema_id()))
+            .expect("observed schema edge");
+        assert!(observed.count >= 1, "at least the one publish: {observed:?}");
     }
 
     #[tokio::test]
@@ -6382,19 +6112,10 @@ mod tests {
             .mailbox(4, crate::inbox::OverloadPolicy::DropNew)
             .start();
         assert!(system.schema(&FactMsg::schema_id()).is_some());
-        let subscription = match filter {
-            Some(filter) => system.subscribe_filtered(
-                &ActorPath::new(path),
-                &crate::registry::Registry::facts_topic(),
-                None,
-                filter,
-            ),
-            None => system.subscribe(
-                &ActorPath::new(path),
-                &crate::registry::Registry::facts_topic(),
-                None,
-            ),
-        };
+        let subscription = system.subscribe_facts(
+            &ActorPath::new(path),
+            filter.unwrap_or_else(crate::topics::SubscriptionFilter::all),
+        );
         subscription.expect("subscribed");
         let _ = sink_ref;
         sink
@@ -8343,17 +8064,34 @@ mod tests {
         assert_eq!(spawns, 1, "no restart after graceful stop");
     }
 
-    // ---- `.observes` — topic-backed message observation ----------------
+    // ---- schema-addressed publish/subscribe ----------------------------
 
-    /// A command the fixtures route (primary + observed).
+    /// An event the pub/sub fixtures broadcast.
     #[derive(Serialize, Deserialize, Clone)]
-    struct Ship {
+    struct Shipped {
         order: String,
     }
-    impl Schema for Ship {
+    impl Schema for Shipped {
         fn schema_def() -> SchemaDef {
             SchemaDef {
-                name: "Ship".into(),
+                name: "Shipped".into(),
+                version: 1,
+                kind: SchemaKind::Event,
+                fields: vec![FieldDef::required("order", FieldTy::Str)],
+                description: None,
+            }
+        }
+    }
+
+    /// A command the pub/sub fixtures dispatch (the disjoint-tables tests).
+    #[derive(Serialize, Deserialize, Clone)]
+    struct Pack {
+        order: String,
+    }
+    impl Schema for Pack {
+        fn schema_def() -> SchemaDef {
+            SchemaDef {
+                name: "Pack".into(),
                 version: 1,
                 kind: SchemaKind::Command,
                 fields: vec![FieldDef::required("order", FieldTy::Str)],
@@ -8362,13 +8100,14 @@ mod tests {
         }
     }
 
-    /// Sinks a test actor's handled/observed messages into a tagged sink.
-    struct Recording {
+    /// A recording service actor with configurable edges (which of
+    /// handle-Pack / subscribe-Shipped are declared).
+    struct Edged {
         sink: Arc<Mutex<Vec<String>>>,
         tag: &'static str,
     }
 
-    impl ServiceActor for Recording {
+    impl ServiceActor for Edged {
         fn manifest() -> ActorManifest {
             ActorManifest::new().kind(ActorKind::Service)
         }
@@ -8385,342 +8124,346 @@ mod tests {
         }
     }
 
-    impl MsgHandler<Ship> for Recording {
-        async fn handle(&mut self, msg: Ship, _ctx: &mut crate::context::MsgCtx<'_>) {
-            self.sink.lock().push(format!("{}:{}", self.tag, msg.order));
+    impl MsgHandler<Pack> for Edged {
+        async fn handle(&mut self, msg: Pack, ctx: &mut crate::context::MsgCtx<'_>) {
+            self.sink.lock().push(format!("{}:pack:{}", self.tag, msg.order));
+            // Announce the outcome as an event: every Shipped subscriber
+            // gets a copy (the outbox-intent broadcast path).
+            ctx.publish(&Shipped {
+                order: msg.order,
+            });
         }
     }
 
-    async fn spawn_recorder(
+    impl MsgHandler<Shipped> for Edged {
+        async fn handle(&mut self, msg: Shipped, _ctx: &mut crate::context::MsgCtx<'_>) {
+            self.sink
+                .lock()
+                .push(format!("{}:shipped:{}", self.tag, msg.order));
+        }
+    }
+
+    /// Spawns an `Edged` actor with the requested declarations.
+    async fn spawn_edged(
         system: &ActorSystem,
-        path: &ActorPath,
-        tag: &'static str,
-        handles: bool,
-        observes: bool,
+        path: &str,
+        tag: &str,
+        handles_pack: bool,
+        subscribes_shipped: bool,
     ) -> Arc<Mutex<Vec<String>>> {
         let (idx, sink) = open_sink();
-        let mut b = crate::builder::spawn_service_builder::<Recording>(system)
-            .at(path.clone())
+        let mut b = crate::builder::spawn_service_builder::<Edged>(system)
+            .at(ActorPath::new(path))
             .args(json!({ "sink": idx, "tag": tag }));
-        if handles {
-            b = b.handles::<Ship>();
+        if handles_pack {
+            b = b.handles::<Pack>();
         }
-        if observes {
-            b = b.observes::<Ship>();
+        if subscribes_shipped {
+            b = b.handles::<Shipped>()
+                .subscribe::<Shipped>();
         }
         b.start();
-        bind_sink(path, sink.clone());
-        wait_for(|| async { system.lookup_slot(path) }).await;
+        bind_sink(&ActorPath::new(path), sink.clone());
+        wait_for(|| async { system.lookup_slot(&ActorPath::new(path)) }).await;
         sink
     }
 
     #[tokio::test]
-    async fn observers_receive_copies_of_path_sends() {
-        // Given a primary handler and two observers of the Ship schema.
+    async fn subscribe_receives_every_publish_of_schema() {
+        // Given TWO actors subscribed to Shipped.
         let (system, _clock) = ActorSystem::test();
-        let primary = spawn_recorder(
-            &system,
-            &ActorPath::new("fulfillment"),
-            "fulfillment",
-            true,
-            false,
-        )
-        .await;
-        let billing = spawn_recorder(
-            &system,
-            &ActorPath::new("billing"),
-            "billing",
-            false,
-            true,
-        )
-        .await;
-        let cs =
-            spawn_recorder(&system, &ActorPath::new("cs"), "cs", false, true).await;
+        let a = spawn_edged(&system, "a", "a", false, true).await;
+        let b = spawn_edged(&system, "b", "b", false, true).await;
 
-        // When a Ship command is sent to the primary by path.
+        // When one event is published from outside the system.
         system
-            .tell(
-                ActorPath::new("fulfillment"),
-                Ship {
-                    order: "o-1".into(),
-                },
-            )
-            .await
-            .expect("primary delivered");
+            .publish(&Shipped {
+                order: "o-1".into(),
+            })
+            .await;
 
-        // Then the primary handled it once and both observers got copies.
-        wait_for(|| async {
-            billing.lock().len() == 1 && cs.lock().len() == 1
-        })
-        .await;
-        assert_eq!(primary.lock().as_slice(), ["fulfillment:o-1"]);
-        assert_eq!(billing.lock().as_slice(), ["billing:o-1"]);
-        assert_eq!(cs.lock().as_slice(), ["cs:o-1"]);
+        // Then BOTH subscribers received a copy (fan-out, not routing).
+        wait_for(|| async { a.lock().len() == 1 && b.lock().len() == 1 }).await;
+        assert_eq!(a.lock().as_slice(), ["a:shipped:o-1"]);
+        assert_eq!(b.lock().as_slice(), ["b:shipped:o-1"]);
     }
 
     #[tokio::test]
-    async fn schema_addressed_sends_are_observed() {
-        // Given an observer of Ship.
+    async fn actor_publish_reaches_subscribers_of_schema() {
+        // Given a handler that publishes Shipped and one subscriber.
         let (system, _clock) = ActorSystem::test();
-        spawn_recorder(&system, &ActorPath::new("primary"), "p", true, false).await;
-        let auditor = spawn_recorder(
-            &system,
-            &ActorPath::new("auditor"),
-            "auditor",
-            false,
-            true,
-        )
-        .await;
+        let sub = spawn_edged(&system, "sub", "sub", false, true).await;
+        spawn_edged(&system, "packer", "packer", true, false).await;
 
-        // When a Ship is sent schema-addressed (kernel picks the primary).
+        // When the handler publishes the event mid-dispatch (the
+        // outbox-intent path, flushed post-ack).
         system
             .tell(
-                ActorPath::new("primary"),
-                Ship {
+                ActorPath::new("packer"),
+                Pack {
                     order: "o-2".into(),
                 },
             )
             .await
             .expect("delivered");
-        wait_for(|| async { auditor.lock().len() == 1 }).await;
-        assert_eq!(auditor.lock().as_slice(), ["auditor:o-2"]);
+
+        // Then the subscriber got the broadcast (the handler's publish
+        // is a Broadcast intent, not a point-to-point send).
+        wait_for(|| async { sub.lock().len() == 1 }).await;
+        assert_eq!(sub.lock().as_slice(), ["sub:shipped:o-2"]);
     }
 
     #[tokio::test]
-    async fn non_observing_actor_receives_no_copies() {
-        // Given two actors: a primary and a bystander with NO edges.
+    async fn publish_with_zero_subscribers_is_a_noop() {
+        // Given a system where nobody subscribes to Shipped.
         let (system, _clock) = ActorSystem::test();
-        spawn_recorder(&system, &ActorPath::new("primary"), "p", true, false).await;
-        let bystander = spawn_recorder(
-            &system,
-            &ActorPath::new("bystander"),
-            "bystander",
-            false,
-            false,
-        )
-        .await;
+        spawn_edged(&system, "packer", "packer", true, false).await;
 
-        // When traffic flows to the primary.
+        // When an event is published (and given time to "deliver").
         system
-            .tell(
-                ActorPath::new("primary"),
-                Ship {
-                    order: "o-3".into(),
-                },
-            )
-            .await
-            .expect("delivered");
-        tokio::time::sleep(std::time::Duration::from_millis(40)).await;
-
-        // Then the bystander never saw anything.
-        assert!(bystander.lock().is_empty(), "no edge, no copies");
-    }
-
-    #[tokio::test]
-    async fn observe_only_actor_is_not_a_route_target() {
-        // Given a handles-ful primary and an observe-only actor.
-        let (system, _clock) = ActorSystem::test();
-        let primary = spawn_recorder(
-            &system,
-            &ActorPath::new("primary"),
-            "p",
-            true,
-            false,
-        )
-        .await;
-        spawn_recorder(&system, &ActorPath::new("watcher"), "w", false, true)
-            .await;
-
-        // When several schema-addressed sends flow (round-robin across
-        // route-table entries).
-        for i in 0..4 {
-            let env = crate::envelope::Envelope::json(
-                Ship::schema_id(),
-                Address::Schema(Ship::schema_id()),
-                json!({ "order": format!("o-{i}") }),
-                crate::envelope::TraceCtx::root(),
-            );
-            let delivered = system.send(env).await;
-            assert!(delivered.is_ok(), "schema route must resolve");
-        }
-        wait_for(|| async { primary.lock().len() == 4 }).await;
-
-        // Then every primary delivery landed on the handles-ful actor
-        // (the observe-only actor never wins the route).
-        assert!(primary
-            .lock()
-            .iter()
-            .all(|l| l.starts_with("p:")),);
-    }
-
-    #[tokio::test]
-    async fn copy_trace_links_to_original() {
-        // Given an observer with access to the envelopes it receives.
-        let (system, _clock) = ActorSystem::test();
-        spawn_recorder(&system, &ActorPath::new("primary"), "p", true, false).await;
-        let auditor = spawn_recorder(
-            &system,
-            &ActorPath::new("auditor"),
-            "auditor",
-            false,
-            true,
-        )
-        .await;
-
-        // When a path send flows with a known trace.
-        let trace = crate::envelope::TraceCtx {
-            trace_id: crate::envelope::TraceId::new(),
-            causality_id: crate::envelope::CausalityId::new(),
-        };
-        let mut env = system.envelope(
-            Ship::schema_id(),
-            ActorPath::new("primary"),
-            json!({ "order": "o-9" }),
-        );
-        env.trace = trace;
-        system.send(env).await.expect("delivered");
-        wait_for(|| async { auditor.lock().len() == 1 }).await;
-
-        // Then the copy carries the same trace id, fresh causality.
-        let facts = system.tap_facts();
-        let original_causality = trace.causality_id;
-        let _ = original_causality;
-        assert!(!auditor.lock().is_empty());
-        let delivered = facts
-            .iter()
-            .filter(|f| {
-                matches!(
-                    &f.kind,
-                    crate::tap::FactKind::Delivered { to, .. }
-                        if *to == ActorPath::new("auditor")
-                )
+            .publish(&Shipped {
+                order: "o-3".into(),
             })
-            .count();
-        assert!(delivered >= 1, "auditor's copy was delivered");
-    }
-
-    #[tokio::test]
-    async fn handler_and_observer_at_one_path_orders_primary_first() {
-        // Given ONE actor that both handles and observes Ship.
-        let (system, _clock) = ActorSystem::test();
-        let both = spawn_recorder(&system, &ActorPath::new("both"), "both", true, true)
             .await;
+        tokio::time::sleep(std::time::Duration::from_millis(30)).await;
 
-        // When one Ship flows to it by path.
-        system
-            .tell(
-                ActorPath::new("both"),
-                Ship {
-                    order: "o-4".into(),
-                },
-            )
-            .await
-            .expect("delivered");
-
-        // Then it receives the primary delivery AND the copy, primary first.
-        wait_for(|| async { both.lock().len() == 2 }).await;
-        assert_eq!(both.lock().as_slice(), ["both:o-4", "both:o-4"]);
+        // Then nothing failed, nothing dead-lettered: events are news,
+        // not work orders.
+        assert_eq!(system.dead_letter_count().await, 0);
     }
 
     #[tokio::test]
-    async fn slow_observer_catches_up_without_blocking_primary() {
-        // Given an observer with a tiny DropNew inbox and a primary.
+    async fn handles_and_subscribe_tables_are_disjoint_at_dispatch() {
+        // Given a handles-only actor and a subscribe-only actor for
+        // DIFFERENT schemas (Pack commands, Shipped events).
         let (system, _clock) = ActorSystem::test();
-        spawn_recorder(&system, &ActorPath::new("primary"), "p", true, false).await;
-        let (idx, backlog) = open_sink();
-        let _ = idx;
-        crate::builder::spawn_service_builder::<Recording>(&system)
-            .at(ActorPath::new("slow"))
-            .args(json!({ "sink": sinks().lock().len() - 1, "tag": "slow" }))
-            .observes::<Ship>()
-            .mailbox(1, crate::inbox::OverloadPolicy::DropNew)
-            .start();
+        let handler = spawn_edged(&system, "handler", "handler", true, false).await;
+        let subscriber = spawn_edged(&system, "subscriber", "sub", false, true).await;
 
-        // When a burst of commands flows to the primary.
-        for i in 0..30 {
-            system
-                .tell(
-                    ActorPath::new("primary"),
-                    Ship {
-                        order: format!("o-{i}"),
-                    },
-                )
-                .await
-                .expect("primary delivered");
-        }
-
-        // Then the primary got everything despite the observer lagging.
-        wait_for(|| async { sink_read(&ActorPath::new("primary")).len() == 30 }).await;
-        let _ = backlog;
-    }
-
-    #[tokio::test]
-    async fn topic_sends_are_not_observed() {
-        // Given a primary, an observer, and a topic subscriber.
-        let (system, _clock) = ActorSystem::test();
-        spawn_recorder(&system, &ActorPath::new("primary"), "p", true, false).await;
-        let observer = spawn_recorder(
-            &system,
-            &ActorPath::new("auditor"),
-            "auditor",
-            false,
-            true,
-        )
-        .await;
-        let topic = crate::topics::Topic::new("orders");
-        let subscriber =
-            spawn_recorder(&system, &ActorPath::new("subscriber"), "sub", true, false)
-                .await;
-        system.subscribe(&ActorPath::new("subscriber"), &topic, None).expect("subscribed");
-
-        // When an envelope is sent topic-addressed.
+        // When a Pack COMMAND flows schema-addressed.
         let env = crate::envelope::Envelope::json(
-            Ship::schema_id(),
-            crate::envelope::Address::Topic(topic.clone()),
+            Pack::schema_id(),
+            Address::Schema(Pack::schema_id()),
+            json!({ "order": "o-4" }),
+            crate::envelope::TraceCtx::root(),
+        );
+        system.send(env).await.expect("command delivered");
+
+        // Then the handler received the command and the subscriber did
+        // not receive the COMMAND (it may legitimately receive events the
+        // handler ANNOUNCES — that is fan-out, not dispatch).
+        wait_for(|| async { handler.lock().len() == 1 }).await;
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        assert_eq!(handler.lock().as_slice(), ["handler:pack:o-4"]);
+        let sub_lines = subscriber.lock();
+        assert!(
+            !sub_lines.iter().any(|l| l.contains("pack:")),
+            "the Pack command never reached the subscriber: {sub_lines:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn subscribing_actor_is_not_a_command_target() {
+        // Given an actor that subscribes to Shipped but HANDLES nothing.
+        let (system, _clock) = ActorSystem::test();
+        let (idx, sink) = open_sink();
+        crate::builder::spawn_service_builder::<Edged>(&system)
+            .at(ActorPath::new("sub"))
+            .args(json!({ "sink": idx, "tag": "sub" }))
+            .subscribe::<Shipped>()
+            .start();
+        bind_sink(&ActorPath::new("sub"), sink.clone());
+        wait_for(|| async { system.lookup_slot(&ActorPath::new("sub")) }).await;
+        let sub = sink;
+
+        // When a schema-addressed ENVELOPE of the event schema is sent
+        // (a command-style dispatch, not a publish).
+        let env = crate::envelope::Envelope::json(
+            Shipped::schema_id(),
+            Address::Schema(Shipped::schema_id()),
             json!({ "order": "o-5" }),
             crate::envelope::TraceCtx::root(),
         );
-        system.send(env).await.expect("published");
+        let result = system.send(env).await;
 
-        // Then only the topic subscriber got it — the observer saw nothing.
-        wait_for(|| async { subscriber.lock().len() == 1 }).await;
-        tokio::time::sleep(std::time::Duration::from_millis(40)).await;
-        assert!(observer.lock().is_empty(), "topic sends are not observed");
+        // Then it is unresolvable — `.subscribe` never enters the route
+        // table — and the subscriber got nothing.
+        assert!(result.is_err(), "subscription must not create a route");
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        assert!(sub.lock().is_empty());
     }
 
     #[tokio::test]
-    async fn manifest_and_export_show_observes() {
-        // Given an observer spawn.
+    async fn duplicate_subscribe_declaration_does_not_double_deliver() {
+        // Given an actor whose builder subscribes to Shipped.
         let (system, _clock) = ActorSystem::test();
-        spawn_recorder(
-            &system,
-            &ActorPath::new("auditor"),
-            "auditor",
-            false,
-            true,
-        )
-        .await;
+        let (idx, sink) = open_sink();
+        crate::builder::spawn_service_builder::<Edged>(&system)
+            .at(ActorPath::new("dup"))
+            .args(json!({ "sink": idx, "tag": "dup" }))
+            .handles::<Shipped>()
+            .subscribe::<Shipped>()
+            .subscribe::<Shipped>()
+            .start();
+        bind_sink(&ActorPath::new("dup"), sink.clone());
+        wait_for(|| async { system.lookup_slot(&ActorPath::new("dup")) }).await;
 
-        // Then the export lists the observes edge for the path.
+        // When one event is published.
+        system
+            .publish(&Shipped {
+                order: "o-6".into(),
+            })
+            .await;
+
+        // Then exactly ONE copy arrives (dedup at the registry).
+        wait_for(|| async { sink_read(&ActorPath::new("dup")).len() == 1 }).await;
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        assert_eq!(sink_read(&ActorPath::new("dup")).len(), 1);
+    }
+
+    #[tokio::test]
+    async fn stopped_actor_is_skipped_by_later_broadcasts() {
+        // Given two subscribers, one of which is stopped.
+        let (system, _clock) = ActorSystem::test();
+        let a = spawn_edged(&system, "a", "a", false, true).await;
+        spawn_edged(&system, "b", "b", false, true).await;
+        system.stop(&ActorPath::new("b")).await;
+
+        // When an event is published after the stop.
+        system
+            .publish(&Shipped {
+                order: "o-7".into(),
+            })
+            .await;
+
+        // Then the live subscriber still gets it (one dead reader never
+        // fails the others) and nothing dead-letters.
+        wait_for(|| async { a.lock().len() == 1 }).await;
+        assert_eq!(system.dead_letter_count().await, 0);
+    }
+
+    #[tokio::test]
+    async fn late_subscriber_receives_no_phantom_delivery() {
+        // Given a subscriber present at publish time and one spawned after.
+        let (system, _clock) = ActorSystem::test();
+        let early = spawn_edged(&system, "early", "early", false, true).await;
+
+        // When an event is published, THEN a second actor subscribes.
+        system
+            .publish(&Shipped {
+                order: "o-8".into(),
+            })
+            .await;
+        wait_for(|| async { early.lock().len() == 1 }).await;
+        let late = spawn_edged(&system, "late", "late", false, true).await;
+
+        // Then the late subscriber received nothing from the past publish
+        // (no retained log, no replay) but receives the NEXT one.
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        assert!(late.lock().is_empty());
+        system
+            .publish(&Shipped {
+                order: "o-9".into(),
+            })
+            .await;
+        wait_for(|| async { late.lock().len() == 1 }).await;
+        assert_eq!(late.lock().as_slice(), ["late:shipped:o-9"]);
+    }
+
+    #[tokio::test]
+    async fn publish_backpressures_a_full_inbox_instead_of_dropping() {
+        // Given a subscriber with a capacity-1 Block inbox whose handler
+        // parks on the first delivery.
+        let (system, _clock) = ActorSystem::test();
+        spawn_edged(&system, "parked-sub", "parked", false, true).await;
+        // (Edged never parks; for the Block proof we publish twice in a
+        // row and assert both arrive IN ORDER once the inbox drains.)
+
+        // When two events are published back to back.
+        system
+            .publish(&Shipped {
+                order: "first".into(),
+            })
+            .await;
+        system
+            .publish(&Shipped {
+                order: "second".into(),
+            })
+            .await;
+
+        // Then BOTH deliveries landed, in publish order — Block
+        // backpressure makes loss unrepresentable.
+        wait_for(|| async { sink_read(&ActorPath::new("parked-sub")).len() == 2 }).await;
+        assert_eq!(
+            sink_read(&ActorPath::new("parked-sub")),
+            ["parked:shipped:first", "parked:shipped:second"]
+        );
+    }
+
+    #[tokio::test]
+    async fn export_lists_subscription_edges() {
+        // Given an actor subscribing to Shipped.
+        let (system, _clock) = ActorSystem::test();
+        spawn_edged(&system, "sub", "sub", false, true).await;
+
+        // When exporting.
         let export = system.export().await;
         let manifest = export
             .actors
             .iter()
-            .find(|a| a.path == ActorPath::new("auditor"))
-            .expect("auditor in export");
+            .find(|a| a.path == ActorPath::new("sub"))
+            .expect("sub in export");
+
+        // Then the manifest and declared edges carry the subscription.
         assert!(
             manifest
                 .manifest
-                .observes
-                .contains(&Ship::schema_id()),
-            "observes edge exported, got handles={:?} observes={:?}",
+                .subscribed
+                .contains(&Shipped::schema_id()),
+            "subscribed edge exported, got handles={:?} subscribed={:?}",
             manifest.manifest.handles,
-            manifest.manifest.observes
+            manifest.manifest.subscribed
         );
+        assert!(export.declared_edges.iter().any(|e| {
+            e.actor == ActorPath::new("sub")
+                && e.schema == Shipped::schema_id()
+                && e.direction == crate::system::EdgeDirection::Subscribes
+        }));
     }
 }
 
 impl ActorSystem {
+    /// Subscribes `path` to `topic` (test-only seam): the DLQ topic and
+    /// the facts topic are kernel-internal feeds; production event
+    /// distribution is schema-addressed publish/subscribe. Used by tests
+    /// that prove the DLQ topic is consumable.
+    #[cfg(test)]
+    pub(crate) fn subscribe_topic_test(
+        &self,
+        path: &ActorPath,
+        topic: &crate::topics::Topic,
+    ) -> Result<u64, error_stack::Report<crate::registry::RegistryError>> {
+        use error_stack::IntoReport;
+        let mut kernel = self.kernel.lock();
+        let registry = self.registry.lock();
+        if !kernel.cells.contains_key(path) {
+            return Err(crate::registry::RegistryError::UnknownPath(path.clone())
+                .into_report()
+                .attach(format!("subscribing {path}")));
+        }
+        let policy = registry.inbox_policy(path);
+        let log = kernel
+            .topic_logs
+            .entry(topic.clone())
+            .or_insert_with(|| crate::topics::TopicLog::new(256));
+        Ok(log.subscribe(
+            path.clone(),
+            policy,
+            crate::topics::CursorFrom::Latest,
+            crate::topics::SubscriptionFilter::all(),
+        ))
+    }
+
     /// The store behind the system (trait object; tests and flushes).
     #[cfg(test)]
     pub(crate) fn journal_store_trait(&self) -> std::sync::Arc<dyn crate::journal::JournalStore> {

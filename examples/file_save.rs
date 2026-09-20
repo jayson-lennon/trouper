@@ -147,12 +147,6 @@ impl Schema for SaveFailed {
     }
 }
 
-/// The topic saves are announced on (the broadcast half of the pattern:
-/// reply = asker only, publish = everyone else).
-fn audit_topic() -> trouper::topics::Topic {
-    trouper::topics::Topic::new("fs.events")
-}
-
 /// THE minimal actor. The domain logic is `save` — a plain method on a
 /// plain struct, testable with `MemFs` and no runtime. The `MsgHandler`
 /// impl is just the integration shim between that method and the runtime:
@@ -205,7 +199,7 @@ impl<S: FileStore + Default> MsgHandler<SaveFile> for FileSaver<S> {
                 };
                 ctx.reply(fact.clone());
                 // The fact channel: observers (and tellers' audits) see it.
-                ctx.publish(audit_topic(), &fact);
+                ctx.publish(&fact);
             }
         }
     }
@@ -279,9 +273,11 @@ async fn run_demo() -> Result<(), Box<dyn std::error::Error>> {
         .handles::<SaveFailed>()
         .start();
     wait(|| async { system.inbox_cursor(&audit).is_some() }).await;
-    system
-        .subscribe(&audit, &audit_topic(), None)
-        .expect("subscribe fs.audit to fs.events");
+    spawn_service_builder::<SaveAudit>(&system)
+        .at(ActorPath::new("fs.audit"))
+        .handles::<SaveFailed>()
+        .subscribe::<SaveFailed>()
+        .start();
 
     // The state reporter the bridge serves every query through.
     trouper::builder::spawn_es_builder::<StateReporter>(&system)
@@ -548,8 +544,8 @@ mod tests {
 
     // ---- adapter tests: the shim over a REAL ActorSystem ----
 
-    /// Spawns `FileSaver<MemFs>` + `SaveAudit` on a fresh test system and
-    /// wires the audit to fs.events.
+    /// Spawns `FileSaver<MemFs>` + `SaveAudit` on a fresh test system; the
+    /// audit subscribes to the `SaveFailed` event.
     async fn demo_system() -> (ActorSystem, ActorPath, ActorPath) {
         let system = ActorSystem::new(SystemConfig::production());
         let saver = trouper::builder::spawn_service_builder::<FileSaver<MemFs>>(&system)
@@ -562,15 +558,12 @@ mod tests {
         let audit = trouper::builder::spawn_service_builder::<SaveAudit>(&system)
             .at(ActorPath::new("test.audit"))
             .args(json!({}))
-            .handles::<SaveFailed>()
+            .subscribe::<SaveFailed>()
             .start();
         wait(|| async {
             system.inbox_cursor(&saver).is_some() && system.inbox_cursor(&audit).is_some()
         })
         .await;
-        system
-            .subscribe(&audit, &audit_topic(), None)
-            .expect("subscribe");
         (system, saver, audit)
     }
 

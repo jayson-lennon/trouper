@@ -284,10 +284,8 @@ async fn main() {
         .mailbox(64, trouper::inbox::OverloadPolicy::DropNew)
         .start();
     system
-        .subscribe_filtered(
+        .subscribe_facts(
             &ActorPath::new("story"),
-            &trouper::registry::Registry::facts_topic(),
-            None,
             trouper::topics::SubscriptionFilter {
                 kind: Some("failed".into()),
                 ..trouper::topics::SubscriptionFilter::default()
@@ -398,10 +396,8 @@ fn add_spawn_filter(system: &ActorSystem) {
         .mailbox(64, trouper::inbox::OverloadPolicy::DropNew)
         .start();
     system
-        .subscribe_filtered(
+        .subscribe_facts(
             &ActorPath::new("story2"),
-            &trouper::registry::Registry::facts_topic(),
-            None,
             trouper::topics::SubscriptionFilter {
                 kind: Some("spawned".into()),
                 ..trouper::topics::SubscriptionFilter::default()

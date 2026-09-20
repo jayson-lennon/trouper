@@ -1,41 +1,43 @@
-//! Observing message traffic: `.observes` vs topic announcements.
+//! Event announcements vs command dispatch: `publish`/`subscribe` vs
+//! `handles`/`tell`.
 //!
-//! Two tools, two questions:
-//! - **Announcement** ("who wants to hear about this?"): the sender
-//!   publishes an event to a topic; subscribers get copies. Here:
-//!   `fulfillment` publishes `Shipped` to `orders`; `billing`
-//!   subscribes.
-//! - **Observation** ("what actually flowed?"): an actor declares
-//!   `.observes::<M>()` and receives a copy of every routed delivery
-//!   of `M` — commands, asks, whatever traffic exists — without the
-//!   sender knowing or caring. Here: `auditor` watches every `Ship`
-//!   command, including the schema-addressed one.
+//! Two transports, two questions:
+//! - **Commands** ("who should DO this?"): `handles::<M>()` + `tell`/
+//!   schema-addressed send. Point-to-point; a second handler for the
+//!   same schema makes the route round-robin.
+//! - **Events** ("who wants to HEAR about this?"): the sender calls
+//!   `ctx.publish(&msg)` (or `system.publish(&msg)` from outside);
+//!   every actor that declared `.subscribe::<M>()` receives a copy —
+//!   insertion order, no round-robin. Zero subscribers ⇒ no-op: events
+//!   are news, not work orders.
+//!
+//! The two declaration tables are disjoint: `billing` handles `Shipped`
+//! AND subscribes to it (both deliver), while `auditor` subscribes to
+//! `Ship` without handling it (never a dispatch target — the command
+//! goes only to `fulfillment`).
 //!
 //! Run: `cargo run --example observe_traffic`
 
 use serde::{Deserialize, Serialize};
-use serde_json::json;
 use std::sync::{Arc, Mutex};
 use trouper::actor::{MsgHandler, ServiceActor};
 use trouper::prelude::*;
-use trouper::registry::{Registry, RegistryError};
+use trouper::registry::RegistryError;
 
-static LINES: std::sync::OnceLock<Mutex<Vec<String>>> = std::sync::OnceLock::new();
+static LINES: std::sync::OnceLock<Arc<Mutex<Vec<String>>>> = std::sync::OnceLock::new();
 
-fn log(line: String) {
-    println!("  {line}");
-    LINES.get_or_init(|| Mutex::new(Vec::new()))
-        .lock()
-        .expect("lines lock")
-        .push(line);
+fn log(line: impl Into<String>) {
+    let lines = LINES.get_or_init(|| Arc::new(Mutex::new(Vec::new())));
+    let line = line.into();
+    println!("{line}");
+    lines.lock().expect("lines lock").push(line);
 }
 
-/// A command: `fulfillment` handles it (point-to-point work).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// A command: fulfillment SHOULD ship the order.
+#[derive(Debug, Serialize, Deserialize)]
 struct Ship {
     order: String,
 }
-
 impl Schema for Ship {
     fn schema_def() -> SchemaDef {
         SchemaDef {
@@ -43,17 +45,16 @@ impl Schema for Ship {
             version: 1,
             kind: SchemaKind::Command,
             fields: vec![FieldDef::required("order", FieldTy::Str)],
-            description: Some("Ship an order (command traffic).".into()),
+            description: Some("Fulfillment should ship the order.".into()),
         }
     }
 }
 
-/// An event: the announcement that shipping happened (published).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// An event: the order WAS shipped (announcement).
+#[derive(Debug, Serialize, Deserialize)]
 struct Shipped {
     order: String,
 }
-
 impl Schema for Shipped {
     fn schema_def() -> SchemaDef {
         SchemaDef {
@@ -84,19 +85,19 @@ impl ServiceActor for Fulfillment {
 impl MsgHandler<Ship> for Fulfillment {
     async fn handle(&mut self, msg: Ship, ctx: &mut MsgCtx<'_>) {
         log(format!("[fulfillment] shipped {}", msg.order));
-        // The announcement: whoever cares subscribes to `orders`.
-        ctx.publish(Topic::new("orders"), &Shipped { order: msg.order });
+        // The announcement: every subscriber of the EVENT gets a copy.
+        ctx.publish(&Shipped { order: msg.order });
     }
 }
 
-/// The announcement consumer: billing subscribes to the topic.
+/// The announcement consumer: billing handles AND subscribes to
+/// `Shipped` — the tables are independent, so it receives both the
+/// broadcasts and (point-to-point) sends.
 struct Billing;
 
 impl ServiceActor for Billing {
     fn manifest() -> ActorManifest {
-        ActorManifest::new()
-            .handles::<Shipped>()
-            .kind(ActorKind::Service)
+        ActorManifest::new().kind(ActorKind::Service)
     }
 
     async fn start(
@@ -112,8 +113,8 @@ impl MsgHandler<Shipped> for Billing {
     }
 }
 
-/// The traffic observer: the auditor sees every Ship COMMAND that
-/// flows — no sender cooperation needed.
+/// The audit subscriber: subscribes to the Ship COMMAND without
+/// handling it — it observes traffic and is never a dispatch target.
 struct Auditor;
 
 impl ServiceActor for Auditor {
@@ -138,23 +139,20 @@ impl MsgHandler<Ship> for Auditor {
 async fn main() {
     let system = ActorSystem::new(SystemConfig::production());
 
-    // The primary (handles Ship), the auditor (observes Ship traffic),
-    // and billing (subscribes to the Shipped announcement).
+    // The primary (handles Ship), the auditor (subscribes to Ship
+    // traffic), and billing (subscribes to the Shipped announcement).
     spawn_service_builder::<Fulfillment>(&system)
         .at(ActorPath::new("fulfillment"))
         .handles::<Ship>()
         .start();
     spawn_service_builder::<Auditor>(&system)
         .at(ActorPath::new("auditor"))
-        .observes::<Ship>()
+        .subscribe::<Ship>()
         .start();
-    let billing = spawn_service_builder::<Billing>(&system)
+    spawn_service_builder::<Billing>(&system)
         .at(ActorPath::new("billing"))
-        .handles::<Shipped>()
+        .subscribe::<Shipped>()
         .start();
-    system
-        .subscribe(&billing, &Topic::new("orders"), None)
-        .expect("billing subscribes to orders");
 
     // 1. A path-addressed Ship command (the usual dispatch).
     system
@@ -167,25 +165,46 @@ async fn main() {
         .await
         .expect("delivered");
 
-    // 2. A schema-addressed Ship (the kernel picks the handler) — the
-    //    auditor sees this too, though nobody announced it.
+    // 2. A schema-addressed Ship (the kernel picks the handler). The
+    //    command still routes ONLY to fulfillment — subscribers are
+    //    never dispatch targets.
     let env = Envelope::json(
         Ship::schema_id(),
         Address::Schema(Ship::schema_id()),
-        json!({ "order": "ord-2" }),
+        serde_json::json!({ "order": "ord-2" }),
         TraceCtx::root(),
     );
     system.send(env).await.expect("schema delivery");
 
-    // Let the topic pumps drain, then tell the story.
+    // 3. A direct announcement from outside the system (no actor in
+    //    the middle): billing gets it, fulfillment does not.
+    system
+        .publish(&Shipped {
+            order: "ord-3".into(),
+        })
+        .await;
+
+    // Let the broadcasts drain, then tell the story.
     tokio::time::sleep(std::time::Duration::from_millis(300)).await;
     println!("--- traffic report ---");
-    let lines = LINES.get().map(|l| l.lock().expect("lines lock").clone()).unwrap_or_default();
-    let ships = lines.iter().filter(|l| l.contains("auditor")).count();
+    let lines = LINES
+        .get()
+        .map(|l| l.lock().expect("lines lock").clone())
+        .unwrap_or_default();
+    let shipped_by_fulfillment = lines
+        .iter()
+        .filter(|l| l.contains("fulfillment"))
+        .count();
+    let ships_seen_by_auditor = lines.iter().filter(|l| l.contains("auditor")).count();
     let announcements = lines.iter().filter(|l| l.contains("billing")).count();
-    println!("  Ship commands observed by the auditor: {ships}");
+    println!("  Ship commands dispatched to fulfillment: {shipped_by_fulfillment}");
+    println!("  Ship commands observed by the auditor: {ships_seen_by_auditor}");
     println!("  Shipped announcements invoiced by billing: {announcements}");
-    assert_eq!(ships, 2, "the auditor saw BOTH Ship commands");
-    assert_eq!(announcements, 2, "billing invoiced both announcements");
-    println!("\nobserve = copies of the traffic; topics = the announcements.");
+    assert_eq!(shipped_by_fulfillment, 2, "commands went to the handler");
+    assert_eq!(ships_seen_by_auditor, 2, "the auditor saw BOTH Ship events");
+    assert_eq!(
+        announcements, 3,
+        "billing invoiced both shipments + the direct announcement"
+    );
+    println!("\npublish/subscribe = events to every subscriber; handles/tell = commands to one handler.");
 }
