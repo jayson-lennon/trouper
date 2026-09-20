@@ -7716,6 +7716,101 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn passivated_entity_reactivation_redeclares_its_subscriptions() {
+        // Given a partition set whose factory declares a SUBSCRIPTION on
+        // Shipped for each entity (50ms idle passivation). The entity
+        // handles the partition's keyed command (activation) and the
+        // broadcast message.
+        let (system, clock) = ActorSystem::test();
+        system.register_schema::<KeyedAdd>();
+        let spec = crate::pool::PartitionSpec {
+            public: ActorPath::new("accts"),
+            system: system.clone(),
+            factory: Arc::new(|system, path, args| {
+                let (idx, sink) = open_sink();
+                bind_sink(path, sink);
+                crate::builder::spawn_service_builder::<Edged>(system)
+                    .at(path.clone())
+                    .args(json!({ "sink": idx, "tag": path.to_string() }))
+                    .passivate_after(std::time::Duration::from_millis(50))
+                    .handles::<KeyedAdd>()
+                    .handles::<Shipped>()
+                    .subscribe::<Shipped>()
+                    .start();
+            }),
+            key_field: "account".to_owned(),
+            args_template: None,
+            opts: SpawnOpts::default(),
+        };
+        system.install_partition_set(spec).expect("install");
+
+        // When an entity is activated (its sink gets the delivery),
+        // passivates, then a broadcast crosses the fabric.
+        let e = system.envelope(
+            KeyedAdd::schema_id(),
+            ActorPath::new("accts"),
+            json!({ "n": 4, "account": "k" }),
+        );
+        system.send(e).await.expect("delivered");
+        wait_for(|| async { !sink_read(&ActorPath::new("accts/k")).is_empty() }).await;
+        clock.advance(std::time::Duration::from_millis(200));
+        wait_for(|| async {
+            stopped_with(
+                &system,
+                &ActorPath::new("accts/k"),
+                crate::actor::StopReason::Passivated,
+            )
+        })
+        .await;
+
+        // And the SAME key is addressed again (the factory re-spawns the
+        // entity, re-declaring its subscription).
+        // Drop the pre-passivation lines, then re-address the same key
+        // until the entity responds again (the stop sweep may still be
+        // tearing the old slot down when the first send lands).
+        sink_table().lock().remove(&ActorPath::new("accts/k").to_string());
+        for _ in 0..200 {
+            let e2 = system.envelope(
+                KeyedAdd::schema_id(),
+                ActorPath::new("accts"),
+                json!({ "n": 10, "account": "k" }),
+            );
+            system.send(e2).await.expect("delivered after passivation");
+            let lines = sink_read(&ActorPath::new("accts/k"));
+            if lines.iter().any(|l| l.ends_with(":keyed:10")) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        let lines = sink_read(&ActorPath::new("accts/k"));
+        assert!(
+            lines.iter().any(|l| l.ends_with(":keyed:10")),
+            "reactivation delivered: {lines:?}"
+        );
+
+
+        // Then the re-spawned entity still receives broadcasts: its
+        // subscription was re-declared by the factory's builder.
+        system
+            .publish(&Shipped {
+                order: "o-post".into(),
+            })
+            .await;
+        wait_for(|| async {
+            sink_read(&ActorPath::new("accts/k"))
+                .iter()
+                .any(|l| l.ends_with(":shipped:o-post"))
+        })
+        .await;
+        let lines = sink_read(&ActorPath::new("accts/k"));
+        assert_eq!(
+            lines.last(),
+            Some(&"accts/k:shipped:o-post".to_owned()),
+            "reactivated entity received the post-reactivation broadcast"
+        );
+    }
+
+    #[tokio::test]
     async fn passivated_entity_reactivates_through_partition_set() {
         // Given a partition set of passivating KeyCounters (50ms idle).
         let (system, clock) = ActorSystem::test();
@@ -8179,6 +8274,12 @@ mod tests {
             ctx.publish(&Shipped {
                 order: msg.order,
             });
+        }
+    }
+
+    impl MsgHandler<KeyedAdd> for Edged {
+        async fn handle(&mut self, msg: KeyedAdd, _ctx: &mut crate::context::MsgCtx<'_>) {
+            self.sink.lock().push(format!("{}:keyed:{}", self.tag, msg.n));
         }
     }
 
