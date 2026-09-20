@@ -16,27 +16,16 @@
 //!   observed by the `fs.audit` subscriber (a tell has no asker: the reply
 //!   channel is gone, the fact channel is not).
 //!
-//! A state-report bridge is installed, so a second shell can reflect the
-//! system; a control bridge is installed too, so a second shell can act
-//! on it — scaling `fs.saver` from outside the process:
-//!
-//! ```text
-//! shell 1: cargo run --example file_save
-//! shell 2: cargo run -p canvas
-//! shell 2: cargo run -p canvas -- ctl ScalePool '{"kind":"saver","workers":3}'
-//! shell 2: cargo run -p canvas   # the export now shows fs.saver as a 3-worker pool
-//! ```
+//! Run it: `cargo run --example file_save`
 
 use error_stack::Report;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use std::sync::Arc;
 use std::time::Duration;
 use tracing::Level;
 use trouper::actor::{MsgHandler, ServiceActor};
 use trouper::prelude::*;
 use trouper::registry::RegistryError;
-use trouper::state_report::{ReportState, StateReported, StateReporter};
 use trouper::system::ActorSystem;
 
 // ---------- the domain seam -------------------------------------------------
@@ -73,8 +62,8 @@ impl FileStore for RealFs {
 /// Rich domain types on both fields. `PathBuf` serializes as a JSON
 /// string; `Vec<u8>` has no native JSON form, so serde picks its array-of-
 /// numbers representation — which is what [`FieldTy::Json`] exists for
-/// ("arbitrary JSON; the escape hatch for payloads the canvas need not
-/// inspect deeply").
+/// ("arbitrary JSON; the escape hatch for payloads a tooling consumer need
+/// not inspect deeply").
 #[derive(Serialize, Deserialize)]
 struct SaveFile {
     path: std::path::PathBuf,
@@ -246,12 +235,11 @@ where
     panic!("demo condition never became true");
 }
 
-/// Runs the demo: tell flow, ask flow, failure paths, then serves state
-/// queries until ctrl-c.
+/// Runs the demo: tell flow, ask flow, failure paths.
 ///
 /// # Errors
 ///
-/// Propagates bridge installation failures (zenoh session/queryable).
+/// Propagates runtime errors (spawn failures, ask rejections).
 async fn run_demo() -> Result<(), Box<dyn std::error::Error>> {
     let system = ActorSystem::new(SystemConfig::production());
 
@@ -278,20 +266,6 @@ async fn run_demo() -> Result<(), Box<dyn std::error::Error>> {
         .handles::<SaveFailed>()
         .subscribe::<SaveFailed>()
         .start();
-
-    // The state reporter the bridge serves every query through.
-    trouper::builder::spawn_es_builder::<StateReporter>(&system)
-        .at(ActorPath::new("state/reporter"))
-        .args(json!({}))
-        .handles::<ReportState>()
-        .emits::<StateReported>()
-        .start();
-    wait(|| async {
-        system
-            .inbox_cursor(&ActorPath::new("state/reporter"))
-            .is_some()
-    })
-    .await;
 
     // --- tell: fire-and-forget, confirmed only by looking at the disk ---
     let tell_path = std::env::temp_dir().join("trouper-sdk-file-save-tell.txt");
@@ -402,46 +376,7 @@ async fn run_demo() -> Result<(), Box<dyn std::error::Error>> {
         export.schemas.len()
     );
 
-    // Keep the bridge session alive — dropping it closes the queryable.
-    let _session = state_report::install(system.clone(), ActorPath::new("state/reporter")).await?;
-
-    // The control plane: the allow-list is the app's choice, made here.
-    // The blueprint binds the code half (the FileSaver type behind the
-    // factory, the public name, the algo, the seed); the wire only ever
-    // carries the variable half — `workers`.
-    let blueprints = state_report::Blueprints::new().with_kind(
-        "saver",
-        state_report::PoolBlueprint {
-            public: ActorPath::new("fs.saver"),
-            algo: trouper::pool::PoolAlgo::RoundRobin,
-            parent: None,
-            seed: 42,
-            args: Some(json!({})),
-            factory: Arc::new(|system, path, args| {
-                trouper::builder::spawn_service_builder::<FileSaver<RealFs>>(system)
-                    .at(path.clone())
-                    .args(args.clone())
-                    .handles::<SaveFile>()
-                    .emits::<SaveAck>()
-                    .emits::<SaveFailed>()
-                    .start();
-            }),
-        },
-    );
-    let router =
-        state_report::ControlRouter::new().with(state_report::ScalePoolCmd::new(blueprints));
-    let _control = state_report::install_control(system.clone(), router).await?;
-
-    println!(
-        "serving state on the trouper/state key — run `cargo run -p canvas` (or the GUI) now (ctrl-c to stop)"
-    );
-    println!(
-        "serving commands on the trouper/control key — try:\n  cargo run -p canvas -- ctl\n  cargo run -p canvas -- ctl ScalePool '{{\"kind\":\"saver\",\"workers\":3}}'"
-    );
-    tokio::signal::ctrl_c()
-        .await
-        .expect("ctrl-c handler installs");
-    println!("bye");
+    println!("demo complete");
     Ok(())
 }
 

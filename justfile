@@ -1,8 +1,8 @@
 test:
-    cargo nextest run --workspace
+    cargo nextest run
 
 check:
-    cargo check --workspace
+    cargo check
 
 build:
-    cargo build --workspace
+    cargo build

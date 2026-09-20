@@ -7767,7 +7767,7 @@ mod tests {
         let spec = crate::pool::PartitionSpec {
             public: ActorPath::new("accts"),
             system: system.clone(),
-            factory: Arc::new(|system, path, args| {
+            factory: Arc::new(|system, path, _args| {
                 let (idx, sink) = open_sink();
                 bind_sink(path, sink);
                 crate::builder::spawn_service_builder::<Edged>(system)
