@@ -8289,6 +8289,10 @@ mod tests {
     struct Edged {
         sink: Arc<Mutex<Vec<String>>>,
         tag: &'static str,
+        /// Per-delivery stall in ms (test scaffolding): holds THIS
+        /// handler open so a test can observe what a fan-out does while
+        /// one subscriber is busy. Zero = no stall.
+        stall_ms: u64,
     }
 
     impl ServiceActor for Edged {
@@ -8301,9 +8305,11 @@ mod tests {
         ) -> Result<Self, error_stack::Report<crate::registry::RegistryError>> {
             let idx = args["sink"].as_u64().expect("sink index") as usize;
             let tag = args["tag"].as_str().expect("tag").to_owned();
+            let stall_ms = args["stall_ms"].as_u64().unwrap_or(0);
             Ok(Self {
                 sink: sinks().lock()[idx].clone(),
                 tag: Box::leak(tag.into_boxed_str()),
+                stall_ms,
             })
         }
     }
@@ -8329,6 +8335,11 @@ mod tests {
 
     impl MsgHandler<Shipped> for Edged {
         async fn handle(&mut self, msg: Shipped, _ctx: &mut crate::context::MsgCtx<'_>) {
+            if self.stall_ms > 0 {
+                // Deliberately slow handler: the delivery loop for THIS
+                // subscriber is busy while later fan-outs queue up.
+                tokio::time::sleep(std::time::Duration::from_millis(self.stall_ms)).await;
+            }
             self.sink
                 .lock()
                 .push(format!("{}:shipped:{}", self.tag, msg.order));
@@ -8364,10 +8375,34 @@ mod tests {
         handles_shipped: bool,
         subscribes_shipped: bool,
     ) -> Arc<Mutex<Vec<String>>> {
+        spawn_edged_stall(
+            system,
+            path,
+            tag,
+            handles_pack,
+            handles_shipped,
+            subscribes_shipped,
+            0,
+        )
+        .await
+    }
+
+    /// Capacity-control variant: the actor's mailbox is `capacity` deep
+    /// and its Shipped handler stalls `stall_ms` per delivery (tests that
+    /// saturate an inbox or need a busy subscriber).
+    async fn spawn_edged_stall(
+        system: &ActorSystem,
+        path: &str,
+        tag: &str,
+        handles_pack: bool,
+        handles_shipped: bool,
+        subscribes_shipped: bool,
+        stall_ms: u64,
+    ) -> Arc<Mutex<Vec<String>>> {
         let (idx, sink) = open_sink();
         let mut b = crate::builder::spawn_service_builder::<Edged>(system)
             .at(ActorPath::new(path))
-            .args(json!({ "sink": idx, "tag": tag }));
+            .args(json!({ "sink": idx, "tag": tag, "stall_ms": stall_ms }));
         if handles_pack {
             b = b.handles::<Pack>();
         }
@@ -8696,6 +8731,293 @@ mod tests {
             sink_read(&ActorPath::new("parked-sub")),
             ["parked:shipped:first", "parked:shipped:second"]
         );
+    }
+
+    #[tokio::test]
+    async fn publish_value_broadcasts_untyped_payload_to_subscribers() {
+        // Given a subscriber that declared `.subscribe::<Shipped>()` at
+        // spawn (the untyped surface has no type to infer it from).
+        let (system, _clock) = ActorSystem::test();
+        let sub = spawn_edged(&system, "sub", "sub", false, true).await;
+
+        // When an UNTYPED payload is published under the same schema.
+        system
+            .publish_value(Shipped::schema_id(), json!({ "order": "o-uv" }))
+            .await;
+
+        // Then the subscriber decoded it like any published event — the
+        // erased bridge's publish reaches declarants identically.
+        wait_for(|| async { sub.lock().len() == 1 }).await;
+        assert_eq!(sub.lock().as_slice(), ["sub:shipped:o-uv"]);
+    }
+
+    #[tokio::test]
+    async fn publish_value_with_zero_subscribers_is_noop() {
+        // Given a system where nobody subscribes to the COMMAND schema
+        // Pack (publish_value must not consult the handles table).
+        let (system, _clock) = ActorSystem::test();
+        spawn_edged(&system, "packer", "packer", true, false).await;
+
+        // When an untyped payload is published under that schema.
+        system
+            .publish_value(Pack::schema_id(), json!({ "order": "o-nosub" }))
+            .await;
+        tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+
+        // Then nothing routed (publish never routes) and nothing
+        // dead-lettered: a zero-subscriber publish is a silent no-op.
+        assert!(sink_read(&ActorPath::new("packer")).is_empty());
+        assert_eq!(system.dead_letter_count().await, 0);
+    }
+
+    #[tokio::test]
+    async fn self_publisher_receives_its_own_published_event() {
+        // Given one actor that both HANDLES Pack and SUBSCRIBES to
+        // Shipped — the event its handler announces lands in its own
+        // mailbox too (fan-out is by declaration, not by sender).
+        let (system, _clock) = ActorSystem::test();
+        let echo = spawn_edged_with(&system, "echo", "echo", true, true, true).await;
+
+        // When a command is dispatched to it (its handler publishes
+        // Shipped mid-dispatch).
+        system
+            .tell(
+                ActorPath::new("echo"),
+                Pack {
+                    order: "o-self".into(),
+                },
+            )
+            .await
+            .expect("delivered");
+
+        // Then the actor received BOTH the command it handled AND the
+        // event it published (self-delivery is the contract).
+        wait_for(|| async { echo.lock().len() == 2 }).await;
+        assert_eq!(
+            echo.lock().as_slice(),
+            ["echo:pack:o-self", "echo:shipped:o-self"]
+        );
+    }
+
+    #[tokio::test]
+    async fn broadcast_delivers_in_subscription_declaration_order() {
+        // Given two subscribers declared in a known order.
+        let (system, _clock) = ActorSystem::test();
+        let first = spawn_edged(&system, "first", "first", false, true).await;
+        let second = spawn_edged(&system, "second", "second", false, true).await;
+
+        // When one event is published and both deliveries settle.
+        system
+            .publish(&Shipped {
+                order: "o-order".into(),
+            })
+            .await;
+        wait_for(|| async { first.lock().len() == 1 && second.lock().len() == 1 }).await;
+
+        // Then the per-subscriber Delivered facts appear in the tap in
+        // declaration order (the fan-out walks the table front to back).
+        let delivered: Vec<(ActorPath, u64)> = system
+            .tap_facts()
+            .into_iter()
+            .filter_map(|f| match f.kind {
+                crate::tap::FactKind::Delivered { to, schema, .. }
+                    if schema == Shipped::schema_id() =>
+                {
+                    Some((to, f.offset))
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(delivered.len(), 2, "one Delivered per subscriber");
+        assert_eq!(
+            delivered,
+            [
+                (ActorPath::new("first"), delivered[0].1),
+                (ActorPath::new("second"), delivered[1].1),
+            ],
+            "declaration order = delivery order: {delivered:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn stalled_subscriber_does_not_block_or_starve_other_subscribers() {
+        // Given a subscriber whose handler stalls 30ms per delivery
+        // (busy, but with the DEFAULT mailbox — the front door buffers
+        // the fan-out) and a fast subscriber declared after it.
+        let (system, _clock) = ActorSystem::test();
+        spawn_edged_stall(&system, "slow", "slow", false, true, true, 30).await;
+        let fast = spawn_edged(&system, "fast", "fast", false, true).await;
+
+        // When four events are published back to back (the slow actor
+        // stays busy for ~120ms while they arrive).
+        for order in ["m-1", "m-2", "m-3", "m-4"] {
+            system
+                .publish(&Shipped {
+                    order: order.into(),
+                })
+                .await;
+        }
+
+        // Then the fast subscriber received all four promptly, in publish
+        // order — its peer's stall never delayed or dropped its copies...
+        wait_for(|| async { fast.lock().len() == 4 }).await;
+        assert_eq!(
+            fast.lock().as_slice(),
+            [
+                "fast:shipped:m-1",
+                "fast:shipped:m-2",
+                "fast:shipped:m-3",
+                "fast:shipped:m-4"
+            ]
+        );
+        // ...and the stalled subscriber drained every copy too, in publish
+        // order (front-door buffering, Block backpressure, no loss).
+        wait_for(|| async { sink_read(&ActorPath::new("slow")).len() == 4 }).await;
+        assert_eq!(
+            sink_read(&ActorPath::new("slow")),
+            [
+                "slow:shipped:m-1",
+                "slow:shipped:m-2",
+                "slow:shipped:m-3",
+                "slow:shipped:m-4"
+            ]
+        );
+        // And the stall surfaced nothing in the DLQ.
+        assert_eq!(system.dead_letter_count().await, 0);
+    }
+
+    #[tokio::test]
+    async fn publish_during_shutdown_sweep_is_silent_noop() {
+        // Given a subscriber with an empty sink.
+        let (system, _clock) = ActorSystem::test();
+        let sub = spawn_edged(&system, "sub", "sub", false, true).await;
+
+        // When the graceful sweep starts in the background (barrier up:
+        // every new delivery refuses) and a publish races it after the
+        // barrier.
+        let sweep = tokio::spawn({
+            let system = system.clone();
+            async move {
+                system
+                    .shutdown_graceful(std::time::Duration::from_secs(5))
+                    .await
+            }
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        system
+            .publish(&Shipped {
+                order: "o-swept".into(),
+            })
+            .await;
+        sweep.await.expect("sweep joins");
+
+        // Then the publish neither panicked nor delivered: the barrier
+        // stands (subscriber's sink empty) and nothing surfaced in the
+        // DLQ — a mid-shutdown publish is a silent no-op, an error would
+        // push on a closed tap after teardown.
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        assert!(sub.lock().is_empty());
+        assert_eq!(system.dead_letter_count().await, 0);
+    }
+
+    #[tokio::test]
+    async fn ctx_publish_records_sent_fact_with_schema_address_and_child_trace() {
+        // Given a Pack handler (whose ctx publishes Shipped) and a
+        // Shipped subscriber.
+        let (system, _clock) = ActorSystem::test();
+        spawn_edged(&system, "packer", "packer", true, false).await;
+        spawn_edged(&system, "sub", "sub", false, true).await;
+
+        // When a command is dispatched from OUTSIDE the system (root
+        // trace) and its announced event fans out.
+        system
+            .tell(
+                ActorPath::new("packer"),
+                Pack {
+                    order: "o-trace".into(),
+                },
+            )
+            .await
+            .expect("delivered");
+        wait_for(|| async { sink_read(&ActorPath::new("sub")).len() == 1 }).await;
+
+        // Then the event's Sent fact is schema-addressed, shares the
+        // command's trace (one conversation) with a FRESH causality (the
+        // publish is a NEW hop caused by the command hop).
+        let facts = system.tap_facts();
+        let cmd_sent = facts
+            .iter()
+            .find(|f| {
+                matches!(
+                    &f.kind,
+                    crate::tap::FactKind::Sent { dest, schema, .. }
+                        if *dest == Address::Path(ActorPath::new("packer"))
+                            && *schema == Pack::schema_id()
+                )
+            })
+            .expect("command Sent fact recorded");
+        let cmd_trace = match &cmd_sent.kind {
+            crate::tap::FactKind::Sent { trace, .. } => trace.clone(),
+            _ => unreachable!(),
+        };
+        let evt_sent = facts
+            .iter()
+            .find(|f| {
+                matches!(
+                    &f.kind,
+                    crate::tap::FactKind::Sent { dest, schema, .. }
+                        if *dest == Address::Schema(Shipped::schema_id())
+                )
+            })
+            .expect("broadcast Sent fact recorded");
+        let (evt_dest, evt_trace) = match &evt_sent.kind {
+            crate::tap::FactKind::Sent { dest, trace, .. } => (dest.clone(), trace.clone()),
+            _ => unreachable!(),
+        };
+        assert_eq!(evt_dest, Address::Schema(Shipped::schema_id()));
+        assert_eq!(
+            evt_trace.trace_id, cmd_trace.trace_id,
+            "ctx.publish stays in the command's conversation"
+        );
+        assert_ne!(
+            evt_trace.causality_id, cmd_trace.causality_id,
+            "the publish is a fresh hop, not the command's causality"
+        );
+    }
+
+    #[tokio::test]
+    async fn restart_in_flight_subscriber_is_skipped_while_others_receive() {
+        // Given a live subscriber and a target whose endpoint is swapped
+        // out from under it (the restart-in-flight state: the slot is
+        // present, the endpoint closed, the loop gone).
+        let (system, _clock) = ActorSystem::test();
+        let live = spawn_edged(&system, "live", "live", false, true).await;
+        spawn_edged(&system, "resurr", "resurr", false, true).await;
+        {
+            let mut registry = system.registry.lock();
+            registry
+                .swap_endpoint(
+                    &ActorPath::new("resurr"),
+                    Endpoint::new(tokio::sync::mpsc::channel(1).0),
+                )
+                .expect("slot exists");
+        }
+
+        // When an event is published mid-restart.
+        system
+            .publish(&Shipped {
+                order: "o-restart".into(),
+            })
+            .await;
+
+        // Then the live subscriber received its copy, the closed-endpoint
+        // subscriber was skipped exactly once (no phantom delivery), and
+        // nothing dead-lettered — one dead reader never fails the others.
+        wait_for(|| async { live.lock().len() == 1 }).await;
+        tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+        assert_eq!(live.lock().as_slice(), ["live:shipped:o-restart"]);
+        assert_eq!(sink_read(&ActorPath::new("resurr")).len(), 0);
+        assert_eq!(system.dead_letter_count().await, 0);
     }
 
     #[tokio::test]
