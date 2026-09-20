@@ -237,10 +237,13 @@ mod tests {
         };
 
         // When nudging the clock repeatedly but never reaching the target
-        // (each nudge counts as a wake; the waiter has a bounded wake budget).
+        // (each nudge counts as a wake; the waiter has a bounded wake
+        // budget). Yields — not sleeps — space the nudges: the point is a
+        // scheduling point per nudge, and the budget has 1000 nudges of
+        // slack over the target, so minor wake coalescing is tolerated.
         for _ in 0..3_000 {
             fake.set_millis(10);
-            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+            tokio::task::yield_now().await;
         }
         let result = waiter.await.expect("joined");
 

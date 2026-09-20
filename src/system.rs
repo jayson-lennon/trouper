@@ -389,9 +389,12 @@ impl ActorSystem {
         spec: crate::pool::PoolSpec,
     ) -> Result<(), error_stack::Report<crate::registry::RegistryError>> {
         // 1. TAKEOVER: stop-drain whoever holds the public path today (a
-        // plain actor). A no-op when the path is free.
+        // plain actor). A no-op when the path is free. The takeover uses
+        // the SAME deadline-bounded stop as everywhere else (not the 5s
+        // default): a stalled holder must not stall the install.
         if self.registry.lock().lookup(&spec.public).is_some() {
-            self.stop(&spec.public).await;
+            const TAKEOVER_STOP_BUDGET: std::time::Duration = std::time::Duration::from_millis(250);
+            self.stop_bounded(&spec.public, TAKEOVER_STOP_BUDGET).await;
         }
         // 2. WORKERS: spawn through the factory; each worker is a
         // supervised child of the spec parent, or parentless.
@@ -1346,8 +1349,13 @@ impl ActorSystemCore {
         registry.add_rule(rule);
     }
 
-    /// The bounded stop; recursion depth bounded by timeout.
-    fn stop_bounded<'a>(
+    /// The bounded stop: identical to [`ActorSystem::stop`], but the
+    /// caller sets the deadline budget instead of the default 5s. Children
+    /// stop first (recursion shares one budget); stragglers after expiry
+    /// are hard-stopped and their undelivered mail lands in the DLQ
+    /// (`StoppedWithMail`) — expiry is an observable outcome, not an
+    /// error.
+    pub fn stop_bounded<'a>(
         &'a self,
         path: &'a ActorPath,
         remaining: std::time::Duration,
@@ -2156,8 +2164,13 @@ mod tests {
             );
         }
 
-        // When the actor is stopped while mail is queued.
-        system.stop(&path).await;
+        // When the actor is stopped while mail is queued. The parked
+        // handler can never finish, so the budget EXPIRES — assert the
+        // expiry path directly with a short budget (the 5s default would
+        // just burn wall clock; the outcome is identical).
+        system
+            .stop_bounded(&path, std::time::Duration::from_millis(100))
+            .await;
 
         // Then the queued envelopes were flushed to the dead-letter
         // mirror with the typed StoppedWithMail reason.
