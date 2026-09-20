@@ -42,7 +42,7 @@ Entries are added or amended **only with human approval**.
 - (runtime) Actor `manifest()` defaults to an empty manifest; builders supply the contract kind and edges, making builder declarations the single source of an actor's declared surface.
 - (runtime) The ActorSystem exposes typed `tell` and `ask` entry points; ask is lease-backed with a mandatory timeout and settles with the same Replied/Timeout/Failed facts as in-actor asks.
 - (runtime) Event emission is declaration-filtered: the kernel drops events whose schema the actor has not declared, before journal append, with a dead-letter fact and a tracing error; journals therefore contain only declared schemas.
-- (runtime) Pools and partition sets are declarative specs resolved by the kernel at route time, never forwarding actors: senders keep addressing the public path; partition sets derive per-entity paths from a schema-declared shard key and activate entities on demand.
+- (runtime) Partition sets are declarative specs resolved by the kernel at route time: senders keep addressing the public path; per-entity paths derive from a schema-declared shard key and entities activate on demand.
 - (runtime) Service-actor asks are lease-backed: every ask carries a mandatory timeout, the reply slot is a runtime lease that dies with the ask, and outcomes (Replied/Timeout/Failed) are tap facts.
 - (tap) The tap is a global bounded drop-oldest ring of facts that may drop under pressure; it is observation only — delivery never flows through it, and JSON projection happens only at the tap boundary (`Fact::to_json`).
 - (tap) Each tap fact carries a monotonic `offset`; the ring exposes its retained `[floor, next)` range, and offset gaps signal eviction.
@@ -55,6 +55,7 @@ Entries are added or amended **only with human approval**.
 - (runtime) Replies are point-to-point: a reply with no reply_to is dropped silently, never broadcast; failures that must reach non-asking observers travel as published events on topics.
 - (runtime) Handler contexts (CmdCtx/MsgCtx) expose only tier-curated methods; the outbox, trace, and ask port are crate-private plumbing.
 - (runtime) Handler effects are typed: ctx reply/publish/send take Message values (Schema + serde), derive the schema id from the type, and serialize at intent time; raw JSON variants remain as the \*\_json escape hatch.
+- (contexts) MsgCtx exposes typed tell/publish/send_to_any/ask/reply; CmdCtx (event-sourced) exposes only sync intents — no ask, because a decision function cannot await.
 - (lifecycle) A trouper actor's on_stop hook runs on graceful stop, self-stop, passivation, and the shutdown sweep; never on crash or hard shutdown.
 - (lifecycle) Service actors receive an async on_stop(&mut self); event-sourced actors receive a sync on_stop(&self).
 - (lifecycle) stop_self() records a deferred intent; the actor stops after the current message commits, flushing pending sends in order.
@@ -64,8 +65,9 @@ Entries are added or amended **only with human approval**.
 - (journal) All event-sourced journal reads and writes route through the async JournalStore trait; the in-memory store is the default and only implementation.
 - (journal) The JournalStore append is awaited before the command's ack, backends may write through or buffer, and the runtime flushes the store once during the shutdown sweep.
 - (supervision) A supervised child's restart engine exits when the child's spec is removed and stays suspended during the shutdown sweep.
+- (supervision) Restart-budget exhaustion stops the child and delivers an Escalated message to its declared parent path; the parent is an ordinary actor whose handler owns the response.
 - (partitions) Partition entities passivate per their factory's builder config and re-spawn on the next send to the public path.
-- (routing) Events broadcast by schema: system.publish and ctx.publish fan out to every actor that declared .subscribe for the message's schema; zero subscribers is a silent no-op.
-- (routing) Commands route point-to-point through the handles table (round-robin across handlers); the handles and subscribe tables are disjoint.
-- (routing) deliver_schema_value dispatches an untyped payload by its schema's declared kind: Event schemas broadcast, Command schemas route to a handler.
-- (routing) declare_subscriber adds a post-spawn subscription for runtime-spawned actors, and a re-spawned partition entity re-declares its subscriptions.
+- (routing) system.publish and ctx.publish deliver one copy to every actor that declared .handles for the schema; zero handlers is a silent no-op.
+- (routing) system.tell delivers one copy to the addressed path; system.send_to_any delivers one copy to one handler of the schema (round-robin); how a message arrived is invisible to the receiver's dispatch.
+- (routing) deliver_schema_value uses the schema's declared kind as the erased bridge's default transport: Event schemas broadcast, Command schemas route to one handler.
+- (routing) A re-spawned partition entity re-declares its handled schemas.
