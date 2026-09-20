@@ -393,7 +393,11 @@ impl MsgHandler<TransferCmd> for TransferService {
         // completion fact instead. A FROZEN counterparty's set was never
         // installed: the send dead-letters, no fact ever comes back, and
         // the tick sweep reclaims the pending.
-        let set = if cmd.from == "frozen" { "frozen-accts" } else { "accts" };
+        let set = if cmd.from == "frozen" {
+            "frozen-accts"
+        } else {
+            "accts"
+        };
         ctx.send(
             Address::Path(ActorPath::new(set)),
             &TransferDebit {
@@ -477,7 +481,9 @@ impl MsgHandler<Tick> for TransferService {
 
 #[tokio::main]
 async fn main() {
-    tracing_subscriber::fmt().with_max_level(Level::ERROR).init();
+    tracing_subscriber::fmt()
+        .with_max_level(Level::ERROR)
+        .init();
     let system = ActorSystem::new(SystemConfig::production());
 
     // The partition spec validates against the schema table AT INSTALL —
@@ -530,9 +536,7 @@ async fn main() {
         tokio::spawn(async move {
             loop {
                 tokio::time::sleep(Duration::from_millis(20)).await;
-                let _ = system
-                    .tell(ActorPath::new("ticker"), TickBeat)
-                    .await;
+                let _ = system.tell(ActorPath::new("ticker"), TickBeat).await;
             }
         });
     }
@@ -615,14 +619,17 @@ async fn main() {
         .iter()
         .filter(|r| r.starts_with("Undeliverable") || r.starts_with("Unresolvable"))
         .count();
-    println!("final: tap facts = {}, dlq = {} ({} 'never settles' drops)", system.tap_facts().len(), dlq, dropped);
+    println!(
+        "final: tap facts = {}, dlq = {} ({} 'never settles' drops)",
+        system.tap_facts().len(),
+        dlq,
+        dropped
+    );
     let drained = system.drain_dead_letters();
     for letter in &drained {
         println!(
             "  drained: {} dest={:?} reason={:?} (envelope retained — inspect, then resend deliberately)",
-            letter.schema,
-            letter.dest,
-            letter.reason
+            letter.schema, letter.dest, letter.reason
         );
     }
     if !drained.is_empty() {

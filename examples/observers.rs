@@ -186,10 +186,7 @@ async fn main() {
     for letter in &drained {
         record(format!(
             "drained: {} → {:?} ({:?}) — envelope schema {}",
-            letter.dest,
-            letter.reason,
-            letter.detail,
-            letter.envelope.schema,
+            letter.dest, letter.reason, letter.detail, letter.envelope.schema,
         ));
     }
     println!(

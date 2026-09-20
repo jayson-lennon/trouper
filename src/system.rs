@@ -1921,7 +1921,9 @@ mod tests {
             with_mail.len()
         );
         assert!(
-            with_mail.iter().all(|l| l.envelope.schema == Add::schema_id()),
+            with_mail
+                .iter()
+                .all(|l| l.envelope.schema == Add::schema_id()),
             "retained letters carry the original envelopes"
         );
     }
@@ -1971,10 +1973,10 @@ mod tests {
         // And the refused envelope is retained host-drainable.
         let drained = system.drain_dead_letters();
         assert!(
-            drained
-                .iter()
-                .any(|l| l.reason == crate::kernel::DeadLetterReason::InboxRefused
-                    && l.envelope.schema == Add::schema_id()),
+            drained.iter().any(
+                |l| l.reason == crate::kernel::DeadLetterReason::InboxRefused
+                    && l.envelope.schema == Add::schema_id()
+            ),
             "DLQ retains the refused envelope"
         );
     }
@@ -4802,16 +4804,14 @@ mod tests {
         };
         let fold: crate::actor::ForeignFold = {
             let f = fact.clone();
-            Arc::new(
-                move |state: &mut JsonValue, ev: &crate::envelope::Event| {
-                    if ev.schema == f {
-                        state["total"] = json!(
-                            state["total"].as_i64().unwrap_or(0)
-                                + ev.payload["delta"].as_i64().unwrap_or(0)
-                        );
-                    }
-                },
-            )
+            Arc::new(move |state: &mut JsonValue, ev: &crate::envelope::Event| {
+                if ev.schema == f {
+                    state["total"] = json!(
+                        state["total"].as_i64().unwrap_or(0)
+                            + ev.payload["delta"].as_i64().unwrap_or(0)
+                    );
+                }
+            })
         };
         system.spawn_es_foreign(
             ActorPath::new("t-pos"),
@@ -4840,16 +4840,14 @@ mod tests {
         };
         let built_fold: crate::actor::ForeignFold = {
             let f = fact.clone();
-            Arc::new(
-                move |state: &mut JsonValue, ev: &crate::envelope::Event| {
-                    if ev.schema == f {
-                        state["total"] = json!(
-                            state["total"].as_i64().unwrap_or(0)
-                                + ev.payload["delta"].as_i64().unwrap_or(0)
-                        );
-                    }
-                },
-            )
+            Arc::new(move |state: &mut JsonValue, ev: &crate::envelope::Event| {
+                if ev.schema == f {
+                    state["total"] = json!(
+                        state["total"].as_i64().unwrap_or(0)
+                            + ev.payload["delta"].as_i64().unwrap_or(0)
+                    );
+                }
+            })
         };
         crate::builder::spawn_foreign(&system)
             .at(ActorPath::new("t-built"))
@@ -5379,16 +5377,14 @@ mod tests {
                         json!({ "delta": cmd["delta"].as_i64().unwrap_or(0) }),
                     )]
                 }),
-                Arc::new(
-                    move |state: &mut JsonValue, ev: &crate::envelope::Event| {
-                        if ev.schema == f_fold {
-                            state["total"] = json!(
-                                state["total"].as_i64().unwrap_or(0)
-                                    + ev.payload["delta"].as_i64().unwrap_or(0)
-                            );
-                        }
-                    },
-                ),
+                Arc::new(move |state: &mut JsonValue, ev: &crate::envelope::Event| {
+                    if ev.schema == f_fold {
+                        state["total"] = json!(
+                            state["total"].as_i64().unwrap_or(0)
+                                + ev.payload["delta"].as_i64().unwrap_or(0)
+                        );
+                    }
+                }),
                 SpawnOpts::default(),
             );
             let mut registry = system.registry.lock();
@@ -5797,7 +5793,10 @@ mod tests {
         }
         impl ServiceActor for Forwarder {
             fn manifest() -> ActorManifest {
-                ActorManifest::new().handles::<Add>().emits::<Add>().kind(ActorKind::Service)
+                ActorManifest::new()
+                    .handles::<Add>()
+                    .emits::<Add>()
+                    .kind(ActorKind::Service)
             }
             async fn start(
                 args: &JsonValue,
@@ -6537,7 +6536,11 @@ mod tests {
             path.clone(),
             &json!({}),
             SpawnOpts::default(),
-            || vec![Arc::new(TypedServiceAdapter::<SelfStopper, Add>::new::<Add>())],
+            || {
+                vec![Arc::new(
+                    TypedServiceAdapter::<SelfStopper, Add>::new::<Add>(),
+                )]
+            },
         );
 
         // When one command drives send → stop_self.
@@ -6563,7 +6566,9 @@ mod tests {
 
         impl ServiceActor for StopOnFirst {
             fn manifest() -> ActorManifest {
-                ActorManifest::new().handles::<Add>().kind(ActorKind::Service)
+                ActorManifest::new()
+                    .handles::<Add>()
+                    .kind(ActorKind::Service)
             }
             async fn start(
                 _args: &JsonValue,
@@ -6583,7 +6588,11 @@ mod tests {
             path.clone(),
             &json!({}),
             SpawnOpts::default(),
-            || vec![Arc::new(TypedServiceAdapter::<StopOnFirst, Add>::new::<Add>())],
+            || {
+                vec![Arc::new(
+                    TypedServiceAdapter::<StopOnFirst, Add>::new::<Add>(),
+                )]
+            },
         );
 
         // When two commands arrive back to back.
@@ -6615,7 +6624,9 @@ mod tests {
         struct SelfStopper2;
         impl ServiceActor for SelfStopper2 {
             fn manifest() -> ActorManifest {
-                ActorManifest::new().handles::<Add>().kind(ActorKind::Service)
+                ActorManifest::new()
+                    .handles::<Add>()
+                    .kind(ActorKind::Service)
             }
             async fn start(
                 _args: &JsonValue,
@@ -6635,7 +6646,11 @@ mod tests {
             path.clone(),
             &json!({}),
             SpawnOpts::default(),
-            || vec![Arc::new(TypedServiceAdapter::<SelfStopper2, Add>::new::<Add>())],
+            || {
+                vec![Arc::new(
+                    TypedServiceAdapter::<SelfStopper2, Add>::new::<Add>(),
+                )]
+            },
         );
 
         // When the actor self-stops and an external stop races in.
@@ -8300,7 +8315,6 @@ mod tests {
 }
 
 impl ActorSystem {
-
     /// The store behind the system (trait object; tests and flushes).
     #[cfg(test)]
     pub(crate) fn journal_store_trait(&self) -> std::sync::Arc<dyn crate::journal::JournalStore> {
@@ -8323,5 +8337,3 @@ impl ActorSystem {
         self.registry.lock().lookup(path).is_some()
     }
 }
-
-

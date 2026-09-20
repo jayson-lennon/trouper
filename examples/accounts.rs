@@ -293,7 +293,9 @@ async fn main() {
         .iter()
         .filter(|f| matches!(&f.kind, FactKind::Failed { path, .. } if *path == account))
         .count();
-    tell(format!("tap fact seen: Failed×{failed} — handler panicked (supervision restarts)"));
+    tell(format!(
+        "tap fact seen: Failed×{failed} — handler panicked (supervision restarts)"
+    ));
 
     // -- 4. Life after restart ----------------------------------------------
     println!("== 4. after restart ==");
@@ -306,7 +308,9 @@ async fn main() {
         .filter(|f| matches!(&f.kind, FactKind::Spawned { restart: true, .. }))
         .count();
     assert!(restarted > 0, "supervision emitted Spawned{{restart:true}}");
-    tell(format!("tap fact seen: Spawned{{restart}}×{restarted} — journal replay rebuilt the actor"));
+    tell(format!(
+        "tap fact seen: Spawned{{restart}}×{restarted} — journal replay rebuilt the actor"
+    ));
     println!("   replay + redelivery → balance 80 (the crash never lost state or mail)");
 
     // -- 5. The journal tells the whole story -------------------------------

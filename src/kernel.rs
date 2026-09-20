@@ -1116,9 +1116,11 @@ impl crate::context::AskPort for KernelAskPort {
                 && registry.lock().lookup(path).map(|i| i.kind)
                     == Some(crate::actor::ActorKind::EventSourced)
             {
-                return Err(error_stack::Report::new(crate::context::AskError::Unresolved(
-                    "event-sourced actors do not answer asks — listen for the fact".to_owned(),
-                )));
+                return Err(error_stack::Report::new(
+                    crate::context::AskError::Unresolved(
+                        "event-sourced actors do not answer asks — listen for the fact".to_owned(),
+                    ),
+                ));
             }
             // Resolve the destination FIRST: an unresolvable ask fails fast.
             let endpoint = {
@@ -1391,10 +1393,7 @@ fn dead_letter_schema(ctx: &EsLoop, intent: &crate::context::Intent, schema: &Sc
             envelope.clone()
         }
         crate::context::Intent::Reply {
-            to,
-            payload,
-            trace,
-            ..
+            to, payload, trace, ..
         } => Envelope::json(schema.clone(), to.clone(), payload.clone(), *trace),
         crate::context::Intent::StopSelf => return,
     };

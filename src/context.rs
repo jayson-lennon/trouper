@@ -860,7 +860,14 @@ mod tests {
         let mut typed_outbox = Outbox::new();
         let mut raw_outbox = Outbox::new();
         {
-            let mut typed = MsgCtx::new(&path, &trace, Some(&reply_to), &view, &mut typed_outbox, None);
+            let mut typed = MsgCtx::new(
+                &path,
+                &trace,
+                Some(&reply_to),
+                &view,
+                &mut typed_outbox,
+                None,
+            );
             let mut raw = MsgCtx::new(&path, &trace, Some(&reply_to), &view, &mut raw_outbox, None);
 
             // When replying the same outcome both ways.
