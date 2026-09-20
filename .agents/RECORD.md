@@ -32,7 +32,7 @@ Entries are added or amended **only with human approval**.
 ---
 
 - (identity) **actor-canvas** is a Rust workspace (edition 2024) whose `actor-runtime` crate is a single-machine actor runtime; the root `actor-canvas` package re-exports it.
-- (runtime) All actor communication is mediated by the runtime: actors never hold channels directly; every send is routed by path or topic through the registry and emits a tap fact.
+- (runtime) All actor communication is mediated by the runtime: actors never hold channels directly; every send is routed by path or schema through the registry and emits a tap fact.
 - (runtime) Event-sourced actors are pure decision functions (sync `handle(&self)` returning events) with a single `apply` used for both live state application and replay; all other actors may perform side effects and use `ask`.
 - (runtime) The registry is kernel code, not an actor: path→endpoint slots, schema, type→handler, and topic→subscriber tables persist across actor restarts; actor identity is its registered path.
 - (runtime) Message schemas are runtime data: Rust types and external JSON descriptors register into the same schema table; payloads cross the runtime boundary as JSON.
@@ -70,7 +70,7 @@ Entries are added or amended **only with human approval**.
 - (journal) The JournalStore append is awaited before the command's ack, backends may write through or buffer, and the runtime flushes the store once during the shutdown sweep.
 - (supervision) A supervised child's restart engine exits when the child's spec is removed and stays suspended during the shutdown sweep.
 - (partitions) Partition entities passivate per their factory's builder config and re-spawn on the next send to the public path.
-- (routing) Observation is topic-backed: an actor spawned with an .observes edge is subscribed to the schema's observation topic, and the kernel publishes a copy of every routed Path or Schema delivery of that schema to it.
-- (routing) Observed copies are at-least-once per observer with per-observer cursors, published after the primary delivery, carrying a fresh causality id under the original's trace id.
-- (routing) Topic-addressed sends are not observed; topic subscribers already receive that traffic natively.
-- (routing) Observe-only actors receive copies but are never selected as primary dispatch targets for the observed schema.
+- (routing) Events broadcast by schema: system.publish and ctx.publish fan out to every actor that declared .subscribe for the message's schema; zero subscribers is a silent no-op.
+- (routing) Commands route point-to-point through the handles table (round-robin across handlers); the handles and subscribe tables are disjoint.
+- (routing) deliver_schema_value dispatches an untyped payload by its schema's declared kind: Event schemas broadcast, Command schemas route to a handler.
+- (routing) declare_subscriber adds a post-spawn subscription for runtime-spawned actors, and a re-spawned partition entity re-declares its subscriptions.
