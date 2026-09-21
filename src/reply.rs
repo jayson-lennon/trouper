@@ -75,6 +75,12 @@ impl ReplyTable {
         self.slots.lock().len()
     }
 
+    /// Whether the lease is still live (tests: the D5 prune seam).
+    #[cfg(test)]
+    pub fn holds(&self, lease: &LeaseId) -> bool {
+        self.slots.lock().contains_key(lease)
+    }
+
     /// Whether no leases are live.
     pub fn is_empty(&self) -> bool {
         self.len() == 0

@@ -35,14 +35,14 @@ pub use crate::actor::SnapshotCadence;
 /// Semantics: the idle timer stamps on each COMPLETED step (peek →
 /// dispatch → ack) — a message merely enqueued does not reset it, so a
 /// wedged actor still passivates. When the timer fires, the actor closes
-/// its inbox door and DRAINS what is already queued before tearing down
+/// its inbox door and drains what is already queued before tearing down
 /// (a race-arrival is processed, not dead-lettered; the drain is bounded
 /// by inbox capacity). A `Stopped { Passivated }` fact is recorded. A
 /// partition set re-spawns the entity on the next send to the public
 /// path; an ES entity replays its journal (lossless). Service entities
 /// restart from genesis — they must tolerate that.
 ///
-/// A STANDALONE actor's passivation is terminal until the host re-spawns
+/// A standalone actor's passivation is terminal until the host re-spawns
 /// it: passivation closes the inbox for good, so nothing without an
 /// activation path can reach it again. Use a partition set (or projector
 /// set) when an actor must stay reachable across idle eviction.
@@ -151,7 +151,7 @@ impl SystemConfig {
 /// properly-initialized fabric.
 ///
 /// The registry is its own mutex (routing never blocks actor-table
-/// mutations); actor tables share [`KernelState`]'s lock because they
+/// mutations); actor tables share the kernel state's lock because they
 /// mutate together.
 pub struct ActorSystemCore {
     /// Routing table: slots, schemas, routes.
@@ -180,7 +180,8 @@ pub struct ActorSystemCore {
 /// configuring, driving, and observing the runtime. Clone it freely —
 /// every clone aliases the same fabric; nothing is copied, and dropping
 /// the last handle never tears anything down (stopping supervision is an
-/// explicit [`ActorSystem::shutdown`] call, not a destructor).
+/// explicit [ActorSystem::shutdown](crate::system::ActorSystem::shutdown)
+/// call, not a destructor).
 #[derive(Clone)]
 pub struct ActorSystem(std::sync::Arc<ActorSystemCore>);
 
@@ -414,7 +415,7 @@ pub enum EdgeDirection {
 pub struct ObservedEdge {
     /// The sending path (absent for system-entry sends).
     pub from: Option<String>,
-    /// The destination ("path:<p>" or "schema:<s>").
+    /// The destination (`path:<p>` or `schema:<s>`).
     pub to: String,
     /// The schema that flowed.
     pub schema: SchemaId,
@@ -1103,8 +1104,10 @@ impl ActorSystemCore {
     }
 
     /// Typed fire-and-forget: serializes `value` under `C`'s schema and
-    /// routes it as a system-root send. Sugar over [`ActorSystem::send`]
-    /// + [`ActorSystem::envelope`] with the payload built by serde.
+    /// routes it as a system-root send. Sugar over
+    /// [ActorSystem::send](crate::system::ActorSystem::send) +
+    /// [ActorSystem::envelope](crate::system::ActorSystem::envelope) with
+    /// the payload built by serde.
     ///
     /// # Errors
     ///
@@ -1130,7 +1133,7 @@ impl ActorSystemCore {
     /// advances the shared rotation; see [`Registry::route`]). Zero
     /// handlers ⇒ the envelope returns as the error (same contract as an
     /// unrouted tell). The receiver cannot distinguish this from a
-    /// direct [`ActorSystem::tell`].
+    /// direct [ActorSystem::tell](crate::system::ActorSystem::tell).
     ///
     /// # Errors
     ///
@@ -1158,12 +1161,13 @@ impl ActorSystemCore {
 
     /// Typed ask from outside the system: serializes `value` under `C`'s
     /// schema, opens a reply lease, and awaits the reply under the
-    /// MANDATORY `timeout`. The lease settles with the same
+    /// mandatory `timeout`. The lease settles with the same
     /// Replied/Timeout/Failed facts an in-actor ask produces (see
-    /// [`crate::kernel::KernelAskPort`]); a timed-out ask's late reply
+    /// `crate::kernel::KernelAskPort`); a timed-out ask's late reply
     /// lands nowhere.
     ///
-    /// Trace root is the entry point, matching [`ActorSystem::send`].
+    /// Trace root is the entry point, matching
+    /// [ActorSystem::send](crate::system::ActorSystem::send).
     ///
     /// # Errors
     ///
@@ -1206,7 +1210,7 @@ impl ActorSystemCore {
     /// under `M`'s schema and fans it out to EVERY actor that declared
     /// `.handles::<M>()` — one copy each. Zero handlers ⇒ silent no-op:
     /// events are news, not work orders. Trace root is the entry point,
-    /// matching [`ActorSystem::send`].
+    /// matching [ActorSystem::send](crate::system::ActorSystem::send).
     ///
     /// Serialization is eager; the returned future borrows only `self`,
     /// so callers' spawned futures stay `Send` without an `M: Sync`
@@ -1235,9 +1239,9 @@ impl ActorSystemCore {
 
     /// Untyped event broadcast from outside the system: the caller has
     /// already serialized the payload under `schema`. Same fan-out
-    /// contract as [`ActorSystem::publish`] — every `.handles` declarant
-    /// of the schema, zero ⇒ silent no-op. The erased bridge closure's
-    /// publish surface.
+    /// contract as [ActorSystem::publish](crate::system::ActorSystem::publish)
+    /// — every `.handles` declarant of the schema, zero ⇒ silent no-op.
+    /// The bridge surface for erased (foreign) callers.
     pub async fn publish_value(&self, schema: SchemaId, payload: Json) {
         let envelope = Envelope::json(
             schema.clone(),
@@ -1248,13 +1252,13 @@ impl ActorSystemCore {
         crate::kernel::broadcast(&self.registry, &self.kernel, schema, envelope).await;
     }
 
-    /// Untyped schema-kind dispatch from outside the system: the erased
-    /// bridge's surface for messages whose COMMAND/EVENT role the caller
-    /// may not know statically. The declared kind chooses the DEFAULT
-    /// transport — Event schemas broadcast (one copy per handler, zero ⇒
-    /// silent no-op), Command schemas route to one handler (tell
-    /// semantics, silent when unrouted). The declaration site decides;
-    /// callers never choose a transport.
+    /// Untyped schema-kind dispatch from outside the system: the bridge
+    /// surface for erased (foreign) callers' messages whose COMMAND/EVENT
+    /// role the caller may not know statically. The declared kind chooses
+    /// the default transport — Event schemas broadcast (one copy per
+    /// handler, zero ⇒ silent no-op), Command schemas route to one
+    /// handler (tell semantics, silent when unrouted). The declaration
+    /// site decides; callers never choose a transport.
     pub async fn deliver_schema_value(&self, schema: SchemaId, payload: Json) {
         let kind = {
             let reg = self.registry.lock();
@@ -2407,6 +2411,151 @@ mod tests {
         why: String,
     }
 
+    /// A serializable ask command (the `system.ask` fixture).
+    #[derive(Command, serde::Serialize, serde::Deserialize)]
+    struct PingAsk {
+        n: i64,
+    }
+
+    /// A live service handler for `PingAsk` (the `system.ask` callee).
+    struct Pinger;
+    impl ServiceActor for Pinger {
+        fn manifest() -> ActorManifest {
+            ActorManifest::new()
+                .handles::<PingAsk>()
+                .kind(ActorKind::Service)
+        }
+        async fn start(
+            _args: &Json,
+        ) -> Result<Self, error_stack::Report<crate::registry::RegistryError>> {
+            Ok(Self)
+        }
+    }
+    impl MsgHandler<PingAsk> for Pinger {
+        async fn handle(&mut self, _msg: PingAsk, _ctx: &mut crate::context::MsgCtx<'_>) {}
+    }
+
+    #[tokio::test]
+    async fn block_senders_await_at_configured_capacity() {
+        // Given a Block actor whose inbox holds FOUR: a burst of twenty
+        // commands must queue, block the senders, and never dead-letter.
+        let (system, _clock) = ActorSystem::test();
+        let path = ActorPath::new("blocked");
+        system.spawn_es::<Counter, _>(
+            path.clone(),
+            &json!({}),
+            SpawnOpts {
+                snapshot: SnapshotCadence::Off,
+                mailbox_capacity: 4,
+                mailbox_policy: OverloadPolicy::Block,
+                high_watermark: None,
+                passivation: None,
+            },
+            || vec![Arc::new(TypedEsAdapter::<Counter, Add>::new::<Add>())],
+        );
+        wait_for(|| async {
+            system
+                .tap_facts()
+                .iter()
+                .any(|f| matches!(&f.kind, crate::tap::FactKind::Spawned { path: p, .. } if *p == path))
+        })
+        .await;
+
+        // When twenty senders race a slow consumer (each sender awaits
+        // its tell: Block backpressure is what paces them).
+        let burst = (1..=20_i64).map(|n| {
+            let system = system.clone();
+            let path = path.clone();
+            async move {
+                let _ = system
+                    .send(system.envelope(Add::schema_id(), path, json!({ "n": n })))
+                    .await
+                    .map_err(|_| "refused")?;
+                Ok::<(), &str>(())
+            }
+        });
+        let sent = futures::future::join_all(burst).await;
+
+        // Then every send was accepted (no refusals) and every command
+        // was processed — the burst is BOUNDED, not dead-lettered.
+        let refused = sent.iter().filter(|r| r.is_err()).count();
+        assert_eq!(refused, 0, "Block never refuses: {sent:?}");
+        let mut total = 0_i64;
+        for _ in 0..1_000 {
+            if let Some(t) = system
+                .with_es_state::<Counter, _>(&path, |c| c.total)
+                .await
+            {
+                total = t;
+                if t == 20 {
+                    break;
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+        }
+        assert_eq!(total, 20, "all twenty commands processed");
+        let reasons = system.dead_letter_reasons().await;
+        assert!(
+            !reasons.iter().any(|r| r.starts_with("InboxRefused")),
+            "zero InboxRefused under Block: {reasons:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn restarted_actor_keeps_configured_mailbox() {
+        // Given a Block actor whose mailbox was spawned at capacity 256.
+        let (system, _clock) = ActorSystem::test();
+        let path = ActorPath::new("restart-capacity");
+        system.spawn_es::<Counter, _>(
+            path.clone(),
+            &json!({}),
+            SpawnOpts {
+                snapshot: SnapshotCadence::Off,
+                mailbox_capacity: 256,
+                mailbox_policy: OverloadPolicy::Block,
+                high_watermark: None,
+                passivation: None,
+            },
+            || {
+                vec![
+                    Arc::new(TypedEsAdapter::<Counter, Add>::new::<Add>()),
+                    Arc::new(TypedEsAdapter::<Counter, Boom>::new::<Boom>()),
+                ]
+            },
+        );
+        wait_for(|| async {
+            system
+                .tap_facts()
+                .iter()
+                .any(|f| matches!(&f.kind, crate::tap::FactKind::Spawned { path: p, .. } if *p == path))
+        })
+        .await;
+
+        // When the actor crashes (panicking handler) and is restarted
+        // through supervision's restart mechanism.
+        let _ = system
+            .send(system.envelope(
+                Boom::schema_id(),
+                path.clone(),
+                json!({ "why": "crash for the restart test" }),
+            ))
+            .await;
+        wait_for_crash(&system, &path).await;
+        system.restart_es(&path, &json!({})).await.expect("restart");
+        wait_for(|| async {
+            system
+                .tap_facts()
+                .iter()
+                .any(|f| matches!(&f.kind, crate::tap::FactKind::Spawned { path: p, restart, .. } if *p == path && *restart))
+        })
+        .await;
+
+        // Then the fresh front door has the SPAWN capacity (256), not
+        // the restarted default (64).
+        let endpoint = system.registry.lock().resolve(&path).expect("live slot");
+        assert_eq!(endpoint.max_capacity(), 256, "restart honors spawn capacity");
+    }
+
     #[tokio::test]
     async fn atomic_step_commits_journal_state_and_cursor_together() {
         // Given a spawned counter actor.
@@ -2735,6 +2884,22 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(2)).await;
         }
         panic!("condition never became true");
+    }
+
+    /// Like [`wait_for`], but returns the polled value once it is `Some`
+    /// (and `false` when the poll budget expires).
+    async fn wait_for_returning<T: Send, F, Fut>(poll: F) -> Option<T>
+    where
+        F: Fn() -> Fut,
+        Fut: std::future::Future<Output = Option<T>>,
+    {
+        for _ in 0..1_000 {
+            if let Some(value) = poll().await {
+                return Some(value);
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+        }
+        None
     }
 
     async fn wait_for_cursor(system: &ActorSystem, path: &ActorPath, expected: u64) {
@@ -4007,6 +4172,92 @@ mod tests {
         // consumed by its reply, and the table is empty — no leaks.
         assert!(kernel.replies.is_empty(), "lease leaked");
         assert!(!kernel.replies.complete(&short_lease, json!({})));
+    }
+
+    #[tokio::test]
+    async fn failed_ask_delivery_cancels_its_lease() {
+        // Given a system with a registered route whose slot's endpoint is
+        // dead (receiver dropped): the lease opens, the request cannot
+        // be delivered.
+        let (system, _clock) = ActorSystem::test();
+        system.register_schema::<PingAsk>();
+        let path = ActorPath::new("ghost");
+        let (tx, rx) = tokio::sync::mpsc::channel::<Envelope>(8);
+        system.registry.lock().insert_slot(
+            path.clone(),
+            crate::schema::ActorManifest::new()
+                .handles::<PingAsk>()
+                .kind(ActorKind::Service),
+            Endpoint::new(tx),
+            OverloadPolicy::Block,
+        )
+        .expect("insert dead slot");
+        drop(rx);
+
+        // When asking through the system's lease-backed ask.
+        let result = system
+            .ask(path.clone(), PingAsk { n: 1 }, std::time::Duration::from_secs(1))
+            .await;
+
+        // Then the ask fails fast AND no lease is left behind.
+        assert!(result.is_err(), "ask to a dead endpoint must fail");
+        let kernel = system.kernel.lock();
+        assert!(kernel.replies.is_empty(), "failed ask leaked its lease");
+        // And the ask ledger stays paired (opened + settled-failed).
+        assert!(
+            kernel
+                .ask_facts
+                .iter()
+                .any(|f| f.outcome == Some(crate::kernel::AskOutcome::Failed)),
+            "delivery failure settled as Failed: {:?}",
+            kernel.ask_facts
+        );
+    }
+
+    #[tokio::test]
+    async fn expired_ask_leases_are_pruned_on_open() {
+        // Given a system with a live handler and an asker whose lease
+        // was opened, then aged past its expiry on the fake clock.
+        let (system, clock) = ActorSystem::test();
+        system.register_schema::<PingAsk>();
+        let (lease, _rx) = {
+            let kernel = system.kernel.lock();
+            kernel
+                .replies
+                .open(std::time::Duration::from_millis(10), system.clock.now())
+        };
+        assert_eq!(system.kernel.lock().replies.len(), 1, "lease open");
+
+        // When a NEW ask opens after the old lease's expiry.
+        clock.advance(std::time::Duration::from_millis(50));
+        let path = ActorPath::new("pinger");
+        system.spawn_service::<crate::system::tests::Pinger, _>(
+            path.clone(),
+            &json!({}),
+            SpawnOpts::default(),
+            || {
+                vec![Arc::new(TypedServiceAdapter::<Pinger, PingAsk>::new::<
+                    PingAsk,
+                >())]
+            },
+        );
+        wait_for(|| async {
+            system
+                .tap_facts()
+                .iter()
+                .any(|f| matches!(&f.kind, crate::tap::FactKind::Spawned { path: p, .. } if *p == path))
+        })
+        .await;
+        let _ = system
+            .ask(path, PingAsk { n: 2 }, std::time::Duration::from_secs(2))
+            .await;
+
+        // Then the expired lease was pruned as a side effect of opening.
+        let kernel = system.kernel.lock();
+        assert!(
+            !kernel.replies.holds(&lease),
+            "expired lease survived a later ask open"
+        );
     }
 
     #[tokio::test]
@@ -6607,6 +6858,218 @@ mod tests {
                 .await
                 .is_none()
         );
+    }
+
+    #[tokio::test]
+    async fn projector_wake_survives_tap_flood() {
+        // Given a 1-slot tap ring — ANY later fact evicts everything the
+        // wake could have observed — a ChatLog projector set, and one
+        // stored fact for key "5" folded by an activation that then
+        // stopped (genuinely cold). A background publisher continuously
+        // floods the ring with unrelated facts.
+        let (system, clock) = ActorSystem::test_with_tap(1);
+        let opts = SpawnOpts {
+            passivation: Some(Passivation {
+                idle_for: std::time::Duration::from_millis(50),
+            }),
+            ..Default::default()
+        };
+        let spec = crate::pool::ProjectorSetSpec {
+            opts,
+            ..install_chat_projector_set_spec(&system, "proj/chats")
+        };
+        system.install_projector_set(spec).expect("install");
+        publish_chatted(&system, "5", "a").await;
+        let path5 = ActorPath::new("proj/chats/5");
+        wait_for(|| async { system_is_live(&system, &path5) }).await;
+        for _ in 0..500 {
+            if system.es_state(&path5).await.is_some() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        clock.advance(std::time::Duration::from_millis(100));
+        system.stop(&path5).await;
+        assert!(
+            system.es_state(&path5).await.is_none(),
+            "projector evicted before the flooded wake"
+        );
+
+        // Unrelated publishes for another key, fast enough that the
+        // 1-slot ring turns over many times per poll window.
+        let flood_system = system.clone();
+        let flood = tokio::spawn(async move {
+            for i in 0..10_000u64 {
+                publish_chatted(&flood_system, "flood", &format!("n{i}")).await;
+                tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+            }
+        });
+
+        // When reading the cold projector through the full wake path —
+        // bounded far below the 5s wake budget so a stall fails fast.
+        let read = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            system.projector_state(&ActorPath::new("proj/chats/5")),
+        )
+        .await;
+
+        // Then the wake still completes despite the evicted CaughtUp
+        // fact, and the fold is complete.
+        flood.abort();
+        let _ = flood.await;
+        let state =
+            read.expect("wake completed under the 2s bound").expect("flooded wake returns the fold");
+        let log: ChatLog = state.decode().expect("state decodes");
+        assert_eq!(log.messages, 1, "exactly the stored fact folded");
+        assert_eq!(log.keys_seen, vec!["a".to_owned()]);
+    }
+
+    /// A counting wrapper over the in-memory store: records how many
+    /// `load()` calls the runtime makes (the D3 idle-snapshot probe).
+    struct CountingLoadsStore {
+        inner: crate::journal::InMemoryJournalStore,
+        loads: std::sync::atomic::AtomicUsize,
+    }
+
+    impl CountingLoadsStore {
+        fn new() -> std::sync::Arc<Self> {
+            std::sync::Arc::new(Self {
+                inner: crate::journal::InMemoryJournalStore::new(),
+                loads: std::sync::atomic::AtomicUsize::new(0),
+            })
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl crate::journal::JournalStore for CountingLoadsStore {
+        async fn append(
+            &self,
+            path: &ActorPath,
+            events: &[crate::envelope::Event],
+        ) -> Result<Vec<crate::journal::SeqNo>, error_stack::Report<crate::journal::JournalError>>
+        {
+            self.inner.append(path, events).await
+        }
+
+        async fn append_snapshot(
+            &self,
+            path: &ActorPath,
+            seq: crate::journal::SeqNo,
+            state: Json,
+            now_ms: u64,
+        ) -> Result<(), error_stack::Report<crate::journal::JournalError>> {
+            self.inner.append_snapshot(path, seq, state, now_ms).await
+        }
+
+        async fn load(
+            &self,
+            path: &ActorPath,
+        ) -> Result<Option<crate::journal::Replay>, error_stack::Report<crate::journal::JournalError>>
+        {
+            self.loads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.inner.load(path).await
+        }
+
+        async fn flush(&self) -> Result<(), error_stack::Report<crate::journal::JournalError>> {
+            self.inner.flush().await
+        }
+
+        fn name(&self) -> &'static str {
+            "counting-loads"
+        }
+
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+
+        async fn append_catchup(
+            &self,
+            path: &ActorPath,
+            events: &[crate::journal::ScannedEvent],
+        ) -> Result<Vec<Option<crate::journal::SeqNo>>, error_stack::Report<crate::journal::JournalError>>
+        {
+            self.inner.append_catchup(path, events).await
+        }
+
+        async fn scan(
+            &self,
+            schemas: &[SchemaId],
+        ) -> Result<Vec<crate::journal::ScannedEvent>, error_stack::Report<crate::journal::JournalError>>
+        {
+            self.inner.scan(schemas).await
+        }
+
+        async fn passivated(
+            &self,
+            path: &ActorPath,
+        ) -> Result<(), error_stack::Report<crate::journal::JournalError>> {
+            self.inner.passivated(path).await
+        }
+
+        async fn purge(
+            &self,
+            path: &ActorPath,
+        ) -> Result<(), error_stack::Report<crate::journal::JournalError>> {
+            self.inner.purge(path).await
+        }
+    }
+
+    #[tokio::test]
+    async fn idle_snapshot_check_skips_journal_load_until_due() {
+        // Given a counting store and an ES actor on a 100ms time-cadence
+        // that has committed exactly one event.
+        let (system, clock) = ActorSystem::test();
+        let store = CountingLoadsStore::new();
+        system.set_journal_store(store.clone());
+        let path = ActorPath::new("cadenced");
+        system.spawn_es::<Counter, _>(
+            path.clone(),
+            &json!({}),
+            SpawnOpts {
+                snapshot: SnapshotCadence::Time(std::time::Duration::from_millis(100)),
+                ..Default::default()
+            },
+            || vec![Arc::new(TypedEsAdapter::<Counter, Add>::new::<Add>())],
+        );
+        let _ = system
+            .tell(path.clone(), Add { n: 1 })
+            .await
+            .expect("commit one event");
+        wait_for(|| async {
+            system
+                .with_es_state::<Counter, _>(&path, |c| c.total)
+                .await
+                .is_some_and(|total| total == 1)
+        })
+        .await;
+        // Recovery at boot already used the store; the probe starts here.
+        store.loads.store(0, std::sync::atomic::Ordering::SeqCst);
+
+        // When the actor idles with the clock advanced HALF the interval:
+        // several idle ticks run, none due.
+        clock.advance(std::time::Duration::from_millis(50));
+        tokio::time::sleep(std::time::Duration::from_millis(120)).await;
+
+        // Then no idle tick loaded the journal: the due check is O(1).
+        let loads = store.loads.load(std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(loads, 0, "non-due idle ticks must not load the journal");
+
+        // When the interval elapses.
+        clock.advance(std::time::Duration::from_millis(60));
+
+        // Then the due idle tick loads the journal and takes the snapshot.
+        wait_for(|| async { store.loads.load(std::sync::atomic::Ordering::SeqCst) >= 1 }).await;
+        let took_snapshot = wait_for_returning(|| async {
+            store
+                .inner
+                .entries_of(&path)
+                .iter()
+                .any(|e| matches!(e, crate::journal::JournalEntry::Snapshot { .. }))
+            .then_some(())
+        })
+        .await
+        .is_some();
+        assert!(took_snapshot, "the due tick produced a snapshot");
     }
 
     #[tokio::test]

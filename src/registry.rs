@@ -44,6 +44,12 @@ impl Endpoint {
         self.capacity.saturating_sub(self.tx.capacity())
     }
 
+    /// The channel's total capacity (tests: the D4 restart-capacity seam).
+    #[cfg(test)]
+    pub fn max_capacity(&self) -> usize {
+        self.capacity
+    }
+
     /// Attempts delivery without waiting: fails immediately when the inbox
     /// is full.
     ///
