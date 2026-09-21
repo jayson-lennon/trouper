@@ -401,9 +401,24 @@ async fn route_inner(
             // RULES first: a matching rule places an observer relative to
             // the flow (Tee copies with a linked causality; Inline
             // interposes the observer in the primary's place).
-            let (delivery, primary_dest) = {
+            let (delivery, primary_dest, tee_endpoint, set_specs) = {
+                // ONE critical section for the send's whole registry read:
+                // the rules decision, the tee copy's endpoint resolve, and
+                // BOTH set-table probes (a plain path pays one lock to
+                // learn it is neither partition nor projector set).
                 let reg = registry.lock();
-                apply_rules(&reg, &envelope, path.clone())
+                let (delivery, primary_dest) = apply_rules(&reg, &envelope, path.clone());
+                let tee_endpoint = delivery
+                    .as_ref()
+                    .and_then(|(_, tee_dest, _)| reg.resolve(tee_dest));
+                let set_specs = (
+                    reg.partitions.get(&path).cloned(),
+                    reg.projector_sets
+                        .get(&path)
+                        .cloned()
+                        .or_else(|| reg.projector_set_owning(&path)),
+                );
+                (delivery, primary_dest, tee_endpoint, set_specs)
             };
             if let Some(tee) = delivery {
                 // Tee: deliver the copy BEFORE the primary (same position
@@ -414,10 +429,7 @@ async fn route_inner(
                 let (mut copy, tee_dest, origin_trace) = tee;
                 copy.trace.trace_id = origin_trace.trace_id;
                 copy.trace.causality_id = crate::envelope::CausalityId::new();
-                let endpoint = {
-                    let reg = registry.lock();
-                    reg.resolve(&tee_dest)
-                };
+                let endpoint = tee_endpoint;
                 if let Some(endpoint) = endpoint {
                     let _ = deliver_with_retry(&endpoint, copy).await;
                     let mut kernel_table = kernel.lock();
@@ -442,9 +454,11 @@ async fn route_inner(
                 }
                 None => path.clone(),
             };
-            // PARTITION SETS: a public set path resolves to ONE entity,
-            // derived from the payload's shard key (activated on demand).
-            let path = match resolve_partition(registry, kernel, shutting_down, &envelope, path.clone()).await {
+            // PARTITION / PROJECTOR SETS: a public set path resolves to
+            // ONE entity/projector, derived from the payload's shard key
+            // (activated on demand); the specs were pre-read above (one
+            // lock for the send's whole registry read).
+            let path = match resolve_partition(registry, kernel, shutting_down, &envelope, path.clone(), set_specs.0.clone(), set_specs.1.clone()).await {
                 Ok(Some(entity)) => entity,
                 Ok(None) => path,
                 Err(missing_key_envelope) => {
@@ -477,11 +491,20 @@ async fn route_inner(
                 .await
                 .is_err()
             {
-                let retry_path =
-                    match resolve_partition(registry, kernel, shutting_down, &envelope, path.clone()).await {
-                        Ok(Some(entity)) => entity,
-                        _ => path.clone(),
-                    };
+                let retry_path = match resolve_partition(
+                    registry,
+                    kernel,
+                    shutting_down,
+                    &envelope,
+                    path.clone(),
+                    set_specs.0,
+                    set_specs.1,
+                )
+                .await
+                {
+                    Ok(Some(entity)) => entity,
+                    _ => path.clone(),
+                };
                 let retry_endpoint = {
                     let registry = registry.lock();
                     registry.resolve(&retry_path)
@@ -512,13 +535,10 @@ async fn route_inner(
             // (rotating when several actors handle the same schema).
             let (target, endpoint) = {
                 let mut registry = registry.lock();
-                match registry.route(schema) {
-                    Some(target) => {
-                        let endpoint = registry.resolve(&target);
-                        (target, endpoint)
-                    }
-                    None => return Err(envelope),
-                }
+                registry.route_resolved(schema)
+            };
+            let Some(target) = target else {
+                return Err(envelope);
             };
             let Some(endpoint) = endpoint else {
                 return Err(envelope);
@@ -557,16 +577,14 @@ async fn resolve_partition(
     shutting_down: &std::sync::atomic::AtomicBool,
     envelope: &Envelope,
     dest: ActorPath,
+    spec: Option<crate::pool::PartitionSpec>,
+    projector_spec: Option<crate::pool::ProjectorSetSpec>,
 ) -> Result<Option<ActorPath>, Envelope> {
-    let spec = {
-        let reg = registry.lock();
-        reg.partitions.get(&dest).cloned()
-    };
     let Some(spec) = spec else {
         // Not an entity partition: fall through to the projector-set
         // check (a path belongs to at most one set — both tables are
-        // keyed by public path).
-        return resolve_projector_set(registry, kernel, shutting_down, envelope, dest).await;
+        // keyed by public path; the caller pre-read BOTH in one lock).
+        return resolve_projector_set(registry, kernel, shutting_down, envelope, projector_spec).await;
     };
     let key = match extract_key(registry, envelope, &spec.key_field) {
         Some(key) => key,
@@ -613,19 +631,13 @@ async fn resolve_projector_set(
     kernel: &Mutex<KernelState>,
     shutting_down: &std::sync::atomic::AtomicBool,
     envelope: &Envelope,
-    dest: ActorPath,
+    spec: Option<crate::pool::ProjectorSetSpec>,
 ) -> Result<Option<ActorPath>, Envelope> {
-    let spec = {
-        let reg = registry.lock();
-        // The set is addressed either by its public path (a direct send)
-        // or by an already-derived per-key path (the broadcast set-arm
-        // derives `public/key` before routing). Both resolve to the same
-        // spec; the key comes from the payload either way.
-        reg.projector_sets
-            .get(&dest)
-            .cloned()
-            .or_else(|| reg.projector_set_owning(&dest))
-    };
+    // The spec arrives pre-read by the caller (one lock for both set
+    // tables). The set is addressed either by its public path (a direct
+    // send) or by an already-derived per-key path (the broadcast set-arm
+    // derives `public/key` before routing); the key comes from the
+    // payload either way.
     let Some(spec) = spec else {
         return Ok(None);
     };
@@ -1088,46 +1100,48 @@ async fn step_es(ctx: &EsLoop) -> Step {
     // CONTINUES with the declared remainder: dropping is a state-consistent
     // outcome (apply runs per appended event), while failing the step would
     // burn restart budget on a static condition redelivery can never heal.
-    let declared = {
-        let registry = ctx.registry.lock();
-        registry
-            .lookup(&ctx.path)
-            .map(|info| info.manifest.emits)
-            .unwrap_or_default()
-    };
-    // Collect back into the compact buffer (stays inline for ≤2): the
-    // dispatch→append path never widens to a heap `Vec`.
-    let events: crate::envelope::Events = events
-        .into_iter()
-        .filter(|event| {
-            let is_declared = declared.contains(&event.schema);
-            if !is_declared {
-                tracing::error!(
-                    actor = %ctx.path,
-                    schema = %event.schema,
-                    "undeclared event dropped before journal append"
-                );
-                // The dropped EVENT is what died: it is dead-lettered as an
-                // envelope addressed back to the emitting actor (same trace,
-                // so the drop stays causally linked to the command). The
-                // envelope SHARES the event's payload tree (Arc bump).
-                let dropped = Envelope::json_arc(
-                    event.schema.clone(),
-                    crate::envelope::Address::Path(ctx.path.clone()),
-                    std::sync::Arc::new(event.payload.clone()),
-                    envelope.trace,
-                )
-                .from(ctx.path.clone());
-                dead_letter(
-                    &ctx.kernel,
-                    &dropped,
-                    crate::kernel::DeadLetterReason::UndeclaredEvent,
-                    "emitted undeclared schema (dropped before journal append)",
-                );
+    // The gate consults declarations WITHOUT copying the manifest: one
+    // lock-held pass partitions the buffer, the lock DROPS, then the
+    // undeclared remainder is dead-lettered (no lock is held across the
+    // async dead-letter work).
+    let (declared_events, undeclared) = {
+        let registry_gate = ctx.registry.lock();
+        let mut declared = crate::envelope::Events::new();
+        let mut undeclared = crate::envelope::Events::new();
+        for event in events {
+            if registry_gate.declares_emit(&ctx.path, &event.schema) {
+                declared.push(event);
+            } else {
+                undeclared.push(event);
             }
-            is_declared
-        })
-        .collect();
+        }
+        (declared, undeclared)
+    };
+    for event in undeclared {
+        tracing::error!(
+            actor = %ctx.path,
+            schema = %event.schema,
+            "undeclared event dropped before journal append"
+        );
+        // The dropped EVENT is what died: it is dead-lettered as an
+        // envelope addressed back to the emitting actor (same trace,
+        // so the drop stays causally linked to the command). The
+        // envelope SHARES the event's payload tree (Arc bump).
+        let dropped = Envelope::json_arc(
+            event.schema.clone(),
+            crate::envelope::Address::Path(ctx.path.clone()),
+            std::sync::Arc::new(event.payload.clone()),
+            envelope.trace,
+        )
+        .from(ctx.path.clone());
+        dead_letter(
+            &ctx.kernel,
+            &dropped,
+            crate::kernel::DeadLetterReason::UndeclaredEvent,
+            "emitted undeclared schema (dropped before journal append)",
+        );
+    }
+    let events = declared_events;
 
     // 5. JOURNAL APPEND (durable record first). The store is awaited
     // OUTSIDE the kernel sync guard — a write-through backend gets
@@ -1688,30 +1702,37 @@ async fn fan_out_emits(
 /// Returns `true` when the outbox carried `StopSelf` (the caller's step
 /// concludes with `Step::Stop`).
 async fn flush_outbox(ctx: &EsLoop, mut outbox: Outbox) -> bool {
-    let declared = {
-        let registry = ctx.registry.lock();
-        registry
-            .lookup(&ctx.path)
-            .map(|info| info.manifest.emits)
-            .unwrap_or_default()
-    };
-    let mut stop_self = false;
-    for intent in outbox.drain() {
-        // THE GATE: every outbound message declares itself. StopSelf is
-        // not a message — it passes untouched.
-        let gated = match intent.emitted_schema() {
-            Some(schema) if !declared.contains(schema) => {
-                tracing::error!(
-                    actor = %ctx.path,
-                    schema = %schema,
-                    "undeclared emit dropped at flush (add .emits::<M>() at the spawn site)"
-                );
-                dead_letter_schema(ctx, &intent, schema);
-                continue;
+    // The gate consults declarations WITHOUT copying the manifest: one
+    // lock-held pass splits intents by declaration, the lock DROPS, then
+    // both arms proceed (no lock across the async delivery work).
+    let (gated, ungated) = {
+        let registry_gate = ctx.registry.lock();
+        let mut ok = Vec::new();
+        let mut dropped = Vec::new();
+        for intent in outbox.drain() {
+            // THE GATE: every outbound message declares itself. StopSelf
+            // is not a message — it passes untouched.
+            let verdict = intent
+                .emitted_schema()
+                .map(|schema| (schema.clone(), registry_gate.declares_emit(&ctx.path, schema)));
+            match verdict {
+                Some((schema, false)) => dropped.push((intent, schema)),
+                _ => ok.push(intent),
             }
-            _ => intent,
-        };
-        match gated {
+        }
+        (ok, dropped)
+    };
+    for (intent, schema) in ungated {
+        tracing::error!(
+            actor = %ctx.path,
+            schema = %schema,
+            "undeclared emit dropped at flush (add .emits::<M>() at the spawn site)"
+        );
+        dead_letter_schema(ctx, &intent, &schema);
+    }
+    let mut stop_self = false;
+    for intent in gated {
+        match intent {
             crate::context::Intent::Send(envelope) => {
                 if let Err(undeliverable) = route(&ctx.registry, &ctx.kernel, &ctx.shutting_down, envelope).await {
                     dead_letter(

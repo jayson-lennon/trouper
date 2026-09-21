@@ -617,6 +617,27 @@ impl Registry {
         }
     }
 
+    /// Whether `path` declared `schema` in its emits — the kernel's emit
+    /// gate, answered WITHOUT cloning the actor's manifest (a lock-held
+    /// read of the live slot).
+    pub fn declares_emit(&self, path: &ActorPath, schema: &SchemaId) -> bool {
+        self.slots
+            .get(path)
+            .is_some_and(|slot| slot.manifest.emits.contains(schema))
+    }
+
+    /// The route pick and its live endpoint in ONE read (a send's single
+    /// critical section; returns both `None`s when unrouted).
+    pub fn route_resolved(&mut self, schema: &SchemaId) -> (Option<ActorPath>, Option<std::sync::Arc<Endpoint>>) {
+        match self.route(schema) {
+            Some(target) => {
+                let endpoint = self.resolve(&target);
+                (Some(target), endpoint)
+            }
+            None => (None, None),
+        }
+    }
+
     /// Declares (or extends) the route for a schema.
     ///
     /// Registering a second handler for a schema converts the route to
