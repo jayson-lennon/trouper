@@ -14,7 +14,7 @@
 use crate::actor::ActorKind;
 use crate::actor::{CommandHandler, EventSourcedActor};
 use crate::context::CmdCtx;
-use crate::envelope::Event;
+use crate::envelope::{Event, Events};
 use crate::schema::{ActorManifest, FieldDef, FieldTy, Schema, SchemaDef, SchemaKind};
 use serde::Deserialize;
 use serde_json::Value;
@@ -99,8 +99,12 @@ impl EventSourcedActor for StateReporter {
 }
 
 impl CommandHandler<ReportState> for StateReporter {
-    fn handle(&self, cmd: ReportState, _ctx: &mut CmdCtx<'_>) -> Vec<Event> {
-        vec![Event::new(StateReported::schema_id(), cmd.export)]
+    fn handle(&self, cmd: ReportState, _ctx: &mut CmdCtx<'_>) -> Events {
+        // Raw push, deliberately: the payload IS the export document, not a
+        // field of a typed fact — there is nothing for IntoEvent to build.
+        let mut events = Events::new();
+        events.push(Event::new(StateReported::schema_id(), cmd.export));
+        events
     }
 }
 

@@ -2224,16 +2224,15 @@ mod tests {
         }
     }
     impl CommandHandler<Add> for Counter {
-        fn handle(&self, cmd: Add, _ctx: &mut CmdCtx<'_>) -> Vec<crate::envelope::Event> {
-            vec![crate::envelope::Event::new(
+        fn handle(&self, cmd: Add, _ctx: &mut CmdCtx<'_>) -> crate::envelope::Events {
+            crate::envelope::Events::from_vec(vec![crate::envelope::Event::new(
                 Added::schema_id(),
                 json!({ "n": cmd.n }),
-            )]
-        }
+            )])        }
     }
 
     impl CommandHandler<Boom> for Counter {
-        fn handle(&self, _cmd: Boom, _ctx: &mut CmdCtx<'_>) -> Vec<crate::envelope::Event> {
+        fn handle(&self, _cmd: Boom, _ctx: &mut CmdCtx<'_>) -> crate::envelope::Events {
             panic!("injected handler panic");
         }
     }
@@ -2790,15 +2789,15 @@ mod tests {
             }
         }
         impl CommandHandler<Add> for Phoenix {
-            fn handle(&self, cmd: Add, _ctx: &mut CmdCtx<'_>) -> Vec<crate::envelope::Event> {
+            fn handle(&self, cmd: Add, _ctx: &mut CmdCtx<'_>) -> crate::envelope::Events {
                 if cmd.n == 666 && !CRASHED_YET.swap(true, std::sync::atomic::Ordering::SeqCst) {
                     // First sight only: crash once, then recover.
                     panic!("transient fault");
                 }
-                vec![crate::envelope::Event::new(
+                crate::envelope::Events::from_vec(vec![crate::envelope::Event::new(
                     Added::schema_id(),
                     json!({ "n": cmd.n }),
-                )]
+                )])
             }
         }
 
@@ -2884,7 +2883,7 @@ mod tests {
             fn apply(&mut self, _event: &crate::envelope::Event) {}
         }
         impl CommandHandler<Add> for AlwaysBoom {
-            fn handle(&self, _cmd: Add, _ctx: &mut CmdCtx<'_>) -> Vec<crate::envelope::Event> {
+            fn handle(&self, _cmd: Add, _ctx: &mut CmdCtx<'_>) -> crate::envelope::Events {
                 panic!("always panics");
             }
         }
@@ -3164,7 +3163,7 @@ mod tests {
             fn apply(&mut self, _event: &crate::envelope::Event) {}
         }
         impl CommandHandler<Add> for Fragile {
-            fn handle(&self, _cmd: Add, _ctx: &mut CmdCtx<'_>) -> Vec<crate::envelope::Event> {
+            fn handle(&self, _cmd: Add, _ctx: &mut CmdCtx<'_>) -> crate::envelope::Events {
                 panic!("never survives");
             }
         }
@@ -4202,7 +4201,7 @@ mod tests {
             fn apply(&mut self, _event: &crate::envelope::Event) {}
         }
         impl CommandHandler<Add> for AlwaysBoom2 {
-            fn handle(&self, _cmd: Add, _ctx: &mut CmdCtx<'_>) -> Vec<crate::envelope::Event> {
+            fn handle(&self, _cmd: Add, _ctx: &mut CmdCtx<'_>) -> crate::envelope::Events {
                 panic!("never-restart child panics");
             }
         }
@@ -4861,11 +4860,12 @@ mod tests {
         }
     }
     impl CommandHandler<Add> for MixedEmitter {
-        fn handle(&self, cmd: Add, _ctx: &mut CmdCtx<'_>) -> Vec<crate::envelope::Event> {
-            vec![
-                crate::envelope::Event::new(Added::schema_id(), json!({ "n": cmd.n })),
-                crate::envelope::Event::new(Smuggled::schema_id(), json!({ "n": cmd.n })),
-            ]
+        fn handle(&self, cmd: Add, _ctx: &mut CmdCtx<'_>) -> crate::envelope::Events {
+            let mut events = crate::envelope::Events::new();
+            events.push(crate::envelope::Event::new(Added::schema_id(), json!({ "n": cmd.n })));
+            // Undeclared: the emit filter must drop this one pre-append.
+            events.push(crate::envelope::Event::new(Smuggled::schema_id(), json!({ "n": cmd.n })));
+            events
         }
     }
 
@@ -5135,12 +5135,11 @@ mod tests {
         }
     }
     impl CommandHandler<Add> for BareCounter {
-        fn handle(&self, cmd: Add, _ctx: &mut CmdCtx<'_>) -> Vec<crate::envelope::Event> {
-            vec![crate::envelope::Event::new(
+        fn handle(&self, cmd: Add, _ctx: &mut CmdCtx<'_>) -> crate::envelope::Events {
+            crate::envelope::Events::from_vec(vec![crate::envelope::Event::new(
                 Added::schema_id(),
                 json!({ "n": cmd.n }),
-            )]
-        }
+            )])        }
     }
 
     /// Reads an actor's registered manifest from the registry (tests).
@@ -5502,12 +5501,11 @@ mod tests {
         }
     }
     impl CommandHandler<Add> for DefaultManifestCounter {
-        fn handle(&self, cmd: Add, _ctx: &mut CmdCtx<'_>) -> Vec<crate::envelope::Event> {
-            vec![crate::envelope::Event::new(
+        fn handle(&self, cmd: Add, _ctx: &mut CmdCtx<'_>) -> crate::envelope::Events {
+            crate::envelope::Events::from_vec(vec![crate::envelope::Event::new(
                 Added::schema_id(),
                 json!({ "n": cmd.n }),
-            )]
-        }
+            )])        }
     }
 
     #[tokio::test]
@@ -5566,12 +5564,11 @@ mod tests {
         }
     }
     impl CommandHandler<Add> for RichCounter {
-        fn handle(&self, cmd: Add, _ctx: &mut CmdCtx<'_>) -> Vec<crate::envelope::Event> {
-            vec![crate::envelope::Event::new(
+        fn handle(&self, cmd: Add, _ctx: &mut CmdCtx<'_>) -> crate::envelope::Events {
+            crate::envelope::Events::from_vec(vec![crate::envelope::Event::new(
                 Added::schema_id(),
                 json!({ "n": cmd.n }),
-            )]
-        }
+            )])        }
     }
 
     #[tokio::test]
@@ -5935,12 +5932,11 @@ mod tests {
         }
     }
     impl CommandHandler<KeyedAdd> for KeyCounter {
-        fn handle(&self, cmd: KeyedAdd, _ctx: &mut CmdCtx<'_>) -> Vec<crate::envelope::Event> {
-            vec![crate::envelope::Event::new(
+        fn handle(&self, cmd: KeyedAdd, _ctx: &mut CmdCtx<'_>) -> crate::envelope::Events {
+            crate::envelope::Events::from_vec(vec![crate::envelope::Event::new(
                 Added::schema_id(),
                 json!({ "n": cmd.n }),
-            )]
-        }
+            )])        }
     }
 
     /// Registers the partition test command (a str shard key field) and
@@ -6957,7 +6953,7 @@ mod tests {
         fn apply(&mut self, _event: &crate::envelope::Event) {}
     }
     impl CommandHandler<Add> for ShutdownBoomer {
-        fn handle(&self, _cmd: Add, _ctx: &mut CmdCtx<'_>) -> Vec<crate::envelope::Event> {
+        fn handle(&self, _cmd: Add, _ctx: &mut CmdCtx<'_>) -> crate::envelope::Events {
             panic!("always panics");
         }
     }
@@ -7288,14 +7284,14 @@ mod tests {
         }
     }
     impl CommandHandler<Add> for StopCounter {
-        fn handle(&self, cmd: Add, _ctx: &mut CmdCtx<'_>) -> Vec<crate::envelope::Event> {
+        fn handle(&self, cmd: Add, _ctx: &mut CmdCtx<'_>) -> crate::envelope::Events {
             if cmd.n == 666 {
                 panic!("poison add");
             }
-            vec![crate::envelope::Event::new(
+            crate::envelope::Events::from_vec(vec![crate::envelope::Event::new(
                 Added::schema_id(),
                 json!({ "n": cmd.n }),
-            )]
+            )])
         }
     }
 

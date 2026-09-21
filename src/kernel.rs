@@ -964,7 +964,9 @@ async fn step_es(ctx: &EsLoop) -> Step {
             .map(|info| info.manifest.emits)
             .unwrap_or_default()
     };
-    let events: Vec<crate::envelope::Event> = events
+    // Collect back into the compact buffer (stays inline for ≤2): the
+    // dispatch→append path never widens to a heap `Vec`.
+    let events: crate::envelope::Events = events
         .into_iter()
         .filter(|event| {
             let is_declared = declared.contains(&event.schema);
@@ -1082,7 +1084,7 @@ async fn step_es(ctx: &EsLoop) -> Step {
     {
         let state = ctx.state().await;
         let mut state = state.lock().await;
-        for event in &events {
+        for event in events.iter() {
             state.apply_erased(event);
         }
     }

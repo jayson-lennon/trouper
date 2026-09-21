@@ -5,14 +5,17 @@
 //! the runtime boundary as JSON; the typed arm exists only for in-process
 //! zero-copy fast paths, erased exactly once at spawn.
 
+use std::ops::Deref;
+
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
+use smallvec::SmallVec;
 use uuid::Uuid;
 
 use crate::actor::ActorPath;
 use crate::clock::Timestamp;
 use crate::reply::LeaseId;
-use crate::schema::SchemaId;
+use crate::schema::{Schema, SchemaId};
 
 /// Where a message is headed.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -103,6 +106,34 @@ impl Event {
     /// Creates an event from a schema id and JSON payload.
     pub fn new(schema: SchemaId, payload: JsonValue) -> Self {
         Self { schema, payload }
+    }
+
+    /// Decodes the payload into the typed fact `T`, matching by schema id
+    /// (`name@version`, exact — version-pinned).
+    ///
+    /// The typed fold for [`crate::actor::EventSourcedActor::apply`] and
+    /// [`crate::actor::Projector::apply`]: an event whose schema is not
+    /// `T`'s (another fact type, or another VERSION of this one) yields
+    /// `None` without touching the payload; a matching event decodes. The
+    /// payload is cloned (one value copy per decoded event — the same cost
+    /// command dispatch already pays).
+    ///
+    /// Unmatched schemas are simply ignored — one fold can consume several
+    /// fact types by stacking `decode` calls.
+    pub fn decode<T: Schema + serde::de::DeserializeOwned>(&self) -> Option<T> {
+        if self.schema != T::schema_id() {
+            return None;
+        }
+        serde_json::from_value(self.payload.clone()).ok()
+    }
+
+    /// Whether this event's schema is exactly `T`'s (`name@version`).
+    ///
+    /// A pure schema-id comparison: no clone, no decode. Use it to skip
+    /// work, or when the payload shape is read dynamically instead of
+    /// decoded into a type.
+    pub fn is<T: Schema>(&self) -> bool {
+        self.schema == T::schema_id()
     }
 }
 
@@ -415,4 +446,390 @@ fn causality_id_is_version_7() {
 
     // Then it is v7.
     assert_eq!(version, 7);
+}
+
+// ---------------------------------------------------------------------------
+// Events — a compact buffer of journal-ready events (§5)
+// ---------------------------------------------------------------------------
+
+/// The events a command handler decided on, ready to journal.
+///
+/// Backed by a [`SmallVec`]: up to two events stay inline with no heap
+/// allocation, which covers almost every event-sourced decision. Overflowing
+/// past two spills to the heap transparently. Handler code never names the
+/// backing type — construct with [`Events::new`], [`Events::one`], and
+/// [`Events::push_event`], and convert typed facts with [`IntoEvent`].
+///
+/// The kernel appends these to the journal in order; conversion to a plain
+/// slice happens through `Deref`, so [`crate::journal::JournalStore::append`]
+/// takes `&[Event]` with no allocation on the path.
+///
+/// There is no `DerefMut<Target = [Event]>`: once a decision is made the
+/// buffer is append-only. [`Events::push`] is the raw escape hatch for
+/// events built by hand; prefer [`Events::push_event`].
+#[derive(Debug, Clone, Default)]
+pub struct Events(SmallVec<[Event; 2]>);
+
+impl Events {
+    /// An empty buffer.
+    pub fn new() -> Self {
+        Self(SmallVec::new())
+    }
+
+    /// A buffer holding exactly one event, built from a typed fact.
+    ///
+    /// The common shape of an event-sourced decision: the handler returns
+    /// `Events::one(Deposited { n })` instead of building an [`Event`] by
+    /// hand. Panics if serializing the fact fails — see [`IntoEvent`].
+    pub fn one(e: impl IntoEvent) -> Self {
+        let mut ev = Self::new();
+        ev.push_event(e);
+        ev
+    }
+
+    /// Appends an event built from a typed fact.
+    ///
+    /// Panics if serializing the fact fails — see [`IntoEvent`].
+    pub fn push_event(&mut self, e: impl IntoEvent) {
+        self.0.push(e.into_event());
+    }
+
+    /// Appends a hand-built [`Event`] (raw escape hatch).
+    pub fn push(&mut self, e: Event) {
+        self.0.push(e);
+    }
+
+    /// Adopts an already-allocated `Vec` of events without copying them.
+    ///
+    /// The bridge for actors implemented outside this crate's typed
+    /// dispatch (foreign actors whose fold closures return `Vec`).
+    pub fn from_vec(v: Vec<Event>) -> Self {
+        Self(SmallVec::from_vec(v))
+    }
+
+    /// The events as a plain slice.
+    pub fn as_slice(&self) -> &[Event] {
+        &self.0
+    }
+}
+
+impl Deref for Events {
+    type Target = [Event];
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl IntoIterator for Events {
+    type Item = Event;
+    type IntoIter = smallvec::IntoIter<[Event; 2]>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.0.into_iter()
+    }
+}
+
+impl FromIterator<Event> for Events {
+    fn from_iter<T: IntoIterator<Item = Event>>(iter: T) -> Self {
+        Self(iter.into_iter().collect())
+    }
+}
+
+impl Extend<Event> for Events {
+    fn extend<T: IntoIterator<Item = Event>>(&mut self, iter: T) {
+        self.0.extend(iter);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// IntoEvent — typed facts become journal-ready events (§6)
+// ---------------------------------------------------------------------------
+
+/// A typed fact that knows how to become a journal-ready [`Event`].
+///
+/// Implemented automatically for every type that is a [`Schema`] and
+/// [`Serialize`] — i.e. for every declared message type. Call sites never
+/// name this trait; they pass typed facts straight to [`Events::one`] or
+/// [`Events::push_event`].
+///
+/// # Panics
+///
+/// [`IntoEvent::into_event`] panics if serializing the payload fails. For
+/// the runtime's value domain (strings, numbers, bools, nulls, and
+/// compositions of them) serialization cannot fail, so a failure here means
+/// a programming bug — a failing invariant is a crash, not a value. Use
+/// [`IntoEvent::try_into_event`] at the boundary of hand-rolled `Serialize`
+/// impls that can fail.
+pub trait IntoEvent: Schema + Serialize + Sized {
+    /// Builds the event, deriving the schema id from the type.
+    ///
+    /// # Panics
+    ///
+    /// Panics with a named message if serializing the payload fails.
+    fn into_event(self) -> Event {
+        self.try_into_event()
+            .unwrap_or_else(|e| panic!("IntoEvent: failed to serialize payload for {}: {e}", Self::schema_id()))
+    }
+
+    /// Builds the event, reporting serialization failure instead of
+    /// panicking.
+    ///
+    /// # Errors
+    ///
+    /// Returns the underlying `serde_json` error if the payload cannot be
+    /// serialized.
+    fn try_into_event(self) -> Result<Event, serde_json::Error> {
+        Ok(Event::new(
+            Self::schema_id(),
+            serde_json::to_value(&self)?,
+        ))
+    }
+}
+
+impl<T: Schema + Serialize> IntoEvent for T {}
+
+#[cfg(test)]
+mod events_tests {
+    use super::*;
+    use crate::actor::CommandHandler;
+    use crate::actor::CommandEntry as _;
+    use crate::actor::EventSourcedActor as _;
+    use crate::context::CmdCtx;
+    use serde::Deserialize;
+    use serde_json::json;
+
+    #[derive(Serialize, Deserialize)]
+    struct Deposited {
+        n: i64,
+    }
+    impl Schema for Deposited {
+        fn schema_def() -> crate::schema::SchemaDef {
+            crate::schema::SchemaDef {
+                name: "Deposited".into(),
+                version: 1,
+                kind: crate::schema::SchemaKind::Event,
+                fields: vec![],
+                description: None,
+            }
+        }
+    }
+
+    #[test]
+    fn events_stays_inline_for_two_and_spills_past() {
+        // Given an empty buffer.
+        let mut events = Events::new();
+
+        // When filling it up to the inline capacity.
+        events.push_event(Deposited { n: 1 });
+        events.push_event(Deposited { n: 2 });
+
+        // Then two events stay inline (no heap allocation).
+        assert!(!events.0.spilled(), "two events must stay inline");
+
+        // When pushing a third event.
+        events.push_event(Deposited { n: 3 });
+
+        // Then the buffer spilled to the heap transparently and kept every
+        // event in order.
+        assert!(events.0.spilled(), "past two events must spill");
+        assert_eq!(events.len(), 3);
+        assert_eq!(events[0].payload["n"], 1);
+        assert_eq!(events[2].payload["n"], 3);
+    }
+
+    #[test]
+    fn into_event_derives_schema_id_and_payload_from_type() {
+        // Given a typed fact.
+        let fact = Deposited { n: 5 };
+
+        // When converting it into an event.
+        let event = fact.into_event();
+
+        // Then the schema id is derived from the type (name@version) and the
+        // payload is the serialized fact.
+        assert_eq!(event.schema, Deposited::schema_id());
+        assert_eq!(event.schema.as_str(), "Deposited@1");
+        assert_eq!(event.payload["n"], 5);
+    }
+
+    #[test]
+    fn decode_yields_the_typed_fact_on_exact_schema_id() {
+        // Given an event recorded as `Deposited@1`.
+        let event = Deposited { n: 7 }.into_event();
+
+        // When decoding it into the typed fact.
+        let decoded: Option<Deposited> = event.decode();
+
+        // Then the fact comes back with its data.
+        assert_eq!(decoded.expect("decode").n, 7);
+    }
+
+    #[test]
+    fn decode_returns_none_on_version_mismatch() {
+        // Given an event recorded as `Deposited@2` (a v2 payload shape).
+        let event = Event::new(SchemaId::new("Deposited", 2), json!({ "n": 9, "cents": 0 }));
+
+        // When decoding it through the v1 type.
+        let decoded: Option<Deposited> = event.decode();
+
+        // Then nothing decodes: version-pinned, no silent corruption.
+        assert!(decoded.is_none(), "v2 payload must not decode as v1");
+    }
+
+    #[test]
+    fn is_matches_without_cloning_or_decoding() {
+        // Given two events: one `Deposited@1`, one `Withdrawn@1`.
+        let deposited = Deposited { n: 1 }.into_event();
+        let withdrawn = Event::new(SchemaId::new("Withdrawn", 1), json!({ "n": 1 }));
+
+        // When asking each whether it IS a Deposited.
+        let deposited_is = deposited.is::<Deposited>();
+        let withdrawn_is = withdrawn.is::<Deposited>();
+
+        // Then only the exact-schema event matches (pure comparison).
+        assert!(deposited_is);
+        assert!(!withdrawn_is);
+    }
+
+    /// A fact whose serialization fails (injected via a hand-rolled impl).
+    #[derive(Clone, Copy)]
+    struct Unserializable {
+        bad: f64,
+    }
+    impl Serialize for Unserializable {
+        fn serialize<S: serde::Serializer>(&self, _serializer: S) -> Result<S::Ok, S::Error> {
+            use serde::ser::Error as _;
+            Err(S::Error::custom("injected serialize failure"))
+        }
+    }
+    impl Schema for Unserializable {
+        fn schema_def() -> crate::schema::SchemaDef {
+            crate::schema::SchemaDef {
+                name: "Unserializable".into(),
+                version: 1,
+                kind: crate::schema::SchemaKind::Event,
+                fields: vec![],
+                description: None,
+            }
+        }
+    }
+
+    #[test]
+    fn try_into_event_reports_serialize_failure() {
+        // Given a fact whose serialization fails.
+        let fact = Unserializable { bad: f64::NAN };
+
+        // When converting with the fallible escape hatch.
+        let result = fact.try_into_event();
+
+        // Then the failure is reported, not panicked.
+        assert!(result.is_err(), "injected failure must surface as Err");
+
+        // When converting with the named-panic path.
+        // Then the panic names the schema.
+        let panicked = std::panic::catch_unwind(move || fact.into_event());
+        let msg = panicked
+            .err()
+            .and_then(|p| p.downcast_ref::<String>().cloned())
+            .unwrap_or_default();
+        assert!(
+            msg.contains("Unserializable@1"),
+            "panic must name the schema, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn dispatch_journals_exactly_the_events_handle_returned() {
+        // Given a counter whose handler returns one typed fact, driven
+        // through the erased dispatch the kernel uses.
+        use crate::context::{Outbox, RuntimeView};
+        struct NullView;
+        impl RuntimeView for NullView {
+            fn lookup(&self, _path: &ActorPath) -> Option<crate::registry::EndpointInfo> {
+                None
+            }
+            fn handlers_of(&self, _schema: &SchemaId) -> Vec<ActorPath> {
+                Vec::new()
+            }
+            fn now(&self) -> crate::clock::Timestamp {
+                crate::clock::Timestamp::from_millis(0)
+            }
+        }
+        let mut state = crate::actor::TypedEsState::new(Counter::restore(&json!({})));
+        let adapter = crate::actor::TypedEsAdapter::<Counter, ReserveStock>::new::<ReserveStock>();
+        let trace = TraceCtx::root();
+        let path = ActorPath::new("t");
+        let mut outbox = Outbox::new();
+        let mut ctx = CmdCtx::new(&path, &trace, None, &NullView, &mut outbox);
+
+        // When dispatching the command.
+        let events = adapter
+            .dispatch(&mut state, &json!({ "qty": 4 }), &mut ctx)
+            .expect("dispatch");
+
+        // Then the buffer holds exactly the decided events, in order, ready
+        // to append as a slice (deref to &[Event], no conversion).
+        assert_eq!(events.len(), 1);
+        let appended: &[Event] = &events;
+        assert_eq!(appended[0].schema, StockReserved::schema_id());
+        assert_eq!(appended[0].payload["qty"], 4);
+    }
+
+    /// Minimal counter state for the dispatch test above (same shape as the
+    /// actor.rs doc fixture).
+    #[derive(Serialize, Deserialize, Default)]
+    struct Counter {
+        count: i64,
+    }
+    impl crate::actor::EventSourcedActor for Counter {
+        fn manifest() -> crate::schema::ActorManifest {
+            crate::schema::ActorManifest::new()
+        }
+        fn restore(_args: &JsonValue) -> Self {
+            Self::default()
+        }
+        fn apply(&mut self, event: &Event) {
+            if event.schema == StockReserved::schema_id() {
+                self.count += event.payload["qty"].as_i64().unwrap_or(0);
+            }
+        }
+    }
+    impl CommandHandler<ReserveStock> for Counter {
+        fn handle(&self, cmd: ReserveStock, _ctx: &mut CmdCtx<'_>) -> Events {
+            Events::one(StockReserved { qty: cmd.qty })
+        }
+    }
+
+    #[derive(Serialize, Deserialize)]
+    struct ReserveStock {
+        qty: i64,
+    }
+    impl Schema for ReserveStock {
+        fn schema_def() -> crate::schema::SchemaDef {
+            crate::schema::SchemaDef {
+                name: "ReserveStock".into(),
+                version: 1,
+                kind: crate::schema::SchemaKind::Command,
+                fields: vec![],
+                description: None,
+            }
+        }
+    }
+
+    #[derive(Serialize, Deserialize)]
+    struct StockReserved {
+        qty: i64,
+    }
+    impl Schema for StockReserved {
+        fn schema_def() -> crate::schema::SchemaDef {
+            crate::schema::SchemaDef {
+                name: "StockReserved".into(),
+                version: 1,
+                kind: crate::schema::SchemaKind::Event,
+                fields: vec![],
+                description: None,
+            }
+        }
+    }
 }

@@ -89,7 +89,12 @@ pub trait CommandHandler<C>: EventSourcedActor {
     ///
     /// Sync, `&self` — no I/O, no await, no mutation. Effects are *declared*
     /// through `ctx` (deferred to post-ack by the kernel).
-    fn handle(&self, cmd: C, ctx: &mut CmdCtx<'_>) -> Vec<crate::envelope::Event>;
+    ///
+    /// Returns an [`Events`](crate::envelope::Events) buffer: build events
+    /// from typed facts ([`Events::one`](crate::envelope::Events::one),
+    /// [`Events::push_event`](crate::envelope::Events::push_event)) — never
+    /// by hand.
+    fn handle(&self, cmd: C, ctx: &mut CmdCtx<'_>) -> crate::envelope::Events;
 }
 
 /// A read model: a state struct that folds other actors' recorded facts.
@@ -285,7 +290,7 @@ pub trait CommandEntry: Send + Sync {
         state: &mut dyn DynEsActor,
         payload: &JsonValue,
         ctx: &mut CmdCtx<'_>,
-    ) -> Result<Vec<crate::envelope::Event>, error_stack::Report<DispatchError>>;
+    ) -> Result<crate::envelope::Events, error_stack::Report<DispatchError>>;
 }
 
 /// Generic adapter: erases `A`'s handler for command type `C`.
@@ -320,7 +325,7 @@ where
         state: &mut dyn DynEsActor,
         payload: &JsonValue,
         ctx: &mut CmdCtx<'_>,
-    ) -> Result<Vec<crate::envelope::Event>, error_stack::Report<DispatchError>> {
+    ) -> Result<crate::envelope::Events, error_stack::Report<DispatchError>> {
         use error_stack::ResultExt;
         let cmd: C = serde_json::from_value(payload.clone()).change_context(
             DispatchError::Decode(format!("command {} did not match its schema", self.schema)),
@@ -421,11 +426,13 @@ impl CommandEntry for ConsumeEntry {
         _state: &mut dyn DynEsActor,
         payload: &JsonValue,
         _ctx: &mut CmdCtx<'_>,
-    ) -> Result<Vec<crate::envelope::Event>, error_stack::Report<DispatchError>> {
-        Ok(vec![crate::envelope::Event::new(
+    ) -> Result<crate::envelope::Events, error_stack::Report<DispatchError>> {
+        let mut events = crate::envelope::Events::new();
+        events.push(crate::envelope::Event::new(
             self.schema.clone(),
             payload.clone(),
-        )])
+        ));
+        Ok(events)
     }
 }
 
@@ -521,14 +528,20 @@ impl CommandEntry for ForeignCommandEntry {
         state: &mut dyn DynEsActor,
         payload: &JsonValue,
         ctx: &mut CmdCtx<'_>,
-    ) -> Result<Vec<crate::envelope::Event>, error_stack::Report<DispatchError>> {
+    ) -> Result<crate::envelope::Events, error_stack::Report<DispatchError>> {
         // DECIDE ONLY (like the typed adapter): the foreign state folds the
-        // returned events itself, post-ack, via its own fold closure.
+        // returned events itself, post-ack, via its own fold closure. The
+        // decision closure is the one `Vec`-returning seam left in the
+        // kernel — wrapped once, here, into the compact buffer.
         let foreign = state
             .as_any_mut()
             .downcast_mut::<ForeignEsState>()
             .expect("foreign entry on non-foreign state — kernel bug");
-        Ok((self.decision)(foreign.state(), payload, ctx))
+        Ok(crate::envelope::Events::from_vec((self.decision)(
+            foreign.state(),
+            payload,
+            ctx,
+        )))
     }
 }
 
@@ -725,11 +738,11 @@ mod tests {
     }
 
     impl CommandHandler<ReserveStock> for Counter {
-        fn handle(&self, cmd: ReserveStock, _ctx: &mut CmdCtx<'_>) -> Vec<crate::envelope::Event> {
-            vec![crate::envelope::Event::new(
+        fn handle(&self, cmd: ReserveStock, _ctx: &mut CmdCtx<'_>) -> crate::envelope::Events {
+            crate::envelope::Events::from_vec(vec![crate::envelope::Event::new(
                 StockReserved::schema_id(),
                 json!({ "qty": cmd.qty }),
-            )]
+            )])
         }
     }
 
@@ -845,7 +858,7 @@ mod tests {
         assert_eq!(captured["count"], 0, "dispatch must not mutate state");
 
         // When the kernel applies the events (post-ack step).
-        for event in &events {
+        for event in events.iter() {
             state.apply_erased(event);
         }
 
@@ -932,7 +945,7 @@ mod tests {
         assert_eq!(state.state()["count"], 0, "dispatch must not fold");
 
         // When the kernel applies (post-ack).
-        for event in &events {
+        for event in events.iter() {
             state.apply_erased(event);
         }
 
