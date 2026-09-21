@@ -55,7 +55,11 @@ Entries are added or amended **only with human approval**.
 - (runtime) All synchronous mutexes are parking_lot: lock() cannot fail, there is no poisoning, and a panic under a lock never wedges later lockers.
 - (runtime) Replies are point-to-point: a reply with no reply_to is dropped silently, never broadcast; every outbound actor message requires a declared .emits and is dropped with an UndeclaredEmit dead letter otherwise.
 - (runtime) Handler contexts (CmdCtx/MsgCtx) expose only tier-curated methods; the outbox, trace, and ask port are crate-private plumbing.
-- (runtime) Handler effects are typed: ctx reply/publish/send take Message values (Schema + serde), derive the schema id from the type, and serialize at intent time; raw JSON variants remain as the \*\_json escape hatch.
+- (runtime) Handler effects are typed: ctx reply/publish/send take Message values (Schema + serde), derive the schema id from the type, and serialize at intent time; raw value escape hatches remain (\*\_json methods, Event::new, into_inner).
+- (values) The runtime's public value type is trouper::Json, a newtype over the internal JSON tree; serde_json types do not appear in public signatures.
+- (runtime) Command handlers return an Events buffer (inline for two events, heap beyond) and construct events from typed values via IntoEvent.
+- (runtime) Event folds decode payloads by schema id via Event::decode::<T>(); unmatched schemas are ignored.
+- (runtime) Spawn arguments are provided as typed Serialize values on builders and decoded in restore via Json; partition entities receive the shard key merged as a "key" field.
 - (contexts) MsgCtx exposes typed send/publish/send_to_any/ask/reply/stop_self, all emits-gated at flush; CmdCtx is pure introspection — an event-sourced entity announces only by returning facts from its decision.
 - (lifecycle) A trouper actor's on_stop hook runs on graceful stop, self-stop, passivation, and the shutdown sweep; never on crash or hard shutdown.
 - (lifecycle) Service actors receive an async on_stop(&mut self); event-sourced actors receive a sync on_stop(&self).
