@@ -34,7 +34,7 @@ Entries are added or amended **only with human approval**.
 - (identity) trouper is a single-crate Rust repository (edition 2024); the `trouper` package is the single-machine actor runtime and the only crate.
 - (runtime) All actor communication is mediated by the runtime: actors never hold channels directly; every send is routed by path or schema through the registry and emits a tap fact.
 - (runtime) Event-sourced actors are pure decision functions (sync `handle(&self)` returning events) with a single `apply` used for both live state application and replay; all other actors may perform side effects and use `ask`.
-- (runtime) The registry is kernel code, not an actor: path→endpoint slots, schema, type→handler, partition specs, and router rule tables persist across actor restarts; actor identity is its registered path.
+- (runtime) The registry is kernel code, not an actor: path→endpoint slots, schema, schema→handler route, partition, projector-set, and router rule tables persist across actor restarts; actor identity is its registered path.
 - (runtime) Message schemas are runtime data: Rust types and external JSON descriptors register into the same schema table; payloads cross the runtime boundary as JSON.
 - (runtime) Event-sourced journals are in-memory, seq-anchored lists of `Event` and `Snapshot` entries; restart restores from the latest snapshot plus the tail, and command redelivery is independent of snapshots.
 - (runtime) Actor spawning is builder-based: typed actors declare `handles`/`emits` inline; foreign actors supply JSON schema plus handle/apply closures; positional spawn functions remain as alternative entry points.
@@ -75,3 +75,10 @@ Entries are added or amended **only with human approval**.
 - (events) Event-sourced actors do not answer asks: system.ask to an ES path fails fast with AskError::Unresolved; consumers listen for facts.
 - (journal) Journals accept only declared schemas: an undeclared recorded event dead-letters UndeclaredEvent before append. Dead letters retain their envelopes and are host-managed via drain_dead_letters; the runtime never redrives automatically.
 - (supervision) An event-sourced entity owns no lifecycle intents: only passivation, external stop, or supervision ends one.
+- (lifecycle) Passivation and stop remove the actor's in-memory state entry; only live actors hold state, and cold state returns by replay from the journal store.
+- (projections) A projector is an event-sourced actor whose consumed facts are re-recorded into its own journal; the journaled origins are its checkpoint and catch-up seeds whatever the journal lacks.
+- (projections) The journal store assigns every recorded fact a globally monotonic ingest_seq at append time; projectors fold in ingest_seq order and scans return origin-recorded entries only.
+- (routing) A projector set declares consumption with a shard key: broadcast copies of a consumed schema resolve a key per copy and activate the owning projector on demand, like a told command.
+- (journal) The store is told passivated(path) when an idle entity leaves memory; a failing hint is logged and never blocks passivation.
+- (queries) projector_state wakes a projector-set entity if needed, awaits catch-up, and returns the complete fold; es_state is a best-effort capture of in-memory state only.
+- (lifecycle) A projector records a CaughtUp tap fact when its catch-up completes.
