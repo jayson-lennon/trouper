@@ -1284,6 +1284,9 @@ impl crate::context::AskPort for KernelAskPort {
         let registry = self.registry.clone();
         let kernel = self.kernel.clone();
         let clock = self.clock.clone();
+        // The settle path rides a clone: the boxed future must be 'static,
+        // and the port is an cheap Arc bundle.
+        let settle_port = self.clone();
         Box::pin(async move {
             // ENTITIES DO NOT ANSWER ASKS: a request aimed at an
             // event-sourced actor fails fast with the named error —
@@ -1316,10 +1319,13 @@ impl crate::context::AskPort for KernelAskPort {
                 ));
             };
 
-            // Open the lease and route the request envelope.
+            // Open the lease and route the request envelope. Expired
+            // leases are reaped here as a side effect of opening — a
+            // dead asker's slot can never accumulate (no reaper task).
             let now = clock.now();
             let (lease, receiver) = {
                 let mut kernel = kernel.lock();
+                kernel.replies.prune(now);
                 let trace = crate::envelope::TraceCtx::root();
                 let (lease, receiver) = kernel.replies.open(ttl, now);
                 kernel.ask_facts.push(AskFact {
@@ -1343,9 +1349,21 @@ impl crate::context::AskPort for KernelAskPort {
                 Envelope::json(schema, dest.clone(), payload, trace).reply_to(Address::Slot(lease));
             match deliver_with_retry(&endpoint, envelope).await {
                 Ok(()) => Ok((lease, receiver)),
-                Err(_) => Err(error_stack::Report::new(
-                    crate::context::AskError::Unresolved(format!("{dest:?}")),
-                )),
+                Err(_) => {
+                    // The request never left: settle the ask as Failed so
+                    // the ledger stays opened/settled-paired and the lease
+                    // is CANCELLED (a leaked slot would hold the reply
+                    // channel open forever).
+                    settle_port.ask_settled(
+                        lease,
+                        dest.clone(),
+                        AskOutcome::Failed,
+                        crate::envelope::TraceCtx::root(),
+                    );
+                    Err(error_stack::Report::new(
+                        crate::context::AskError::Unresolved(format!("{dest:?}")),
+                    ))
+                }
             }
         })
     }
