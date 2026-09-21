@@ -202,8 +202,9 @@ pub struct ActorSystemCore {
     /// Set by the graceful shutdown sweep: new routes dead-letter with
     /// `ShuttingDown`, partition activation is disabled, supervision
     /// engines suspend, and passivation stands down (the sweep owns
-    /// termination).
-    pub(crate) shutting_down: std::sync::atomic::AtomicBool,
+    /// termination). SHARED with the kernel state (one `Arc<AtomicBool>`):
+    /// the send path reads it lock-free through this handle.
+    pub(crate) shutting_down: std::sync::Arc<std::sync::atomic::AtomicBool>,
     /// The journal store every ES actor's journal lives in (in-memory by
     /// default; swapped per system at construction).
     pub(crate) journal_store_slot:
@@ -711,8 +712,13 @@ impl ActorSystemCore {
         // sweep's flush; the kernel reads/writes through the same Arc.
         let journal_store: std::sync::Arc<dyn crate::journal::JournalStore> =
             std::sync::Arc::new(crate::journal::InMemoryJournalStore::new());
+        // ONE shutdown barrier, shared by the core and the kernel state:
+        // the sweep stores through the core handle, the send path reads
+        // through clones — never a lock in between.
+        let shutting_down = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let mut kernel = KernelState::with_tap_capacity(config.tap_capacity);
         kernel.journal_store = journal_store.clone();
+        kernel.shutting_down = shutting_down.clone();
         Self {
             registry,
             kernel: Arc::new(Mutex::new(kernel)),
@@ -720,7 +726,7 @@ impl ActorSystemCore {
             view,
             child_shutdowns: parking_lot::Mutex::new(Vec::new()),
             mailbox_defaults: config.default_mailbox,
-            shutting_down: std::sync::atomic::AtomicBool::new(false),
+            shutting_down,
             journal_store_slot: parking_lot::RwLock::new(journal_store),
         }
     }
@@ -731,7 +737,10 @@ impl ActorSystemCore {
     /// the same Arcs the spawn captured). A loop facade never owns
     /// supervision shutdown senders and never reports `shutting_down`.
     pub(crate) fn loop_facade(ctx: &crate::kernel::EsLoop) -> Self {
-        let store = ctx.kernel.lock().journal_store.clone();
+        let (store, shutting_down) = {
+            let kernel = ctx.kernel.lock();
+            (kernel.journal_store.clone(), kernel.shutting_down.clone())
+        };
         Self {
             registry: ctx.registry.clone(),
             kernel: ctx.kernel.clone(),
@@ -739,7 +748,7 @@ impl ActorSystemCore {
             view: ctx.view.clone(),
             child_shutdowns: parking_lot::Mutex::new(Vec::new()),
             mailbox_defaults: MailboxDefaults::default(),
-            shutting_down: std::sync::atomic::AtomicBool::new(false),
+            shutting_down,
             journal_store_slot: parking_lot::RwLock::new(store),
         }
     }
@@ -946,6 +955,7 @@ impl ActorSystemCore {
             .insert(path.clone(), self.clock.now().as_millis());
         if let Some(wm) = opts.high_watermark {
             kernel.watermarks.insert(path.clone(), (wm, false));
+            cell.has_watermark.store(true, std::sync::atomic::Ordering::SeqCst);
         }
         kernel.record_fact(
             self.clock.now(),
@@ -963,6 +973,7 @@ impl ActorSystemCore {
             cell,
             registry: self.registry.clone(),
             kernel: self.kernel.clone(),
+            shutting_down: self.shutting_down.clone(),
             view: self.view.clone(),
             clock: self.clock.clone(),
         };
@@ -1081,6 +1092,7 @@ impl ActorSystemCore {
             .insert(path.clone(), self.clock.now().as_millis());
         if let Some(wm) = opts.high_watermark {
             kernel.watermarks.insert(path.clone(), (wm, false));
+            cell.has_watermark.store(true, std::sync::atomic::Ordering::SeqCst);
         }
         kernel.record_fact(
             self.clock.now(),
@@ -1097,6 +1109,7 @@ impl ActorSystemCore {
             cell: cell.clone(),
             registry: self.registry.clone(),
             kernel: self.kernel.clone(),
+            shutting_down: self.shutting_down.clone(),
             view: self.view.clone(),
             clock: self.clock.clone(),
         };
@@ -1150,7 +1163,7 @@ impl ActorSystemCore {
     /// Returns the envelope back when its destination does not resolve
     /// (callers dead-letter or retry).
     pub async fn send(&self, envelope: Envelope) -> Result<ActorPath, Envelope> {
-        route(&self.registry, &self.kernel, envelope).await
+        route(&self.registry, &self.kernel, &self.shutting_down, envelope).await
     }
 
     /// Typed fire-and-forget: serializes `value` under `C`'s schema and
@@ -1283,7 +1296,7 @@ impl ActorSystemCore {
             TraceCtx::root(),
         );
         async move {
-            crate::kernel::broadcast(&self.registry, &self.kernel, schema, envelope).await;
+            crate::kernel::broadcast(&self.registry, &self.kernel, &self.shutting_down, schema, envelope).await;
         }
     }
 
@@ -1299,7 +1312,7 @@ impl ActorSystemCore {
             payload,
             TraceCtx::root(),
         );
-        crate::kernel::broadcast(&self.registry, &self.kernel, schema, envelope).await;
+        crate::kernel::broadcast(&self.registry, &self.kernel, &self.shutting_down, schema, envelope).await;
     }
 
     /// Untyped schema-kind dispatch from outside the system: the bridge
@@ -1384,6 +1397,7 @@ impl ActorSystemCore {
             cell,
             registry: self.registry.clone(),
             kernel: self.kernel.clone(),
+            shutting_down: self.shutting_down.clone(),
             view: self.view.clone(),
             clock: self.clock.clone(),
         };
@@ -1566,6 +1580,7 @@ impl ActorSystemCore {
                         cell,
                         registry: self.registry.clone(),
                         kernel: self.kernel.clone(),
+                        shutting_down: self.shutting_down.clone(),
                         view: self.view.clone(),
                         clock: self.clock.clone(),
                     };

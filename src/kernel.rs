@@ -147,7 +147,10 @@ pub(crate) struct KernelState {
     /// route (deliveries dead-letter with `ShuttingDown`), by partition
     /// activation (refused), by the supervision engines (suspended), and
     /// by passivation (stands down).
-    pub(crate) shutting_down: std::sync::atomic::AtomicBool,
+    ///
+    /// Shared as an `Arc<AtomicBool>`: the send path reads it LOCK-FREE
+    /// (the core keeps a clone), never through the kernel lock.
+    pub(crate) shutting_down: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl Default for KernelState {
@@ -182,7 +185,7 @@ impl KernelState {
             last_work_ms: HashMap::new(),
             caught_up: HashMap::new(),
             last_event_seq: HashMap::new(),
-            shutting_down: std::sync::atomic::AtomicBool::new(false),
+            shutting_down: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
     }
 }
@@ -277,6 +280,11 @@ pub(crate) struct ActorCell {
     /// The spawn-configured inbox overload policy (drives the front-door
     /// channel depth and the Block hold-retry).
     pub(crate) mailbox_policy: crate::inbox::OverloadPolicy,
+    /// Whether this actor declared a high-watermark at spawn. When false,
+    /// the front door skips its watermark check entirely — the enqueue
+    /// path never takes the kernel lock for it (D: the lock-free fast
+    /// path; most actors declare no watermark).
+    pub(crate) has_watermark: std::sync::atomic::AtomicBool,
     /// The running loop's handle, when a task is live.
     pub(crate) handle: tokio::sync::Mutex<Option<ActorHandle>>,
     /// Wakes the actor loop when work arrives (latency optimization; the
@@ -302,6 +310,7 @@ impl ActorCell {
             inbox: tokio::sync::Mutex::new(inbox),
             mailbox_capacity,
             mailbox_policy,
+            has_watermark: std::sync::atomic::AtomicBool::new(false),
             handle: tokio::sync::Mutex::new(None),
             work: Arc::new(Notify::new()),
             on_stop_done: std::sync::atomic::AtomicBool::new(false),
@@ -328,6 +337,8 @@ pub(crate) struct EsLoop {
     pub(crate) registry: Arc<crate::system::CountingRegistryLock>,
     /// The shared actor tables.
     pub(crate) kernel: Arc<Mutex<KernelState>>,
+    /// Lock-free clone of the shutdown barrier (the send-path check).
+    pub(crate) shutting_down: std::sync::Arc<std::sync::atomic::AtomicBool>,
     /// The read-only view handed to handler contexts.
     pub(crate) view: Arc<dyn RuntimeView>,
     /// The injected clock (lease expiries, deterministic tests).
@@ -353,28 +364,29 @@ impl EsLoop {
 /// Routes an envelope through the registry to its destination.
 ///
 /// Returns the delivered path, or the envelope back for dead-lettering
-/// when the destination does not resolve.
+/// when the destination does not resolve. `shutting_down` is the shared
+/// shutdown barrier, read LOCK-FREE (never through the kernel lock).
 pub(crate) async fn route(
     registry: &crate::system::CountingRegistryLock,
     kernel: &Mutex<KernelState>,
+    shutting_down: &std::sync::atomic::AtomicBool,
     envelope: Envelope,
 ) -> Result<ActorPath, Envelope> {
-    route_inner(registry, kernel, envelope).await
+    route_inner(registry, kernel, shutting_down, envelope).await
 }
 
 async fn route_inner(
     registry: &crate::system::CountingRegistryLock,
     kernel: &Mutex<KernelState>,
+    shutting_down: &std::sync::atomic::AtomicBool,
     envelope: Envelope,
 ) -> Result<ActorPath, Envelope> {
     // SHUTDOWN BARRIER: once the sweep starts, nothing new is accepted —
     // every delivery dead-letters with `ShuttingDown` (observably, never
-    // silently). Activation is refused inside resolve_partition.
-    if kernel
-        .lock()
-        .shutting_down
-        .load(std::sync::atomic::Ordering::SeqCst)
-    {
+    // silently). A lock-free atomic read: the hot send path never
+    // touches the kernel lock for this. Activation is refused inside
+    // resolve_partition.
+    if shutting_down.load(std::sync::atomic::Ordering::SeqCst) {
         dead_letter(
             kernel,
             &envelope,
@@ -432,7 +444,7 @@ async fn route_inner(
             };
             // PARTITION SETS: a public set path resolves to ONE entity,
             // derived from the payload's shard key (activated on demand).
-            let path = match resolve_partition(registry, kernel, &envelope, path.clone()).await {
+            let path = match resolve_partition(registry, kernel, shutting_down, &envelope, path.clone()).await {
                 Ok(Some(entity)) => entity,
                 Ok(None) => path,
                 Err(missing_key_envelope) => {
@@ -466,7 +478,7 @@ async fn route_inner(
                 .is_err()
             {
                 let retry_path =
-                    match resolve_partition(registry, kernel, &envelope, path.clone()).await {
+                    match resolve_partition(registry, kernel, shutting_down, &envelope, path.clone()).await {
                         Ok(Some(entity)) => entity,
                         _ => path.clone(),
                     };
@@ -542,6 +554,7 @@ async fn route_inner(
 async fn resolve_partition(
     registry: &crate::system::CountingRegistryLock,
     kernel: &Mutex<KernelState>,
+    shutting_down: &std::sync::atomic::AtomicBool,
     envelope: &Envelope,
     dest: ActorPath,
 ) -> Result<Option<ActorPath>, Envelope> {
@@ -553,7 +566,7 @@ async fn resolve_partition(
         // Not an entity partition: fall through to the projector-set
         // check (a path belongs to at most one set — both tables are
         // keyed by public path).
-        return resolve_projector_set(registry, kernel, envelope, dest).await;
+        return resolve_projector_set(registry, kernel, shutting_down, envelope, dest).await;
     };
     let key = match extract_key(registry, envelope, &spec.key_field) {
         Some(key) => key,
@@ -565,12 +578,9 @@ async fn resolve_partition(
     if registry.lock().lookup(&entity_path).is_some() {
         return Ok(Some(entity_path));
     }
-    // The sweep disables activation: nothing new may start mid-shutdown.
-    if kernel
-        .lock()
-        .shutting_down
-        .load(std::sync::atomic::Ordering::SeqCst)
-    {
+    // The sweep disables activation: nothing new may start mid-shutdown
+    // (a lock-free read).
+    if shutting_down.load(std::sync::atomic::Ordering::SeqCst) {
         return Err(envelope.clone());
     } // ACTIVATE: spawn the entity from the shared factory. The factory's
     // spawn registers the entity's slot; a concurrent same-key send is
@@ -601,6 +611,7 @@ fn extract_key(registry: &crate::system::CountingRegistryLock, envelope: &Envelo
 async fn resolve_projector_set(
     registry: &crate::system::CountingRegistryLock,
     kernel: &Mutex<KernelState>,
+    shutting_down: &std::sync::atomic::AtomicBool,
     envelope: &Envelope,
     dest: ActorPath,
 ) -> Result<Option<ActorPath>, Envelope> {
@@ -625,11 +636,7 @@ async fn resolve_projector_set(
     if registry.lock().lookup(&projector_path).is_some() {
         return Ok(Some(projector_path));
     }
-    if kernel
-        .lock()
-        .shutting_down
-        .load(std::sync::atomic::Ordering::SeqCst)
-    {
+    if shutting_down.load(std::sync::atomic::Ordering::SeqCst) {
         return Err(envelope.clone());
     }
     (spec.factory)(&spec.system, &projector_path, &spec.entity_args(&key));
@@ -789,23 +796,28 @@ pub(crate) async fn front_door_loop(
         let accepted = push_holding_block(&cell, &kernel, envelope.clone()).await;
         // WATERMARK CHECK (rate-limited): fires on the UP-crossing only;
         // the latch re-arms when the depth falls back to/below the mark.
-        let depth = cell.inbox.lock().await.len() as u64;
-        let mut kernel_state = kernel.lock();
-        if let Some((wm, fired)) = kernel_state.watermarks.get_mut(&cell.path) {
-            if depth > *wm && !*fired {
-                *fired = true;
-                kernel_state.record_fact(
-                    envelope.trace.causality_id.as_millis_ts(),
-                    crate::tap::FactKind::Backpressured {
-                        path: cell.path.clone(),
-                        depth,
-                    },
-                );
-            } else if depth <= *wm && *fired {
-                *fired = false;
+        // Actors with no declared watermark (the common case) skip the
+        // whole block — no depth read, no kernel lock on this path (the
+        // cell-local flag answers "declared?" without either).
+        if cell.has_watermark.load(std::sync::atomic::Ordering::SeqCst) {
+            let depth = cell.inbox.lock().await.len() as u64;
+            let mut kernel_state = kernel.lock();
+            if let Some((wm, fired)) = kernel_state.watermarks.get_mut(&cell.path) {
+                if depth > *wm && !*fired {
+                    *fired = true;
+                    kernel_state.record_fact(
+                        envelope.trace.causality_id.as_millis_ts(),
+                        crate::tap::FactKind::Backpressured {
+                            path: cell.path.clone(),
+                            depth,
+                        },
+                    );
+                } else if depth <= *wm && *fired {
+                    *fired = false;
+                }
             }
+            drop(kernel_state);
         }
-        drop(kernel_state);
         if accepted {
             cell.work.notify_one();
         }
@@ -1485,6 +1497,7 @@ impl crate::context::AskPort for KernelAskPort {
 pub(crate) async fn broadcast(
     registry: &crate::system::CountingRegistryLock,
     kernel: &Mutex<KernelState>,
+    shutting_down: &std::sync::atomic::AtomicBool,
     schema: SchemaId,
     envelope: Envelope,
 ) {
@@ -1574,7 +1587,7 @@ pub(crate) async fn broadcast(
         }
         let mut keyed = envelope.clone();
         keyed.dest = crate::envelope::Address::Path(derived);
-        if let Err(undeliverable) = route(registry, kernel, keyed).await {
+        if let Err(undeliverable) = route(registry, kernel, shutting_down, keyed).await {
             dead_letter(
                 kernel,
                 &undeliverable,
@@ -1591,6 +1604,7 @@ pub(crate) async fn broadcast(
 async fn resolve_reply(
     kernel: &Mutex<KernelState>,
     registry: &crate::system::CountingRegistryLock,
+    shutting_down: &std::sync::atomic::AtomicBool,
     to: Address,
     schema: SchemaId,
     payload: Json,
@@ -1607,7 +1621,7 @@ async fn resolve_reply(
             // A schema-addressed reply is an ordinary routed send (the
             // route table picks a handler).
             let envelope = Envelope::json(schema, to, payload, trace);
-            if let Err(undeliverable) = route(registry, kernel, envelope).await {
+            if let Err(undeliverable) = route(registry, kernel, shutting_down, envelope).await {
                 dead_letter(
                     kernel,
                     &undeliverable,
@@ -1620,7 +1634,7 @@ async fn resolve_reply(
             // Durable name: an ordinary envelope (any actor may have moved
             // on; unresolvable replies dead-letter like any send).
             let envelope = Envelope::json(schema, Address::Path(path.clone()), payload, trace);
-            if let Err(undeliverable) = route(registry, kernel, envelope).await {
+            if let Err(undeliverable) = route(registry, kernel, shutting_down, envelope).await {
                 dead_letter(
                     kernel,
                     &undeliverable,
@@ -1658,7 +1672,7 @@ async fn fan_out_emits(
         )
         .from(ctx.path.clone())
         .with_recorded_origin(ctx.path.clone(), *seq);
-        broadcast(&ctx.registry, &ctx.kernel, schema, envelope).await;
+        broadcast(&ctx.registry, &ctx.kernel, &ctx.shutting_down, schema, envelope).await;
     }
 }
 
@@ -1699,7 +1713,7 @@ async fn flush_outbox(ctx: &EsLoop, mut outbox: Outbox) -> bool {
         };
         match gated {
             crate::context::Intent::Send(envelope) => {
-                if let Err(undeliverable) = route(&ctx.registry, &ctx.kernel, envelope).await {
+                if let Err(undeliverable) = route(&ctx.registry, &ctx.kernel, &ctx.shutting_down, envelope).await {
                     dead_letter(
                         &ctx.kernel,
                         &undeliverable,
@@ -1712,6 +1726,7 @@ async fn flush_outbox(ctx: &EsLoop, mut outbox: Outbox) -> bool {
                 broadcast(
                     &ctx.registry,
                     &ctx.kernel,
+                    &ctx.shutting_down,
                     envelope.schema.clone(),
                     envelope,
                 )
@@ -1723,7 +1738,7 @@ async fn flush_outbox(ctx: &EsLoop, mut outbox: Outbox) -> bool {
                 payload,
                 trace,
             } => {
-                resolve_reply(&ctx.kernel, &ctx.registry, to, schema, payload, trace).await;
+                resolve_reply(&ctx.kernel, &ctx.registry, &ctx.shutting_down, to, schema, payload, trace).await;
             }
             crate::context::Intent::StopSelf => stop_self = true,
         }
@@ -2334,6 +2349,7 @@ pub async fn supervise_child(
                 },
                 registry: system.registry.clone(),
                 kernel: system.kernel.clone(),
+                shutting_down: system.shutting_down.clone(),
                 view: system.view.clone(),
                 clock: system.clock.clone(),
             };
