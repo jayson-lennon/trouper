@@ -20,8 +20,15 @@ use crate::schema::{ActorManifest, Schema, SchemaDef, SchemaError};
 ///
 /// Senders clone this handle; a restart swaps in a fresh endpoint under the
 /// same path, so pre-crash handles die quietly while the path keeps working.
-/// The mpsc is the inbox's "Block" overload made concrete: a full mailbox
-/// backpressures senders via `.send().await`.
+/// The mpsc is the inbox's "Block" overload made concrete: its depth is the
+/// spawn-configured capacity, so a full mailbox backpressures senders via
+/// `.send().await` at exactly the configured bound.
+///
+/// # Known hazard
+///
+/// True blocking means a cycle of actors whose mailboxes ALL fill up can
+/// deadlock: every member is blocked sending while blocked flushes wait on
+/// blocked peers. Size mailboxes so hot cycles cannot saturate every hop.
 #[derive(Debug)]
 pub struct Endpoint {
     tx: mpsc::Sender<Envelope>,

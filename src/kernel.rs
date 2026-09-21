@@ -132,6 +132,11 @@ pub(crate) struct KernelState {
     pub(crate) passivation: HashMap<ActorPath, crate::system::Passivation>,
     /// Injected-clock millis of each actor's last completed message step.
     pub(crate) last_work_ms: HashMap<ActorPath, u64>,
+    /// Per-projector caught-up counter: incremented every time a
+    /// projector's catch-up completes. The wake path polls this counter
+    /// instead of scanning the evictable tap ring (the tap's CaughtUp
+    /// fact remains the host-observable marker).
+    pub(crate) caught_up: HashMap<ActorPath, u64>,
     /// The graceful-shutdown barrier: set by the sweep, read on every
     /// route (deliveries dead-letter with `ShuttingDown`), by partition
     /// activation (refused), by the supervision engines (suspended), and
@@ -169,6 +174,7 @@ impl KernelState {
             watermarks: HashMap::new(),
             passivation: HashMap::new(),
             last_work_ms: HashMap::new(),
+            caught_up: HashMap::new(),
             shutting_down: std::sync::atomic::AtomicBool::new(false),
         }
     }

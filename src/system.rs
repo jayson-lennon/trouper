@@ -623,9 +623,15 @@ pub(crate) async fn catch_up_projector(
     //    history, never before it.
     armed.start_loop();
 
-    // 4. The observable completion marker: projector_state and tests wait
-    //    on this fact.
+    // 4. The observable completion marker: the kernel's caught-up counter
+    //    (the wake path's wait signal) and the tap fact (the host-observable
+    //    record) both advance here.
     let mut kernel = system.kernel.lock();
+    kernel
+        .caught_up
+        .entry(path.clone())
+        .and_modify(|count| *count += 1)
+        .or_insert(1);
     kernel.record_fact(
         system.clock.now(),
         crate::tap::FactKind::CaughtUp { path, seeded },
@@ -2048,30 +2054,33 @@ impl ActorSystem {
         };
         // Delivered-but-unfolded mail wakes the projector but folds AFTER
         // catch-up (the loop starts post-seed). Wait for the mail to
-        // drain first; otherwise the CaughtUp fact from the wake's own
-        // catch-up would satisfy the poll below while the fold is still
-        // incomplete.
+        // drain first; otherwise the wake's own catch-up would signal
+        // caught-up while the fold is still incomplete.
         self.await_quiescent(path).await;
-        let watermark = self.kernel.lock().tap.next_offset();
+        let watermark = {
+            let kernel = self.kernel.lock();
+            kernel.caught_up.get(path).copied().unwrap_or(0)
+        };
         let key = path
             .as_str()
             .strip_prefix(&format!("{}/", spec.public.as_str()))
             .unwrap_or_default()
             .to_owned();
         (spec.factory)(self, path, &spec.entity_args(&key));
-        // Poll for the CaughtUp fact past the watermark. The factory's
-        // arm is synchronous (slot + routes exist immediately), but the
-        // catch-up future runs concurrently — the fact is the marker.
+        // Poll for the caught-up counter moving PAST the watermark. The
+        // counter lives in the kernel (never evicted): under tap pressure
+        // the CaughtUp FACT may drop out of the ring, but the wake signal
+        // survives. The factory's arm is synchronous (slot + routes exist
+        // immediately); the catch-up future runs concurrently — the
+        // counter is the marker.
         const CAUGHT_UP_BUDGET: std::time::Duration = std::time::Duration::from_secs(5);
         let deadline = tokio::time::Instant::now() + CAUGHT_UP_BUDGET;
         loop {
-            if self
-                .tap_facts_from(watermark)
-                .iter()
-                .any(|fact| {
-                    matches!(&fact.kind, crate::tap::FactKind::CaughtUp { path: p, .. } if p == path)
-                })
-            {
+            let caught_up = {
+                let kernel = self.kernel.lock();
+                kernel.caught_up.get(path).copied().unwrap_or(0)
+            };
+            if caught_up > watermark {
                 return true;
             }
             if tokio::time::Instant::now() >= deadline {
