@@ -412,11 +412,11 @@ async fn route_inner(
                     .as_ref()
                     .and_then(|(_, tee_dest, _)| reg.resolve(tee_dest));
                 let set_specs = (
-                    reg.partitions.get(&path).cloned(),
+                    reg.partitions.get(path).cloned(),
                     reg.projector_sets
-                        .get(&path)
+                        .get(path)
                         .cloned()
-                        .or_else(|| reg.projector_set_owning(&path)),
+                        .or_else(|| reg.projector_set_owning(path)),
                 );
                 (delivery, primary_dest, tee_endpoint, set_specs)
             };

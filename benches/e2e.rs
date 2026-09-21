@@ -621,11 +621,10 @@ fn swarm(c: &mut Criterion) {
         let counters: Vec<Arc<std::sync::atomic::AtomicU64>> = rt.block_on(async {
             let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
             loop {
-                let sinks = SWARM_SINKS.lock().expect("sinks");
-                if sinks.len() >= counters_before + receivers {
-                    break sinks[counters_before..].to_vec();
+                let ready = SWARM_SINKS.lock().expect("sinks").len() >= counters_before + receivers;
+                if ready {
+                    break SWARM_SINKS.lock().expect("sinks")[counters_before..].to_vec();
                 }
-                drop(sinks);
                 if tokio::time::Instant::now() >= deadline {
                     panic!("swarm sinks never registered");
                 }
