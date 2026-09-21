@@ -85,4 +85,6 @@ Entries are added or amended **only with human approval**.
 - (routing) A projector set declares consumption with a shard key: broadcast copies of a consumed schema resolve a key per copy and activate the owning projector on demand, like a told command.
 - (journal) The store is told passivated(path) when an idle entity leaves memory; a failing hint is logged and never blocks passivation.
 - (queries) projector_state wakes a projector-set entity if needed, awaits catch-up, and returns the complete fold; es_state is a best-effort capture of in-memory state only.
+- (queries) with_es_state/with_projector_state read entity and projector state typed under the state lock with no serialization; try_ variants are sync and non-blocking.
+- (queries) Typed reads cover live entities and projectors only: foreign actors read as JSON, passivated entities read None, and service-actor state is not a readable surface.
 - (lifecycle) A projector records a CaughtUp tap fact when its catch-up completes.
