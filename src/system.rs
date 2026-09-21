@@ -7076,19 +7076,22 @@ mod tests {
         // When the interval elapses.
         clock.advance(std::time::Duration::from_millis(60));
 
-        // Then the due idle tick loads the journal and takes the snapshot.
-        wait_for(|| async { store.loads.load(std::sync::atomic::Ordering::SeqCst) >= 1 }).await;
+        // Then the due idle tick takes the snapshot WITHOUT a journal
+        // load: the due check and the anchor seq come from kernel-side
+        // bookkeeping, so the store's only contact is append_snapshot.
         let took_snapshot = wait_for_returning(|| async {
             store
                 .inner
                 .entries_of(&path)
                 .iter()
                 .any(|e| matches!(e, crate::journal::JournalEntry::Snapshot { .. }))
-            .then_some(())
+                .then_some(())
         })
         .await
         .is_some();
         assert!(took_snapshot, "the due tick produced a snapshot");
+        let loads = store.loads.load(std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(loads, 0, "the idle snapshot path never loads the journal");
     }
 
     #[tokio::test]

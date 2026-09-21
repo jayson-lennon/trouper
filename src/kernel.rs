@@ -137,6 +137,12 @@ pub(crate) struct KernelState {
     /// instead of scanning the evictable tap ring (the tap's CaughtUp
     /// fact remains the host-observable marker).
     pub(crate) caught_up: HashMap<ActorPath, u64>,
+    /// Each ES actor's last COMMITTED event seq, updated at the ack point
+    /// of the atomic step. Lets the idle time-cadence snapshot check run
+    /// O(1) — the anchor seq comes from kernel bookkeeping, not a full
+    /// journal load (only this path's own appends advance it, so it is
+    /// never stale-high).
+    pub(crate) last_event_seq: HashMap<ActorPath, crate::journal::SeqNo>,
     /// The graceful-shutdown barrier: set by the sweep, read on every
     /// route (deliveries dead-letter with `ShuttingDown`), by partition
     /// activation (refused), by the supervision engines (suspended), and
@@ -175,6 +181,7 @@ impl KernelState {
             passivation: HashMap::new(),
             last_work_ms: HashMap::new(),
             caught_up: HashMap::new(),
+            last_event_seq: HashMap::new(),
             shutting_down: std::sync::atomic::AtomicBool::new(false),
         }
     }
@@ -1109,6 +1116,9 @@ async fn step_es(ctx: &EsLoop) -> Step {
     ctx.cell.inbox.lock().await.ack();
     {
         let mut kernel = ctx.kernel.lock();
+        if let Some(last) = seqs.last() {
+            kernel.last_event_seq.insert(ctx.path.clone(), *last);
+        }
         kernel.record_fact(
             envelope.trace.causality_id.as_millis_ts(),
             crate::tap::FactKind::Acked {
@@ -1713,64 +1723,37 @@ async fn snapshot_now(ctx: &EsLoop, last: crate::journal::SeqNo) {
 /// another message still snapshots when the interval elapses. BETWEEN
 /// messages by construction — the idle check runs after a full step drained
 /// the inbox.
+///
+/// The due check is O(1): anchor and last committed seq come from
+/// kernel-side bookkeeping (`snapshot_cadence_ms`, `last_event_seq`), so
+/// an idle tick never loads the journal — `snapshot_now`'s capture reads
+/// the live state, and the store only learns of the snapshot via
+/// `append_snapshot`.
 async fn maybe_snapshot_on_idle(ctx: &EsLoop) {
-    let cadence = {
+    let (cadence, anchor_ms, last_committed) = {
         let kernel = ctx.kernel.lock();
-        kernel
-            .snapshot_policy
-            .get(&ctx.path)
-            .copied()
-            .unwrap_or_default()
+        (
+            kernel
+                .snapshot_policy
+                .get(&ctx.path)
+                .copied()
+                .unwrap_or_default(),
+            kernel.snapshot_cadence_ms.get(&ctx.path).copied().flatten(),
+            kernel.last_event_seq.get(&ctx.path).copied(),
+        )
     };
     let crate::actor::SnapshotCadence::Time(interval) = cadence else {
         return;
     };
-    // Anchor + last committed seq: the store's replay (load reflects
-    // buffered state), read WITHOUT holding the kernel sync guard across
-    // the await.
-    let replay = {
-        let store = ctx.kernel.lock().journal_store.clone();
-        match store.load(&ctx.path).await {
-            Ok(replay) => replay,
-            Err(_) => return,
-        }
+    // An unanchored cadence is never due (safe default), and an actor
+    // that never committed has nothing to anchor a snapshot to: the
+    // first post-snapshot seq would wrongly skip event seq 0 on restore.
+    let (Some(anchor), Some(last)) = (anchor_ms, last_committed) else {
+        return;
     };
-    // An empty journal never snapshots: the anchor seq would be
-    // "genesis", and a later restore would wrongly skip event seq 0.
-    let Some(r) = replay else { return };
-    if r.tail.is_empty() && r.snapshot.is_none() {
+    if ctx.clock.now().as_millis().saturating_sub(anchor) < interval.as_millis() as u64 {
         return;
     }
-    let (anchor_ms, now_ms) = {
-        let kernel = ctx.kernel.lock();
-        (
-            kernel.snapshot_cadence_ms.get(&ctx.path).copied().flatten(),
-            ctx.clock.now().as_millis(),
-        )
-    };
-    let Some(anchor) = anchor_ms else {
-        return; // unanchored: not due (safe default)
-    };
-    if now_ms.saturating_sub(anchor) < interval.as_millis() as u64 {
-        return;
-    }
-    // Anchor at the LAST COMMITTED EVENT's seq: seqs are 0-based, so the
-    // first post-snapshot seq is snap_seq + 1 (or 0 without a snapshot),
-    // and the tail's length lands on the last one.
-    let last = match r.tail.len() {
-        0 => match r.snapshot.as_ref() {
-            Some(snap) => snap.seq(),
-            None => return,
-        },
-        tail_len => {
-            let base = r
-                .snapshot
-                .as_ref()
-                .map(|s| s.seq().as_u64() + 1)
-                .unwrap_or(0);
-            crate::journal::SeqNo::new(base + tail_len as u64 - 1)
-        }
-    };
     snapshot_now(ctx, last).await;
 }
 
