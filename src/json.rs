@@ -1,5 +1,5 @@
-//! [`Json`] — the runtime's public value type: a newtype over the internal
-//! JSON tree.
+//! [`Json`] — the runtime's public value type: a newtype over the
+//! underlying JSON tree.
 //!
 //! `serde_json` types never appear in the runtime's public signatures: spawn
 //! args, event payloads, snapshot blobs, and export documents all cross the
@@ -8,9 +8,9 @@
 //! and snapshots written by earlier versions load unchanged. Anything the
 //! wrapper does not cover is one [`Json::into_inner`] away.
 //!
-//! The representation is permanent, not provisional: shard-key extraction
-//! reads `payload[key_field]` on the live value, and journals, foreign
-//! actors, export, and args-merge all depend on key-value semantics.
+//! The representation is stable: shard-key extraction reads
+//! `payload[key_field]` on the live value, and journals, foreign actors,
+//! export, and args-merge all depend on key-value semantics.
 
 use serde::{Deserialize, Serialize};
 
@@ -18,7 +18,7 @@ use serde::{Deserialize, Serialize};
 ///
 /// Reads go through `Deref` (so `args["key"]`, `value.as_i64()`, and every
 /// other `serde_json::Value` accessor work as-is); construction comes from
-/// literals via the [`json!`](crate::json) macro, from any [`Serialize`]
+/// literals via the [`json!`](crate::json!) macro, from any [`Serialize`]
 /// value via [`Json::of`], or from a raw tree via `From`.
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct Json(pub(crate) serde_json::Value);
@@ -30,7 +30,8 @@ impl Json {
     ///
     /// Panics (named) if serialization fails — for the runtime's value
     /// domain it cannot; a failure here is a programming bug. Prefer the
-    /// `json!` macro or `From` conversions at literal sites.
+    /// [`json!`](crate::json!) macro or `From` conversions at literal
+    /// sites.
     pub fn of<T: Serialize>(value: &T) -> Self {
         match serde_json::to_value(value) {
             Ok(v) => Self(v),

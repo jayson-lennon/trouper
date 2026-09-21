@@ -1,14 +1,11 @@
-//! Handler-facing context: the actors' entire syscall surface.
+//! Handler-facing context: the effect and introspection surface handlers see.
 //!
-//! Event-sourced handlers are pure — [`CmdCtx`] records *intents* into an
-//! [`Outbox`] and performs nothing; the kernel flushes the outbox AFTER
-//! journal-append + ack, so a crash before ack never duplicates a send.
-//! Service handlers get [`MsgCtx`], a superset; its `ask` method arrives
-//! with the reply-lease machinery (Phase 5).
+//! Effects recorded through [`CmdCtx`] and [`MsgCtx`] are performed after the
+//! current message is acknowledged, so a crash mid-handler never duplicates a
+//! send. [`MsgCtx`] is the superset: only it can `ask`.
 //!
-//! Contexts touch the registry only through [`RuntimeView`], a read-only
-//! view — user code never holds the registry lock, so lookups from inside a
-//! handler can never deadlock the kernel.
+//! Lookups from inside a handler take a read-only snapshot of the registry,
+//! so user code never blocks the runtime.
 
 use crate::actor::ActorPath;
 use crate::clock::Timestamp;
@@ -20,7 +17,8 @@ use crate::schema::SchemaId;
 
 /// Read-only runtime view for handlers: registry lookups plus the clock.
 ///
-/// Implemented by the system facade; the kernel hands contexts a reference.
+/// Implemented by the system facade; the delivery engine hands contexts a
+/// reference.
 pub(crate) trait RuntimeView: Send + Sync {
     /// Snapshot info about a path, if registered.
     fn lookup(&self, path: &ActorPath) -> Option<crate::registry::EndpointInfo>;
@@ -32,7 +30,7 @@ pub(crate) trait RuntimeView: Send + Sync {
     fn now(&self) -> Timestamp;
 }
 
-/// One deferred effect, fully stamped; the kernel executes these post-ack.
+/// One deferred effect, fully stamped.
 #[derive(Debug)]
 pub(crate) enum Intent {
     /// A point-to-point send to an address.
@@ -51,7 +49,7 @@ pub(crate) enum Intent {
         trace: TraceCtx,
     },
     /// Terminate the handling actor gracefully after this message
-    /// commits (performed post-ack, so a crash before ack discards the
+    /// commits (performed after the ack, so a crash before it discards the
     /// stop exactly like any other intent — the actor restarts and
     /// continues). NEVER journaled: replay never synthesizes a stop.
     StopSelf,
@@ -71,7 +69,8 @@ impl Intent {
     }
 }
 
-/// Effects recorded by a handler, flushed by the kernel after ack.
+/// Effects recorded by a handler, performed after the message is
+/// acknowledged.
 #[derive(Debug, Default)]
 pub(crate) struct Outbox {
     intents: Vec<Intent>,
@@ -88,12 +87,12 @@ impl Outbox {
         self.intents.push(Intent::Send(envelope));
     }
 
-    /// Records a broadcast intent (performed by the kernel post-ack).
+    /// Records a broadcast intent (performed after the ack).
     pub(crate) fn push_broadcast(&mut self, envelope: Envelope) {
         self.intents.push(Intent::Broadcast(envelope));
     }
 
-    /// Records a reply intent (resolved by the kernel at flush time).
+    /// Records a reply intent (resolved at flush time).
     pub(crate) fn push_reply(
         &mut self,
         to: Address,
@@ -109,8 +108,8 @@ impl Outbox {
         });
     }
 
-    /// Records the self-termination intent. Executed post-ack by the
-    /// kernel: intents recorded BEFORE it flush first (in-order), and a
+    /// Records the self-termination intent. Executed after the ack:
+    /// intents recorded before it flush first (in-order), and a
     /// crash before ack discards it entirely.
     pub(crate) fn push_stop_self(&mut self) {
         self.intents.push(Intent::StopSelf);
@@ -160,7 +159,8 @@ pub(crate) struct CtxCore<'a> {
     reply_to: Option<&'a Address>,
     /// Read-only runtime view (lookups + clock).
     view: &'a dyn RuntimeView,
-    /// The outbox the kernel flushes after ack.
+    /// The deferred effects of the message being handled, performed after
+    /// the ack.
     outbox: &'a mut Outbox,
 }
 
@@ -187,22 +187,21 @@ impl CtxCore<'_> {
         self.view.handlers_of(schema)
     }
 
-    /// The time the message was received (injected clock = deterministic).
+    /// The time the message was received, per the system's clock (test
+    /// fakes make this deterministic).
     pub fn recv_ts(&self) -> Timestamp {
         self.view.now()
     }
 }
 
-/// Context for event-sourced handlers: PURE INTROSPECTION.
+/// Context for event-sourced handlers: introspection only.
 ///
-/// An entity announces only by RETURNING FACTS from its decision — the
-/// kernel appends, applies, and broadcasts them. [`CmdCtx`] exposes no
+/// An entity announces only by returning facts from its decision — the
+/// runtime appends, applies, and broadcasts them. [`CmdCtx`] exposes no
 /// effects: no send, no publish, no send_to_any, no reply, no stop_self
 /// (an entity owns no lifecycle intents — only passivation, external
 /// stop, or supervision ends one). It cannot `ask` either: a decision
-/// function is sync and CANNOT await, so no ask can even compile.
-///
-/// The constructor is crate-private: only the kernel assembles contexts.
+/// function is sync, so an await inside it cannot compile.
 pub struct CmdCtx<'a> {
     core: CtxCore<'a>,
 }
@@ -238,7 +237,8 @@ impl<'a> CmdCtx<'a> {
         self.core.handlers_of(schema)
     }
 
-    /// The time the message was received (injected clock = deterministic).
+    /// The time the message was received, per the system's clock (test
+    /// fakes make this deterministic).
     pub fn recv_ts(&self) -> Timestamp {
         self.core.recv_ts()
     }
@@ -287,7 +287,7 @@ pub enum AskError {
 
 /// The ask machinery shared by [`MsgCtx::ask`] (in-actor asks) and
 /// [`crate::system::ActorSystem::ask`] (system-level asks): open a reply
-/// lease over the port, await the reply under the MANDATORY timeout, and
+/// lease over the port, await the reply under the required timeout, and
 /// settle the lease with a Replied/Timeout/Failed fact so nothing leaks.
 ///
 /// The timeout produces an [`AskOutcome::Timeout`] fact; a late reply lands
@@ -329,12 +329,10 @@ pub(crate) async fn ask_via_port(
     }
 }
 
-/// Context for service-actor handlers: async, impure by design.
+/// Context for service-actor handlers: async, with the full effect surface.
 ///
 /// The sync surface matches [`CmdCtx`]; `ask` is exclusive to this tier —
 /// an event-sourced decision function cannot await.
-///
-/// The constructor is crate-private: only the kernel assembles contexts.
 pub struct MsgCtx<'a> {
     core: CtxCore<'a>,
     /// The impure port (leases + routing); absent only in pure tests that
@@ -343,11 +341,10 @@ pub struct MsgCtx<'a> {
 }
 
 impl<'a> MsgCtx<'a> {
-    /// Terminate this actor gracefully: records the intent and returns
-    /// immediately — no await semantics, never blocks. The stop executes
-    /// after this message commits (and after any intents recorded before
-    /// it); a crash before the commit discards it. Code after the call in
-    /// the handler still runs; call it last (or `return` after) to make
+    /// Terminate this actor gracefully. The stop executes after this
+    /// message commits (and after any intents recorded before it); a
+    /// crash before the commit discards it. Code after the call in the
+    /// handler still runs; call it last (or `return` after) to make
     /// "stop now" unambiguous.
     pub fn stop_self(&mut self) {
         self.core.outbox.push_stop_self();
@@ -415,9 +412,9 @@ impl<'a> MsgCtx<'a> {
         }
     }
 
-    /// THE ask: send a request and await its reply, with a MANDATORY
-    /// timeout. Exclusive to service actors — an ES decision function is
-    /// sync and cannot await (AC5).
+    /// Sends a request and awaits its reply. The timeout is required.
+    /// Exclusive to service actors — an event-sourced decision function
+    /// cannot await.
     ///
     /// The timeout produces an [`AskOutcome::Timeout`] fact; the reply
     /// lease dies with it, so a late reply lands nowhere.
@@ -433,9 +430,8 @@ impl<'a> MsgCtx<'a> {
     }
 
     /// Typed ask: the request's schema id and payload come from the
-    /// message type — the typed sibling of [`MsgCtx::ask_json`]. Same
-    /// MANDATORY-timeout lease, same tier exclusivity (`ask` awaits, so a
-    /// sync ES decision function has none; see [`CmdCtx`]).
+    /// message type — the typed sibling of [`MsgCtx::ask_json`]. The
+    /// timeout is required; only service actors can ask (see [`CmdCtx`]).
     ///
     /// The reply arrives as raw JSON this pass, matching
     /// [`crate::system::ActorSystem::ask`]'s return; decode it with the
@@ -462,24 +458,26 @@ impl<'a> MsgCtx<'a> {
 
     /// Records a ONE-OF send (typed): exactly one copy goes to ONE actor
     /// that declared `.handles::<M>()`, round-robin through the route
-    /// table (deferred; flushed post-ack). The typed sibling of
-    /// [`MsgCtx::publish`] — news (publish) reaches everyone, work
-    /// (send_to_any) reaches one. Zero handlers ⇒ dead-letter on flush.
+    /// table. The delivery happens after the current message is
+    /// acknowledged. The typed sibling of [`MsgCtx::publish`] — publish
+    /// reaches everyone, send_to_any reaches one. Zero handlers ⇒ the
+    /// envelope is dead-lettered.
     pub fn send_to_any<M: Message>(&mut self, msg: &M) {
         let payload = Json::of(&msg);
         let schema = M::schema_id();
         self.send_json(Address::Schema(schema.clone()), schema, payload, None);
     }
 
-    /// Records a send to `dest` (deferred; the kernel flushes post-ack).
-    /// Typed: the schema id comes from the message type.
+    /// Records a send to `dest`; delivered after the current message is
+    /// acknowledged. Typed: the schema id comes from the message type.
     pub fn send<M: Message>(&mut self, dest: Address, msg: &M, reply_to: Option<Address>) {
         let payload = Json::of(&msg);
         self.send_json(dest, M::schema_id(), payload, reply_to);
     }
 
-    /// Records an event broadcast (deferred; flushed post-ack). Typed:
-    /// the schema id comes from the message type. Zero subscribers ⇒
+    /// Records an event broadcast to every `.handles` declarant of the
+    /// schema; delivered after the current message is acknowledged. Typed:
+    /// the schema id comes from the message type. Zero subscribers is a
     /// silent no-op: events are news, not work orders.
     pub fn publish<M: Message>(&mut self, msg: &M) {
         let payload = Json::of(&msg);
@@ -489,8 +487,8 @@ impl<'a> MsgCtx<'a> {
     /// Records a reply to the message's `reply_to`, if the sender asked.
     ///
     /// A reply without a `reply_to` is dropped silently: the asker is gone,
-    /// so the fact is unobservable by definition. It is NEVER a broadcast —
-    /// use [`MsgCtx::publish`] for events.
+    /// so the fact is unobservable by definition. Not a broadcast — use
+    /// [`MsgCtx::publish`] for events.
     pub fn reply<M: Message>(&mut self, msg: M) {
         let payload = Json::of(&msg);
         self.reply_json(M::schema_id(), payload);
@@ -506,7 +504,8 @@ impl<'a> MsgCtx<'a> {
         self.core.handlers_of(schema)
     }
 
-    /// The time the message was received (injected clock = deterministic).
+    /// The time the message was received, per the system's clock (test
+    /// fakes make this deterministic).
     pub fn recv_ts(&self) -> Timestamp {
         self.core.recv_ts()
     }

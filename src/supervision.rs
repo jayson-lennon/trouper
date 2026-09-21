@@ -1,11 +1,11 @@
 //! Declarative supervision: restart policies, budgets, and backoff as
 //! plain data interpreted by the restart engine.
 //!
-//! An [`ActorSpec`] says WHAT to do when a child fails; the engine
-//! (kernel) decides WHEN it may happen. Failures inside the budget
-//! restart the child after a backoff delay; exhausting the budget stops
-//! the child and escalates a control message (an ordinary message the
-//! parent handles) to the parent.
+//! An [`ActorSpec`] declares what happens when a child fails; the restart
+//! engine decides when it may happen. Failures inside the budget restart
+//! the child after a backoff delay; exhausting the budget stops the child
+//! and escalates a control message to the parent (an ordinary message the
+//! parent handles).
 
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
@@ -91,8 +91,8 @@ pub struct ActorSpec {
     pub backoff: Backoff,
     /// Genesis args (reused at every restart — the child's config).
     pub args: crate::json::Json,
-    /// The spawn closure the kernel calls to rebuild the child. Returns
-    /// Ok(()) after the child runs again; the kernel drives restarts.
+    /// The spawn closure the runtime calls to rebuild the child. Returns
+    /// Ok(()) after the child runs again; the runtime drives restarts.
     #[allow(clippy::type_complexity)]
     pub spawn: std::sync::Arc<
         dyn Fn(&crate::system::ActorSystem, &crate::actor::ActorPath, &crate::json::Json)
@@ -114,7 +114,7 @@ impl std::fmt::Debug for ActorSpec {
 }
 
 impl ActorSpec {
-    /// The JSON control envelope the engine escalates to the parent.
+    /// The JSON control envelope the runtime escalates to the parent.
     pub fn escalation_message(&self, reason: &str) -> crate::json::Json {
         crate::json!({
             "escalated": self.path.to_string(),

@@ -1,10 +1,10 @@
-//! The registry: kernel, not actor.
+//! The registry: the runtime's path, schema, and route tables.
 //!
-//! Bootstrap paradox resolved by construction: the registry must never
-//! deadlock and must survive every actor restart, so it is plain kernel data.
-//! It holds three tables — path→endpoint slots, the schema table, and
-//! schema→handler routes. Actor identity is its registered path; handles
-//! survive restarts because slots are swapped, never invalidated.
+//! It is plain data behind a lock — never an actor — so routing can never
+//! deadlock on it and registrations survive every actor restart. It holds
+//! three tables: path→endpoint slots, the schema table, and schema→handler
+//! routes. Actor identity is its registered path; handles survive restarts
+//! because slots are swapped, never invalidated.
 
 use std::collections::{BTreeMap, HashMap};
 
@@ -44,7 +44,8 @@ impl Endpoint {
         self.capacity.saturating_sub(self.tx.capacity())
     }
 
-    /// Tries to enqueue an envelope without waiting.
+    /// Attempts delivery without waiting: fails immediately when the inbox
+    /// is full.
     ///
     /// # Errors
     ///
@@ -220,7 +221,7 @@ pub enum RegistryError {
     InvalidSpec,
 }
 
-/// All kernel tables: slots, schemas, routes, pools/partitions, and rules.
+/// All runtime tables: slots, schemas, routes, pools/partitions, and rules.
 #[derive(Debug, Default)]
 pub struct Registry {
     schemas: SchemaTable,
@@ -268,7 +269,6 @@ impl Registry {
         self.schemas.by_id(id)
     }
 
-    /// The shared schema table (for export).
     /// A snapshot of every live slot for export: (path, manifest).
     pub fn slot_manifests(&self) -> Vec<(ActorPath, ActorManifest)> {
         self.slots
@@ -320,6 +320,7 @@ impl Registry {
         (partitions, rules)
     }
 
+    /// The shared schema table (for export).
     pub fn schemas(&self) -> &SchemaTable {
         &self.schemas
     }
@@ -355,7 +356,7 @@ impl Registry {
     }
 
     /// Swaps a slot's endpoint — the restart mechanism. Identity (the path,
-    /// the manifest, the inbox cursor held by the kernel) persists.
+    /// the manifest, the inbox cursor held by the runtime) persists.
     ///
     /// # Errors
     ///
@@ -393,10 +394,10 @@ impl Registry {
         Ok(slot.manifest)
     }
 
-    /// Declares an emit edge on a LIVE slot (adds `schema` to the slot
+    /// Declares an emit edge on a live slot (adds `schema` to the slot
     /// manifest's `emits`). Used by foreign spawns to declare the event
     /// schemas their decision closures produce — undeclared emits are
-    /// dropped by the kernel, so this declaration is load-bearing.
+    /// dropped by the runtime, so this declaration is load-bearing.
     ///
     /// # Errors
     ///
@@ -424,7 +425,7 @@ impl Registry {
     }
 
     /// Installs a partition set: validates the spec against the schema
-    /// table (refuse-to-lie), then records it. Entities are NOT spawned
+    /// table, then records it. Entities are not spawned
     /// here — activation happens on demand in the router.
     ///
     /// # Errors
@@ -463,8 +464,8 @@ impl Registry {
     }
 
     /// Installs a projector set: validates every consumed schema against
-    /// the schema table (refuse-to-lie), then records it. Projectors are
-    /// NOT spawned here — activation happens on demand when a broadcast of
+    /// the schema table, then records it. Projectors are
+    /// not spawned here — activation happens on demand when a broadcast of
     /// a consumed schema crosses the fabric.
     ///
     /// # Errors
@@ -584,7 +585,7 @@ impl Registry {
     /// Routes `schema` to a handler path and registers the route.
     ///
     /// For [`RoutePolicy::Single`] the sole path wins; for round-robin the
-    /// registry's shared cursor rotates. Projector-set members are NOT
+    /// registry's shared cursor rotates. Projector-set members are not
     /// routable by schema: a per-key projector's only delivery obligation
     /// is its keyed copy (the broadcast set arm); a schema-addressed send
     /// has no key, so it must never land on a key-derived actor.

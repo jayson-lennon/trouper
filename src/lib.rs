@@ -5,7 +5,7 @@
 //! facts, journal-backed event-sourced actors, declarative supervision, and
 //! dynamic add/remove of actors.
 //!
-//! See `.plans/actor-runtime-core/plan.md` for the authoritative spec.
+//! The `examples/` directory in the repository is the tour: each file is a runnable scenario over the public API.
 
 // The schema derive macros emit `::trouper::...` paths (so they resolve for
 // downstream consumers); aliasing `self` makes the same paths work inside

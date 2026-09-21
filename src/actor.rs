@@ -1,16 +1,14 @@
 //! The two-tier actor contract.
 //!
-//! Tier 1 — [`EventSourced`]: pure decision functions. `handle` is sync and
-//! takes `&self`, so no I/O and no await are physically possible; the events
-//! it returns are facts. [`EventSourced::apply`] is THE mutation site, used
-//! identically for live application and replay.
+//! [`EventSourcedActor`] is the journaled tier: handlers are pure functions
+//! from state and command to events, and the runtime persists and replays
+//! those events. [`ServiceActor`] is the unjournaled tier: async handlers
+//! with I/O and `ask`.
 //!
-//! Tier 2 — [`ServiceActor`]: impure by design (Phase 5).
-//!
-//! The kernel only ever sees the erased shells ([`DynEsActor`],
-//! [`CommandEntry`]); generic adapters erase the Rust types exactly once at
-//! spawn, which is what lets foreign actors (no Rust types at all) share
-//! every table and code path.
+//! The runtime drives erased versions of both tiers; the generic adapters in
+//! this module connect the typed traits to those erased shells, which is what
+//! lets foreign actors (defined outside Rust, state as JSON) share every
+//! table and code path.
 
 use std::sync::Arc;
 
@@ -22,17 +20,18 @@ use crate::journal::JournalError;
 use crate::json::Json;
 use crate::schema::{ActorManifest, Schema, SchemaId};
 
-/// Event-sourced domain actor: pure, journaled, replayable.
+/// An event-sourced domain actor: state lives only as a fold of recorded
+/// events, so the runtime can journal it, replay it, and restore it after a
+/// crash.
 ///
-/// Implementors get journal-backed restart for free; snapshots are opt-in
-/// via the spawn policy and go through [`EventSourced::capture`] /
-/// [`EventSourced::restore_from`].
+/// Snapshots are opt-in via the spawn policy and go through
+/// [`EventSourcedActor::capture`] / [`EventSourcedActor::restore_from`].
 pub trait EventSourcedActor:
     Send + Sync + Serialize + DeserializeOwned + Default + 'static
 {
     /// Declares edges and the contract kind (always [`ActorKind::EventSourced`]).
     ///
-    /// Defaults to an EMPTY manifest: the typed spawn builder stamps the
+    /// Defaults to an empty manifest: the typed spawn builder stamps the
     /// contract kind and merges its declared edges, making the builder the
     /// single source of an actor's declared surface. Override only when
     /// spawning through the positional entry points, which take edges from
@@ -61,11 +60,12 @@ pub trait EventSourcedActor:
         Self::default()
     }
 
-    /// THE mutation. Used for live application AND replay — one code path,
-    /// so live state and replayed state can never diverge.
+    /// Applies a recorded event to state. Used for both live application and
+    /// replay, so `apply` must be total over the actor's recorded events.
     fn apply(&mut self, event: &crate::envelope::Event);
 
-    /// Snapshot seam: serialize state. Default = state IS the snapshot.
+    /// Serializes state for a journal snapshot. The default captures the
+    /// state as JSON.
     ///
     /// # Errors
     ///
@@ -76,11 +76,12 @@ pub trait EventSourcedActor:
             .change_context(JournalError::Snapshot)
     }
 
-    /// Snapshot seam: rebuild from a snapshot blob. Default = decode JSON.
+    /// Rebuilds state from a snapshot blob. The default decodes the blob as
+    /// JSON.
     ///
     /// Takes no spawn args: a snapshot is self-sufficient; args matter only
-    /// at genesis. This override IS the sanctioned cache-hydration hook for
-    /// `#[serde(skip)]` fields.
+    /// at genesis. This is the hook for hydrating `#[serde(skip)]` caches
+    /// after a restore.
     ///
     /// # Errors
     ///
@@ -90,61 +91,58 @@ pub trait EventSourcedActor:
         snap.decode::<Self>().change_context(JournalError::Restore)
     }
 
-    /// Graceful-stop hook: runs ONCE after the final inbox drain, with
-    /// the fully folded state, on external stop, self-stop, passivation,
-    /// and the shutdown sweep. NEVER on crash (the instance is poisoned
+    /// Graceful-stop hook: runs once after the final inbox drain, with the
+    /// fully folded state. Called on external stop, self-stop, passivation,
+    /// and the shutdown sweep — not on crash (the instance is poisoned
     /// mid-panic) or hard [`crate::system::ActorSystem::shutdown`].
     ///
-    /// Sync and `&self` — the ES tier is pure; there is no context, no
-    /// I/O, no await. Observation only (export a summary, stamp a metric).
+    /// There is no context, no I/O, no await. Observation only: export a
+    /// summary, stamp a metric.
     fn on_stop(&self) {}
 }
 
-/// Typed sugar over the erased dispatch table: a pure decision function for
-/// one command type. Registered once per (actor, command) pair at spawn.
+/// Implement this trait on event sourced actors to handle commands.
 pub trait CommandHandler<C>: EventSourcedActor {
-    /// Decides: given current state and the command, which events happen?
+    /// What to do when command `C` is received.
     ///
-    /// Sync, `&self` — no I/O, no await, no mutation. Effects are *declared*
-    /// through `ctx` (deferred to post-ack by the kernel).
+    /// Event sourced actors must be _pure_. State is mutated by applying the
+    /// returned `Events` in the [`EventSourcedActor::apply`] implementation.
+    /// Events are automatically saved to the journal.
     ///
-    /// Returns an [`Events`](crate::envelope::Events) buffer: build events
-    /// from typed facts ([`Events::one`](crate::envelope::Events::one),
-    /// [`Events::push_event`](crate::envelope::Events::push_event)) — never
-    /// by hand.
+    /// Use [`CmdCtx`](crate::context::CmdCtx) to access meta-information
+    /// about the command.
     fn handle(&self, cmd: C, ctx: &mut CmdCtx<'_>) -> crate::envelope::Events;
 }
 
 /// A read model: a state struct that folds other actors' recorded facts.
 ///
-/// The struct IS the actor (like [`EventSourcedActor`], no wrapper): one
-/// fold — [`Projector::apply`] — runs identically for live deliveries,
-/// catch-up seeding, and restart replay, so a projector can never show one
-/// answer to history and another to the present. No `manifest`: the
-/// projector builder is the single source of the declared surface — every
-/// `.consumes` schema becomes both a handled input and a re-recorded
-/// output (the journal IS the checkpoint).
+/// The struct is the actor: one fold — [`Projector::apply`] — runs for live
+/// deliveries, catch-up seeding, and restart replay alike. Facts a projector
+/// consumes are re-recorded into its own journal, which is its checkpoint:
+/// the builder's `.consumes` declarations define both the handled inputs and
+/// the re-recorded outputs.
 ///
 /// [`Default`] is the genesis: replay-from-nothing and rebuild-from-genesis
 /// construct the fold deterministically from it.
 pub trait Projector: Send + Sync + Serialize + DeserializeOwned + Default + 'static {
-    /// THE fold. Same code for history (catch-up), live facts, and restart
-    /// replay. Match on `event.schema` — unmatched schemas are ignored, so
-    /// one read model can consume several fact types (declare each with
-    /// `.consumes`).
+    /// The fold: applies a recorded fact to the read model. Runs for
+    /// catch-up history, live facts, and restart replay alike. Match on
+    /// `event.schema` — unmatched schemas are ignored, so one read model can
+    /// consume several fact types (declare each with `.consumes`).
     fn apply(&mut self, event: &crate::envelope::Event);
 
-    /// Graceful-stop hook: runs ONCE after the final drain, with the fully
-    /// folded state, on external stop / self-stop / the shutdown sweep.
-    /// Sync and `&self` — observation only.
+    /// Graceful-stop hook: runs once after the final drain, with the fully
+    /// folded state, on external stop, self-stop, and the shutdown sweep.
+    /// Observation only.
     fn on_stop(&self) {}
 }
 
-/// Edge/service actor: async, I/O and `ask` allowed; NOT journaled.
+/// An edge or service actor: async handlers, I/O and `ask` allowed. Not
+/// journaled — a restart builds a fresh instance.
 pub trait ServiceActor: Send + 'static {
     /// Declares edges and the contract kind (always [`ActorKind::Service`]).
     ///
-    /// Defaults to an EMPTY manifest: the typed spawn builder stamps the
+    /// Defaults to an empty manifest: the typed spawn builder stamps the
     /// contract kind and merges its declared edges, making the builder the
     /// single source of an actor's declared surface. Override only when
     /// spawning through the positional entry points, which take edges from
@@ -164,14 +162,14 @@ pub trait ServiceActor: Send + 'static {
     where
         Self: Sized;
 
-    /// Graceful-stop hook: runs ONCE after the final inbox drain, on
-    /// external stop, self-stop, passivation, and the shutdown sweep.
-    /// NEVER on crash (the instance is poisoned mid-panic) or hard
+    /// Graceful-stop hook: runs once after the final inbox drain, on
+    /// external stop, self-stop, passivation, and the shutdown sweep —
+    /// not on crash (the instance is poisoned mid-panic) or hard
     /// [`crate::system::ActorSystem::shutdown`].
     ///
-    /// Async and `&mut self` — flush buffers, close connections, send
-    /// farewell messages via `ctx` if needed. Keep it bounded: the
-    /// shutdown sweep joins it under the sweep deadline.
+    /// Flush buffers, close connections, send farewell messages via `ctx`
+    /// if needed. Keep it bounded: the shutdown sweep joins it under the
+    /// sweep deadline.
     fn on_stop(&mut self, ctx: &mut crate::context::MsgCtx<'_>) -> impl Future<Output = ()> + Send {
         let _ = ctx;
         async {}
@@ -194,17 +192,18 @@ pub trait MsgHandler<M>: ServiceActor {
 pub enum DispatchError {
     /// The payload failed to decode into the handler's command type.
     Decode(String),
-    /// The state shell was not the type this adapter registered (kernel bug).
+    /// The state shell at the path was not the type this adapter registered.
     StateMismatch,
 }
 
-/// The object-safe ES shell the kernel actually drives.
+/// The erased event-sourced shell the runtime drives: the object-safe view
+/// behind every spawned ES actor.
 ///
-/// Erases `A: EventSourced` behind four verbs — downcast (for the adapter
-/// that registered this exact type), mutate ([`DynEsActor::apply_erased`]),
-/// persist ([`DynEsActor::capture_erased`]), and rebuild. A poisoned
-/// instance (post-panic) is never reused: [`DynEsActor::rebuild`]
-/// constructs a fresh one from snapshot-or-genesis plus the replay tail.
+/// Downcast (for the adapter that registered this exact type), mutate
+/// ([`DynEsActor::apply_erased`]), persist ([`DynEsActor::capture_erased`]),
+/// and rebuild. A poisoned instance (post-panic) is never reused:
+/// [`DynEsActor::rebuild`] constructs a fresh one from snapshot-or-genesis
+/// plus the replay tail.
 pub trait DynEsActor: Send {
     /// The live state as `Any` — the downcast seam for adapters.
     fn as_any_mut(&mut self) -> &mut dyn std::any::Any;
@@ -212,23 +211,23 @@ pub trait DynEsActor: Send {
     /// The live state as shared `Any` — the seam for typed zero-copy reads.
     fn as_any(&self) -> &dyn std::any::Any;
 
-    /// Applies one event to live state (the ONLY mutation path).
+    /// Applies one event to live state (the only mutation path).
     fn apply_erased(&mut self, event: &crate::envelope::Event);
 
     /// Serializes live state for a journal snapshot.
     ///
     /// # Errors
     ///
-    /// Propagates [`EventSourced::capture`] failures.
+    /// Propagates [`EventSourcedActor::capture`] failures.
     fn capture_erased(&self) -> Result<Json, error_stack::Report<JournalError>>;
 
     /// Rebuilds state: genesis, or snapshot + replay tail. Runs on spawn
-    /// AND on restart after a panic — the poisoned instance is dropped,
+    /// and on restart after a panic — the poisoned instance is dropped,
     /// never mutated.
     ///
     /// # Errors
     ///
-    /// Propagates [`EventSourced::restore_from`] failures.
+    /// Propagates [`EventSourcedActor::restore_from`] failures.
     fn rebuild(
         &self,
         args: &Json,
@@ -244,14 +243,13 @@ pub trait DynEsActor: Send {
     fn state_type_name(&self) -> &'static str;
 }
 
-/// Downcast seam for a SHARED read of ES state (generic: the reader knows
+/// Downcast seam for a shared read of ES state (generic: the reader knows
 /// the state type), mirroring [`ServiceAny`].
 ///
-/// Live ES state is always behind
-/// `Arc<tokio::Mutex<Box<dyn DynEsActor>>>`, so a shared borrow cannot
-/// escape the guard; this trait is how a lock-holding closure sees the
-/// typed state without serializing. A [`ForeignEsState`] (or a wrong typed
-/// shell) misses → `None`.
+/// Live ES state is always behind an async mutex, so a shared borrow cannot
+/// escape the guard; this trait is how a lock-holding closure sees the typed
+/// state without serializing. A [`ForeignEsState`] (or a wrong typed shell)
+/// misses → `None`.
 pub trait EsAny {
     /// Runs `f` over the live state as `&A`, when this shell holds an
     /// [`TypedEsState`]`<A>`.
@@ -330,23 +328,22 @@ impl<A: EventSourcedActor> DynEsActor for TypedEsState<A> {
 
 /// The object-safe command dispatch the registry routes by [`SchemaId`].
 ///
-/// One entry per (actor path, command schema); the kernel asks the entry to
-/// decode the JSON, run the typed handler, and apply the resulting events.
-/// No `A` or `C` survives the waist — the adapter holds the types, the
-/// kernel holds the state shell.
+/// One entry per (actor path, command schema): it decodes the incoming
+/// payload, runs the typed handler, and applies the resulting events to the
+/// actor's state.
 pub trait CommandEntry: Send + Sync {
     /// The command schema this entry decodes.
     fn schema(&self) -> SchemaId;
 
     /// Decodes `payload`, runs the typed handler, and applies the returned
-    /// events to `state` — decision and fold in one kernel-driven step.
+    /// events to `state` — decision and fold in one step.
     ///
     /// # Errors
     ///
     /// [`DispatchError::Decode`] when the JSON does not match the command
     /// type (the message is dead-lettered, not panicked on);
     /// [`DispatchError::StateMismatch`] when the state is not this
-    /// adapter's actor type (a kernel bug).
+    /// adapter's actor type.
     fn dispatch(
         &self,
         state: &mut dyn DynEsActor,
@@ -410,10 +407,10 @@ where
     }
 }
 
-/// Concrete [`DynEsActor`] for a typed read model `P`: the kernel drives it
+/// Concrete [`DynEsActor`] for a typed read model `P`: the runtime drives it
 /// exactly like an entity, but there is no decision function — every
-/// delivered fact IS the event (the builder's `ConsumeEntry` records it
-/// verbatim) and [`Projector::apply`] is the only mutation.
+/// delivered fact is recorded verbatim and [`Projector::apply`] is the only
+/// mutation.
 pub struct TypedProjectorState<P: Projector> {
     state: P,
 }
@@ -473,12 +470,12 @@ impl<P: Projector> DynEsActor for TypedProjectorState<P> {
     }
 }
 
-/// The projector's dispatch table entry: the delivered fact IS the event.
+/// The projector's dispatch table entry: the delivered fact is the event.
 ///
-/// No decode, no user code — the identity decision. The kernel journals
-/// what `dispatch` returns and applies it to the fold, so a consumed fact
-/// is re-recorded into the projector's own journal (its checkpoint) with
-/// zero per-consumption domain code.
+/// No decode, no user code — the identity decision. The recorded copy is
+/// applied to the fold, so a consumed fact is re-recorded into the
+/// projector's own journal (its checkpoint) with zero per-consumption
+/// domain code.
 pub struct ConsumeEntry {
     schema: SchemaId,
 }
@@ -517,8 +514,8 @@ pub type ForeignDecision =
 /// The erased twin for actors defined entirely outside Rust: state is JSON,
 /// decisions are a [`ForeignDecision`] closure.
 ///
-/// Implements [`DynEsActor`] so the kernel drives it identically; its
-/// `capture` is a JSON clone because the state is already at the waist.
+/// Implements [`DynEsActor`] so the runtime drives it identically; `capture`
+/// is a JSON clone because the state is already JSON.
 #[derive(Clone)]
 pub struct ForeignEsState {
     state: Json,
@@ -627,8 +624,8 @@ impl CommandEntry for ForeignCommandEntry {
     }
 }
 
-/// The object-safe service shell the kernel drives: one erased instance.
-/// NOT journaled — restart constructs a fresh instance via
+/// The object-safe service shell the runtime drives: one erased instance.
+/// Not journaled — restart constructs a fresh instance via
 /// [`ServiceActor::start`]. Dispatch runs through a [`MsgEntry`] adapter,
 /// which downcasts the shell and the decoded message by type.
 pub trait DynServiceActor: std::any::Any + Send {
@@ -1145,8 +1142,8 @@ mod tests {
     }
 }
 
-/// Actor identity IS its path: handles survive restarts because the registry
-/// maps the path to a swappable endpoint slot.
+/// An actor's identity. Handles survive restarts because the registry maps
+/// the path to a swappable endpoint slot.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct ActorPath(Arc<str>);
@@ -1154,7 +1151,8 @@ pub struct ActorPath(Arc<str>);
 /// Which of the two actor contracts an actor implements.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum ActorKind {
-    /// Pure, journaled, replayable — implements [`crate::actor::EventSourced`].
+    /// Pure, journaled, replayable — implements
+    /// [`crate::actor::EventSourcedActor`].
     EventSourced,
     /// Impure by design: async handlers, I/O and `ask` allowed.
     Service,
@@ -1176,13 +1174,13 @@ pub enum StopReason {
     Shutdown,
 }
 
-/// How often an event-sourced actor takes journal snapshots. Default: OFF.
+/// How often an event-sourced actor takes journal snapshots. Default: off.
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub enum SnapshotCadence {
     /// Never snapshot (replay is always full).
     #[default]
     Off,
-    /// Snapshot every `n` events (taken BETWEEN messages, never mid-step) —
+    /// Snapshot every `n` events (taken between messages, never mid-step) —
     /// bounds recovery cost deterministically.
     Messages(u64),
     /// Snapshot when at least this much clock time passed since the last

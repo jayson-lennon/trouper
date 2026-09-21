@@ -56,7 +56,7 @@ pub struct DeadLetter {
     pub envelope: Envelope,
 }
 
-/// An ask lifecycle event (tap facts from Phase 7 read these).
+/// An ask lifecycle event, recorded to the tap when an ask opens and settles.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum AskOutcome {
     /// The callee replied in time.
@@ -106,7 +106,7 @@ pub(crate) struct KernelState {
     pub(crate) services: HashMap<ActorPath, Arc<tokio::sync::Mutex<Box<dyn DynServiceActor>>>>,
     /// Reply-slot leases (the mechanism half of reply addresses).
     pub(crate) replies: crate::reply::ReplyTable,
-    /// Ask lifecycle facts (the tap consumes these in Phase 7).
+    /// Ask lifecycle facts (the tap consumes these).
     pub(crate) ask_facts: Vec<AskFact>,
     /// Per-actor async message dispatch entries.
     pub(crate) msg_entries: HashMap<ActorPath, Vec<Arc<dyn MsgEntry>>>,
@@ -766,7 +766,7 @@ pub(crate) async fn es_actor_loop(loop_ctx: EsLoop, mut shutdown: watch::Receive
                 maybe_snapshot_on_idle(&loop_ctx).await;
                 maybe_passivate(&loop_ctx).await;
             }
-            Step::Crashed => break, // supervisor (Phase 8) takes over
+            Step::Crashed => break, // supervisor takes over
             Step::Stop => {
                 loop_ctx
                     .graceful_exit(crate::actor::StopReason::Normal)
@@ -1731,7 +1731,8 @@ async fn maybe_snapshot_on_idle(ctx: &EsLoop) {
     snapshot_now(ctx, last).await;
 }
 
-/// Closes the inbox on stop; Phase 8 flushes undelivered entries to the DLQ.
+/// Closes the inbox on stop; teardown (or the sweep) flushes undelivered
+/// entries to the DLQ.
 async fn drain_inbox_on_stop(ctx: &EsLoop) {
     let mut inbox = ctx.cell.inbox.lock().await;
     inbox.close();
@@ -1818,7 +1819,7 @@ async fn maybe_passivate(ctx: &EsLoop) {
 }
 /// The service actor loop: pop → decode → dispatch (async, impure) →
 /// drop the message. No journal, no cursor — service actors are at-most-once
-/// by design (Phase 8 adds supervision around this loop).
+/// by design (supervision wraps this loop).
 pub(crate) async fn service_actor_loop(loop_ctx: ServiceLoop, mut shutdown: watch::Receiver<bool>) {
     loop {
         if *shutdown.borrow_and_update() {
@@ -1994,7 +1995,7 @@ async fn step_service(ctx: &ServiceLoop) -> Step {
 ///    persist, so pending messages (including the one that crashed the
 ///    actor) redeliver exactly once from where the cursor stopped.
 ///
-/// The supervisor (Phase 8) wraps this with policy/budget/backoff checks.
+/// The supervisor wraps this with policy/budget/backoff checks.
 ///
 /// # Errors
 ///
@@ -2265,8 +2266,7 @@ async fn escalate(
             },
         );
     }
-    // Remove the child's slot (its identity leaves the registry; the
-    // graceful-stop cascade arrives with the stop API in Phase 9). The
+    // Remove the child's slot (its identity leaves the registry). The
     // in-memory state dies too: only live actors hold state, and this
     // child is terminal (crash recovery already returned above).
     {
@@ -2303,11 +2303,11 @@ pub enum DeadLetterReason {
     /// The system is in its graceful shutdown sweep; the barrier refuses
     /// all new deliveries.
     ShuttingDown,
-    /// The actor emitted an event whose schema it never declared (the
-    /// pre-journal filter: the journal guard).
+    /// The actor emitted an event whose schema it never declared (checked
+    /// before the journal append).
     UndeclaredEvent,
     /// The actor recorded an outbound effect whose schema it never
-    /// declared in `.emits` (the flush-time gate: the wire guard).
+    /// declared in `.emits` (checked when recorded effects are flushed).
     UndeclaredEmit,
     /// A partition-set command arrived without its shard key.
     ShardKeyMissing,

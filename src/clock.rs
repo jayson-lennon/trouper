@@ -1,9 +1,8 @@
 //! The injected clock service: the only source of time in the runtime.
 //!
-//! A behavior service per the project skill: the implementation varies
-//! (`SystemClock` in production, `FakeClock` in tests), so it lives behind a
-//! trait with an `Arc<dyn>` wrapper. Deterministic tests require that no
-//! kernel code reads wall time directly.
+//! The implementation varies (`SystemClock` in production, `FakeClock` in
+//! tests), so it lives behind a trait with an `Arc<dyn>` wrapper.
+//! Deterministic tests require that no runtime code reads wall time directly.
 
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};

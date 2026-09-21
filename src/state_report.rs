@@ -2,13 +2,13 @@
 //! looked like.
 //!
 //! [`ReportState`] carries an already-captured [`SystemExport`] document
-//! (built by an async caller via [`ActorSystem::export`]); the [`StateReporter`]
+//! (built by an async caller via [`ActorSystem::export`](crate::system::ActorSystem::export)); the [`StateReporter`]
 //! actor emits it verbatim as a [`StateReported`] event. Because event-sourced
 //! handlers are pure and synchronous, the capture itself happens outside the
 //! actor — the command payload is the seam.
 //!
 //! The reporter's state (`seq`, last export) is inspectable via
-//! [`ActorSystem::es_state`], which is how a bridge detects that a fresh
+//! [`ActorSystem::es_state`](crate::system::ActorSystem::es_state), which is how a bridge detects that a fresh
 //! report has landed.
 
 use crate::actor::ActorKind;
@@ -33,7 +33,7 @@ pub struct ReportState {
     pub export: Json,
 }
 
-/// A system export was recorded. The event payload IS the export document —
+/// A system export was recorded. The event payload *is* the export document —
 /// a verbatim, replayable record of what the system looked like.
 ///
 /// (The schema is zero-field: the payload is the export document itself,

@@ -1,15 +1,16 @@
-//! The declarative spawn surface: builders over the erased spawn funnel.
+//! The declarative spawn surface: builders over the runtime's
+//! type-erased spawn machinery.
 //!
 //! One call says each type ONCE. The typed builder accumulates handles,
 //! emit edges, and mailbox/snapshot options, constructing the erased
-//! adapters internally — the kernel still sees exactly what the positional
+//! adapters internally — the runtime still sees exactly what the positional
 //! spawns see (one [`crate::actor::CommandEntry`] per handled schema,
 //! declared edges in the manifest). The foreign builder replaces anonymous
 //! closure parameters with named EventSourced-vocabulary methods
 //! ([`ForeignBuilder::handle`] decides, [`ForeignBuilder::apply`] folds).
 //!
 //! Positional spawns (`spawn_es`, `spawn_service`, `spawn_es_foreign`)
-//! remain only as deprecated thin wrappers over the same funnel.
+//! remain only as deprecated thin wrappers over the same machinery.
 
 use std::sync::Arc;
 
@@ -92,7 +93,7 @@ pub struct SpawnBuilder<A: crate::actor::EventSourcedActor> {
 }
 
 impl<A: crate::actor::EventSourcedActor> SpawnBuilder<A> {
-    /// The actor's identity (required; identity IS the path).
+    /// The path to spawn the actor at (required).
     pub fn at(mut self, path: impl Into<ActorPath>) -> Self {
         self.path = Some(path.into());
         self
@@ -133,8 +134,8 @@ impl<A: crate::actor::EventSourcedActor> SpawnBuilder<A> {
         self
     }
 
-    /// Declares an emitted event schema — an ENFORCED edge: the kernel
-    /// drops undeclared emits before journal append.
+    /// Declares an emitted event schema — an enforced edge: the runtime
+    /// drops undeclared emits before the journal append.
     ///
     /// `E`'s schema descriptor is registered into the schema table here,
     /// at the declaration site (idempotent — see
@@ -225,7 +226,7 @@ pub struct ServiceBuilder<A: ServiceActor> {
 }
 
 impl<A: ServiceActor> ServiceBuilder<A> {
-    /// The actor's identity (required).
+    /// The path to spawn the actor at (required).
     pub fn at(mut self, path: impl Into<ActorPath>) -> Self {
         self.path = Some(path.into());
         self
@@ -293,12 +294,12 @@ impl<A: ServiceActor> ServiceBuilder<A> {
         self
     }
 
-    /// Declares an emitted message schema for a service actor. Since
-    /// v0.5.0 this is UNIFORM: the flush-time gate drops every outbound
-    /// message whose schema is not declared here (an `UndeclaredEmit`
-    /// dead letter) — a service actor publishing undeclared schemas no
-    /// longer silently delivers. Declared edges are published in the
-    /// manifest so the export/GUI shows the actor's outputs.
+    /// Declares an emitted message schema for a service actor. The
+    /// flush-time gate drops every outbound message whose schema is not
+    /// declared here, as an `UndeclaredEmit` dead letter — a service actor
+    /// publishing undeclared schemas never silently delivers. Declared
+    /// edges are published in the manifest so the export/GUI shows the
+    /// actor's outputs.
     ///
     /// `E`'s schema descriptor is registered into the schema table here,
     /// at the declaration site.
@@ -375,7 +376,7 @@ impl<A: ServiceActor> ServiceBuilder<A> {
 }
 
 /// The foreign event-sourced builder: JSON schema in, JSON state out,
-/// decision + fold closures attached by NAME instead of positional soup.
+/// decision and fold closures attached by name.
 pub struct ForeignBuilder {
     system: crate::system::ActorSystem,
     path: Option<ActorPath>,
@@ -388,7 +389,7 @@ pub struct ForeignBuilder {
 }
 
 impl ForeignBuilder {
-    /// The actor's identity (required).
+    /// The path to spawn the actor at (required).
     pub fn at(mut self, path: impl Into<ActorPath>) -> Self {
         self.path = Some(path.into());
         self
@@ -414,7 +415,8 @@ impl ForeignBuilder {
         self
     }
 
-    /// The fold closure: (state, event) — THE mutation, live and replay.
+    /// The fold closure: `(state, event)` — applies each event to the
+    /// state. Runs for live delivery and replay alike.
     pub fn apply(mut self, f: crate::actor::ForeignFold) -> Self {
         self.fold = Some(f);
         self
@@ -496,10 +498,9 @@ impl ForeignBuilder {
 /// re-recorded into its OWN journal (the checkpoint): on spawn it replays
 /// its journal, scans the store for what it lacks, seeds the gap, and only
 /// then opens its inbox loop — live facts published during seeding queue
-/// up and fold after history. There is no `.passivate_after` here
-/// deliberately: a standalone passivated projector has no wake path (no
-/// set ⇒ no factory, no key derivation), so it would starve silently —
-/// passivation for projectors exists only through
+/// up and fold after history. Passivation is deliberately not offered
+/// here: a standalone passivated projector has no wake path and would
+/// never re-activate. Passivation for projectors exists only through
 /// [`crate::pool::ProjectorSetSpec`].
 pub fn spawn_projector_builder<P: crate::actor::Projector>(
     system: &crate::system::ActorSystem,
@@ -527,7 +528,7 @@ pub struct ProjectorBuilder<P: crate::actor::Projector> {
 }
 
 impl<P: crate::actor::Projector> ProjectorBuilder<P> {
-    /// The projector's identity (required; identity IS the path).
+    /// The path to spawn the projector at (required).
     pub fn at(mut self, path: impl Into<ActorPath>) -> Self {
         self.path = Some(path.into());
         self

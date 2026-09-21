@@ -1,7 +1,7 @@
 //! Per-actor delivery: bounded inboxes with offset-based peek/ack.
 //!
-//! Delivery NEVER rides the tap: the tap may drop facts under pressure,
-//! delivery must not. Each actor has one inbox; the kernel peeks at its
+//! Delivery never rides the tap: the tap may drop facts under pressure;
+//! delivery must not. Each actor has one inbox; the runtime peeks at its
 //! cursor, processes, and acks — the offset survives actor restarts, which
 //! is what makes redelivery possible.
 
@@ -35,7 +35,7 @@ pub enum InboxError {
 
 /// A refused push, carrying the envelope back to the caller.
 ///
-/// The kernel turns every variant into a `DeadLettered` fact: dropped
+/// The runtime turns every variant into a `DeadLettered` fact: dropped
 /// messages must stay observable, never silently vanish.
 #[derive(Debug, wherror::Error)]
 #[error(debug)]
@@ -97,16 +97,18 @@ impl Inbox {
     /// Attempts to enqueue an envelope, applying the overload policy.
     ///
     /// * `Block`  → returns `Err(Full(envelope))` and the caller retries
-    ///   (the kernel's front door is an mpsc whose `.send().await` IS the
+    ///   (the runtime's front door is an mpsc whose `.send().await` is the
     ///   block).
     /// * `DropNew` → the envelope is returned refused.
     /// * `DropOld` → the oldest queued envelope is evicted and returned
-    ///   (the kernel dead-letters it), and the new envelope is queued.
+    ///   (the runtime dead-letters it), and the new envelope is queued.
     ///
     /// # Errors
     ///
-    /// Returns the refused envelope ([`InboxError::Full`]) under Block/
-    /// DropNew when full, and [`InboxError::Closed`] once draining.
+    /// Returns the offset assigned to the envelope, or the refusal reason
+    /// with the envelope back by value ([`Refused::Full`] under Block/
+    /// DropNew when full, [`Refused::Closed`] once draining, and
+    /// [`Refused::Evicted`] with the oldest envelope under DropOld).
     // The refused envelope travels back by value on purpose: the kernel
     // dead-letters exactly what was refused (allowed workspace-wide in
     // Cargo.toml).
@@ -165,7 +167,7 @@ impl Inbox {
         self.open
     }
 
-    /// The cursor's current offset — the next entry the kernel will see.
+    /// The cursor's current offset — the next entry the runtime will see.
     pub fn cursor(&self) -> InboxOffset {
         InboxOffset::new(self.cursor)
     }
@@ -187,7 +189,7 @@ impl Inbox {
     /// # Panics
     ///
     /// Panics if the cursor is already past every entry ever enqueued — a
-    /// kernel bug, since only the kernel peeks and acks.
+    /// runtime bug, since only the runtime peeks and acks.
     pub fn ack(&mut self) -> InboxOffset {
         if self.cursor >= self.next_offset {
             panic!("inbox acked past the write head at cursor {self:?}");
@@ -203,7 +205,7 @@ impl Inbox {
         InboxOffset::new(self.cursor)
     }
 
-    /// Drains every un-acked entry (kernel uses this on shutdown/DLQ flush).
+    /// Drains every un-acked entry (the runtime uses this on shutdown/DLQ flush).
     pub fn drain(&mut self) -> impl Iterator<Item = (InboxOffset, Envelope)> + '_ {
         self.queue
             .drain(..)
@@ -221,7 +223,7 @@ impl Inbox {
     }
 }
 
-/// Position within one actor's inbox; independent of the journal's [`SeqNo`].
+/// Position within one actor's inbox; independent of the journal's [`SeqNo`](crate::journal::SeqNo).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct InboxOffset(u64);

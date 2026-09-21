@@ -1,11 +1,11 @@
 //! The tap: a global observation ring of facts.
 //!
-//! The tap is NOT a delivery path — envelopes never travel through it.
-//! Every waist crossing (send, deliver, ack, spawn, stop, ask, publish,
-//! fail, escalate, dead-letter) appends a [`Fact`] to a bounded ring that
-//! drops the OLDEST entries under pressure. Subscribers hold an offset
-//! into the ring and read forward; the ring's JSON projection exists only
-//! at its boundary (`Fact::to_json`), never on the emit path.
+//! The tap is not a delivery path — envelopes never travel through it.
+//! Every runtime boundary crossing (send, deliver, ack, spawn, stop, ask,
+//! publish, fail, escalate, dead-letter) appends a [`Fact`] to a bounded
+//! ring that drops the oldest entries under pressure. Subscribers hold an
+//! offset into the ring and read forward; the ring's JSON projection exists
+//! only at its boundary (`Fact::to_json`), never on the emit path.
 
 use std::collections::VecDeque;
 
@@ -30,7 +30,7 @@ pub struct Fact {
     pub kind: FactKind,
 }
 
-/// The fact variants, keyed to the spec's emit points.
+/// The fact variants, one variant per observable runtime event.
 #[derive(Debug, Clone)]
 pub enum FactKind {
     /// An envelope was routed to a destination.
@@ -102,7 +102,7 @@ pub enum FactKind {
 }
 
 impl Fact {
-    /// The JSON projection (the tap boundary — serialization lives HERE
+    /// The JSON projection (the tap boundary — serialization lives here
     /// and nowhere else).
     pub fn to_json(&self) -> Json {
         let base = json!({
@@ -222,7 +222,7 @@ impl Fact {
 pub struct TapRing {
     capacity: usize,
     entries: VecDeque<Fact>,
-    /// The offset the NEXT fact gets (monotonic across evictions).
+    /// The offset the next fact gets (monotonic across evictions).
     next_offset: u64,
     /// The lowest retained offset.
     floor: u64,
@@ -239,7 +239,7 @@ impl TapRing {
         }
     }
 
-    /// The offset the NEXT pushed fact will carry.
+    /// The offset the next pushed fact will carry.
     pub fn next_offset(&self) -> u64 {
         self.next_offset
     }

@@ -20,12 +20,13 @@ use crate::schema::{Schema, SchemaId};
 /// Where a message is headed.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum Address {
-    /// A named actor's inbox.
+    /// A named actor's inbox. Survives restarts.
     Path(ActorPath),
-    /// A reply slot for an in-flight `ask`; a mechanism, dies with the ask.
+    /// A reply slot for an in-flight `ask`; lives only as long as the
+    /// asker awaits the reply.
     Slot(LeaseId),
-    /// Any handler of the schema: the kernel picks one per send
-    /// (RoundRobin across registered handlers; Single while only one).
+    /// Any handler of the schema: the runtime picks one per send
+    /// (round-robin across registered handlers; single while only one).
     Schema(SchemaId),
 }
 
@@ -58,18 +59,18 @@ impl TraceCtx {
 
 /// What an envelope carries.
 ///
-/// Clonable so the kernel can peek a message without consuming it: the
-/// envelope stays at the inbox cursor until acked, which is what makes
-/// redelivery possible. The typed arm is an `Arc` clone (cheap).
+/// Clonable so the runtime can peek a message without consuming it: the
+/// envelope stays at the inbox cursor until acknowledged, which is what
+/// makes redelivery possible. The typed arm is an `Arc` clone (cheap).
 #[derive(Clone)]
 pub enum Payload {
-    /// RESERVED in-proc fast path, not yet crossed by production code:
-    /// every runtime boundary is JSON today (the "JSON waist" decision),
-    /// so no adapter constructs this arm yet. Kept as the seam for a
-    /// future zero-copy path; downstream code must still handle it (see
-    /// [`Payload::into_json`] treating it as an error).
+    /// A reserved in-process fast path, not yet crossed by production code:
+    /// every runtime boundary is JSON today, so no adapter constructs this
+    /// arm yet. Kept as the seam for a future zero-copy path; downstream
+    /// code must still handle it ([`Payload::as_json`] treats it as an
+    /// error).
     Typed(std::sync::Arc<dyn std::any::Any + Send + Sync>),
-    /// The waist representation: plain JSON.
+    /// Plain JSON.
     Json(Json),
 }
 
@@ -140,8 +141,9 @@ impl Event {
     }
 }
 
-/// The runtime-internal message wrapper. Not serializable as a whole: the
-/// durable parts (trace, schema, JSON payload) are copied out at the waist.
+/// The runtime's message wrapper. Not serializable as a whole: the durable
+/// parts (trace, schema, JSON payload) are copied out when crossing the
+/// runtime boundary.
 #[derive(Debug, Clone)]
 pub struct Envelope {
     /// The payload's schema.
@@ -150,15 +152,15 @@ pub struct Envelope {
     pub dest: Address,
     /// The logical sending path, when the sender is an actor.
     pub from: Option<ActorPath>,
-    /// Where a reply should go: a durable [`Address::Path`] or a mechanism
-    /// [`Address::Slot`].
+    /// Where a reply should go: a durable [`Address::Path`] or a
+    /// short-lived reply slot ([`Address::Slot`]).
     pub reply_to: Option<Address>,
     /// Trace metadata of this hop.
     pub trace: TraceCtx,
     /// The message body.
     pub payload: Payload,
     /// Where this copy's fact was recorded — `(source journal, seq)` —
-    /// when the message IS a recorded fact (broadcast copies of consumed
+    /// when the message is a recorded fact (broadcast copies of consumed
     /// events). A projector stamps its journal entries with it: the
     /// checkpoint's source identity for live-delivered copies, so a
     /// restart never re-seeds (never double-folds) a fact it folded live.
@@ -177,7 +179,7 @@ pub struct RecordedOrigin {
 }
 
 impl Envelope {
-    /// Assembles a JSON envelope — the waist representation.
+    /// Assembles a JSON-payload envelope.
     pub fn json(
         schema: SchemaId,
         dest: Address,
@@ -195,7 +197,7 @@ impl Envelope {
         }
     }
 
-    /// The JSON view of the payload (the waist representation).
+    /// The JSON view of the payload (or `null` for a typed payload).
     pub fn payload_json(&self) -> &Json {
         static NULL: std::sync::OnceLock<Json> = std::sync::OnceLock::new();
         match &self.payload {
@@ -204,9 +206,9 @@ impl Envelope {
         }
     }
 
-    /// Assembles a typed envelope for the RESERVED in-proc fast path.
-    /// Production code crosses the schema waist as JSON; this constructor
-    /// exists for that future path and for the erased-payload unit test.
+    /// Assembles a typed envelope for the reserved in-process fast path.
+    /// Production code passes payloads as JSON; this constructor exists for
+    /// that future path and for the erased-payload unit test.
     #[doc(hidden)]
     pub fn typed<T: Send + Sync + 'static>(
         schema: SchemaId,
@@ -250,7 +252,7 @@ impl Envelope {
         self
     }
 
-    /// The payload as JSON, if it is already at the waist.
+    /// The payload as JSON, if it is one.
     pub fn as_json(&self) -> Option<&Json> {
         match &self.payload {
             Payload::Json(value) => Some(value),
@@ -258,10 +260,8 @@ impl Envelope {
         }
     }
 
-    /// Takes the payload as JSON, encoding the typed arm at the schema waist.
-    ///
-    /// Typed payloads require the type to be JSON-encodable; this is the
-    /// single encode point for the fast path.
+    /// Takes the payload as JSON. The error arm is the typed payload
+    /// itself — typed payloads have no JSON encoding on this path.
     pub fn into_json(self) -> Result<Json, Payload> {
         match self.payload {
             Payload::Json(value) => Ok(value),
@@ -463,19 +463,12 @@ fn causality_id_is_version_7() {
 
 /// The events a command handler decided on, ready to journal.
 ///
-/// Backed by a [`SmallVec`]: up to two events stay inline with no heap
-/// allocation, which covers almost every event-sourced decision. Overflowing
-/// past two spills to the heap transparently. Handler code never names the
-/// backing type — construct with [`Events::new`], [`Events::one`], and
-/// [`Events::push_event`], and convert typed facts with [`IntoEvent`].
+/// Construct from typed facts with [`Events::one`] and
+/// [`Events::push_event`]; conversion through [`IntoEvent`] is automatic.
+/// The runtime appends these to the journal in order.
 ///
-/// The kernel appends these to the journal in order; conversion to a plain
-/// slice happens through `Deref`, so [`crate::journal::JournalStore::append`]
-/// takes `&[Event]` with no allocation on the path.
-///
-/// There is no `DerefMut<Target = [Event]>`: once a decision is made the
-/// buffer is append-only. [`Events::push`] is the raw escape hatch for
-/// events built by hand; prefer [`Events::push_event`].
+/// The buffer is append-only: [`Events::push`] exists for events built by
+/// hand, [`Events::push_event`] for typed facts.
 #[derive(Debug, Clone, Default)]
 pub struct Events(SmallVec<[Event; 2]>);
 
@@ -488,8 +481,8 @@ impl Events {
     /// A buffer holding exactly one event, built from a typed fact.
     ///
     /// The common shape of an event-sourced decision: the handler returns
-    /// `Events::one(Deposited { n })` instead of building an [`Event`] by
-    /// hand. Panics if serializing the fact fails — see [`IntoEvent`].
+    /// `Events::one(Deposited { n })`. Panics if serializing the fact fails
+    /// — see [`IntoEvent`].
     pub fn one(e: impl IntoEvent) -> Self {
         let mut ev = Self::new();
         ev.push_event(e);
@@ -503,7 +496,7 @@ impl Events {
         self.0.push(e.into_event());
     }
 
-    /// Appends a hand-built [`Event`] (raw escape hatch).
+    /// Appends a hand-built [`Event`].
     pub fn push(&mut self, e: Event) {
         self.0.push(e);
     }

@@ -1,10 +1,12 @@
-//! Reply-slot leases: the mechanism half of the name/mechanism split.
+//! Reply-slot leases: the short-lived half of an ask's reply address.
 //!
-//! A reply address is either a durable [`Address::Path`] (a name — survives
-//! restarts, an ordinary envelope) or [`Address::Slot`] (a lease — a oneshot
+//! A reply address is either a durable
+//! [`Address::Path`](crate::envelope::Address::Path) (survives restarts,
+//! an ordinary envelope) or a
+//! [`Address::Slot`](crate::envelope::Address::Slot) (a lease — a oneshot
 //! channel that exists only as long as its asker awaits, with an expiry so
-//! a dead asker's slot can never leak). The log records only names; slots
-//! are runtime-internal and die with the ask.
+//! a dead asker's slot can never leak). The journal records only names;
+//! slots are runtime-internal and die with the ask.
 
 use parking_lot::Mutex;
 use std::collections::HashMap;

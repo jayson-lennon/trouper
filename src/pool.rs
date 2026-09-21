@@ -1,14 +1,14 @@
 //! Declarative partition-set and router-rule specs, resolved by the
-//! kernel at route time — never forwarding actors.
+//! runtime at route time.
 //!
 //! A partition set derives a per-entity path from a schema-declared shard
 //! key and activates entities on demand from a shared factory. Router
 //! rules place observers at a tier: `Tee` copies (at-most-once, never an
 //! audit mechanism), `Inline` interposes.
 //!
-//! (Worker pools are NOT a kernel construct here: spawn a supervisor
+//! (Worker pools are not a runtime construct: spawn a supervisor
 //! actor that owns the worker lifecycle and let senders use
-//! `send_to_any` — the route table already round-robins one-of sends.)
+//! `send_to_any` — the route table round-robins one-of sends.)
 
 use crate::actor::ActorPath;
 use crate::json::Json;
@@ -17,11 +17,11 @@ use crate::schema::SchemaId;
 /// Where a rule places an observer relative to the flow it watches.
 #[derive(Debug, Clone)]
 pub enum RuleAction {
-    /// Deliver a COPY to the observer; the primary delivery is untouched.
-    /// The copy carries a NEW causality id under the original's trace id
+    /// Deliver a copy to the observer; the primary delivery is untouched.
+    /// The copy carries a new causality id under the original's trace id
     /// (two deliveries of one message must not look like a chain of two
     /// hops). At-most-once: the copy is dropped if the observer's inbox
-    /// is full — a teed copy is NOT an audit mechanism.
+    /// is full — a teed copy is not an audit mechanism.
     Tee(ActorPath),
     /// Interpose the observer: it receives the envelope in the primary's
     /// place and is responsible for forwarding it.
@@ -32,7 +32,7 @@ pub enum RuleAction {
 /// match), the action applies. `None` criteria are wildcards.
 #[derive(Debug, Clone)]
 pub struct Rule {
-    /// Matches the ORIGINAL sender path (`from`), if declared.
+    /// Matches the original sender path (`from`), if declared.
     pub source: Option<ActorPath>,
     /// Matches the envelope's schema, if declared.
     pub schema: Option<SchemaId>,
@@ -43,9 +43,9 @@ pub struct Rule {
 }
 
 /// A partition-set spec: per-entity actors derived from a schema-declared
-/// shard key, activated on demand from ONE shared factory.
+/// shard key, activated on demand from one shared factory.
 ///
-/// Senders address the public path forever; the kernel extracts the key,
+/// Senders address the public path forever; the runtime extracts the key,
 /// derives `public/key`, and spawns the entity there on first sight.
 #[derive(Clone)]
 pub struct PartitionSpec {
@@ -54,15 +54,15 @@ pub struct PartitionSpec {
     /// The system handle the factory spawns entities through (captured at
     /// install so the router can activate without extra plumbing).
     pub system: crate::system::ActorSystem,
-    /// Spawns ONE entity at the given path (an ES spawn — the entity owns
-    /// its journal). The factory owns the actor type; the kernel owns the
+    /// Spawns one entity at the given path (an ES spawn — the entity owns
+    /// its journal). The factory owns the actor type; the runtime owns the
     /// naming and the activation moment.
     #[allow(clippy::type_complexity)]
     pub factory:
         std::sync::Arc<dyn Fn(&crate::system::ActorSystem, &ActorPath, &Json) + Send + Sync>,
     /// The command field carrying the shard key (extracted per envelope).
     /// Must be marked [`crate::schema::FieldRole::ShardKey`] in at least one
-    /// handled command schema — validated at install (refuse-to-lie).
+    /// handled command schema — validated at install.
     pub key_field: String,
     /// Genesis args template: the derived key is merged in as `"key"`.
     pub args_template: Option<Json>,
@@ -93,8 +93,8 @@ impl std::fmt::Debug for PartitionSpec {
     }
 }
 
-/// A projector-set spec: per-key projectors derived from a CONSUMED fact's
-/// shard key, activated on demand from ONE shared factory.
+/// A projector-set spec: per-key projectors derived from a consumed fact's
+/// shard key, activated on demand from one shared factory.
 ///
 /// The per-key twin of [`PartitionSpec`] for read models: broadcast copies
 /// of a consumed schema resolve `public/key` per copy and wake the owning
@@ -111,9 +111,9 @@ pub struct ProjectorSetSpec {
     pub public: ActorPath,
     /// The system handle the factory spawns projectors through.
     pub system: crate::system::ActorSystem,
-    /// Spawns ONE projector at the given path (a projector spawn — the
+    /// Spawns one projector at the given path (a projector spawn — the
     /// projector owns its journal and its catch-up). The factory owns the
-    /// read-model type and its consumed schemas; the kernel owns the
+    /// read-model type and its consumed schemas; the runtime owns the
     /// naming and the activation moment.
     #[allow(clippy::type_complexity)]
     pub factory:
@@ -121,7 +121,7 @@ pub struct ProjectorSetSpec {
     /// The consumed-fact field carrying the shard key (extracted per
     /// broadcast copy). Must be marked
     /// [`crate::schema::FieldRole::ShardKey`] in at least one consumed
-    /// schema — validated at install (refuse-to-lie).
+    /// schema — validated at install.
     pub key_field: String,
     /// Genesis args template: the derived key is merged in as `"key"`
     /// (a projector's fold genesis is `Default`, so this rides the
@@ -160,10 +160,11 @@ impl std::fmt::Debug for ProjectorSetSpec {
     }
 }
 
-/// Extracts the shard-key string from a payload per the schema def.
+/// Extracts the shard-key string from a payload per the schema
+/// definition.
 ///
-/// Schema-aware, not stringly: the key field's declared type decides how
-/// the JSON value renders into the entity path (ints vs strings).
+/// The key field's declared type decides how the JSON value renders into
+/// the entity path (ints vs strings).
 pub fn extract_shard_key(
     schema: &crate::schema::SchemaDef,
     key_field: &str,

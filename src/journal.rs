@@ -1,7 +1,7 @@
 //! In-memory, seq-anchored journals: lists of [`Event`] and [`Snapshot`]
 //! entries. Restart restores from the latest snapshot plus the tail; command
-//! redelivery is independent of snapshots. Persistence is deliberately out of
-//! scope (see spec Anti-Goals).
+//! redelivery is independent of snapshots. Persisted backends implement the
+//! [`JournalStore`] trait; the in-memory store is the default.
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -48,7 +48,7 @@ pub enum JournalEntry {
         /// for journals written before projectors existed).
         #[serde(default)]
         origin: EventOrigin,
-        /// The store-assigned global arrival order across ALL paths.
+        /// The store-assigned global arrival order across all paths.
         /// Defaults to 0 for legacy entries (they sort early; ordering
         /// among them falls back to per-journal seq).
         #[serde(default)]
@@ -58,7 +58,7 @@ pub enum JournalEntry {
     Snapshot {
         /// Sequence of the last event folded into `state`.
         seq: SeqNo,
-        /// The snapshot state (JSON at the waist).
+        /// The snapshot state.
         state: Json,
     },
 }
@@ -115,7 +115,7 @@ pub struct JournaledEvent {
 }
 
 impl JournaledEvent {
-    /// Whether this entry is a RECORDED fact (never a checkpoint
+    /// Whether this entry is a recorded fact (never a checkpoint
     /// re-record) whose payload names `key` under `key_field` — the
     /// per-key projector seed test, mirroring broadcast's derivation.
     pub fn recorded_payload_key(&self, key_field: &str, key: &str) -> bool {
@@ -159,12 +159,12 @@ pub struct Replay {
 /// Where an actor's journal lives.
 ///
 /// Contract:
-/// - [`append`](JournalStore::append) is awaited BEFORE the command's
+/// - [`append`](JournalStore::append) is awaited before the command's
 ///   ack — a write-through store therefore gets "never ack what isn't
 ///   journaled"; a buffering store persists pending entries in
-///   [`flush`](JournalStore::flush), which the runtime calls ONCE during
+///   [`flush`](JournalStore::flush), which the runtime calls once during
 ///   the graceful shutdown sweep (after every actor drained, before slot
-///   removal). Between flushes, `load` must reflect BUFFERED state, so
+///   removal). Between flushes, `load` must reflect buffered state, so
 ///   reactivation sees everything appended.
 /// - Per-path sequence assignment belongs to the store: one loop task per
 ///   actor path, so per-path appends are already serialized. The store
@@ -180,7 +180,7 @@ pub trait JournalStore: Send + Sync {
     /// # Errors
     ///
     /// [`JournalError::Append`] when the store refuses the write; the
-    /// kernel aborts the step BEFORE the ack (the message stays queued).
+    /// runtime aborts the step before the ack (the message stays queued).
     async fn append(
         &self,
         path: &crate::actor::ActorPath,
@@ -228,7 +228,7 @@ pub trait JournalStore: Send + Sync {
 
     /// Appends catch-up seeds to a projector's journal: `events` are
     /// recorded with origin [`EventOrigin::CatchUp`], traced to
-    /// `(journal, seq)` — the projector's checkpoint. IDEMPOTENT: an
+    /// `(journal, seq)` — the projector's checkpoint. Idempotent: an
     /// entry whose `(journal, seq)` the checkpoint already holds is
     /// skipped (the projector folded it live or seeded it earlier), which
     /// is what makes live copies and re-seeds fold exactly once. The
@@ -248,7 +248,7 @@ pub trait JournalStore: Send + Sync {
     }
 
     /// Surfaces every `Recorded`-origin entry whose schema is in `schemas`,
-    /// across ALL paths (passivated actors included — the store holds what
+    /// across all paths (passivated actors included — the store holds what
     /// the runtime forgets), ascending `ingest_seq`. Re-recorded
     /// projector entries are invisible by construction.
     ///
@@ -296,11 +296,11 @@ pub trait JournalStore: Send + Sync {
     }
 }
 
-/// The default store: today's in-memory [`Journal`] per actor path.
+/// The default store: an in-memory [`Journal`] per actor path.
 #[derive(Debug, Default)]
 pub struct InMemoryJournalStore {
     journals: parking_lot::Mutex<HashMap<crate::actor::ActorPath, Journal>>,
-    /// Globally monotonic arrival order across ALL paths. Assigned under
+    /// Globally monotonic arrival order across all paths. Assigned under
     /// the journals lock (append serialization), never reset by purge —
     /// ordering history is append-only even when a journal is dropped.
     ingest_seq: AtomicU64,
@@ -358,7 +358,7 @@ pub fn downcast_in_memory(
 ) -> Option<&InMemoryJournalStore> {
     // `Arc<dyn JournalStore>` is not `Any` at the trait level; the
     // concrete handle minted at construction is. Comparison by the
-    // concrete address: the kernel keeps the typed Arc alongside.
+    // concrete address: the runtime keeps the typed Arc alongside.
     store.as_any().downcast_ref::<InMemoryJournalStore>()
 }
 
@@ -700,8 +700,8 @@ impl SeqNo {
         self.0
     }
 
-    /// Whether this is the [`before_genesis`] sentinel (compare by value,
-    /// since `u64::MAX` is unreachable by honest counting).
+    /// Whether this is the [`SeqNo::before_genesis`] sentinel (compare by
+    /// value, since `u64::MAX` is unreachable by honest counting).
     pub fn is_before_genesis(self) -> bool {
         self.0 == u64::MAX
     }

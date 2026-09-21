@@ -43,7 +43,7 @@ pub enum FieldTy {
     Str,
     /// A UUID string.
     Uuid,
-    /// Arbitrary JSON; the escape hatch for payloads the canvas need not
+    /// Arbitrary JSON; the escape hatch for payloads consumers need not
     /// inspect deeply.
     Json,
     /// A list of values of one element type.
@@ -78,8 +78,8 @@ pub struct FieldDef {
     pub name: String,
     /// The field's type.
     pub ty: FieldTy,
-    /// The unit of measure, e.g. `"ms"`, `"kg"`; presentation data for the
-    /// canvas, never interpreted by the runtime.
+    /// The unit of measure, e.g. `"ms"`, `"kg"`; presentation data,
+    /// never interpreted by the runtime.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub unit: Option<String>,
     /// Accepted numeric bounds, if any.
@@ -96,7 +96,7 @@ pub struct FieldDef {
 
 /// A structural role a field can play beyond its data type.
 ///
-/// The runtime reads roles to make routing decisions; the canvas renders
+/// The runtime reads roles to make routing decisions; exports render
 /// them so the declared routing is visible.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum FieldRole {
@@ -190,7 +190,7 @@ impl SchemaDef {
         SchemaId::new(&self.name, self.version)
     }
 
-    /// Serializes the descriptor to JSON — the export/canvas projection.
+    /// Serializes the descriptor to JSON (for export).
     pub fn to_json(&self) -> Json {
         Json::of(self)
     }
@@ -210,9 +210,9 @@ impl SchemaDef {
 /// Both paths produce the same [`SchemaDef`], so a schema is identical
 /// whether it arrived from code or from data.
 ///
-/// Prefer deriving the impl with [`Event`] / [`Command`] — the derives
-/// generate `schema_def` from the struct's fields. Hand-write the impl
-/// only for complex or foreign descriptors.
+/// Prefer deriving the impl with the [`Event`] / [`Command`] derives —
+/// they generate `schema_def` from the struct's fields. Hand-write the
+/// impl only for complex or foreign descriptors.
 pub trait Schema {
     /// The type's schema descriptor.
     fn schema_def() -> SchemaDef;
@@ -233,9 +233,8 @@ pub use trouper_macros::{Command, Event};
 /// ends. The bound for typed effect methods — the schema id comes from the
 /// type, the payload from serde.
 ///
-/// Blanket-implemented: any `Schema` type with both serde derives IS a
-/// `Message` (the adapters decode inbound messages, so every schema type
-/// already carries the derives).
+/// Blanket-implemented: any `Schema` type with both serde derives is a
+/// `Message`.
 pub trait Message: Schema + Serialize + DeserializeOwned {}
 impl<T: Schema + Serialize + DeserializeOwned> Message for T {}
 
@@ -246,7 +245,7 @@ impl<T: Schema + Serialize + DeserializeOwned> Message for T {}
 /// Manifest entries reference [`SchemaId`]s only — Rust-registered and
 /// JSON-registered schemas are indistinguishable here, which is what makes
 /// declared edges uniform for export. Produced by the [`ActorManifest`]
-/// builder at spawn; the kernel registers routes from it.
+/// builder at spawn; the runtime registers routes from it.
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 pub struct ActorManifest {
     /// Schemas this actor accepts — the one receive declaration. `.handles`
@@ -254,9 +253,10 @@ pub struct ActorManifest {
     /// arrives via tell, send_to_any, or publish is invisible here.
     #[serde(default)]
     pub handles: Vec<SchemaId>,
-    /// Event schemas this actor emits. THE outbound declaration: every
+    /// Event schemas this actor emits. The outbound declaration: every
     /// message an actor sends, publishes, or replies with must appear
-    /// here or the kernel drops it at flush (UndeclaredEmit).
+    /// here or the runtime drops it at flush (an `UndeclaredEmit` dead
+    /// letter).
     #[serde(default)]
     pub emits: Vec<SchemaId>,
     /// Which actor contract this actor implements.
