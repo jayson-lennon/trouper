@@ -100,7 +100,8 @@ pub struct FieldDef {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum FieldRole {
     /// The partition key: partition-set routers extract this field from a
-    /// command payload to derive the entity path.
+    /// command OR consumed-fact payload to derive the entity path (a
+    /// projector set resolves its per-key projectors through it).
     ShardKey,
 }
 
@@ -135,7 +136,9 @@ impl FieldDef {
         self
     }
 
-    /// Marks this field as the partition's shard key.
+    /// Marks this field as the partition's shard key (the key a router
+    /// extracts from a command or consumed-fact payload to derive the
+    /// entity path).
     pub fn as_shard_key(mut self) -> Self {
         self.role = Some(FieldRole::ShardKey);
         self

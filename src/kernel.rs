@@ -98,6 +98,9 @@ pub(crate) struct KernelState {
     pub(crate) snapshot_cadence_ms: HashMap<ActorPath, Option<u64>>,
     pub(crate) es_state: HashMap<ActorPath, Arc<tokio::sync::Mutex<Box<dyn DynEsActor>>>>,
     pub(crate) entries: HashMap<ActorPath, Vec<Arc<dyn CommandEntry>>>,
+    /// Live projectors: their step-9 fan-out is suppressed (a projector's
+    /// re-records are checkpoint writes, never new facts).
+    pub(crate) projectors: HashSet<ActorPath>,
     pub(crate) snapshot_policy: HashMap<ActorPath, crate::actor::SnapshotCadence>,
     /// Live service instances (service actors are not journaled).
     pub(crate) services: HashMap<ActorPath, Arc<tokio::sync::Mutex<Box<dyn DynServiceActor>>>>,
@@ -156,6 +159,7 @@ impl KernelState {
             replies: crate::reply::ReplyTable::default(),
             ask_facts: Vec::new(),
             msg_entries: HashMap::new(),
+            projectors: HashSet::new(),
             genesis_args: HashMap::new(),
             crashed: HashSet::new(),
             dead_letters: Vec::new(),
@@ -456,26 +460,17 @@ async fn resolve_partition(
 ) -> Result<Option<ActorPath>, Envelope> {
     let spec = {
         let reg = registry.lock();
-        let Some(spec) = reg.partitions.get(&dest) else {
-            return Ok(None);
-        };
-        spec.clone()
+        reg.partitions.get(&dest).cloned()
     };
-    // Schema-aware key extraction from the payload (schema lock scoped).
-    let key = {
-        let reg = registry.lock();
-        let payload = envelope.as_json().cloned().unwrap_or(JsonValue::Null);
-        match reg.schema(&envelope.schema) {
-            Some(def) => crate::pool::extract_shard_key(def, &spec.key_field, &payload),
-            None => payload
-                .get(&spec.key_field)
-                .and_then(|v| v.as_str().map(str::to_owned)),
-        }
+    let Some(spec) = spec else {
+        // Not an entity partition: fall through to the projector-set
+        // check (a path belongs to at most one set — both tables are
+        // keyed by public path).
+        return resolve_projector_set(registry, kernel, envelope, dest).await;
     };
-    let Some(key) = key else {
-        // The schema declares the key required; arriving here is a
-        // contract break (or an unregistered foreign sender).
-        return Err(envelope.clone());
+    let key = match extract_key(registry, envelope, &spec.key_field) {
+        Some(key) => key,
+        None => return Err(envelope.clone()),
     };
     // Determinism is structural: same key → same derived path.
     let entity_path = ActorPath::new(format!("{}/{}", dest, key).as_str());
@@ -496,6 +491,81 @@ async fn resolve_partition(
     // a race delivers to the winner's entity (same derived path).
     (spec.factory)(&spec.system, &entity_path, &spec.entity_args(&key));
     Ok(Some(entity_path))
+}
+
+/// Schema-aware shard-key extraction from an envelope's payload.
+fn extract_key(registry: &Mutex<Registry>, envelope: &Envelope, key_field: &str) -> Option<String> {
+    let reg = registry.lock();
+    let payload = envelope.as_json().cloned().unwrap_or(JsonValue::Null);
+    match reg.schema(&envelope.schema) {
+        Some(def) => crate::pool::extract_shard_key(def, key_field, &payload),
+        None => payload
+            .get(key_field)
+            .and_then(|v| v.as_str().map(str::to_owned)),
+    }
+}
+
+/// The projector-set arm of partition resolution: identical derive →
+/// activate-on-demand → deliver core, over the projector-set table.
+///
+/// Only projector sets participate (an entity `PartitionSpec` never
+/// declared consumption, so a broadcast copy aimed at it is not a
+/// delivery obligation — the activation rule is declaration-scoped).
+async fn resolve_projector_set(
+    registry: &Mutex<Registry>,
+    kernel: &Mutex<KernelState>,
+    envelope: &Envelope,
+    dest: ActorPath,
+) -> Result<Option<ActorPath>, Envelope> {
+    let spec = {
+        let reg = registry.lock();
+        // The set is addressed either by its public path (a direct send)
+        // or by an already-derived per-key path (the broadcast set-arm
+        // derives `public/key` before routing). Both resolve to the same
+        // spec; the key comes from the payload either way.
+        reg.projector_sets
+            .get(&dest)
+            .cloned()
+            .or_else(|| reg.projector_set_owning(&dest))
+    };
+    let Some(spec) = spec else {
+        return Ok(None);
+    };
+    let Some(key) = extract_key(registry, envelope, &spec.key_field) else {
+        return Err(envelope.clone());
+    };
+    let projector_path = ActorPath::new(format!("{}/{}", spec.public, key).as_str());
+    if registry.lock().lookup(&projector_path).is_some() {
+        return Ok(Some(projector_path));
+    }
+    if kernel
+        .lock()
+        .shutting_down
+        .load(std::sync::atomic::Ordering::SeqCst)
+    {
+        return Err(envelope.clone());
+    }
+    (spec.factory)(&spec.system, &projector_path, &spec.entity_args(&key));
+    // The set owns lifecycle policy for its activated projectors:
+    // passivation and snapshot cadence ride the spec. (A projector's
+    // builder has no passivate_after — a standalone passivated projector
+    // has no wake path — so per-key passivation can only come from here.)
+    // Applied AFTER the factory returns: the arm is synchronous, so the
+    // config is in place before the loop's first idle poll.
+    {
+        let mut kernel = kernel.lock();
+        if let Some(passivation) = spec.opts.passivation {
+            kernel
+                .passivation
+                .insert(projector_path.clone(), passivation);
+        }
+        if spec.opts.snapshot != crate::actor::SnapshotCadence::Off {
+            kernel
+                .snapshot_policy
+                .insert(projector_path.clone(), spec.opts.snapshot);
+        }
+    }
+    Ok(Some(projector_path))
 }
 
 /// Applies the first matching router rule to a path-addressed envelope.
@@ -933,15 +1003,64 @@ async fn step_es(ctx: &EsLoop) -> Step {
     // by the filter; the events own their traces now.
     let seqs = {
         let store = ctx.kernel.lock().journal_store.clone();
-        let seqs = store.append(&ctx.path, &events).await.map_err(|report| {
-            tracing::error!(actor = %ctx.path, error = ?report, "journal append failed");
+        // A stamped envelope IS a recorded fact from elsewhere (a
+        // projector consuming a broadcast copy): journal the identity
+        // re-record as a CHECKPOINT — origin `CatchUp { source: the
+        // recording journal, seq }`, the same identity the seeding path
+        // writes. `CatchUp` is invisible to `scan` (a projector's
+        // journal is never another projector's source of truth) and
+        // idempotent against seeding. The append answers `None` when
+        // this journal already held the fact (seeded first): the step
+        // acks and skips to the next message (the fold already
+        // happened, or will, via the seed).
+        let (appended, apply_new) = match envelope.recorded_origin() {
+            Some(origin) => {
+                let scanned: Vec<crate::journal::ScannedEvent> = events
+                    .iter()
+                    .map(|event| crate::journal::ScannedEvent {
+                        journal: origin.journal.clone(),
+                        seq: origin.seq,
+                        ingest_seq: 0,
+                        event: event.clone(),
+                    })
+                    .collect();
+                match store.append_catchup(&ctx.path, &scanned).await {
+                    Ok(results) => {
+                        let apply_new = results.iter().all(|slot| slot.is_some());
+                        (
+                            Ok(events
+                                .iter()
+                                .map(|_| crate::journal::SeqNo::new(0))
+                                .collect::<Vec<_>>()),
+                            apply_new,
+                        )
+                    }
+                    Err(report) => {
+                        tracing::error!(actor = %ctx.path, error = ?report, "journal append failed");
+                        (Err(()), false)
+                    }
+                }
+            }
+            None => match store.append(&ctx.path, &events).await {
+                Ok(seqs) => (Ok(seqs), true),
+                Err(report) => {
+                    tracing::error!(actor = %ctx.path, error = ?report, "journal append failed");
+                    (Err(()), false)
+                }
+            },
+        };
+        if appended.is_err() {
             let mut kernel = ctx.kernel.lock();
             kernel.crashed.insert(ctx.path.clone());
-        });
-        match seqs {
-            Ok(seqs) => seqs,
-            Err(()) => return Step::Crashed,
+            return Step::Crashed;
         }
+        if !apply_new {
+            // Already checkpointed by the seeding path: ack (durably held)
+            // and move on — replay restores this fact from the journal.
+            ctx.cell.inbox.lock().await.ack();
+            return Step::Work;
+        }
+        appended.expect("append ok checked above")
     };
 
     // 6. ACK (the commit point: this message will never redeliver).
@@ -975,8 +1094,19 @@ async fn step_es(ctx: &EsLoop) -> Step {
 
     // 9. EMIT FAN-OUT (recorded, declared facts broadcast to every actor
     // that declared .handles — the named step exists so the order never
-    // changes).
-    fan_out_emits(ctx, &events).await;
+    // changes). Each copy is STAMPED with the recording (path, seq): a
+    // consuming projector reads the stamp into its checkpoint, so a
+    // restart never re-seeds (never double-folds) a fact it folded live.
+    // A projector's own re-records fan out NOWHERE: they are checkpoint
+    // writes of facts that were already broadcast when their source
+    // recorded them (re-broadcasting would echo every consumed fact back
+    // into the fabric — and echo the echo). The gate is the ACTOR (the
+    // kernel's projector set), not the envelope: a projector consuming a
+    // plain host publish has no stamp, but its re-record is still just a
+    // checkpoint write.
+    if !ctx.kernel.lock().projectors.contains(&ctx.path) {
+        fan_out_emits(ctx, &events, &seqs).await;
+    }
 
     // 10. MAYBE SNAPSHOT (policy-gated, BETWEEN messages).
     maybe_snapshot(ctx, seqs).await;
@@ -1220,9 +1350,24 @@ pub(crate) async fn broadcast(
 ) {
     let targets: Vec<(ActorPath, Arc<Endpoint>)> = {
         let reg = registry.lock();
-        reg.handlers_of(&schema)
+        let all: Vec<(ActorPath, Arc<Endpoint>)> = reg
+            .handlers_of(&schema)
             .into_iter()
             .filter_map(|path| reg.resolve(&path).map(|endpoint| (path, endpoint)))
+            .collect();
+        // Projector-set MEMBERS are pulled out of the plain fan-out: a
+        // per-key projector's only delivery obligation is its keyed copy
+        // (the set arm below). A copy of every OTHER key's fact would
+        // fold cross-key data into its fold — the set's key derivation
+        // is the whole point of per-key read models.
+        let member_paths: Vec<ActorPath> = all
+            .iter()
+            .map(|(path, _)| path)
+            .filter(|path| reg.projector_set_owning(path).is_some())
+            .cloned()
+            .collect();
+        all.into_iter()
+            .filter(|(path, _)| !member_paths.contains(path))
             .collect()
     };
     // ONE Sent fact per publish (not per delivery): the broadcast itself is
@@ -1244,6 +1389,59 @@ pub(crate) async fn broadcast(
         // unrepresentable; sizing mailboxes is the spawner's call). A
         // closed endpoint (restart in flight) skips this one delivery.
         let _ = deliver_with_retry(endpoint, envelope.clone()).await;
+    }
+    // PROJECTOR SETS: a declared consumption with a shard key is a
+    // delivery obligation — a per-set copy resolves `public/key` and
+    // activates the owning projector on demand (like a told command). A
+    // live projector that declared the schema already received its copy
+    // above; only derived paths NOT among the targets are serviced here
+    // (never a double delivery).
+    let sets = {
+        let reg = registry.lock();
+        reg.projector_sets_consuming(&schema)
+    };
+    for set in sets {
+        let Some(key) = extract_key(registry, &envelope, &set.key_field) else {
+            // That copy only: live declarants are already served.
+            dead_letter(
+                kernel,
+                &envelope,
+                DeadLetterReason::ShardKeyMissing,
+                "broadcast fact for a projector set arrived without its key",
+            );
+            continue;
+        };
+        let derived = ActorPath::new(format!("{}/{}", set.public, key).as_str());
+        // NEVER deliver a derived copy back to its own source journal: the
+        // projector's journal already holds the fact (it recorded it), so
+        // a checkpoint of itself would seed a phantom second fold.
+        if envelope.from.as_ref() == Some(&derived) {
+            continue;
+        }
+        // NEVER deliver a derived copy sourced from ANY projector-set
+        // member: that member already folded the fact AND checkpointed
+        // it (its journal holds a CatchUp copy). A second delivery
+        // would seed a phantom re-fold into a sibling view.
+        if envelope
+            .from
+            .as_ref()
+            .is_some_and(|from| registry.lock().projector_set_owning(from).is_some())
+        {
+            continue;
+        }
+        if targets.iter().any(|(path, _)| *path == derived) {
+            continue;
+        }
+        let mut keyed = envelope.clone();
+        keyed.dest = crate::envelope::Address::Path(derived);
+        if let Err(undeliverable) = route(registry, kernel, keyed).await {
+            dead_letter(
+                kernel,
+                &undeliverable,
+                DeadLetterReason::Unresolvable,
+                "projector copy did not resolve after activation",
+            );
+        }
     }
 }
 
@@ -1301,16 +1499,21 @@ async fn resolve_reply(
 /// must not duplicate broadcasts). A recorded fact with zero handlers is
 /// a silent no-op (one Sent fact, no deliveries, no DLQ); an entity that
 /// `.handles` its own fact legally delivers a copy to itself.
-async fn fan_out_emits(ctx: &EsLoop, events: &[crate::envelope::Event]) {
+async fn fan_out_emits(
+    ctx: &EsLoop,
+    events: &[crate::envelope::Event],
+    seqs: &[crate::journal::SeqNo],
+) {
     let cause = crate::envelope::TraceCtx::root();
-    for event in events {
+    for (event, seq) in events.iter().zip(seqs.iter()) {
         let envelope = Envelope::json(
             event.schema.clone(),
             crate::envelope::Address::Schema(event.schema.clone()),
             event.payload.clone(),
             cause,
         )
-        .from(ctx.path.clone());
+        .from(ctx.path.clone())
+        .with_recorded_origin(ctx.path.clone(), *seq);
         broadcast(&ctx.registry, &ctx.kernel, event.schema.clone(), envelope).await;
     }
 }
@@ -1604,6 +1807,16 @@ async fn maybe_passivate(ctx: &EsLoop) {
             _ => break,
         }
     }
+    // Lifecycle hint BEFORE the exit: the journal is durable (everything
+    // drained), so the store may demote the path to cold storage. A
+    // failing hint never blocks passivation — log and proceed.
+    let store = ctx.kernel.lock().journal_store.clone();
+    if let Err(e) = store.passivated(&ctx.path).await {
+        tracing::error!(
+            actor = %ctx.path,
+            "journal store refused the passivated hint: {e}"
+        );
+    }
     ctx.graceful_exit(crate::actor::StopReason::Passivated)
         .await;
 }
@@ -1809,6 +2022,7 @@ pub(crate) async fn restart_es(
             .unwrap_or(crate::journal::Replay {
                 snapshot: None,
                 tail: Vec::new(),
+                events: Vec::new(),
             })
     };
     let (snapshot, tail) = (replay.snapshot, replay.tail);
@@ -2059,10 +2273,13 @@ async fn escalate(
         );
     }
     // Remove the child's slot (its identity leaves the registry; the
-    // graceful-stop cascade arrives with the stop API in Phase 9).
+    // graceful-stop cascade arrives with the stop API in Phase 9). The
+    // in-memory state dies too: only live actors hold state, and this
+    // child is terminal (crash recovery already returned above).
     {
         let mut registry = system.registry.lock();
         let _ = registry.remove_slot(&spec.path);
+        system.kernel.lock().es_state.remove(&spec.path);
     }
     let message = spec.escalation_message(reason);
     if let Some(parent) = &spec.parent {

@@ -25,12 +25,23 @@ use crate::schema::{ActorManifest, Schema, SchemaDef, SchemaError};
 #[derive(Debug)]
 pub struct Endpoint {
     tx: mpsc::Sender<Envelope>,
+    /// The channel's total capacity (`pending` derives from it).
+    capacity: usize,
 }
 
 impl Endpoint {
     /// Wraps the front-door sender.
     pub fn new(tx: mpsc::Sender<Envelope>) -> Self {
-        Self { tx }
+        Self {
+            capacity: tx.max_capacity(),
+            tx,
+        }
+    }
+
+    /// Envelopes accepted into the channel but not yet moved into the
+    /// inbox by the front door (tests/reads: quiescence detection).
+    pub fn pending(&self) -> usize {
+        self.capacity.saturating_sub(self.tx.capacity())
     }
 
     /// Tries to enqueue an envelope without waiting.
@@ -222,6 +233,9 @@ pub struct Registry {
     /// Partition sets by PUBLIC path (entities own the real slots, derived
     /// from the set's path on demand).
     pub(crate) partitions: HashMap<ActorPath, crate::pool::PartitionSpec>,
+    /// Projector sets by PUBLIC path (per-key projectors own the real
+    /// slots, derived from the set's path on demand).
+    pub(crate) projector_sets: HashMap<ActorPath, crate::pool::ProjectorSetSpec>,
     /// Router rules in declaration (priority) order.
     pub(crate) rules: Vec<crate::pool::Rule>,
 }
@@ -448,6 +462,86 @@ impl Registry {
         Ok(())
     }
 
+    /// Installs a projector set: validates every consumed schema against
+    /// the schema table (refuse-to-lie), then records it. Projectors are
+    /// NOT spawned here — activation happens on demand when a broadcast of
+    /// a consumed schema crosses the fabric.
+    ///
+    /// # Errors
+    ///
+    /// [`RegistryError::InvalidSpec`] when a consumed schema does not
+    /// exist, is not an Event, or no consumed schema declares the spec's
+    /// key field as the ShardKey: a projector set whose key can never be
+    /// extracted would silently dead-letter every broadcast copy, so it is
+    /// rejected at install.
+    pub fn install_projector_set(
+        &mut self,
+        spec: crate::pool::ProjectorSetSpec,
+    ) -> Result<(), error_stack::Report<RegistryError>> {
+        use error_stack::IntoReport;
+        for schema in &spec.consumed {
+            let def = self.schema(schema).ok_or_else(|| {
+                RegistryError::InvalidSpec.into_report().attach(format!(
+                    "projector set {}: consumed schema {schema} is not registered \
+                         — declare it before installing",
+                    spec.public
+                ))
+            })?;
+            if def.kind != crate::schema::SchemaKind::Event {
+                return Err(RegistryError::InvalidSpec.into_report().attach(format!(
+                    "projector set {}: consumed schema {schema} is a Command — \
+                         projectors fold facts, not commands",
+                    spec.public
+                )));
+            }
+        }
+        // The key field must be declared (with the ShardKey role) on at
+        // least one consumed EVENT schema — broadcast copies of it are the
+        // set's activation trigger, and a copy without its key would
+        // dead-letter every time.
+        let key_declared = spec.consumed.iter().any(|schema| {
+            self.schema(schema).is_some_and(|def| {
+                def.fields.iter().any(|f| {
+                    f.name == spec.key_field && f.role == Some(crate::schema::FieldRole::ShardKey)
+                })
+            })
+        });
+        if !key_declared {
+            return Err(RegistryError::InvalidSpec.into_report().attach(format!(
+                "projector set {}: no consumed schema declares field `{}` as ShardKey",
+                spec.public, spec.key_field
+            )));
+        }
+        self.projector_sets.insert(spec.public.clone(), spec);
+        Ok(())
+    }
+
+    /// Every projector set consuming `schema` (the broadcast fan-out's
+    /// activation candidates).
+    pub fn projector_sets_consuming(
+        &self,
+        schema: &SchemaId,
+    ) -> Vec<crate::pool::ProjectorSetSpec> {
+        self.projector_sets
+            .values()
+            .filter(|spec| spec.consumed.contains(schema))
+            .cloned()
+            .collect()
+    }
+
+    /// The projector set owning `path` (a per-key projector derived from
+    /// `public/key`), if any.
+    pub fn projector_set_owning(&self, path: &ActorPath) -> Option<crate::pool::ProjectorSetSpec> {
+        self.projector_sets
+            .values()
+            .find(|spec| {
+                path.as_str()
+                    .strip_prefix(&format!("{}/", spec.public.as_str()))
+                    .is_some_and(|key| !key.is_empty() && !key.contains('/'))
+            })
+            .cloned()
+    }
+
     /// Destination set for a schema's route (tests/canvas introspection).
     pub fn route_dests(&self, schema: &SchemaId) -> Vec<ActorPath> {
         self.routes
@@ -490,10 +584,23 @@ impl Registry {
     /// Routes `schema` to a handler path and registers the route.
     ///
     /// For [`RoutePolicy::Single`] the sole path wins; for round-robin the
-    /// registry's shared cursor rotates.
+    /// registry's shared cursor rotates. Projector-set members are NOT
+    /// routable by schema: a per-key projector's only delivery obligation
+    /// is its keyed copy (the broadcast set arm); a schema-addressed send
+    /// has no key, so it must never land on a key-derived actor.
     pub fn route(&mut self, schema: &SchemaId) -> Option<ActorPath> {
         let policy = self.routes.get(schema)?;
-        policy.pick(&mut self.route_cursor)
+        let candidate = policy.pick(&mut self.route_cursor)?;
+        if self.projector_set_owning(&candidate).is_some() {
+            // Rotating pick hit a projector member: scan for a plain
+            // handler; none means the schema belongs to projectors only.
+            let pool = self.handlers_of(schema);
+            pool.iter()
+                .find(|path| self.projector_set_owning(path).is_none())
+                .cloned()
+        } else {
+            Some(candidate)
+        }
     }
 
     /// Declares (or extends) the route for a schema.

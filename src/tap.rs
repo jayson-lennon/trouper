@@ -94,6 +94,10 @@ pub enum FactKind {
     /// Fires once per crossing (down-crossings re-arm it), never per
     /// message — sustained overload stays observable without flooding.
     Backpressured { path: ActorPath, depth: u64 },
+    /// A projector finished its catch-up (history folded; the live tail
+    /// is now authoritative). `seeded` counts the facts the scan filled
+    /// in (0 = the journal already covered everything).
+    CaughtUp { path: ActorPath, seeded: u64 },
 }
 
 impl Fact {
@@ -197,6 +201,11 @@ impl Fact {
                 "kind": "backpressured",
                 "path": path.to_string(),
                 "depth": depth,
+            }),
+            FactKind::CaughtUp { path, seeded } => json!({
+                "kind": "caught_up",
+                "path": path.to_string(),
+                "seeded": seeded,
             }),
         };
         let object = value.as_object_mut().expect("fact json is an object");

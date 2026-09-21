@@ -123,6 +123,23 @@ pub struct Envelope {
     pub trace: TraceCtx,
     /// The message body.
     pub payload: Payload,
+    /// Where this copy's fact was recorded — `(source journal, seq)` —
+    /// when the message IS a recorded fact (broadcast copies of consumed
+    /// events). A projector stamps its journal entries with it: the
+    /// checkpoint's source identity for live-delivered copies, so a
+    /// restart never re-seeds (never double-folds) a fact it folded live.
+    /// `None` for everything else (commands, host sends).
+    pub(crate) recorded_origin: Option<RecordedOrigin>,
+}
+
+/// The fact-stamp a broadcast copy carries (see
+/// [`Envelope::recorded_origin`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecordedOrigin {
+    /// The journal the fact was recorded in.
+    pub journal: ActorPath,
+    /// The fact's seq inside that journal.
+    pub seq: crate::journal::SeqNo,
 }
 
 impl Envelope {
@@ -135,6 +152,7 @@ impl Envelope {
             reply_to: None,
             trace,
             payload: Payload::Json(payload),
+            recorded_origin: None,
         }
     }
 
@@ -163,7 +181,21 @@ impl Envelope {
             reply_to: None,
             trace,
             payload: Payload::Typed(std::sync::Arc::new(payload)),
+            recorded_origin: None,
         }
+    }
+
+    /// Stamps this copy as a recorded fact from `(journal, seq)` (the
+    /// broadcast fan-out does this; projectors read it back into their
+    /// checkpoint).
+    pub fn with_recorded_origin(mut self, journal: ActorPath, seq: crate::journal::SeqNo) -> Self {
+        self.recorded_origin = Some(RecordedOrigin { journal, seq });
+        self
+    }
+
+    /// The copy's fact stamp, if it carries one.
+    pub fn recorded_origin(&self) -> Option<&RecordedOrigin> {
+        self.recorded_origin.as_ref()
     }
 
     /// Sets the logical sender.

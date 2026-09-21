@@ -472,3 +472,169 @@ impl ForeignBuilder {
         Ok(path)
     }
 }
+
+/// Begins a projector spawn: a read model `P` that folds other actors'
+/// recorded facts.
+///
+/// ```ignore
+/// spawn_projector_builder::<Balances>(&system)
+///     .at(ActorPath::new("proj/balances"))
+///     .consumes::<Deposited>()
+///     .consumes::<Withdrawn>()
+///     .start_and_catchup()   // or .start().await for background seeding
+///     .await;
+/// ```
+///
+/// A projector is an event-sourced actor whose consumed facts are
+/// re-recorded into its OWN journal (the checkpoint): on spawn it replays
+/// its journal, scans the store for what it lacks, seeds the gap, and only
+/// then opens its inbox loop — live facts published during seeding queue
+/// up and fold after history. There is no `.passivate_after` here
+/// deliberately: a standalone passivated projector has no wake path (no
+/// set ⇒ no factory, no key derivation), so it would starve silently —
+/// passivation for projectors exists only through
+/// [`crate::pool::ProjectorSetSpec`].
+pub fn spawn_projector_builder<P: crate::actor::Projector>(
+    system: &crate::system::ActorSystem,
+) -> ProjectorBuilder<P> {
+    ProjectorBuilder {
+        system: system.clone(),
+        path: None,
+        args: JsonValue::Null,
+        consumed: Vec::new(),
+        opts: SpawnOpts::default(),
+        _actor: std::marker::PhantomData,
+    }
+}
+
+/// The typed projector builder. `P` is named once at
+/// [`spawn_projector_builder`]; each consumed fact schema at
+/// [`ProjectorBuilder::consumes`].
+pub struct ProjectorBuilder<P: crate::actor::Projector> {
+    system: crate::system::ActorSystem,
+    path: Option<ActorPath>,
+    args: JsonValue,
+    consumed: Vec<SchemaId>,
+    opts: SpawnOpts,
+    _actor: std::marker::PhantomData<fn(&P)>,
+}
+
+impl<P: crate::actor::Projector> ProjectorBuilder<P> {
+    /// The projector's identity (required; identity IS the path).
+    pub fn at(mut self, path: impl Into<ActorPath>) -> Self {
+        self.path = Some(path.into());
+        self
+    }
+
+    /// Spawn arguments (JSON). A projector's genesis is [`Default`]; args
+    /// are carried for manifests/export only.
+    pub fn args(mut self, args: JsonValue) -> Self {
+        self.args = args;
+        self
+    }
+
+    /// Declares a consumed fact schema `D`: this projector handles `D` (a
+    /// route is installed — broadcast copies included) AND re-records every
+    /// folded copy into its own journal with a CatchUp origin (the
+    /// checkpoint). Repeat per schema; `D` is written exactly once.
+    ///
+    /// `D`'s descriptor is registered into the schema table here, at the
+    /// declaration site.
+    pub fn consumes<D: Schema>(mut self) -> Self {
+        self.system.register_schema::<D>();
+        let id = D::schema_id();
+        if !self.consumed.contains(&id) {
+            self.consumed.push(id);
+        }
+        self
+    }
+
+    /// The snapshot cadence (default Off). A projector's snapshot folds
+    /// its re-recorded journal like any other.
+    pub fn snapshot(mut self, cadence: crate::actor::SnapshotCadence) -> Self {
+        self.opts.snapshot = cadence;
+        self
+    }
+
+    /// Mailbox capacity and overload policy (default 64 / Block).
+    pub fn mailbox(mut self, capacity: usize, policy: crate::inbox::OverloadPolicy) -> Self {
+        self.opts.mailbox_capacity = capacity;
+        self.opts.mailbox_policy = policy;
+        self
+    }
+
+    /// Inbox depth at which a `Backpressured` fact fires (once/crossing).
+    pub fn high_watermark(mut self, depth: u64) -> Self {
+        self.opts.high_watermark = Some(depth);
+        self
+    }
+
+    /// Starts the actor; ARMS synchronously (slot + routes exist the
+    /// moment this returns — an activation factory can rely on it) and
+    /// returns the path immediately. Catch-up continues in the background:
+    /// the fold is complete only after a `CaughtUp { .. }` tap fact for
+    /// this path.
+    ///
+    /// # Panics
+    ///
+    /// Panics when `.at()` was never called, the path is already taken, or
+    /// a consumed schema is registered as a Command (a projector folds
+    /// FACTS, not commands). Requires a tokio runtime (the catch-up task
+    /// spawns onto it).
+    pub fn start(self) -> ActorPath {
+        let (system, path, consumed, args, opts) = self.validated_parts();
+        let armed = system.arm_projector::<P>(&path, &consumed, &args, opts);
+        tokio::spawn(crate::system::catch_up_projector(system, armed, consumed));
+        path
+    }
+
+    /// Starts the actor and AWAITS its catch-up: the returned projector
+    /// has folded every fact the store held at spawn time (later facts
+    /// arrive live). A `CaughtUp { path, seeded }` fact records the
+    /// outcome.
+    ///
+    /// # Panics
+    ///
+    /// Panics when `.at()` was never called, the path is already taken, or
+    /// a consumed schema is registered as a Command.
+    pub async fn start_and_catchup(self) -> ActorPath {
+        let (system, path, consumed, args, opts) = self.validated_parts();
+        let armed = system.arm_projector::<P>(&path, &consumed, &args, opts);
+        crate::system::catch_up_projector(system, armed, consumed).await;
+        path
+    }
+
+    /// Shared validation + part assembly (register → kind check →
+    /// consumed list). Kind checking happens HERE, not at `.consumes()`:
+    /// a def can only be validated after its registration.
+    fn validated_parts(
+        self,
+    ) -> (
+        crate::system::ActorSystem,
+        ActorPath,
+        Vec<SchemaId>,
+        JsonValue,
+        SpawnOpts,
+    ) {
+        let ProjectorBuilder {
+            system,
+            path,
+            args,
+            consumed,
+            opts,
+            _actor,
+        } = self;
+        let path = path.expect("builder requires .at(path)");
+        for schema in &consumed {
+            let def = system
+                .schema(schema)
+                .unwrap_or_else(|| panic!("consumed schema {schema} vanished after registration"));
+            assert!(
+                def.kind == crate::schema::SchemaKind::Event,
+                "projector at {path} consumes {schema}, which is a Command — \
+                 projectors fold facts, not commands"
+            );
+        }
+        (system, path, consumed, args, opts)
+    }
+}

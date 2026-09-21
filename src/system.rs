@@ -42,6 +42,11 @@ pub use crate::actor::SnapshotCadence;
 /// partition set re-spawns the entity on the next send to the public
 /// path; an ES entity replays its journal (lossless). Service entities
 /// restart from genesis — they must tolerate that.
+///
+/// A STANDALONE actor's passivation is terminal until the host re-spawns
+/// it: passivation closes the inbox for good, so nothing without an
+/// activation path can reach it again. Use a partition set (or projector
+/// set) when an actor must stay reachable across idle eviction.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Passivation {
     /// Maximum idle time (no completed message step) before the actor
@@ -191,6 +196,39 @@ impl std::ops::Deref for ActorSystem {
 impl std::fmt::Debug for ActorSystem {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ActorSystem").finish_non_exhaustive()
+    }
+}
+
+/// An ES actor whose tables are registered but whose inbox loop has not
+/// started (the projector spawn's intermediate state).
+///
+/// The window is the cutover buffer: deliveries published since the arm
+/// sit in the inbox (backpressure upstream when it fills), and
+/// [`ArmedEsActor::start_loop`] begins the loop so they fold AFTER
+/// whatever the caller seeded — history first, live tail second, never a
+/// gap, never a duplicate.
+pub(crate) struct ArmedEsActor {
+    path: ActorPath,
+    loop_ctx: crate::kernel::EsLoop,
+    rx: tokio::sync::mpsc::Receiver<Envelope>,
+}
+
+impl ArmedEsActor {
+    /// Starts the front door + ES loop (the actor goes live).
+    pub(crate) fn start_loop(self) {
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let path = self.path.clone();
+        let kernel = self.loop_ctx.kernel.clone();
+        let task = self.loop_ctx.start_tracked(self.rx, shutdown_rx);
+        let kernel = kernel.lock();
+        if let Some(cell) = kernel.cells.get(&path)
+            && let Ok(mut handle) = cell.handle.try_lock()
+        {
+            *handle = Some(crate::kernel::ActorHandle {
+                shutdown: shutdown_tx,
+                task: Some(task),
+            });
+        }
     }
 }
 
@@ -429,6 +467,171 @@ pub struct SystemExport {
     pub rules: Vec<RuleExport>,
 }
 
+/// The projector's catch-up: replay own journal → scan the store for what
+/// it lacks → seed the gap → start the inbox loop → record `CaughtUp`.
+///
+/// Runs BETWEEN [`ActorSystemCore::arm_projector`] and
+/// [`ArmedEsActor::start_loop`]: the arm registered the routes, so live
+/// copies published during seeding sit queued in the inbox (Block
+/// backpressure upstream), and they fold after history once the loop
+/// starts — no gap, no duplicate, per-source order preserved.
+pub(crate) async fn catch_up_projector(
+    system: ActorSystem,
+    armed: ArmedEsActor,
+    consumed: Vec<crate::schema::SchemaId>,
+) {
+    let path = armed.path.clone();
+    let store = system.kernel.lock().journal_store.clone();
+
+    // 1. REPLAY OWN JOURNAL: snapshot-or-genesis + tail (relocated
+    //    recover_at_boot, run pre-loop for projectors). The checkpoint is
+    //    every CatchUp origin in the WHOLE journal — including entries a
+    //    snapshot already folded, or a restart would re-seed and
+    //    double-fold them.
+    let mut seeded: u64 = 0;
+    let replay = store.load(&path).await.ok().flatten();
+    if let Some(replay) = &replay {
+        let snapshot_state = replay.snapshot.as_ref().and_then(|e| match e {
+            crate::journal::JournalEntry::Snapshot { state, .. } => Some(state.clone()),
+            _ => None,
+        });
+        let fresh = {
+            let state_arc = {
+                let kernel = system.kernel.lock();
+                kernel.es_state.get(&path).cloned()
+            };
+            match state_arc {
+                Some(state_arc) => {
+                    let old = state_arc.lock().await;
+                    old.rebuild(&serde_json::json!({}), snapshot_state, &replay.tail)
+                }
+                None => return, // torn down mid-catch-up; nothing to seed into
+            }
+        };
+        match fresh {
+            Ok(state) => {
+                let mut kernel = system.kernel.lock();
+                kernel
+                    .es_state
+                    .insert(path.clone(), Arc::new(tokio::sync::Mutex::new(state)));
+            }
+            Err(_) => return, // unrecoverable state; leave the arm pristine
+        }
+    }
+
+    // 2. SCAN + SEED THE GAP: everything `Recorded` anywhere in the store
+    //    (ascending ingest order — a total order across sources), minus
+    //    this projector's own journal (covered by the replay). The store's
+    //    append_catchup is IDEMPOTENT on the (source, seq) origin — the
+    //    checkpoint IS the journal — and its answer says which facts are
+    //    NEWLY recorded; only those fold (append before apply, mirroring
+    //    the kernel's atomic step). A live copy published during this scan
+    //    that the store just checkpointed gets skipped by the step's
+    //    identical check, so every fact folds exactly once.
+    if let Ok(scanned) = store.scan(&consumed).await {
+        // Per-key sets fold ONLY their key's facts: a copy whose source
+        // journal is another key's sibling (`chats/rust` vs `chats/k8s`)
+        // must never seed this projector — the key derivation is the
+        // whole point of per-key read models.
+        let own_set = {
+            let registry = system.registry.lock();
+            registry.projector_set_owning(&path)
+        };
+        // A source journal qualifies for this key iff it RECORDED at
+        // least one fact whose payload names this key (never checkpoint
+        // re-records: a projector's journal is never another projector's
+        // source of truth).
+        let qualifying = {
+            let store = store.clone();
+            move |key_field: String, my_key: String, journal_path: ActorPath| {
+                let store = store.clone();
+                async move {
+                    store
+                        .load(&journal_path)
+                        .await
+                        .ok()
+                        .flatten()
+                        .is_some_and(|replay| {
+                            replay
+                                .events
+                                .iter()
+                                .any(|je| je.recorded_payload_key(&key_field, &my_key))
+                        })
+                }
+            }
+        };
+        // Per-key sets fold ONLY their key's facts: a candidate folds iff
+        // its source journal qualifies for this key (recorded a fact with
+        // this key in its payload — the same derivation broadcast uses).
+        let (key_field, my_key) = match &own_set {
+            Some(spec) => (
+                Some(spec.key_field.clone()),
+                path.as_str().rsplit('/').next().unwrap_or("").to_owned(),
+            ),
+            None => (None, String::new()),
+        };
+        let mut candidates = Vec::new();
+        for sc in scanned {
+            // Own-journal entries are covered by the replay (everything
+            // the journal holds folds on rebuild) — never re-seed them.
+            if sc.journal == path {
+                continue;
+            }
+            let keep = match &key_field {
+                Some(key_field) => {
+                    qualifying(
+                        key_field.as_str().to_owned(),
+                        my_key.clone(),
+                        sc.journal.clone(),
+                    )
+                    .await
+                }
+                None => true, // standalone projector: no key filter
+            };
+            if keep {
+                candidates.push(sc);
+            }
+        }
+        let newly = store
+            .append_catchup(&path, &candidates)
+            .await
+            .ok()
+            .map(|results| {
+                candidates
+                    .into_iter()
+                    .zip(results)
+                    .filter_map(|(scanned, seq)| seq.map(|_| scanned))
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        seeded = newly.len() as u64;
+        if !newly.is_empty() {
+            let state_arc = {
+                let kernel = system.kernel.lock();
+                kernel.es_state.get(&path).cloned()
+            };
+            if let Some(state_arc) = state_arc {
+                let mut state = state_arc.lock().await;
+                for sc in &newly {
+                    state.apply_erased(&sc.event);
+                }
+            }
+        }
+    }
+
+    // 3. GO LIVE: the loop starts NOW — queued live copies fold after
+    //    history, never before it.
+    armed.start_loop();
+
+    // 4. The observable completion marker: projector_state and tests wait
+    //    on this fact.
+    let mut kernel = system.kernel.lock();
+    kernel.record_fact(
+        system.clock.now(),
+        crate::tap::FactKind::CaughtUp { path, seeded },
+    );
+}
+
 impl ActorSystemCore {
     /// Spawns a foreign (no-Rust-types) event-sourced actor: the schema,
     /// state fold, and command decision are all runtime JSON data. This is
@@ -613,6 +816,27 @@ impl ActorSystemCore {
         opts: SpawnOpts,
         args: &JsonValue,
     ) {
+        let armed = self.arm_es_erased(path, manifest, state, entries, opts, args);
+        armed.start_loop();
+    }
+
+    /// Registers an ES actor's slot, routes, and kernel tables WITHOUT
+    /// starting its loop (the projector spawn's arm phase).
+    ///
+    /// Registration is synchronous, so from return on, publishes to the
+    /// handled schemas are delivered into the actor's inbox (backpressure
+    /// upstream once it fills) while the inbox loop is NOT yet running —
+    /// the projector builder seeds history between arm and loop start, and
+    /// queued live deliveries fold after it, never before.
+    pub(crate) fn arm_es_erased(
+        &self,
+        path: ActorPath,
+        manifest: crate::schema::ActorManifest,
+        state: Box<dyn crate::actor::DynEsActor>,
+        entries: Vec<Arc<dyn CommandEntry>>,
+        opts: SpawnOpts,
+        args: &JsonValue,
+    ) -> ArmedEsActor {
         let opts = self.resolve_opts(opts);
         let (tx, rx) = tokio::sync::mpsc::channel::<Envelope>(opts.mailbox_capacity.max(1) * 2);
         // The manifest is the union of what the actor type declares and
@@ -688,7 +912,7 @@ impl ActorSystemCore {
         );
         drop(kernel);
 
-        // Front door + ES loop, sharing the kernel tables.
+        // Front door + ES loop parts; the loop starts in `start_loop`.
         let loop_ctx = EsLoop {
             path: path.clone(),
             cell,
@@ -697,17 +921,41 @@ impl ActorSystemCore {
             view: self.view.clone(),
             clock: self.clock.clone(),
         };
-        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
-        let task = loop_ctx.start_tracked(rx, shutdown_rx);
-        let kernel = self.kernel.lock();
-        if let Some(cell) = kernel.cells.get(&path)
-            && let Ok(mut handle) = cell.handle.try_lock()
-        {
-            *handle = Some(crate::kernel::ActorHandle {
-                shutdown: shutdown_tx,
-                task: Some(task),
-            });
+        ArmedEsActor { path, loop_ctx, rx }
+    }
+
+    /// The projector spawn's arm phase: registers the read model as an
+    /// event-sourced actor whose consumed schemas are BOTH its handled
+    /// inputs (a `ConsumeEntry` each: the fact re-records itself) and its
+    /// declared emits (the re-records journal legally). The inbox loop is
+    /// NOT started — [`catch_up_projector`] seeds history first.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the path is already taken (builder contract).
+    pub(crate) fn arm_projector<P: crate::actor::Projector>(
+        &self,
+        path: &ActorPath,
+        consumed: &[crate::schema::SchemaId],
+        args: &JsonValue,
+        opts: SpawnOpts,
+    ) -> ArmedEsActor {
+        // handles = consumed (routes + entries), emits = consumed (the
+        // re-records must pass the pre-append declaration filter or every
+        // seeded fact would be dropped as UndeclaredEvent).
+        let mut manifest = crate::schema::ActorManifest::new();
+        for schema in consumed {
+            manifest = manifest.handles_id(schema.clone()).emits_id(schema.clone());
         }
+        manifest = manifest.kind(crate::actor::ActorKind::EventSourced);
+        let entries: Vec<Arc<dyn CommandEntry>> = consumed
+            .iter()
+            .map(|schema| Arc::new(crate::actor::ConsumeEntry::new(schema.clone())) as _)
+            .collect();
+        // Genesis is `P::default()` (args carried for manifests only).
+        let state = Box::new(crate::actor::TypedProjectorState::<P>::new(P::default()));
+        self.kernel.lock().projectors.insert(path.clone());
+        self.arm_es_erased(path.clone(), manifest, state, entries, opts, args)
     }
 
     /// Spawns a service (edge) actor at `path`: async handlers, I/O and
@@ -1124,6 +1372,26 @@ impl ActorSystemCore {
         registry.install_partition_set(spec)
     }
 
+    /// Installs a projector set: per-key projectors derived from a
+    /// consumed fact's shard key, activated on demand by broadcast copies
+    /// of the consumed schemas. Projectors are NOT spawned here — the
+    /// first consumed broadcast (or a [`ActorSystem::projector_state`]
+    /// read) activates them.
+    ///
+    /// # Errors
+    ///
+    /// [`crate::registry::RegistryError::InvalidSpec`] when a consumed
+    /// schema is missing or a Command, or no consumed schema declares the
+    /// spec's key field as the ShardKey (refuse-to-lie: the set could
+    /// never extract a key and would dead-letter every copy).
+    pub fn install_projector_set(
+        &self,
+        spec: crate::pool::ProjectorSetSpec,
+    ) -> Result<(), error_stack::Report<crate::registry::RegistryError>> {
+        let mut registry = self.registry.lock();
+        registry.install_projector_set(spec)
+    }
+
     /// Appends a router rule (declaration order is priority order): when
     /// a path-addressed envelope matches all of the rule's `Some`
     /// criteria, the rule's action applies at [`route`](crate::kernel)
@@ -1312,6 +1580,13 @@ impl ActorSystemCore {
                 registry.drop_routes_of(path);
             }
             kernel.cells.remove(path);
+            // The actor's in-memory state dies with it, regardless of stop
+            // reason: only live actors hold state. Cold state returns by
+            // replay from the journal store (the durable copy).
+            kernel.es_state.remove(path);
+            // The projector marker dies with the actor too (a re-spawn
+            // re-registers it via the factory's builder).
+            kernel.projectors.remove(path);
             // Passivation bookkeeping dies with the actor (a partition set
             // re-spawn re-registers it via the factory's builder).
             kernel.passivation.remove(path);
@@ -1579,6 +1854,201 @@ impl Default for ActorSystem {
 }
 
 impl ActorSystem {
+    /// The complete read of a projector: the fold of every fact the store
+    /// holds for the projector's consumed schemas, captured after its
+    /// catch-up has completed.
+    ///
+    /// A live projector is captured directly. A cold path owned by a
+    /// projector SET is woken: the set's factory spawns (or re-spawns) the
+    /// projector, the call waits — bounded — for the projector's
+    /// `CaughtUp` tap fact, and the fold is captured. `None` means the
+    /// path is neither live nor set-owned (a cold STANDALONE projector has
+    /// no wake path; re-run its builder), or the wake did not reach
+    /// `CaughtUp` within the budget.
+    ///
+    /// This is deliberately unlike [`ActorSystem::es_state`], which never
+    /// wakes anything: es_state is a peek at in-memory state (None when
+    /// cold), projector_state is the complete answer (wake + catch-up +
+    /// capture).
+    pub async fn projector_state(&self, path: &ActorPath) -> Option<JsonValue> {
+        // HOT: the projector is live — capture once it has no pending
+        // work (a wake copy may still sit queued while its loop spins up;
+        // the read waits, bounded, so the capture is the fold of
+        // everything delivered so far).
+        if self.es_state(path).await.is_some() {
+            self.await_quiescent(path).await;
+            return self.es_state(path).await;
+        }
+        // COLD, SET-OWNED: wake through the set's factory and wait for the
+        // catch-up fact (bounded — an observable timeout, never a hang).
+        let spec = {
+            let registry = self.registry.lock();
+            registry.projector_set_owning(path)?
+        };
+        // Delivered-but-unfolded mail wakes the projector but folds AFTER
+        // catch-up (the loop starts post-seed). Wait for the mail to
+        // drain first; otherwise the CaughtUp fact from the wake's own
+        // catch-up would satisfy the poll below while the fold is still
+        // incomplete.
+        self.await_quiescent(path).await;
+        let watermark = self.kernel.lock().tap.next_offset();
+        let key = path
+            .as_str()
+            .strip_prefix(&format!("{}/", spec.public.as_str()))
+            .unwrap_or_default()
+            .to_owned();
+        (spec.factory)(self, path, &spec.entity_args(&key));
+        // Poll for the CaughtUp fact past the watermark. The factory's
+        // arm is synchronous (slot + routes exist immediately), but the
+        // catch-up future runs concurrently — the fact is the marker.
+        const CAUGHT_UP_BUDGET: std::time::Duration = std::time::Duration::from_secs(5);
+        let deadline = tokio::time::Instant::now() + CAUGHT_UP_BUDGET;
+        loop {
+            if self
+                .tap_facts_from(watermark)
+                .iter()
+                .any(|fact| {
+                    matches!(&fact.kind, crate::tap::FactKind::CaughtUp { path: p, .. } if p == path)
+                })
+            {
+                break;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return None;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        // Catch-up is complete; wait out any queued live copies (bounded)
+        // so the capture is the fold of everything delivered so far.
+        self.await_quiescent(path).await;
+        self.es_state(path).await
+    }
+
+    /// Destroys and re-creates a projector set entity: stop → purge its
+    /// journal → re-activate through the set's factory → await catch-up.
+    /// The re-fold equals a from-scratch fold of everything the store
+    /// holds (the same scan, the same `apply`). SET-OWNED paths only: the
+    /// runtime has a recipe (the factory) only for set entities — to
+    /// rebuild a standalone projector, `purge_journal` + re-run your
+    /// builder.
+    ///
+    /// # Errors
+    ///
+    /// [`crate::registry::RegistryError::InvalidSpec`] when `path` is not
+    /// owned by a projector set; the store's purge error otherwise.
+    pub async fn rebuild_projector(
+        &self,
+        path: &ActorPath,
+    ) -> Result<(), error_stack::Report<crate::registry::RegistryError>> {
+        let spec = {
+            let registry = self.registry.lock();
+            registry.projector_set_owning(path).ok_or_else(|| {
+                error_stack::Report::new(crate::registry::RegistryError::InvalidSpec).attach(
+                    format!(
+                        "rebuild_projector: {path} is not owned by a projector set — \
+                             purge_journal + re-run the builder for standalone projectors"
+                    ),
+                )
+            })?
+        };
+        // Stop first (post-teardown the fold leaves memory), then purge
+        // the journal: the durable record is the checkpoint, so a rebuild
+        // IS a forget-everything.
+        self.stop(path).await;
+        self.purge_journal(path).await.map_err(|report| {
+            error_stack::Report::new(crate::registry::RegistryError::InvalidSpec)
+                .attach("rebuild_projector: journal purge failed")
+                .attach(report.to_string())
+        })?;
+        let key = path
+            .as_str()
+            .strip_prefix(&format!("{}/", spec.public.as_str()))
+            .unwrap_or_default()
+            .to_owned();
+        (spec.factory)(self, path, &spec.entity_args(&key));
+        // Await the re-fold (same bounded poll as projector_state).
+        let watermark = self.kernel.lock().tap.next_offset();
+        const BUDGET: std::time::Duration = std::time::Duration::from_secs(5);
+        let deadline = tokio::time::Instant::now() + BUDGET;
+        loop {
+            if self
+                .tap_facts_from(watermark)
+                .iter()
+                .any(|fact| {
+                    matches!(&fact.kind, crate::tap::FactKind::CaughtUp { path: p, .. } if p == path)
+                })
+            {
+                break;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return Err(
+                    error_stack::Report::new(crate::registry::RegistryError::InvalidSpec)
+                        .attach("rebuild_projector: catch-up did not complete within the budget"),
+                );
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        self.await_quiescent(path).await;
+        Ok(())
+    }
+
+    /// Purges `path`'s journal and snapshots from the store (host-facing
+    /// primitive). The next spawn re-scans the whole store: a purge IS a
+    /// full rebuild for a projector, and a forget-everything for an
+    /// entity. Composition primitive for standalone projectors (the
+    /// runtime has no recipe to re-spawn them).
+    ///
+    /// # Errors
+    ///
+    /// The store's purge error (e.g. a backend that cannot delete).
+    pub async fn purge_journal(
+        &self,
+        path: &ActorPath,
+    ) -> Result<(), error_stack::Report<crate::journal::JournalError>> {
+        let store = self.kernel.lock().journal_store.clone();
+        store.purge(path).await
+    }
+
+    /// Bounded wait until `path` has no message in flight: the mpsc is
+    /// drained into the inbox AND the inbox is empty. Empty alone is not
+    /// quiescence — a just-armed projector's loop starts after seeding, so
+    /// its inbox reads empty while wake copies still sit in the channel.
+    /// Checked twice with a yield between (an empty-after-nonempty read
+    /// means the loop caught up). Returns after the budget regardless.
+    async fn await_quiescent(&self, path: &ActorPath) {
+        const QUIESCE_BUDGET: std::time::Duration = std::time::Duration::from_secs(5);
+        let deadline = tokio::time::Instant::now() + QUIESCE_BUDGET;
+        let mut was_busy = false;
+        while tokio::time::Instant::now() < deadline {
+            let quiet = self.inbox_debug_len(path).await == 0 && self.endpoint_pending(path) == 0;
+            if quiet && was_busy {
+                return;
+            }
+            if quiet && !was_busy {
+                // One yield: a message sent between the two empty reads
+                // flips `was_busy` and restarts the wait.
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                if self.inbox_debug_len(path).await == 0 && self.endpoint_pending(path) == 0 {
+                    return;
+                }
+                was_busy = true;
+                continue;
+            }
+            was_busy = true;
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    }
+
+    /// Envelopes in flight to `path` (accepted into the channel, not yet
+    /// in the inbox).
+    fn endpoint_pending(&self, path: &ActorPath) -> usize {
+        self.registry
+            .lock()
+            .resolve(path)
+            .map(|endpoint| endpoint.pending())
+            .unwrap_or(0)
+    }
+
     /// The store behind the system (trait object; tests and flushes).
     #[cfg(test)]
     pub(crate) fn journal_store_trait(&self) -> std::sync::Arc<dyn crate::journal::JournalStore> {
@@ -1629,8 +2099,6 @@ mod tests {
                     .count()
         }
 
-        /// Dead-letter schemas collected so far (tests).
-        /// The number of envelopes currently queued in `path`'s inbox (tests).
         pub fn inbox_depth(&self, path: &ActorPath) -> usize {
             let kernel = self.kernel.lock();
             kernel
@@ -5522,6 +5990,97 @@ mod tests {
         }
     }
 
+    /// A fact schema consumed by projector fixtures: a chat message whose
+    /// `chat_id` is the shard key.
+    #[derive(Serialize, Deserialize, Clone)]
+    struct Chatted {
+        chat_id: String,
+        text: String,
+    }
+    impl Schema for Chatted {
+        fn schema_def() -> SchemaDef {
+            SchemaDef {
+                name: "Chatted".into(),
+                version: 1,
+                kind: SchemaKind::Event,
+                fields: vec![
+                    FieldDef::required("chat_id", FieldTy::Str).as_shard_key(),
+                    FieldDef::required("text", FieldTy::Str),
+                ],
+                description: None,
+            }
+        }
+    }
+
+    /// A per-chat read model: the count of messages seen (projector
+    /// fixtures). Consumes `Chatted` only.
+    #[derive(Serialize, Deserialize, Default, Debug)]
+    struct ChatLog {
+        messages: i64,
+        #[serde(default)]
+        keys_seen: Vec<String>,
+    }
+    impl crate::actor::Projector for ChatLog {
+        fn apply(&mut self, event: &crate::envelope::Event) {
+            if event.schema.as_str() == "Chatted@1" {
+                self.messages += 1;
+                if let Some(text) = event.payload["text"].as_str() {
+                    self.keys_seen.push(text.to_owned());
+                }
+            }
+        }
+    }
+
+    /// Installs a ChatLog projector set over `public` (consumes the
+    /// `Chatted` fact, keyed by `chat_id`).
+    fn install_chat_projector_set(
+        system: &ActorSystem,
+        public: &str,
+    ) -> Result<(), error_stack::Report<crate::registry::RegistryError>> {
+        system.register_schema::<Chatted>();
+        let spec = crate::pool::ProjectorSetSpec {
+            public: ActorPath::new(public),
+            system: system.clone(),
+            factory: Arc::new(|system, path, args| {
+                // Fire-and-forget: the arm is synchronous; catch-up (and
+                // its CaughtUp fact) continues in the background.
+                crate::builder::spawn_projector_builder::<ChatLog>(system)
+                    .at(path.clone())
+                    .args(args.clone())
+                    .consumes::<Chatted>()
+                    .start();
+            }),
+            key_field: "chat_id".to_owned(),
+            args_template: None,
+            opts: SpawnOpts::default(),
+            consumed: vec![Chatted::schema_id()],
+        };
+        system.install_projector_set(spec)
+    }
+
+    /// Publishes one `Chatted` fact through the host broadcast.
+    async fn publish_chatted(system: &ActorSystem, chat_id: &str, text: &str) {
+        system
+            .publish_value(
+                Chatted::schema_id(),
+                serde_json::json!({ "chat_id": chat_id, "text": text }),
+            )
+            .await;
+    }
+
+    /// Seeds events into a SOURCE journal through the test seam (the
+    /// durable record an entity would have written).
+    fn seed_journal_events(
+        system: &ActorSystem,
+        path: &ActorPath,
+        events: Vec<crate::envelope::Event>,
+    ) {
+        use crate::journal::JournalStore;
+        let store = system.journal_store_trait();
+        let store = crate::journal::downcast_in_memory(&store).expect("in-memory store");
+        store.append_sync(path, &events).expect("seed append");
+    }
+
     #[tokio::test]
     async fn partition_keys_activate_distinct_entities_with_separate_journals() {
         // Given a partition set over "accounts" (str shard key `account`).
@@ -5672,6 +6231,364 @@ mod tests {
             result.is_err(),
             "spec without a declared shard key rejected"
         );
+    }
+
+    // ---- projector sets: broadcast activation (v0.6.0) ----------------
+
+    #[tokio::test]
+    async fn projector_set_activates_on_consumed_broadcast() {
+        // Given a ChatLog projector set over "proj/chats" consuming Chatted
+        // (shard key `chat_id`).
+        let (system, _clock) = ActorSystem::test();
+        install_chat_projector_set(&system, "proj/chats").expect("install");
+
+        // When a broadcast copy of Chatted for chat "7" crosses the fabric.
+        publish_chatted(&system, "7", "hello").await;
+
+        // Then the per-key projector proj/chats/7 activates, catches up
+        // (history includes this very fact), and folds it exactly once.
+        let state = system
+            .projector_state(&ActorPath::new("proj/chats/7"))
+            .await
+            .expect("projector activated by broadcast");
+        let log: ChatLog = serde_json::from_value(state).expect("state decodes");
+        assert_eq!(log.messages, 1, "exactly one fold of the single fact");
+        // And the sibling key was never activated.
+        assert!(
+            system
+                .es_state(&ActorPath::new("proj/chats/8"))
+                .await
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn passivated_projector_wakes_and_gap_fills() {
+        // Given a ChatLog projector set whose projectors passivate after a
+        // short idle, one folded fact, and a passivated (evicted) projector.
+        let (system, clock) = ActorSystem::test();
+        let mut opts = SpawnOpts::default();
+        opts.passivation = Some(Passivation {
+            idle_for: std::time::Duration::from_millis(50),
+        });
+        system.register_schema::<Chatted>();
+        let spec = crate::pool::ProjectorSetSpec {
+            opts,
+            ..install_chat_projector_set_spec(&system, "proj/chats")
+        };
+        system.install_projector_set(spec).expect("install");
+        publish_chatted(&system, "9", "one").await;
+        let path = ActorPath::new("proj/chats/9");
+        let _ = system.projector_state(&path).await.expect("first read");
+
+        // When the idle window elapses on the fake clock (no messages).
+        clock.advance(std::time::Duration::from_millis(100));
+        wait_for(|| async {
+            !system_is_live(&system, &path) && system.es_state(&path).await.is_none()
+        })
+        .await;
+        publish_chatted(&system, "9", "two").await;
+
+        // When two more facts for the same key are broadcast while the
+        // projector is cold.
+        publish_chatted(&system, "9", "three").await;
+
+        // Then the broadcast wakes the projector, it gap-fills from the
+        // store (its own journal holds only the first fact), and the fold
+        // is complete — nothing lost across the passivation cycle.
+        let state = system
+            .projector_state(&path)
+            .await
+            .expect("woken projector");
+        let log: ChatLog = serde_json::from_value(state).expect("state decodes");
+        assert_eq!(log.messages, 3, "all three facts folded exactly once");
+        assert_eq!(
+            log.keys_seen,
+            vec!["one".to_owned(), "two".to_owned(), "three".to_owned()],
+            "order preserved across passivation + gap-fill"
+        );
+    }
+
+    #[tokio::test]
+    async fn projector_state_wakes_and_returns_complete_fold() {
+        // Given a ChatLog projector set and two stored facts for key "5",
+        // with NO projector spawned yet: the first publish ACTIVATES it
+        // (a declared consumption is a delivery obligation), so the
+        // genuinely-cold precondition needs a passivation cycle first.
+        let (system, clock) = ActorSystem::test();
+        let mut opts = SpawnOpts::default();
+        opts.passivation = Some(Passivation {
+            idle_for: std::time::Duration::from_millis(50),
+        });
+        let spec = crate::pool::ProjectorSetSpec {
+            opts,
+            ..install_chat_projector_set_spec(&system, "proj/chats")
+        };
+        system.install_projector_set(spec).expect("install");
+        publish_chatted(&system, "5", "a").await;
+        publish_chatted(&system, "5", "b").await;
+        // Let the activation come live (slot registered), fold the two
+        // facts, then advance past the idle window.
+        let path5 = ActorPath::new("proj/chats/5");
+        wait_for(|| async { system_is_live(&system, &path5) }).await;
+        wait_for(|| async { system.dead_letter_reasons().await.is_empty() }).await;
+        // Drive the fold to completion with one bounded quiesce-equivalent:
+        // publish already happened, so just wait for the fold to land.
+        for _ in 0..500 {
+            if system.es_state(&path5).await.is_some() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        clock.advance(std::time::Duration::from_millis(100));
+        // On a fake clock the idle loop cannot self-wake, so drive the
+        // eviction deterministically through the public stop (identical
+        // teardown path: state freed, journal durable).
+        system.stop(&path5).await;
+        assert!(
+            system.es_state(&path5).await.is_none(),
+            "projector evicted before the cold read"
+        );
+
+        // When reading through projector_state (the complete read: wake +
+        // catch-up + capture) from COLD.
+        let state = system
+            .projector_state(&ActorPath::new("proj/chats/5"))
+            .await
+            .expect("wake returns the fold");
+
+        // Then the fold is COMPLETE (not mid-seed) and decodeable.
+        let log: ChatLog = serde_json::from_value(state).expect("state decodes");
+        assert_eq!(log.messages, 2, "both facts folded before capture");
+        assert_eq!(log.keys_seen, vec!["a".to_owned(), "b".to_owned()]);
+
+        // And an UNKNOWN (not set-owned, not live) path reads as None —
+        // an observable miss, never a hang.
+        assert!(
+            system
+                .projector_state(&ActorPath::new("proj/nowhere/1"))
+                .await
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn es_state_is_frozen_after_passivation() {
+        // Given a ChatLog projector whose projector passes cold, folded
+        // once, then passivated (true eviction).
+        let (system, clock) = ActorSystem::test();
+        let mut opts = SpawnOpts::default();
+        opts.passivation = Some(Passivation {
+            idle_for: std::time::Duration::from_millis(50),
+        });
+        let spec = crate::pool::ProjectorSetSpec {
+            opts,
+            ..install_chat_projector_set_spec(&system, "proj/chats")
+        };
+        system.install_projector_set(spec).expect("install");
+        publish_chatted(&system, "3", "warm").await;
+        let path = ActorPath::new("proj/chats/3");
+        let _ = system.projector_state(&path).await.expect("first read");
+        clock.advance(std::time::Duration::from_millis(100));
+        wait_for(|| async { system.es_state(&path).await.is_none() }).await;
+
+        // When nothing publishes (es_state NEVER wakes anything — it is
+        // a pure peek), repeated reads stay None.
+        assert!(system.es_state(&path).await.is_none());
+        assert!(
+            system.es_state(&path).await.is_none(),
+            "es_state is frozen: peek-only, no wake"
+        );
+
+        // And the complete read wakes it: the cold projector gap-fills
+        // and returns the full fold.
+        let state = system.projector_state(&path).await.expect("complete");
+        let log: ChatLog = serde_json::from_value(state).expect("decodes");
+        assert_eq!(log.messages, 1, "woken by the complete read alone");
+    }
+
+    #[tokio::test]
+    async fn rebuild_refolds_history_from_scratch() {
+        // Given two Chatted facts in a SOURCE journal (an entity's record,
+        // host-seeded through the test seam) and a ChatLog projector that
+        // folded them.
+        let (system, _clock) = ActorSystem::test();
+        install_chat_projector_set(&system, "proj/chats").expect("install");
+        let source = ActorPath::new("chats");
+        seed_journal_events(
+            &system,
+            &source,
+            vec![
+                crate::envelope::Event::new(
+                    Chatted::schema_id(),
+                    serde_json::json!({ "chat_id": "1", "text": "x" }),
+                ),
+                crate::envelope::Event::new(
+                    Chatted::schema_id(),
+                    serde_json::json!({ "chat_id": "1", "text": "y" }),
+                ),
+            ],
+        );
+        let path = ActorPath::new("proj/chats/1");
+        let state = system.projector_state(&path).await.expect("initial");
+        let log: ChatLog = serde_json::from_value(state).expect("decodes");
+        assert_eq!(log.messages, 2);
+
+        // When the projector is rebuilt (stop → purge → re-activate →
+        // await catch-up).
+        system.rebuild_projector(&path).await.expect("rebuild");
+
+        // Then the re-fold equals a from-scratch fold: same facts, exactly
+        // once each (the purged journal cannot double-count).
+        let state = system.projector_state(&path).await.expect("post-rebuild");
+        let log: ChatLog = serde_json::from_value(state).expect("decodes");
+        assert_eq!(log.messages, 2, "purge + re-fold == fresh fold");
+        assert_eq!(
+            log.keys_seen,
+            vec!["x".to_owned(), "y".to_owned()],
+            "order preserved through rebuild"
+        );
+
+        // And rebuild REFUSES paths the runtime has no recipe for.
+        assert!(
+            system
+                .rebuild_projector(&ActorPath::new("standalone/proj"))
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn install_projector_set_refuses_keyless_consumed_schema() {
+        // Given a system with a registered event schema that has NO
+        // shard-key field.
+        let (system, _clock) = ActorSystem::test();
+        system.register_schema::<Chatted>();
+        let spec = crate::pool::ProjectorSetSpec {
+            key_field: "channel".to_owned(),
+            ..install_chat_projector_set_spec(&system, "proj/chats")
+        };
+
+        // When a projector set names a key field no consumed schema marks
+        // as ShardKey.
+        let result = system.install_projector_set(spec);
+
+        // Then the install is REFUSED.
+        assert!(result.is_err(), "keyless consumed schema rejected");
+    }
+
+    #[tokio::test]
+    async fn install_projector_set_refuses_command_schema() {
+        // Given a system with the KeyedAdd COMMAND registered.
+        let (system, _clock) = ActorSystem::test();
+        system.register_schema::<KeyedAdd>();
+
+        // When a projector set consumes it (commands are not facts).
+        let spec = crate::pool::ProjectorSetSpec {
+            key_field: "account".to_owned(),
+            ..install_chat_projector_set_spec(&system, "proj/chats")
+        };
+        // Replace the consumed list with the command schema.
+        let spec = crate::pool::ProjectorSetSpec {
+            consumed: vec![KeyedAdd::schema_id()],
+            ..spec
+        };
+        let result = system.install_projector_set(spec);
+
+        // Then the install is REFUSED.
+        assert!(result.is_err(), "command schemas are not foldable facts");
+    }
+
+    #[tokio::test]
+    async fn keyless_broadcast_copy_dead_letters_shard_key_missing() {
+        // Given an installed ChatLog projector set.
+        let (system, _clock) = ActorSystem::test();
+        install_chat_projector_set(&system, "proj/chats").expect("install");
+
+        // When a Chatted copy without its key field is published (a
+        // foreign sender bypassing the schema).
+        system
+            .publish_value(
+                Chatted::schema_id(),
+                serde_json::json!({ "text": "no key" }),
+            )
+            .await;
+
+        // Then the per-set copy dead-letters as ShardKeyMissing and no
+        // projector activates.
+        wait_for(|| async {
+            system
+                .dead_letter_reasons()
+                .await
+                .iter()
+                .any(|reason| reason.starts_with("ShardKeyMissing"))
+        })
+        .await;
+        assert!(
+            system
+                .es_state(&ActorPath::new("proj/chats/"))
+                .await
+                .is_none()
+                && system
+                    .es_state(&ActorPath::new("proj/chats"))
+                    .await
+                    .is_none(),
+            "no projector spawned for a keyless copy"
+        );
+    }
+
+    #[tokio::test]
+    async fn entity_partition_sets_do_not_activate_on_broadcast() {
+        // Given a KeyCounter ENTITY partition set (no consumption declared)
+        // and a broadcast of the Chatted fact.
+        let (system, _clock) = ActorSystem::test();
+        install_key_partition(&system, "accounts").expect("install");
+
+        // When the fact is broadcast (no .handles declarant exists for it).
+        publish_chatted(&system, "7", "ignored").await;
+
+        // Then no entity spawns: the activation rule is declaration-scoped
+        // — an entity partition set never declared consumption, so a
+        // broadcast copy is not its delivery obligation.
+        assert!(
+            system
+                .es_state(&ActorPath::new("accounts/7"))
+                .await
+                .is_none(),
+            "entity sets do not wake on broadcast facts"
+        );
+    }
+
+    /// The projector-set spec builder for fixtures (tests override
+    /// individual fields with struct-update syntax).
+    fn install_chat_projector_set_spec(
+        system: &ActorSystem,
+        public: &str,
+    ) -> crate::pool::ProjectorSetSpec {
+        system.register_schema::<Chatted>();
+        crate::pool::ProjectorSetSpec {
+            public: ActorPath::new(public),
+            system: system.clone(),
+            factory: Arc::new(|system, path, args| {
+                // Fire-and-forget: the arm is synchronous; catch-up (and
+                // its CaughtUp fact) continues in the background.
+                crate::builder::spawn_projector_builder::<ChatLog>(system)
+                    .at(path.clone())
+                    .args(args.clone())
+                    .consumes::<Chatted>()
+                    .start();
+            }),
+            key_field: "chat_id".to_owned(),
+            args_template: None,
+            opts: SpawnOpts::default(),
+            consumed: vec![Chatted::schema_id()],
+        }
+    }
+
+    /// Whether the path has a live slot.
+    fn system_is_live(system: &ActorSystem, path: &ActorPath) -> bool {
+        let registry = system.registry.lock();
+        registry.lookup(path).is_some()
     }
 
     #[tokio::test]
@@ -6269,6 +7186,59 @@ mod tests {
         }
     }
 
+    /// A JournalStore test double whose `passivated` hint ALWAYS fails:
+    /// passivation must complete anyway (log-and-continue).
+    struct HintFailStore {
+        inner: std::sync::Arc<dyn crate::journal::JournalStore>,
+    }
+    impl HintFailStore {
+        fn new(inner: std::sync::Arc<dyn crate::journal::JournalStore>) -> Self {
+            Self { inner }
+        }
+    }
+    #[async_trait::async_trait]
+    impl crate::journal::JournalStore for HintFailStore {
+        async fn append(
+            &self,
+            path: &crate::actor::ActorPath,
+            events: &[crate::envelope::Event],
+        ) -> Result<Vec<crate::journal::SeqNo>, error_stack::Report<crate::journal::JournalError>>
+        {
+            self.inner.append(path, events).await
+        }
+        async fn load(
+            &self,
+            path: &crate::actor::ActorPath,
+        ) -> Result<Option<crate::journal::Replay>, error_stack::Report<crate::journal::JournalError>>
+        {
+            self.inner.load(path).await
+        }
+        async fn append_snapshot(
+            &self,
+            path: &crate::actor::ActorPath,
+            seq: crate::journal::SeqNo,
+            state: JsonValue,
+            now_ms: u64,
+        ) -> Result<(), error_stack::Report<crate::journal::JournalError>> {
+            self.inner.append_snapshot(path, seq, state, now_ms).await
+        }
+        async fn flush(&self) -> Result<(), error_stack::Report<crate::journal::JournalError>> {
+            self.inner.flush().await
+        }
+        async fn passivated(
+            &self,
+            _path: &crate::actor::ActorPath,
+        ) -> Result<(), error_stack::Report<crate::journal::JournalError>> {
+            Err(crate::journal::JournalError::Hint.into())
+        }
+        fn name(&self) -> &'static str {
+            "hintfail-test"
+        }
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+    }
+
     /// An ES counter with a sync on_stop that records the final total.
     static ES_HOOK_LOG: std::sync::OnceLock<Arc<std::sync::Mutex<Vec<String>>>> =
         std::sync::OnceLock::new();
@@ -6719,6 +7689,193 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn es_state_is_none_after_passivation() {
+        // Given a passivating counter (100ms idle) that folded one event.
+        let (system, clock) = ActorSystem::test();
+        let path = ActorPath::new("leak");
+        system.register_schema::<Add>();
+        system.register_schema::<Added>();
+        let opts = SpawnOpts {
+            passivation: Some(Passivation {
+                idle_for: std::time::Duration::from_millis(100),
+            }),
+            ..SpawnOpts::default()
+        };
+        system.spawn_es::<Counter, _>(path.clone(), &json!({}), opts, || {
+            vec![Arc::new(TypedEsAdapter::<Counter, Add>::new::<Add>())]
+        });
+        system
+            .send(system.envelope(Add::schema_id(), path.clone(), json!({ "n": 5 })))
+            .await
+            .expect("delivered");
+        wait_for_cursor(&system, &path, 1).await;
+
+        // When the idle window elapses and passivation completes.
+        clock.advance(std::time::Duration::from_millis(500));
+        wait_for(|| async { stopped_with(&system, &path, crate::actor::StopReason::Passivated) })
+            .await;
+
+        // Then the in-memory state entry is GONE (only live actors hold
+        // state — the fold must not leak).
+        assert!(
+            system.es_state(&path).await.is_none(),
+            "the passivated actor's state was freed"
+        );
+        // And the journal survives as the durable copy.
+        assert_eq!(system.journal_len(&path), 1, "journal survives");
+    }
+
+    #[tokio::test]
+    async fn passivated_hint_error_is_logged_not_fatal() {
+        // Given a passivating counter on a store whose `passivated` hint
+        // always fails.
+        let (system, clock) = ActorSystem::test();
+        let path = ActorPath::new("hintfail");
+        system.register_schema::<Add>();
+        system.register_schema::<Added>();
+        let inner = std::sync::Arc::new(crate::journal::InMemoryJournalStore::new());
+        system.set_journal_store(std::sync::Arc::new(HintFailStore::new(inner)));
+        let opts = SpawnOpts {
+            passivation: Some(Passivation {
+                idle_for: std::time::Duration::from_millis(100),
+            }),
+            ..SpawnOpts::default()
+        };
+        system.spawn_es::<Counter, _>(path.clone(), &json!({}), opts, || {
+            vec![Arc::new(TypedEsAdapter::<Counter, Add>::new::<Add>())]
+        });
+
+        // When the idle window elapses.
+        clock.advance(std::time::Duration::from_millis(500));
+
+        // Then passivation completed anyway (the hint never blocks the
+        // caller) and the state entry was freed.
+        wait_for(|| async { stopped_with(&system, &path, crate::actor::StopReason::Passivated) })
+            .await;
+        assert!(system.es_state(&path).await.is_none(), "state freed");
+    }
+
+    #[tokio::test]
+    async fn passivated_state_returns_by_replay_on_reshpawn() {
+        // Given a passivated counter with one journaled event.
+        let (system, clock) = ActorSystem::test();
+        let path = ActorPath::new("replayback");
+        system.register_schema::<Add>();
+        system.register_schema::<Added>();
+        let opts = SpawnOpts {
+            passivation: Some(Passivation {
+                idle_for: std::time::Duration::from_millis(100),
+            }),
+            ..SpawnOpts::default()
+        };
+        system.spawn_es::<Counter, _>(path.clone(), &json!({}), opts, || {
+            vec![Arc::new(TypedEsAdapter::<Counter, Add>::new::<Add>())]
+        });
+        system
+            .send(system.envelope(Add::schema_id(), path.clone(), json!({ "n": 5 })))
+            .await
+            .expect("delivered");
+        wait_for_cursor(&system, &path, 1).await;
+        clock.advance(std::time::Duration::from_millis(500));
+        wait_for(|| async { stopped_with(&system, &path, crate::actor::StopReason::Passivated) })
+            .await;
+
+        // When the host re-spawns the same path cold.
+        system.spawn_es::<Counter, _>(path.clone(), &json!({}), SpawnOpts::default(), || {
+            vec![Arc::new(TypedEsAdapter::<Counter, Add>::new::<Add>())]
+        });
+
+        // Then the fresh instance replayed the journal before its first
+        // step (cold state returns by replay, not genesis).
+        wait_for(|| async { count_total_json(&system, &path).await == Some(5) }).await;
+    }
+
+    #[tokio::test]
+    async fn external_stop_also_drops_the_state_entry() {
+        // Given a live counter (no passivation configured).
+        let (system, _clock) = ActorSystem::test();
+        let path = ActorPath::new("stopdrop");
+        system.register_schema::<Add>();
+        system.register_schema::<Added>();
+        system.spawn_es::<Counter, _>(path.clone(), &json!({}), SpawnOpts::default(), || {
+            vec![Arc::new(TypedEsAdapter::<Counter, Add>::new::<Add>())]
+        });
+        assert!(system.es_state(&path).await.is_some(), "live at spawn");
+
+        // When the host stops it externally.
+        system.stop(&path).await;
+
+        // Then the state entry was torn down with the slot.
+        assert!(
+            system.es_state(&path).await.is_none(),
+            "stop frees the state entry"
+        );
+    }
+
+    #[tokio::test]
+    async fn crash_rebuild_still_works_after_teardown_change() {
+        // Given a supervised ES child.
+        let (system, _clock) = ActorSystem::test();
+        system.register_schema::<Add>();
+        system.register_schema::<Added>();
+        system.register_schema::<Boom>();
+        let child = ActorPath::new("crashrebuild");
+        let spec = crate::supervision::ActorSpec {
+            path: child.clone(),
+            parent: None,
+            restart: crate::supervision::RestartPolicy::Permanent,
+            budget: crate::supervision::RestartBudget::per(5, std::time::Duration::from_secs(10)),
+            backoff: crate::supervision::Backoff {
+                base: std::time::Duration::from_millis(5),
+                max: std::time::Duration::from_millis(20),
+                factor: 2.0,
+            },
+            args: json!({}),
+            spawn: Arc::new(|sys: &ActorSystem, path: &ActorPath, args: &JsonValue| {
+                sys.spawn_es::<Counter, _>(path.clone(), args, SpawnOpts::default(), || {
+                    vec![
+                        Arc::new(TypedEsAdapter::<Counter, Add>::new::<Add>()),
+                        Arc::new(TypedEsAdapter::<Counter, Boom>::new::<Boom>()),
+                    ]
+                });
+            }),
+        };
+        system.spawn(spec);
+        wait_for(|| async {
+            system.tap_facts().iter().any(
+                |f| matches!(&f.kind, crate::tap::FactKind::Spawned { path: p, .. } if *p == child),
+            )
+        })
+        .await;
+
+        // When a good command commits, then a poison crashes the child
+        // (the crash path must NOT route through teardown_tables —
+        // restart_es expects the state entry present).
+        system
+            .send(system.envelope(Add::schema_id(), child.clone(), json!({ "n": 5 })))
+            .await
+            .expect("delivered");
+        wait_for_cursor(&system, &child, 1).await;
+        system
+            .send(system.envelope(Boom::schema_id(), child.clone(), json!({ "why": "x" })))
+            .await
+            .expect("delivered");
+
+        // Then supervision restarted it through restart_es, and the fresh
+        // instance replayed the pre-crash event.
+        wait_for(|| async {
+            system.tap_facts().iter().any(|f| {
+                matches!(
+                    &f.kind,
+                    crate::tap::FactKind::Spawned { path: p, restart: true, .. } if *p == child
+                )
+            })
+        })
+        .await;
+        wait_for(|| async { count_total_json(&system, &child).await == Some(5) }).await;
+    }
+
+    #[tokio::test]
     async fn incoming_message_resets_the_passivation_timer() {
         // Given a passivating counter (100ms idle window).
         let (system, clock) = ActorSystem::test();
@@ -6798,16 +7955,14 @@ mod tests {
         wait_for(|| async { stopped_with(&system, &path, crate::actor::StopReason::Passivated) })
             .await;
 
-        // Then close-door-then-drain processed the racer: the folded
-        // state carries BOTH events (1 + 7), and no DLQ traffic exists.
-        assert_eq!(
-            system
-                .es_state(&path)
-                .await
-                .and_then(|s| s["total"].as_i64()),
-            Some(8),
-            "racer was drained and folded"
-        );
+        // Then close-door-then-drain processed the racer: a cold re-spawn
+        // replays BOTH events (1 + 7) from the store — passivation freed
+        // the in-memory state, so the durable journal is the observable
+        // proof — and no DLQ traffic exists.
+        system.spawn_es::<Counter, _>(path.clone(), &json!({}), SpawnOpts::default(), || {
+            vec![Arc::new(TypedEsAdapter::<Counter, Add>::new::<Add>())]
+        });
+        wait_for(|| async { count_total_json(&system, &path).await == Some(8) }).await;
         assert_eq!(system.dead_letter_schemas().len(), 0, "no DLQ traffic");
     }
 

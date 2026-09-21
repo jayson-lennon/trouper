@@ -236,11 +236,12 @@ async fn main() {
 
     // 4. A PUBLISHED event: every LIVE entity that declared MarketBell
     //    receives one copy and journals its decision — dispatched
-    //    through the SAME entry table as a told command. Alice is still
-    //    live (inside her idle window); a passivated entity receives
-    //    nothing (publish never activates, never phantom-delivers).
+    //    through the SAME entry table as a told command. Alice was
+    //    re-activated at step 3 (inside her idle window); a passivated
+    //    entity receives nothing (publish never activates, never
+    //    phantom-delivers).
     system.publish(&MarketBell { ring: 5 }).await;
-    tokio::time::sleep(Duration::from_millis(80)).await;
+    tokio::time::sleep(Duration::from_millis(30)).await;
     let alice3 = system
         .es_state(&ActorPath::new("accts/alice"))
         .await

@@ -92,6 +92,31 @@ pub trait CommandHandler<C>: EventSourcedActor {
     fn handle(&self, cmd: C, ctx: &mut CmdCtx<'_>) -> Vec<crate::envelope::Event>;
 }
 
+/// A read model: a state struct that folds other actors' recorded facts.
+///
+/// The struct IS the actor (like [`EventSourcedActor`], no wrapper): one
+/// fold — [`Projector::apply`] — runs identically for live deliveries,
+/// catch-up seeding, and restart replay, so a projector can never show one
+/// answer to history and another to the present. No `manifest`: the
+/// projector builder is the single source of the declared surface — every
+/// `.consumes` schema becomes both a handled input and a re-recorded
+/// output (the journal IS the checkpoint).
+///
+/// [`Default`] is the genesis: replay-from-nothing and rebuild-from-genesis
+/// construct the fold deterministically from it.
+pub trait Projector: Send + Sync + Serialize + DeserializeOwned + Default + 'static {
+    /// THE fold. Same code for history (catch-up), live facts, and restart
+    /// replay. Match on `event.schema` — unmatched schemas are ignored, so
+    /// one read model can consume several fact types (declare each with
+    /// `.consumes`).
+    fn apply(&mut self, event: &crate::envelope::Event);
+
+    /// Graceful-stop hook: runs ONCE after the final drain, with the fully
+    /// folded state, on external stop / self-stop / the shutdown sweep.
+    /// Sync and `&self` — observation only.
+    fn on_stop(&self) {}
+}
+
 /// Edge/service actor: async, I/O and `ask` allowed; NOT journaled.
 pub trait ServiceActor: Send + 'static {
     /// Declares edges and the contract kind (always [`ActorKind::Service`]).
@@ -312,6 +337,95 @@ where
         // state even if it panics. The LOOP applies the returned events
         // after journal-append + ack (spec atomic ordering, step 7).
         Ok(typed.state.handle(cmd, ctx))
+    }
+}
+
+/// Concrete [`DynEsActor`] for a typed read model `P`: the kernel drives it
+/// exactly like an entity, but there is no decision function — every
+/// delivered fact IS the event (the builder's `ConsumeEntry` records it
+/// verbatim) and [`Projector::apply`] is the only mutation.
+pub struct TypedProjectorState<P: Projector> {
+    state: P,
+}
+
+impl<P: Projector> TypedProjectorState<P> {
+    /// Wraps live read-model state.
+    pub fn new(state: P) -> Self {
+        Self { state }
+    }
+}
+
+impl<P: Projector> DynEsActor for TypedProjectorState<P> {
+    fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
+        self
+    }
+
+    fn apply_erased(&mut self, event: &crate::envelope::Event) {
+        self.state.apply(event);
+    }
+
+    fn capture_erased(&self) -> Result<JsonValue, error_stack::Report<JournalError>> {
+        use error_stack::ResultExt;
+        serde_json::to_value(&self.state).change_context(JournalError::Snapshot)
+    }
+
+    fn rebuild(
+        &self,
+        _args: &JsonValue,
+        snapshot: Option<JsonValue>,
+        tail: &[crate::envelope::Event],
+    ) -> Result<Box<dyn DynEsActor>, error_stack::Report<JournalError>> {
+        use error_stack::ResultExt;
+        // A projector's genesis is Default (not spawn args): the read model
+        // is derived entirely from the facts it folds. Snapshot or genesis,
+        // then the fold runs over the tail exactly as the live path does.
+        let mut fresh: P = match snapshot {
+            Some(snap) => serde_json::from_value(snap).change_context(JournalError::Restore)?,
+            None => P::default(),
+        };
+        for event in tail {
+            fresh.apply(event);
+        }
+        Ok(Box::new(TypedProjectorState { state: fresh }))
+    }
+
+    fn on_stop_es(&self) {
+        self.state.on_stop();
+    }
+}
+
+/// The projector's dispatch table entry: the delivered fact IS the event.
+///
+/// No decode, no user code — the identity decision. The kernel journals
+/// what `dispatch` returns and applies it to the fold, so a consumed fact
+/// is re-recorded into the projector's own journal (its checkpoint) with
+/// zero per-consumption domain code.
+pub struct ConsumeEntry {
+    schema: SchemaId,
+}
+
+impl ConsumeEntry {
+    /// Creates the identity entry for a consumed fact schema.
+    pub fn new(schema: SchemaId) -> Self {
+        Self { schema }
+    }
+}
+
+impl CommandEntry for ConsumeEntry {
+    fn schema(&self) -> SchemaId {
+        self.schema.clone()
+    }
+
+    fn dispatch(
+        &self,
+        _state: &mut dyn DynEsActor,
+        payload: &JsonValue,
+        _ctx: &mut CmdCtx<'_>,
+    ) -> Result<Vec<crate::envelope::Event>, error_stack::Report<DispatchError>> {
+        Ok(vec![crate::envelope::Event::new(
+            self.schema.clone(),
+            payload.clone(),
+        )])
     }
 }
 
