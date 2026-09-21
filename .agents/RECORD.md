@@ -89,3 +89,4 @@ Entries are added or amended **only with human approval**.
 - (queries) with_es_state/with_projector_state read entity and projector state typed under the state lock with no serialization; try_ variants are sync and non-blocking.
 - (queries) Typed reads cover live entities and projectors only: foreign actors read as JSON, passivated entities read None, and service-actor state is not a readable surface.
 - (lifecycle) A projector records a CaughtUp tap fact when its catch-up completes.
+- (docs) The trouper crate's public API documentation follows std rustdoc style — consumer-relevant statements only, no implementation narration — and cargo doc runs warning-free.
