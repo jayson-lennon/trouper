@@ -11,7 +11,7 @@ use std::sync::Arc;
 
 use crate::actor::ActorPath;
 use crate::actor::{
-    CommandEntry, DynServiceActor, EventSourcedActor, EsAny, MsgEntry, ServiceActor, TypedEsState,
+    CommandEntry, DynServiceActor, EsAny, EventSourcedActor, MsgEntry, ServiceActor, TypedEsState,
     TypedServiceState,
 };
 use crate::clock::Timestamp;
@@ -1895,10 +1895,19 @@ impl ActorSystem {
     /// Typed, ZERO-COPY read of a live entity's state: runs `f` over the
     /// state under its lock — no serialize, no clone.
     ///
+    /// The closure is SYNC (it holds the state lock) and `R` is owned (the
+    /// guard drops before return — clone the field you need, return it).
+    /// `None` means "no `<A>` state at this path right now", which folds
+    /// together: no live entry (cold, passivated, or unknown path), the
+    /// entry being a different state type (foreign actors' JSON included
+    /// — [`Self::es_state`] remains their read path; the mismatch is
+    /// logged at debug).
+    ///
     /// Sync and non-blocking: takes the state lock with `try_lock`, so a
     /// read never stalls a render thread — `None` when the fold currently
-    /// holds the lock (the caller keeps its previous frame). See
-    /// [`ActorSystem::with_es_state`] for the awaiting variant.
+    /// holds the lock (the caller keeps its previous frame; never retry
+    /// inside the read). See [`ActorSystem::with_es_state`] for the
+    /// awaiting variant.
     pub fn try_with_es_state<A: EventSourcedActor, R>(
         &self,
         path: &ActorPath,
@@ -1924,6 +1933,12 @@ impl ActorSystem {
 
     /// Typed, ZERO-COPY read of a live projector's fold: runs `f` over the
     /// read model under its state lock — no serialize, no clone.
+    ///
+    /// The closure is SYNC (it holds the state lock) and `R` is owned (the
+    /// guard drops before return — clone the field you need, return it).
+    /// `None` means "no `<P>` fold at this path right now": no live entry,
+    /// wrong type (foreign actors' JSON included), or — for the `try_`
+    /// pair only — a lock the fold currently holds.
     ///
     /// Sync and non-blocking like [`ActorSystem::try_with_es_state`]; use
     /// [`ActorSystem::with_projector_state`] to wake a cold set-owned
@@ -1954,9 +1969,12 @@ impl ActorSystem {
     /// The awaiting typed twin of [`ActorSystem::es_state`]: runs `f` over
     /// a live entity's state under its lock — no serialize, no clone.
     ///
-    /// Never wakes anything (like `es_state`): a cold or passivated entity
-    /// reads `None` — only [`ActorSystem::with_projector_state`] has a
-    /// wake path, and only for set-owned projectors.
+    /// The closure is SYNC and `R` owned (see [`Self::try_with_es_state`]).
+    /// `None` means "no `<A>` state at this path right now": a cold or
+    /// passivated entity (this read NEVER wakes anything, like `es_state`
+    /// — only [`Self::with_projector_state`] has a wake path, and only for
+    /// set-owned projectors) or a wrong type at the path (foreign actors'
+    /// JSON included; the mismatch is logged at debug).
     pub async fn with_es_state<A: EventSourcedActor, R>(
         &self,
         path: &ActorPath,
@@ -1967,9 +1985,19 @@ impl ActorSystem {
 
     /// The typed, zero-copy twin of [`ActorSystem::projector_state`]: runs
     /// `f` over the live read model under its state lock — no serialize,
-    /// no clone. Wake semantics are IDENTICAL to `projector_state` (hot:
-    /// quiesce then read; cold set-owned: wake + bounded `CaughtUp` wait),
-    /// except a live projector whose state is not `P` also reads `None`.
+    /// no clone.
+    ///
+    /// The closure is SYNC and `R` owned (see [`Self::try_with_es_state`]).
+    /// Wake semantics are IDENTICAL to `projector_state`:
+    ///
+    /// - **live projector** — quiesce (a wake copy may still sit queued
+    ///   while its loop spins up), then read typed;
+    /// - **cold, set-owned path** — wake through the set's factory, wait
+    ///   bounded for the `CaughtUp` fact, then read typed;
+    /// - **cold standalone projector / unknown path** — `None` (no wake
+    ///   path; re-run the builder);
+    /// - **wake misses its catch-up budget** — `None`;
+    /// - **live but not a `P`** — `None` (mismatch logged at debug).
     pub async fn with_projector_state<P: crate::actor::Projector, R>(
         &self,
         path: &ActorPath,
@@ -9856,7 +9884,10 @@ mod tests {
 
         // And the shape parity holds: the JSON capture says the same thing.
         assert_eq!(
-            system.es_state(&path).await.and_then(|s| s["total"].as_i64()),
+            system
+                .es_state(&path)
+                .await
+                .and_then(|s| s["total"].as_i64()),
             Some(21)
         );
     }
@@ -9874,9 +9905,7 @@ mod tests {
 
         // When reading the fold typed (hot path — no wake in between).
         let seen = system
-            .with_projector_state::<ChatLog, _>(&ActorPath::new("proj/chats/7"), |log| {
-                log.messages
-            })
+            .with_projector_state::<ChatLog, _>(&ActorPath::new("proj/chats/7"), |log| log.messages)
             .await;
 
         // Then the typed read matches the JSON capture.
@@ -9983,9 +10012,7 @@ mod tests {
         wait_for(|| async { system_is_live(&system, &path) }).await;
 
         // When reading it as a DIFFERENT actor type through both seams.
-        let wrong_es = system
-            .with_es_state::<BareCounter, _>(&path, |_| ())
-            .await;
+        let wrong_es = system.with_es_state::<BareCounter, _>(&path, |_| ()).await;
         let wrong_try = system.try_with_es_state::<BareCounter, _>(&path, |_| ());
 
         // Then both miss — None, no panic, no capture.
@@ -10045,9 +10072,7 @@ mod tests {
                 }),
                 ..Default::default()
             },
-            || {
-                vec![Arc::new(TypedEsAdapter::<SpiedCounter, Add>::new::<Add>())]
-            },
+            || vec![Arc::new(TypedEsAdapter::<SpiedCounter, Add>::new::<Add>())],
         );
         wait_for(|| async { system_is_live(&system, &path) }).await;
         clock.advance(std::time::Duration::from_millis(100));
@@ -10074,11 +10099,7 @@ mod tests {
         });
         for i in 0..25 {
             system
-                .send(system.envelope(
-                    Add::schema_id(),
-                    path.clone(),
-                    json!({ "n": 2, "seq": i }),
-                ))
+                .send(system.envelope(Add::schema_id(), path.clone(), json!({ "n": 2, "seq": i })))
                 .await
                 .expect("delivered");
         }

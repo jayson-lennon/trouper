@@ -12,7 +12,10 @@
 //! `passivate_after`).
 //!
 //! Also demonstrated: `rebuild_projector` (stop → purge → re-activate
-//! → catch-up), which equals a from-scratch fold.
+//! → catch-up), which equals a from-scratch fold, and the typed
+//! zero-copy reads (`with_projector_state` / `try_with_es_state`),
+//! which hand the live fold to a closure with no serialize + decode
+//! round-trip.
 //!
 //! Run: `cargo run --example chat_log`
 
@@ -188,6 +191,16 @@ async fn main() {
         .await
         .expect("rust");
     println!("chats/rust   : {rust:?}");
+    // The typed twin: the LIVE fold under its lock — no serialize, no
+    // decode. Same answer as the JSON capture above.
+    let last_typed = system
+        .with_projector_state::<ChatLog, _>(&ActorPath::new("chats/rust"), |log| {
+            log.transcript.last().cloned()
+        })
+        .await
+        .expect("typed read")
+        .expect("non-empty transcript");
+    println!("chats/rust   : last message read TYPED (zero-copy): {last_typed:?}");
     let k8s = system
         .projector_state(&ActorPath::new("chats/k8s"))
         .await
@@ -232,4 +245,18 @@ async fn main() {
         .await
         .expect("rebuilt");
     println!("chats/rust rebuilt (fresh fold): {rust:?}");
+
+    // ---- Frame-style read: sync, non-blocking, typed -----------------
+    // The GUI render-loop pattern: a try_ read never blocks — when the
+    // fold holds the lock, the frame keeps the previous value.
+    if let Some(live) = system
+        .try_with_projector_state::<ChatLog, _>(&ActorPath::new("chats/rust"), |log| {
+            (log.messages, log.transcript.len())
+        })
+    {
+        println!(
+            "chats/rust try_ read (never blocks): messages={} transcript={}",
+            live.0, live.1
+        );
+    }
 }

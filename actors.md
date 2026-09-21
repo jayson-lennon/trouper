@@ -506,6 +506,29 @@ members — a keyless send has no key to derive with.
   re-activate → catch-up; the result equals a from-scratch fold.
   `system.purge_journal(path)` is the standalone primitive.
 
+**Typed reads (zero-copy).** The JSON reads above serialize the whole fold per call.
+When the host knows the state type, the typed twins run a closure over the LIVE state
+under its lock — no serialize, no clone, no decode. The closure is sync and must not
+hold borrowed data past the call (clone what you need, return it owned):
+
+- `system.with_es_state::<A, R>(path, |state: &A| ...)` / `with_projector_state::<P, R>`
+  — the awaiting variants. Same wake semantics as their JSON twins (`with_projector_state`
+  wakes a cold set-owned projector; `with_es_state` never wakes).
+- `system.try_with_es_state::<A, R>(path, |state: &A| ...)` / `try_with_projector_state`
+  — the sync, NON-BLOCKING variants (`try_lock`): for render frames on a GUI thread
+  where awaiting is not an option. A lock the fold currently holds (microseconds) reads
+  as `None` — the caller keeps its previous frame; never retry inside the read.
+
+All four return `Option<R>` — `None` is "no `<A>` state at this path right now", folding
+together: no live entry (cold/unknown), wrong type (including foreign actors, whose
+state IS JSON — `es_state` remains their read path; a mismatch is logged at debug), a
+busy lock (the `try_` pair only), and — `with_projector_state` only — a cold wake that
+missed its catch-up budget. Cold set-owned projectors wake only through the ASYNC
+projector read; a cold standalone entity or standalone projector reads `None` on every
+variant (no wake path). Service actors are deliberately not readable typed: between
+awaits their state has no invariant, so the model's answer to "what is this worker
+doing" is a fact folded by a projector, not a memory peek.
+
 The set is how per-key read models stay memory-bounded: idle projectors passivate
 (with true eviction), and the next fact for their key wakes them and gap-fills from
 the store. A **standalone** projector has no wake path (no factory, no key derivation)

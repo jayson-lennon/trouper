@@ -1141,7 +1141,10 @@ mod tests {
     fn state_type_name_reports_the_state_type() {
         // Given shells for a typed entity, a projector, and a foreign actor.
         let typed = TypedEsState::new(Counter { count: 0 });
-        let foreign = ForeignEsState::new(json!({}), Arc::new(|_s: &mut Json, _e: &crate::envelope::Event| {}));
+        let foreign = ForeignEsState::new(
+            json!({}),
+            Arc::new(|_s: &mut Json, _e: &crate::envelope::Event| {}),
+        );
 
         // When asking each for its state type name.
         let typed_name = typed.state_type_name();
