@@ -11,16 +11,16 @@ use std::collections::HashMap;
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
-use serde_json::Value as JsonValue;
 use tokio::sync::oneshot;
 use uuid::Uuid;
 
+use crate::json::Json;
 use crate::clock::Timestamp;
 
 /// One reply slot: the asker's oneshot plus its expiry.
 pub struct ReplySlot {
     /// Where the reply is delivered (taken on reply).
-    pub sender: oneshot::Sender<JsonValue>,
+    pub sender: oneshot::Sender<Json>,
     /// When the lease expires (swept by [`ReplyTable::prune`]).
     pub expires_at: Timestamp,
 }
@@ -35,7 +35,7 @@ impl ReplyTable {
     /// Opens a lease: registers a oneshot with an expiry and returns both
     /// ends — the [`LeaseId`] (for the envelope's reply address) and the
     /// receiver the asker awaits.
-    pub fn open(&self, ttl: Duration, now: Timestamp) -> (LeaseId, oneshot::Receiver<JsonValue>) {
+    pub fn open(&self, ttl: Duration, now: Timestamp) -> (LeaseId, oneshot::Receiver<Json>) {
         let (sender, receiver) = oneshot::channel();
         let lease = LeaseId::new();
         self.slots.lock().insert(
@@ -50,7 +50,7 @@ impl ReplyTable {
 
     /// Completes a lease: delivers `payload` to the asker if the slot is
     /// still live. Returns false when the slot is gone (expired or pruned).
-    pub fn complete(&self, lease: &LeaseId, payload: JsonValue) -> bool {
+    pub fn complete(&self, lease: &LeaseId, payload: Json) -> bool {
         match self.slots.lock().remove(lease) {
             Some(slot) => slot.sender.send(payload).is_ok(),
             None => false,
@@ -96,11 +96,11 @@ mod tests {
         let (lease, receiver) = table.open(Duration::from_secs(10), Timestamp::from_millis(0));
 
         // When completing it.
-        let delivered = table.complete(&lease, serde_json::json!({ "ok": true }));
+        let delivered = table.complete(&lease, crate::json!({ "ok": true }));
 
         // Then the asker receives the payload and the slot is consumed.
         assert!(delivered);
-        assert_eq!(receiver.await_sync(), serde_json::json!({ "ok": true }));
+        assert_eq!(receiver.await_sync(), crate::json!({ "ok": true }));
         assert!(table.is_empty());
     }
 
@@ -112,7 +112,7 @@ mod tests {
 
         // When pruning after expiry.
         table.prune(Timestamp::from_millis(10));
-        let delivered = table.complete(&lease, serde_json::json!({}));
+        let delivered = table.complete(&lease, crate::json!({}));
 
         // Then the slot is gone and completion reports failure.
         assert!(!delivered);
@@ -121,11 +121,11 @@ mod tests {
 
     /// Await helper for the sync test (single value, sender already fired).
     trait AwaitSync {
-        fn await_sync(self) -> JsonValue;
+        fn await_sync(self) -> Json;
     }
 
-    impl AwaitSync for oneshot::Receiver<JsonValue> {
-        fn await_sync(self) -> JsonValue {
+    impl AwaitSync for oneshot::Receiver<Json> {
+        fn await_sync(self) -> Json {
             use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
             fn noop(_: *const ()) {}
             fn clone(_: *const ()) -> RawWaker {

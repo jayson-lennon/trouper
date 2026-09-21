@@ -8,12 +8,12 @@
 use std::ops::Deref;
 
 use serde::{Deserialize, Serialize};
-use serde_json::Value as JsonValue;
 use smallvec::SmallVec;
 use uuid::Uuid;
 
 use crate::actor::ActorPath;
 use crate::clock::Timestamp;
+use crate::json::Json;
 use crate::reply::LeaseId;
 use crate::schema::{Schema, SchemaId};
 
@@ -70,7 +70,7 @@ pub enum Payload {
     /// [`Payload::into_json`] treating it as an error).
     Typed(std::sync::Arc<dyn std::any::Any + Send + Sync>),
     /// The waist representation: plain JSON.
-    Json(JsonValue),
+    Json(Json),
 }
 
 impl std::fmt::Display for Address {
@@ -99,13 +99,16 @@ pub struct Event {
     /// The event's schema.
     pub schema: SchemaId,
     /// The event's JSON payload.
-    pub payload: JsonValue,
+    pub payload: Json,
 }
 
 impl Event {
     /// Creates an event from a schema id and JSON payload.
-    pub fn new(schema: SchemaId, payload: JsonValue) -> Self {
-        Self { schema, payload }
+    pub fn new(schema: SchemaId, payload: impl Into<Json>) -> Self {
+        Self {
+            schema,
+            payload: payload.into(),
+        }
     }
 
     /// Decodes the payload into the typed fact `T`, matching by schema id
@@ -124,7 +127,7 @@ impl Event {
         if self.schema != T::schema_id() {
             return None;
         }
-        serde_json::from_value(self.payload.clone()).ok()
+        serde_json::from_value(self.payload.0.clone()).ok()
     }
 
     /// Whether this event's schema is exactly `T`'s (`name@version`).
@@ -175,23 +178,24 @@ pub struct RecordedOrigin {
 
 impl Envelope {
     /// Assembles a JSON envelope — the waist representation.
-    pub fn json(schema: SchemaId, dest: Address, payload: JsonValue, trace: TraceCtx) -> Self {
+    pub fn json(schema: SchemaId, dest: Address, payload: impl Into<Json>, trace: TraceCtx) -> Self {
         Self {
             schema,
             dest,
             from: None,
             reply_to: None,
             trace,
-            payload: Payload::Json(payload),
+            payload: Payload::Json(payload.into()),
             recorded_origin: None,
         }
     }
 
     /// The JSON view of the payload (the waist representation).
-    pub fn payload_json(&self) -> &JsonValue {
+    pub fn payload_json(&self) -> &Json {
+        static NULL: std::sync::OnceLock<Json> = std::sync::OnceLock::new();
         match &self.payload {
             Payload::Json(value) => value,
-            Payload::Typed(_) => &JsonValue::Null,
+            Payload::Typed(_) => NULL.get_or_init(Json::default),
         }
     }
 
@@ -242,7 +246,7 @@ impl Envelope {
     }
 
     /// The payload as JSON, if it is already at the waist.
-    pub fn as_json(&self) -> Option<&JsonValue> {
+    pub fn as_json(&self) -> Option<&Json> {
         match &self.payload {
             Payload::Json(value) => Some(value),
             Payload::Typed(_) => None,
@@ -253,7 +257,7 @@ impl Envelope {
     ///
     /// Typed payloads require the type to be JSON-encodable; this is the
     /// single encode point for the fast path.
-    pub fn into_json(self) -> Result<JsonValue, Payload> {
+    pub fn into_json(self) -> Result<Json, Payload> {
         match self.payload {
             Payload::Json(value) => Ok(value),
             typed @ Payload::Typed(_) => Err(typed),
@@ -264,7 +268,7 @@ impl Envelope {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde_json::json;
+    use crate::json;
 
     #[test]
     fn address_survives_serde_roundtrip_for_each_variant() {
@@ -597,7 +601,7 @@ mod events_tests {
     use crate::actor::EventSourcedActor as _;
     use crate::context::CmdCtx;
     use serde::Deserialize;
-    use serde_json::json;
+    use crate::json;
 
     #[derive(Serialize, Deserialize)]
     struct Deposited {
@@ -694,6 +698,7 @@ mod events_tests {
 
     /// A fact whose serialization fails (injected via a hand-rolled impl).
     #[derive(Clone, Copy)]
+    #[allow(dead_code)] // the payload value never serializes; that's the test
     struct Unserializable {
         bad: f64,
     }
@@ -786,7 +791,7 @@ mod events_tests {
         fn manifest() -> crate::schema::ActorManifest {
             crate::schema::ActorManifest::new()
         }
-        fn restore(_args: &JsonValue) -> Self {
+        fn restore(_args: &Json) -> Self {
             Self::default()
         }
         fn apply(&mut self, event: &Event) {

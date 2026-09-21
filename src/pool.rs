@@ -11,6 +11,7 @@
 //! `send_to_any` — the route table already round-robins one-of sends.)
 
 use crate::actor::ActorPath;
+use crate::json::Json;
 use crate::schema::SchemaId;
 
 /// Where a rule places an observer relative to the flow it watches.
@@ -58,14 +59,14 @@ pub struct PartitionSpec {
     /// naming and the activation moment.
     #[allow(clippy::type_complexity)]
     pub factory: std::sync::Arc<
-        dyn Fn(&crate::system::ActorSystem, &ActorPath, &serde_json::Value) + Send + Sync,
+        dyn Fn(&crate::system::ActorSystem, &ActorPath, &Json) + Send + Sync,
     >,
     /// The command field carrying the shard key (extracted per envelope).
     /// Must be marked [`crate::schema::FieldRole::ShardKey`] in at least one
     /// handled command schema — validated at install (refuse-to-lie).
     pub key_field: String,
     /// Genesis args template: the derived key is merged in as `"key"`.
-    pub args_template: Option<serde_json::Value>,
+    pub args_template: Option<Json>,
     /// Spawn opts for activated entities (snapshot cadence, mailbox).
     pub opts: crate::system::SpawnOpts,
 }
@@ -73,13 +74,14 @@ pub struct PartitionSpec {
 impl PartitionSpec {
     /// The genesis args for one entity: the template with the extracted
     /// shard key merged in as `"key"` (so `restore` seeds per-entity state).
-    pub fn entity_args(&self, key: &str) -> serde_json::Value {
-        let mut merged = match &self.args_template {
-            Some(serde_json::Value::Object(map)) => map.clone(),
+    pub fn entity_args(&self, key: &str) -> Json {
+        let merged = match &self.args_template {
+            Some(Json(serde_json::Value::Object(map))) => map.clone(),
             _ => serde_json::Map::new(),
         };
+        let mut merged = merged;
         merged.insert("key".into(), serde_json::Value::String(key.to_owned()));
-        serde_json::Value::Object(merged)
+        Json(serde_json::Value::Object(merged))
     }
 }
 
@@ -116,7 +118,7 @@ pub struct ProjectorSetSpec {
     /// naming and the activation moment.
     #[allow(clippy::type_complexity)]
     pub factory: std::sync::Arc<
-        dyn Fn(&crate::system::ActorSystem, &ActorPath, &serde_json::Value) + Send + Sync,
+        dyn Fn(&crate::system::ActorSystem, &ActorPath, &Json) + Send + Sync,
     >,
     /// The consumed-fact field carrying the shard key (extracted per
     /// broadcast copy). Must be marked
@@ -126,7 +128,7 @@ pub struct ProjectorSetSpec {
     /// Genesis args template: the derived key is merged in as `"key"`
     /// (a projector's fold genesis is `Default`, so this rides the
     /// manifest/export — the factory may consume it).
-    pub args_template: Option<serde_json::Value>,
+    pub args_template: Option<Json>,
     /// Spawn opts for activated projectors (snapshot cadence, mailbox,
     /// passivation).
     pub opts: crate::system::SpawnOpts,
@@ -139,13 +141,14 @@ pub struct ProjectorSetSpec {
 impl ProjectorSetSpec {
     /// The genesis args for one projector: the template with the
     /// extracted shard key merged in as `"key"`.
-    pub fn entity_args(&self, key: &str) -> serde_json::Value {
-        let mut merged = match &self.args_template {
-            Some(serde_json::Value::Object(map)) => map.clone(),
+    pub fn entity_args(&self, key: &str) -> Json {
+        let merged = match &self.args_template {
+            Some(Json(serde_json::Value::Object(map))) => map.clone(),
             _ => serde_json::Map::new(),
         };
+        let mut merged = merged;
         merged.insert("key".into(), serde_json::Value::String(key.to_owned()));
-        serde_json::Value::Object(merged)
+        Json(serde_json::Value::Object(merged))
     }
 }
 
@@ -166,7 +169,7 @@ impl std::fmt::Debug for ProjectorSetSpec {
 pub fn extract_shard_key(
     schema: &crate::schema::SchemaDef,
     key_field: &str,
-    payload: &serde_json::Value,
+    payload: &Json,
 ) -> Option<String> {
     let field_ty = schema
         .fields

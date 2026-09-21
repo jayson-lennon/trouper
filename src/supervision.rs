@@ -8,7 +8,6 @@
 //! parent handles) to the parent.
 
 use serde::{Deserialize, Serialize};
-use serde_json::json;
 use std::collections::VecDeque;
 use std::time::Duration;
 
@@ -91,12 +90,12 @@ pub struct ActorSpec {
     /// Exponential backoff between restarts.
     pub backoff: Backoff,
     /// Genesis args (reused at every restart — the child's config).
-    pub args: serde_json::Value,
+    pub args: crate::json::Json,
     /// The spawn closure the kernel calls to rebuild the child. Returns
     /// Ok(()) after the child runs again; the kernel drives restarts.
     #[allow(clippy::type_complexity)]
     pub spawn: std::sync::Arc<
-        dyn Fn(&crate::system::ActorSystem, &crate::actor::ActorPath, &serde_json::Value)
+        dyn Fn(&crate::system::ActorSystem, &crate::actor::ActorPath, &crate::json::Json)
             + Send
             + Sync,
     >,
@@ -116,8 +115,8 @@ impl std::fmt::Debug for ActorSpec {
 
 impl ActorSpec {
     /// The JSON control envelope the engine escalates to the parent.
-    pub fn escalation_message(&self, reason: &str) -> serde_json::Value {
-        json!({
+    pub fn escalation_message(&self, reason: &str) -> crate::json::Json {
+        crate::json!({
             "escalated": self.path.to_string(),
             "reason": reason,
         })
@@ -263,7 +262,7 @@ mod tests {
         let spec_path = crate::actor::ActorPath::new("worker");
 
         // When the escalation message is built.
-        let message = json!({
+        let message = crate::json!({
             "escalated": spec_path.to_string(),
             "reason": "budget exhausted",
         });

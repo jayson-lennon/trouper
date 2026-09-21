@@ -8,9 +8,9 @@
 
 use std::collections::{BTreeMap, HashMap};
 
-use serde_json::Value as JsonValue;
 use tokio::sync::mpsc;
 
+use crate::json::Json;
 use crate::actor::{ActorKind, ActorPath};
 use crate::envelope::Envelope;
 use crate::schema::SchemaId;
@@ -163,7 +163,7 @@ impl SchemaTable {
     /// Returns an error when `json` is not a valid [`SchemaDef`].
     pub fn register_json(
         &mut self,
-        json: JsonValue,
+        json: Json,
     ) -> Result<SchemaId, error_stack::Report<SchemaError>> {
         let def = SchemaDef::from_json(json)?;
         Ok(self.register(def))
@@ -253,7 +253,7 @@ impl Registry {
     /// Returns an error when `json` is not a valid [`SchemaDef`].
     pub fn register_schema_json(
         &mut self,
-        json: JsonValue,
+        json: Json,
     ) -> Result<SchemaId, error_stack::Report<SchemaError>> {
         self.schemas.register_json(json)
     }
@@ -655,7 +655,7 @@ impl Registry {
 mod tests {
     use super::*;
     use crate::envelope::TraceCtx;
-    use serde_json::json;
+    use crate::json;
 
     fn manifest(kind: ActorKind) -> ActorManifest {
         ActorManifest::new().kind(kind)

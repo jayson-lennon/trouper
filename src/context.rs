@@ -16,7 +16,7 @@ use crate::envelope::{Address, Envelope, TraceCtx};
 use crate::kernel::AskOutcome;
 use crate::schema::Message;
 use crate::schema::SchemaId;
-use serde_json::Value as JsonValue;
+use crate::json::Json;
 
 /// Read-only runtime view for handlers: registry lookups plus the clock.
 ///
@@ -46,7 +46,7 @@ pub(crate) enum Intent {
         /// The reply schema (tracing) — may be the request's schema id.
         schema: SchemaId,
         /// The reply payload.
-        payload: JsonValue,
+        payload: Json,
         /// The trace of the message being replied to (causality links).
         trace: TraceCtx,
     },
@@ -98,7 +98,7 @@ impl Outbox {
         &mut self,
         to: Address,
         schema: SchemaId,
-        payload: JsonValue,
+        payload: Json,
         trace: TraceCtx,
     ) {
         self.intents.push(Intent::Reply {
@@ -141,7 +141,7 @@ pub(crate) type AskChannelFuture = std::pin::Pin<
                 Output = Result<
                     (
                         crate::reply::LeaseId,
-                        tokio::sync::oneshot::Receiver<JsonValue>,
+                        tokio::sync::oneshot::Receiver<Json>,
                     ),
                     error_stack::Report<AskError>,
                 >,
@@ -263,7 +263,7 @@ pub(crate) trait AskPort: Send + Sync {
         &self,
         dest: Address,
         schema: SchemaId,
-        payload: JsonValue,
+        payload: Json,
         ttl: std::time::Duration,
     ) -> AskChannelFuture;
 
@@ -299,10 +299,10 @@ pub(crate) async fn ask_via_port(
     port: &dyn AskPort,
     dest: Address,
     schema: SchemaId,
-    payload: JsonValue,
+    payload: Json,
     timeout: std::time::Duration,
     trace: TraceCtx,
-) -> Result<JsonValue, error_stack::Report<AskError>> {
+) -> Result<Json, error_stack::Report<AskError>> {
     use error_stack::ResultExt;
     let dest_label = format!("{dest:?}");
     let (lease, mut receiver) = port
@@ -311,7 +311,7 @@ pub(crate) async fn ask_via_port(
         .change_context(AskError::Unresolved(format!("{dest:?}")))?;
     let outcome = match tokio::time::timeout(timeout, &mut receiver).await {
         Ok(Ok(reply)) => Some((AskOutcome::Replied, reply)),
-        Ok(Err(_)) => Some((AskOutcome::Failed, JsonValue::Null)),
+        Ok(Err(_)) => Some((AskOutcome::Failed, Json::default())),
         Err(_) => None,
     };
     match outcome {
@@ -362,7 +362,7 @@ impl<'a> MsgCtx<'a> {
         &mut self,
         dest: Address,
         schema: SchemaId,
-        payload: JsonValue,
+        payload: Json,
         reply_to: Option<Address>,
     ) {
         let mut envelope = Envelope::json(schema, dest, payload, self.core.child_trace())
@@ -376,7 +376,7 @@ impl<'a> MsgCtx<'a> {
     /// Escape hatch: records a broadcast with an explicit schema id and
     /// hand-built payload. The envelope's destination is the schema
     /// address itself — the trace's `dest` reads as the fan-out target.
-    pub(crate) fn publish_json(&mut self, schema: SchemaId, payload: JsonValue) {
+    pub(crate) fn publish_json(&mut self, schema: SchemaId, payload: Json) {
         let envelope = Envelope::json(
             schema.clone(),
             Address::Schema(schema),
@@ -389,7 +389,7 @@ impl<'a> MsgCtx<'a> {
 
     /// Records a reply with an explicit schema id and hand-built payload.
     /// Same silent-drop contract as [`MsgCtx::reply`].
-    pub(crate) fn reply_json(&mut self, schema: SchemaId, payload: JsonValue) {
+    pub(crate) fn reply_json(&mut self, schema: SchemaId, payload: Json) {
         if let Some(reply_to) = self.core.reply_to() {
             self.core
                 .outbox
@@ -428,9 +428,9 @@ impl<'a> MsgCtx<'a> {
         &mut self,
         dest: Address,
         schema: SchemaId,
-        payload: JsonValue,
+        payload: Json,
         timeout: std::time::Duration,
-    ) -> Result<JsonValue, error_stack::Report<AskError>> {
+    ) -> Result<Json, error_stack::Report<AskError>> {
         let port = self.port.expect("ask requires a port (service tier)");
         ask_via_port(port, dest, schema, payload, timeout, *self.core.trace).await
     }
@@ -458,8 +458,8 @@ impl<'a> MsgCtx<'a> {
         dest: Address,
         req: &M,
         timeout: std::time::Duration,
-    ) -> Result<JsonValue, error_stack::Report<AskError>> {
-        let payload = serde_json::to_value(req).expect("schema payload serializes");
+    ) -> Result<Json, error_stack::Report<AskError>> {
+        let payload = Json::of(req);
         self.ask_json(dest, M::schema_id(), payload, timeout).await
     }
 
@@ -469,7 +469,7 @@ impl<'a> MsgCtx<'a> {
     /// [`MsgCtx::publish`] — news (publish) reaches everyone, work
     /// (send_to_any) reaches one. Zero handlers ⇒ dead-letter on flush.
     pub fn send_to_any<M: Message>(&mut self, msg: &M) {
-        let payload = serde_json::to_value(msg).expect("schema payload serializes");
+        let payload = Json::of(&msg);
         let schema = M::schema_id();
         self.send_json(Address::Schema(schema.clone()), schema, payload, None);
     }
@@ -477,7 +477,7 @@ impl<'a> MsgCtx<'a> {
     /// Records a send to `dest` (deferred; the kernel flushes post-ack).
     /// Typed: the schema id comes from the message type.
     pub fn send<M: Message>(&mut self, dest: Address, msg: &M, reply_to: Option<Address>) {
-        let payload = serde_json::to_value(msg).expect("schema payload serializes");
+        let payload = Json::of(&msg);
         self.send_json(dest, M::schema_id(), payload, reply_to);
     }
 
@@ -485,7 +485,7 @@ impl<'a> MsgCtx<'a> {
     /// the schema id comes from the message type. Zero subscribers ⇒
     /// silent no-op: events are news, not work orders.
     pub fn publish<M: Message>(&mut self, msg: &M) {
-        let payload = serde_json::to_value(msg).expect("schema payload serializes");
+        let payload = Json::of(&msg);
         self.publish_json(M::schema_id(), payload);
     }
 
@@ -495,7 +495,7 @@ impl<'a> MsgCtx<'a> {
     /// so the fact is unobservable by definition. It is NEVER a broadcast —
     /// use [`MsgCtx::publish`] for events.
     pub fn reply<M: Message>(&mut self, msg: M) {
-        let payload = serde_json::to_value(&msg).expect("schema payload serializes");
+        let payload = Json::of(&msg);
         self.reply_json(M::schema_id(), payload);
     }
 
@@ -872,7 +872,7 @@ mod tests {
 
             // When replying the same outcome both ways.
             typed.reply(Reserved { ok: true });
-            raw.reply_json(Reserved::schema_id(), serde_json::json!({ "ok": true }));
+            raw.reply_json(Reserved::schema_id(), crate::json!({ "ok": true }));
         }
 
         // Then the drained intents are identical.
@@ -920,7 +920,7 @@ mod tests {
         }
         {
             let mut raw = MsgCtx::new(&path, &trace, None, &view, &mut raw_outbox, None);
-            raw.publish_json(StockReserved::schema_id(), serde_json::json!({ "qty": 2 }));
+            raw.publish_json(StockReserved::schema_id(), crate::json!({ "qty": 2 }));
         }
 
         // Then the broadcast intents are identical.
@@ -963,7 +963,7 @@ mod tests {
             raw.send_json(
                 Address::Path(ActorPath::new("inventory")),
                 ReserveStock::schema_id(),
-                serde_json::json!({ "qty": 2 }),
+                crate::json!({ "qty": 2 }),
                 None,
             );
         }

@@ -9,7 +9,8 @@
 
 use std::collections::VecDeque;
 
-use serde_json::json;
+use crate::json::Json;
+use crate::json;
 
 use crate::actor::{ActorKind, ActorPath, StopReason};
 use crate::envelope::{Address, TraceCtx};
@@ -103,7 +104,7 @@ pub enum FactKind {
 impl Fact {
     /// The JSON projection (the tap boundary — serialization lives HERE
     /// and nowhere else).
-    pub fn to_json(&self) -> serde_json::Value {
+    pub fn to_json(&self) -> Json {
         let base = json!({
             "offset": self.offset,
             "ts": self.ts.as_millis(),

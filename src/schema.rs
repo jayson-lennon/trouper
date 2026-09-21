@@ -6,8 +6,9 @@
 //! Rust type. `SchemaId`s embed their version (`name@version`) from day one.
 
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
-use serde_json::Value as JsonValue;
 use std::sync::Arc;
+
+use crate::json::Json;
 
 /// Errors surfaced while parsing schema descriptors.
 #[derive(Debug, wherror::Error)]
@@ -172,9 +173,9 @@ impl SchemaDef {
     ///
     /// Returns [`SchemaError::InvalidDescriptor`] when `json` is not a valid
     /// [`SchemaDef`].
-    pub fn from_json(json: JsonValue) -> Result<Self, error_stack::Report<SchemaError>> {
+    pub fn from_json(json: Json) -> Result<Self, error_stack::Report<SchemaError>> {
         use error_stack::ResultExt;
-        serde_json::from_value(json).change_context(SchemaError::InvalidDescriptor)
+        json.decode::<Self>().change_context(SchemaError::InvalidDescriptor)
     }
 
     /// The schema's stable identifier (`name@version`).
@@ -183,8 +184,8 @@ impl SchemaDef {
     }
 
     /// Serializes the descriptor to JSON — the export/canvas projection.
-    pub fn to_json(&self) -> JsonValue {
-        serde_json::to_value(self).unwrap_or(JsonValue::Null)
+    pub fn to_json(&self) -> Json {
+        Json::of(self)
     }
 
     /// The name of the field carrying `role`, if any.
@@ -338,7 +339,7 @@ impl std::fmt::Display for SchemaId {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde_json::json;
+    use crate::json;
 
     /// A test command with a hand-written schema (no macros, per spec).
     struct ReserveStock {
@@ -530,9 +531,9 @@ mod field_role_tests {
     #[test]
     fn old_descriptor_json_without_role_deserializes() {
         // Given a descriptor JSON from before FieldRole existed.
-        let raw = serde_json::json!({ "name": "n", "ty": "int" });
+        let raw = crate::json!({ "name": "n", "ty": "int" });
         // When deserialized.
-        let f: FieldDef = serde_json::from_value(raw).expect("old shape");
+        let f: FieldDef = raw.decode().expect("old shape");
         // Then role defaults to None.
         assert_eq!(f.role, None);
     }

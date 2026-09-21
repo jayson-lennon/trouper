@@ -16,6 +16,7 @@ pub mod context;
 pub mod envelope;
 pub mod inbox;
 pub mod journal;
+pub mod json;
 pub mod kernel;
 pub mod pool;
 pub mod registry;
@@ -25,6 +26,8 @@ pub mod state_report;
 pub mod supervision;
 pub mod system;
 pub mod tap;
+
+pub use crate::json::Json;
 
 /// Everything a typical actor author needs.
 pub mod prelude {
@@ -37,6 +40,7 @@ pub mod prelude {
     pub use crate::envelope::*;
     pub use crate::inbox::InboxOffset;
     pub use crate::journal::SeqNo;
+    pub use crate::json::Json;
     pub use crate::kernel::DeadLetterReason;
     pub use crate::pool::{PartitionSpec, ProjectorSetSpec};
     pub use crate::reply::LeaseId;

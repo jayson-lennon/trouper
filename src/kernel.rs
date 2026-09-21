@@ -22,7 +22,6 @@ use std::collections::{HashMap, HashSet};
 use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
 
-use serde_json::Value as JsonValue;
 use tokio::sync::{Notify, mpsc, watch};
 
 use serde::{Deserialize, Serialize};
@@ -32,6 +31,7 @@ use crate::context::{CmdCtx, Outbox, RuntimeView};
 use crate::envelope::{Address, Envelope, TraceCtx};
 use crate::inbox::Inbox;
 use crate::journal::{JournalEntry, JournalError};
+use crate::json::Json;
 use crate::registry::{Endpoint, Registry};
 use crate::schema::SchemaId;
 
@@ -111,7 +111,7 @@ pub(crate) struct KernelState {
     /// Per-actor async message dispatch entries.
     pub(crate) msg_entries: HashMap<ActorPath, Vec<Arc<dyn MsgEntry>>>,
     /// Spawn args (genesis rebuild needs them at restart time).
-    pub(crate) genesis_args: HashMap<ActorPath, JsonValue>,
+    pub(crate) genesis_args: HashMap<ActorPath, Json>,
     /// Paths whose loop died to a handler panic (awaiting supervision).
     pub(crate) crashed: HashSet<ActorPath>,
     /// Envelopes that could not be delivered or decoded.
@@ -496,7 +496,7 @@ async fn resolve_partition(
 /// Schema-aware shard-key extraction from an envelope's payload.
 fn extract_key(registry: &Mutex<Registry>, envelope: &Envelope, key_field: &str) -> Option<String> {
     let reg = registry.lock();
-    let payload = envelope.as_json().cloned().unwrap_or(JsonValue::Null);
+    let payload = envelope.as_json().cloned().unwrap_or(Json::default());
     match reg.schema(&envelope.schema) {
         Some(def) => crate::pool::extract_shard_key(def, key_field, &payload),
         None => payload
@@ -817,7 +817,7 @@ async fn recover_at_boot(ctx: &EsLoop) {
             .genesis_args
             .get(&ctx.path)
             .cloned()
-            .unwrap_or_else(|| serde_json::json!({}))
+            .unwrap_or_else(Json::default)
     };
     let fresh = {
         let old = old.lock().await;
@@ -901,7 +901,7 @@ async fn step_es(ctx: &EsLoop) -> Step {
         let payload = envelope
             .as_json()
             .cloned()
-            .unwrap_or(serde_json::Value::Null);
+            .unwrap_or(Json::default());
         let mut cmd_ctx = CmdCtx::new(
             &ctx.path,
             &envelope.trace,
@@ -1219,7 +1219,7 @@ impl crate::context::AskPort for KernelAskPort {
         &self,
         dest: Address,
         schema: SchemaId,
-        payload: JsonValue,
+        payload: Json,
         ttl: std::time::Duration,
     ) -> std::pin::Pin<
         Box<
@@ -1227,7 +1227,7 @@ impl crate::context::AskPort for KernelAskPort {
                     Output = Result<
                         (
                             crate::reply::LeaseId,
-                            tokio::sync::oneshot::Receiver<JsonValue>,
+                            tokio::sync::oneshot::Receiver<Json>,
                         ),
                         error_stack::Report<crate::context::AskError>,
                     >,
@@ -1455,7 +1455,7 @@ async fn resolve_reply(
     registry: &Mutex<Registry>,
     to: Address,
     schema: SchemaId,
-    payload: JsonValue,
+    payload: Json,
     trace: TraceCtx,
 ) {
     match to {
@@ -1920,7 +1920,7 @@ async fn step_service(ctx: &ServiceLoop) -> Step {
     let payload = envelope
         .as_json()
         .cloned()
-        .unwrap_or(serde_json::Value::Null);
+        .unwrap_or(Json::default());
     let decoded = match entry.decode(&payload) {
         Ok(msg) => msg,
         Err(report) => {
@@ -2010,7 +2010,7 @@ async fn step_service(ctx: &ServiceLoop) -> Step {
 /// Propagates rebuild failures (a corrupt snapshot or undecodable state).
 pub(crate) async fn restart_es(
     ctx: &EsLoop,
-    genesis_args: &JsonValue,
+    genesis_args: &Json,
 ) -> Result<(), error_stack::Report<JournalError>> {
     // Replay input comes from the STORE (load reflects buffered state).
     // A supervised child ALWAYS rebuilds: a crash before the first append
@@ -2212,7 +2212,7 @@ pub async fn supervise_child(
                     .genesis_args
                     .get(&spec.path)
                     .cloned()
-                    .unwrap_or(JsonValue::Object(serde_json::Map::new()))
+                    .unwrap_or_else(|| crate::json!({}))
             };
             restart_es(&ctx, &genesis_args)
                 .await

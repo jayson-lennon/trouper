@@ -11,13 +11,13 @@
 //! [`ActorSystem::es_state`], which is how a bridge detects that a fresh
 //! report has landed.
 
+use crate::json::Json;
 use crate::actor::ActorKind;
 use crate::actor::{CommandHandler, EventSourcedActor};
 use crate::context::CmdCtx;
 use crate::envelope::{Event, Events};
 use crate::schema::{ActorManifest, FieldDef, FieldTy, Schema, SchemaDef, SchemaKind};
 use serde::Deserialize;
-use serde_json::Value;
 
 /// Ask the reporter to record the attached export document.
 ///
@@ -28,7 +28,7 @@ use serde_json::Value;
 #[derive(Deserialize)]
 pub struct ReportState {
     /// The captured `SystemExport` document.
-    pub export: Value,
+    pub export: Json,
 }
 
 impl Schema for ReportState {
@@ -75,7 +75,7 @@ impl Schema for StateReported {
 #[derive(serde::Serialize, serde::Deserialize, Default)]
 pub struct StateReporter {
     seq: u64,
-    export: Option<Value>,
+    export: Option<Json>,
 }
 
 impl EventSourcedActor for StateReporter {
@@ -86,7 +86,7 @@ impl EventSourcedActor for StateReporter {
             .kind(ActorKind::EventSourced)
     }
 
-    fn restore(_args: &Value) -> Self {
+    fn restore(_args: &Json) -> Self {
         Self::default()
     }
 
@@ -115,9 +115,9 @@ mod tests {
     use crate::context::{CmdCtx, Outbox, RuntimeView};
     use crate::envelope::TraceCtx;
     use crate::schema::SchemaId;
-    use serde_json::json;
+    use crate::json;
 
-    fn test_export(actors: usize) -> Value {
+    fn test_export(actors: usize) -> Json {
         json!({ "actors": [{ "path": format!("actor-{actors}") }] })
     }
 

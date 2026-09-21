@@ -13,8 +13,8 @@
 
 use std::sync::Arc;
 
-use serde_json::Value as JsonValue;
 
+use crate::json::Json;
 use crate::actor::{ActorKind, ActorPath};
 use crate::actor::{
     CommandEntry, ForeignCommandEntry, ForeignDecision, ForeignEsState, ForeignFold, MsgEntry,
@@ -41,7 +41,7 @@ pub fn spawn_es_builder<A: crate::actor::EventSourcedActor>(
     SpawnBuilder {
         system: system.clone(),
         path: None,
-        args: JsonValue::Null,
+        args: Json::default(),
         entries: Vec::new(),
         emits: Vec::new(),
         opts: SpawnOpts::default(),
@@ -56,7 +56,7 @@ pub fn spawn_service_builder<A: ServiceActor>(
     ServiceBuilder {
         system: system.clone(),
         path: None,
-        args: JsonValue::Null,
+        args: Json::default(),
         start_override: None,
         entries: Vec::new(),
         emits: Vec::new(),
@@ -71,7 +71,7 @@ pub fn spawn_foreign(system: &crate::system::ActorSystem) -> ForeignBuilder {
         system: system.clone(),
         path: None,
         schema_json: None,
-        genesis: JsonValue::Object(serde_json::Map::new()),
+        genesis: crate::json!({}),
         emits: Vec::new(),
         decision: None,
         fold: None,
@@ -85,7 +85,7 @@ pub fn spawn_foreign(system: &crate::system::ActorSystem) -> ForeignBuilder {
 pub struct SpawnBuilder<A: crate::actor::EventSourcedActor> {
     system: crate::system::ActorSystem,
     path: Option<ActorPath>,
-    args: JsonValue,
+    args: Json,
     entries: Vec<Arc<dyn CommandEntry>>,
     emits: Vec<SchemaId>,
     opts: SpawnOpts,
@@ -100,7 +100,7 @@ impl<A: crate::actor::EventSourcedActor> SpawnBuilder<A> {
     }
 
     /// Genesis arguments (seed state; snapshot restores need no args).
-    pub fn args(mut self, args: JsonValue) -> Self {
+    pub fn args(mut self, args: Json) -> Self {
         self.args = args;
         self
     }
@@ -213,7 +213,7 @@ impl<A: crate::actor::EventSourcedActor> SpawnBuilder<A> {
 pub struct ServiceBuilder<A: ServiceActor> {
     system: crate::system::ActorSystem,
     path: Option<ActorPath>,
-    args: JsonValue,
+    args: Json,
     start_override: Option<crate::system::ServiceStart>,
     entries: Vec<Arc<dyn MsgEntry>>,
     emits: Vec<SchemaId>,
@@ -229,7 +229,7 @@ impl<A: ServiceActor> ServiceBuilder<A> {
     }
 
     /// Start arguments (I/O allowed inside `start`).
-    pub fn args(mut self, args: JsonValue) -> Self {
+    pub fn args(mut self, args: Json) -> Self {
         self.args = args;
         self
     }
@@ -373,8 +373,8 @@ impl<A: ServiceActor> ServiceBuilder<A> {
 pub struct ForeignBuilder {
     system: crate::system::ActorSystem,
     path: Option<ActorPath>,
-    schema_json: Option<JsonValue>,
-    genesis: JsonValue,
+    schema_json: Option<Json>,
+    genesis: Json,
     emits: Vec<SchemaId>,
     decision: Option<ForeignDecision>,
     fold: Option<ForeignFold>,
@@ -390,13 +390,13 @@ impl ForeignBuilder {
 
     /// The command schema descriptor this foreign actor handles.
     /// Registered into the schema table at `start`.
-    pub fn schema(mut self, json: JsonValue) -> Self {
+    pub fn schema(mut self, json: Json) -> Self {
         self.schema_json = Some(json);
         self
     }
 
     /// Genesis JSON state.
-    pub fn args(mut self, genesis: JsonValue) -> Self {
+    pub fn args(mut self, genesis: Json) -> Self {
         self.genesis = genesis;
         self
     }
@@ -500,7 +500,7 @@ pub fn spawn_projector_builder<P: crate::actor::Projector>(
     ProjectorBuilder {
         system: system.clone(),
         path: None,
-        args: JsonValue::Null,
+        args: Json::default(),
         consumed: Vec::new(),
         opts: SpawnOpts::default(),
         _actor: std::marker::PhantomData,
@@ -513,7 +513,7 @@ pub fn spawn_projector_builder<P: crate::actor::Projector>(
 pub struct ProjectorBuilder<P: crate::actor::Projector> {
     system: crate::system::ActorSystem,
     path: Option<ActorPath>,
-    args: JsonValue,
+    args: Json,
     consumed: Vec<SchemaId>,
     opts: SpawnOpts,
     _actor: std::marker::PhantomData<fn(&P)>,
@@ -528,7 +528,7 @@ impl<P: crate::actor::Projector> ProjectorBuilder<P> {
 
     /// Spawn arguments (JSON). A projector's genesis is [`Default`]; args
     /// are carried for manifests/export only.
-    pub fn args(mut self, args: JsonValue) -> Self {
+    pub fn args(mut self, args: Json) -> Self {
         self.args = args;
         self
     }
@@ -613,7 +613,7 @@ impl<P: crate::actor::Projector> ProjectorBuilder<P> {
         crate::system::ActorSystem,
         ActorPath,
         Vec<SchemaId>,
-        JsonValue,
+        Json,
         SpawnOpts,
     ) {
         let ProjectorBuilder {

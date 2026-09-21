@@ -15,9 +15,9 @@
 use std::sync::Arc;
 
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
-use serde_json::Value as JsonValue;
 use std::fmt;
 
+use crate::json::Json;
 use crate::context::CmdCtx;
 use crate::journal::JournalError;
 use crate::schema::{ActorManifest, Schema, SchemaId};
@@ -42,7 +42,7 @@ pub trait EventSourcedActor: Send + Sync + Serialize + DeserializeOwned + 'stati
     /// Genesis state — a fresh instance (no snapshot exists).
     ///
     /// `args` are spawn arguments (JSON); use them to seed initial state.
-    fn restore(args: &JsonValue) -> Self;
+    fn restore(args: &Json) -> Self;
 
     /// THE mutation. Used for live application AND replay — one code path,
     /// so live state and replayed state can never diverge.
@@ -53,9 +53,9 @@ pub trait EventSourcedActor: Send + Sync + Serialize + DeserializeOwned + 'stati
     /// # Errors
     ///
     /// Fails when the state cannot be serialized to JSON.
-    fn capture(&self) -> Result<JsonValue, error_stack::Report<JournalError>> {
+    fn capture(&self) -> Result<Json, error_stack::Report<JournalError>> {
         use error_stack::ResultExt;
-        serde_json::to_value(self).change_context(JournalError::Snapshot)
+        Ok::<Json, error_stack::Report<JournalError>>(Json::of(self)).change_context(JournalError::Snapshot)
     }
 
     /// Snapshot seam: rebuild from a snapshot blob. Default = decode JSON.
@@ -67,9 +67,9 @@ pub trait EventSourcedActor: Send + Sync + Serialize + DeserializeOwned + 'stati
     /// # Errors
     ///
     /// Fails when the blob does not decode into this state type.
-    fn restore_from(snap: JsonValue) -> Result<Self, error_stack::Report<JournalError>> {
+    fn restore_from(snap: Json) -> Result<Self, error_stack::Report<JournalError>> {
         use error_stack::ResultExt;
-        serde_json::from_value(snap).change_context(JournalError::Restore)
+        snap.decode::<Self>().change_context(JournalError::Restore)
     }
 
     /// Graceful-stop hook: runs ONCE after the final inbox drain, with
@@ -141,7 +141,7 @@ pub trait ServiceActor: Send + 'static {
     ///
     /// Fails when the service cannot start (the spawn fails).
     fn start(
-        args: &JsonValue,
+        args: &Json,
     ) -> impl Future<Output = Result<Self, error_stack::Report<crate::registry::RegistryError>>> + Send
     where
         Self: Sized;
@@ -199,7 +199,7 @@ pub trait DynEsActor: Send {
     /// # Errors
     ///
     /// Propagates [`EventSourced::capture`] failures.
-    fn capture_erased(&self) -> Result<JsonValue, error_stack::Report<JournalError>>;
+    fn capture_erased(&self) -> Result<Json, error_stack::Report<JournalError>>;
 
     /// Rebuilds state: genesis, or snapshot + replay tail. Runs on spawn
     /// AND on restart after a panic — the poisoned instance is dropped,
@@ -210,8 +210,8 @@ pub trait DynEsActor: Send {
     /// Propagates [`EventSourced::restore_from`] failures.
     fn rebuild(
         &self,
-        args: &JsonValue,
-        snapshot: Option<JsonValue>,
+        args: &Json,
+        snapshot: Option<Json>,
         tail: &[crate::envelope::Event],
     ) -> Result<Box<dyn DynEsActor>, error_stack::Report<JournalError>>;
 
@@ -241,14 +241,14 @@ impl<A: EventSourcedActor> DynEsActor for TypedEsState<A> {
         self.state.apply(event);
     }
 
-    fn capture_erased(&self) -> Result<JsonValue, error_stack::Report<JournalError>> {
+    fn capture_erased(&self) -> Result<Json, error_stack::Report<JournalError>> {
         self.state.capture()
     }
 
     fn rebuild(
         &self,
-        args: &JsonValue,
-        snapshot: Option<JsonValue>,
+        args: &Json,
+        snapshot: Option<Json>,
         tail: &[crate::envelope::Event],
     ) -> Result<Box<dyn DynEsActor>, error_stack::Report<JournalError>> {
         let mut fresh: A = match snapshot {
@@ -288,7 +288,7 @@ pub trait CommandEntry: Send + Sync {
     fn dispatch(
         &self,
         state: &mut dyn DynEsActor,
-        payload: &JsonValue,
+        payload: &Json,
         ctx: &mut CmdCtx<'_>,
     ) -> Result<crate::envelope::Events, error_stack::Report<DispatchError>>;
 }
@@ -323,11 +323,11 @@ where
     fn dispatch(
         &self,
         state: &mut dyn DynEsActor,
-        payload: &JsonValue,
+        payload: &Json,
         ctx: &mut CmdCtx<'_>,
     ) -> Result<crate::envelope::Events, error_stack::Report<DispatchError>> {
         use error_stack::ResultExt;
-        let cmd: C = serde_json::from_value(payload.clone()).change_context(
+        let cmd: C = payload.decode::<C>().change_context(
             DispatchError::Decode(format!("command {} did not match its schema", self.schema)),
         )?;
 
@@ -369,15 +369,15 @@ impl<P: Projector> DynEsActor for TypedProjectorState<P> {
         self.state.apply(event);
     }
 
-    fn capture_erased(&self) -> Result<JsonValue, error_stack::Report<JournalError>> {
+    fn capture_erased(&self) -> Result<Json, error_stack::Report<JournalError>> {
         use error_stack::ResultExt;
-        serde_json::to_value(&self.state).change_context(JournalError::Snapshot)
+        Ok::<Json, error_stack::Report<JournalError>>(Json::of(&self.state)).change_context(JournalError::Snapshot)
     }
 
     fn rebuild(
         &self,
-        _args: &JsonValue,
-        snapshot: Option<JsonValue>,
+        _args: &Json,
+        snapshot: Option<Json>,
         tail: &[crate::envelope::Event],
     ) -> Result<Box<dyn DynEsActor>, error_stack::Report<JournalError>> {
         use error_stack::ResultExt;
@@ -385,7 +385,7 @@ impl<P: Projector> DynEsActor for TypedProjectorState<P> {
         // is derived entirely from the facts it folds. Snapshot or genesis,
         // then the fold runs over the tail exactly as the live path does.
         let mut fresh: P = match snapshot {
-            Some(snap) => serde_json::from_value(snap).change_context(JournalError::Restore)?,
+            Some(snap) => snap.decode::<P>().change_context(JournalError::Restore)?,
             None => P::default(),
         };
         for event in tail {
@@ -424,7 +424,7 @@ impl CommandEntry for ConsumeEntry {
     fn dispatch(
         &self,
         _state: &mut dyn DynEsActor,
-        payload: &JsonValue,
+        payload: &Json,
         _ctx: &mut CmdCtx<'_>,
     ) -> Result<crate::envelope::Events, error_stack::Report<DispatchError>> {
         let mut events = crate::envelope::Events::new();
@@ -438,7 +438,7 @@ impl CommandEntry for ConsumeEntry {
 
 /// A foreign actor's decision function: JSON state + JSON command → events.
 pub type ForeignDecision = Arc<
-    dyn Fn(&JsonValue, &JsonValue, &mut CmdCtx<'_>) -> Vec<crate::envelope::Event> + Send + Sync,
+    dyn Fn(&Json, &Json, &mut CmdCtx<'_>) -> Vec<crate::envelope::Event> + Send + Sync,
 >;
 
 /// The erased twin for actors defined entirely outside Rust: state is JSON,
@@ -448,24 +448,24 @@ pub type ForeignDecision = Arc<
 /// `capture` is a JSON clone because the state is already at the waist.
 #[derive(Clone)]
 pub struct ForeignEsState {
-    state: JsonValue,
+    state: Json,
     fold: ForeignFold,
 }
 
 impl ForeignEsState {
     /// Wraps foreign JSON state with its fold closure.
-    pub fn new(state: JsonValue, fold: ForeignFold) -> Self {
+    pub fn new(state: Json, fold: ForeignFold) -> Self {
         Self { state, fold }
     }
 
     /// The current JSON state.
-    pub fn state(&self) -> &JsonValue {
+    pub fn state(&self) -> &Json {
         &self.state
     }
 }
 
 /// A foreign actor's fold: JSON state + event → mutated state.
-pub type ForeignFold = Arc<dyn Fn(&mut JsonValue, &crate::envelope::Event) + Send + Sync>;
+pub type ForeignFold = Arc<dyn Fn(&mut Json, &crate::envelope::Event) + Send + Sync>;
 
 impl DynEsActor for ForeignEsState {
     fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
@@ -476,21 +476,21 @@ impl DynEsActor for ForeignEsState {
         (self.fold)(&mut self.state, event);
     }
 
-    fn capture_erased(&self) -> Result<JsonValue, error_stack::Report<JournalError>> {
+    fn capture_erased(&self) -> Result<Json, error_stack::Report<JournalError>> {
         Ok(self.state.clone())
     }
 
     fn rebuild(
         &self,
-        args: &JsonValue,
-        snapshot: Option<JsonValue>,
+        args: &Json,
+        snapshot: Option<Json>,
         tail: &[crate::envelope::Event],
     ) -> Result<Box<dyn DynEsActor>, error_stack::Report<JournalError>> {
         // Foreign rebuild: snapshot or a genesis shell, then the fold runs
         // over the tail exactly as the live path does (one code path).
         let mut fresh = match snapshot {
             Some(snap) => ForeignEsState::new(snap, self.fold.clone()),
-            None => ForeignEsState::new(serde_json::json!({ "args": args }), self.fold.clone()),
+            None => ForeignEsState::new(crate::json!({ "args": args }), self.fold.clone()),
         };
         for event in tail {
             fresh.apply_erased(event);
@@ -526,7 +526,7 @@ impl CommandEntry for ForeignCommandEntry {
     fn dispatch(
         &self,
         state: &mut dyn DynEsActor,
-        payload: &JsonValue,
+        payload: &Json,
         ctx: &mut CmdCtx<'_>,
     ) -> Result<crate::envelope::Events, error_stack::Report<DispatchError>> {
         // DECIDE ONLY (like the typed adapter): the foreign state folds the
@@ -592,7 +592,7 @@ pub trait MsgEntry: Send + Sync {
     /// [`DispatchError::Decode`] when the payload does not match.
     fn decode(
         &self,
-        payload: &JsonValue,
+        payload: &Json,
     ) -> Result<Box<dyn std::any::Any + Send>, error_stack::Report<DispatchError>>;
 
     /// Runs the typed handler against the boxed message (consumes it).
@@ -633,10 +633,10 @@ where
 
     fn decode(
         &self,
-        payload: &JsonValue,
+        payload: &Json,
     ) -> Result<Box<dyn std::any::Any + Send>, error_stack::Report<DispatchError>> {
         use error_stack::ResultExt;
-        let msg: M = serde_json::from_value(payload.clone()).change_context(
+        let msg: M = payload.decode::<M>().change_context(
             DispatchError::Decode(format!("message {} did not match its schema", self.schema)),
         )?;
         Ok(Box::new(msg))
@@ -679,7 +679,7 @@ mod tests {
     use crate::actor::{ActorKind, ActorPath};
     use crate::schema::{FieldDef, FieldTy, SchemaDef, SchemaKind};
     use serde::Deserialize;
-    use serde_json::json;
+    use crate::json;
 
     #[derive(Deserialize)]
     struct ReserveStock {
@@ -726,7 +726,7 @@ mod tests {
                 .kind(ActorKind::EventSourced)
         }
 
-        fn restore(_args: &JsonValue) -> Self {
+        fn restore(_args: &Json) -> Self {
             Self { count: 0 }
         }
 
@@ -912,7 +912,7 @@ mod tests {
         });
         let fold: ForeignFold = Arc::new(|state, event| {
             let qty = event.payload["qty"].as_i64().unwrap_or(0);
-            state["count"] = json!(state["count"].as_i64().unwrap_or(0) + qty);
+            state["count"] = serde_json::json!(state["count"].as_i64().unwrap_or(0) + qty);
         });
         let entry = ForeignCommandEntry::new(schema, decision);
         let mut state = ForeignEsState::new(json!({ "count": 0 }), fold);

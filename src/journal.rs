@@ -4,11 +4,11 @@
 //! scope (see spec Anti-Goals).
 
 use serde::{Deserialize, Serialize};
-use serde_json::Value as JsonValue;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-pub use crate::envelope::Event;
+pub use crate::json::Json;
+use crate::envelope::Event;
 
 /// Why an actor's journal holds a fact.
 ///
@@ -59,7 +59,7 @@ pub enum JournalEntry {
         /// Sequence of the last event folded into `state`.
         seq: SeqNo,
         /// The snapshot state (JSON at the waist).
-        state: JsonValue,
+        state: Json,
     },
 }
 
@@ -197,7 +197,7 @@ pub trait JournalStore: Send + Sync {
         &self,
         path: &crate::actor::ActorPath,
         seq: SeqNo,
-        state: JsonValue,
+        state: Json,
         now_ms: u64,
     ) -> Result<(), error_stack::Report<JournalError>>;
 
@@ -450,7 +450,7 @@ impl JournalStore for InMemoryJournalStore {
         &self,
         path: &crate::actor::ActorPath,
         seq: SeqNo,
-        state: JsonValue,
+        state: Json,
         now_ms: u64,
     ) -> Result<(), error_stack::Report<JournalError>> {
         let mut journals = self.journals.lock();
@@ -616,7 +616,7 @@ impl Journal {
 
     /// Appends a snapshot anchored at `seq` (the last folded event),
     /// stamped with `now_ms` for the time cadence.
-    pub fn append_snapshot(&mut self, seq: SeqNo, state: JsonValue, now_ms: u64) {
+    pub fn append_snapshot(&mut self, seq: SeqNo, state: Json, now_ms: u64) {
         self.last_snapshot_ms = Some(now_ms);
         self.entries.push(JournalEntry::Snapshot { seq, state });
     }
@@ -717,7 +717,7 @@ impl std::fmt::Display for SeqNo {
 mod tests {
     use super::*;
     use crate::schema::SchemaId;
-    use serde_json::json;
+    use crate::json;
 
     fn event(qty: i64) -> Event {
         Event::new(SchemaId::new("StockReserved", 1), json!({ "qty": qty }))

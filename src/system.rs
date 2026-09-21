@@ -9,7 +9,6 @@
 use parking_lot::Mutex;
 use std::sync::Arc;
 
-use serde_json::Value as JsonValue;
 
 use crate::actor::ActorPath;
 use crate::actor::{
@@ -23,6 +22,7 @@ use crate::envelope::{Address, Envelope, TraceCtx};
 use crate::inbox::InboxOffset;
 use crate::inbox::{Inbox, OverloadPolicy};
 pub use crate::kernel::DeadLetter;
+use crate::json::Json;
 use crate::kernel::{ActorCell, EsLoop, KernelState, route};
 use crate::registry::{Endpoint, EndpointInfo, Registry};
 use crate::schema::Schema;
@@ -385,7 +385,7 @@ pub struct ActorExport {
     /// The actor's declared edges.
     pub manifest: crate::schema::ActorManifest,
     /// Live ES state via `capture` (ES actors only).
-    pub state: Option<JsonValue>,
+    pub state: Option<Json>,
     /// The actor's inbox ack cursor (ES progress).
     pub cursor: Option<u64>,
 }
@@ -503,7 +503,7 @@ pub(crate) async fn catch_up_projector(
             match state_arc {
                 Some(state_arc) => {
                     let old = state_arc.lock().await;
-                    old.rebuild(&serde_json::json!({}), snapshot_state, &replay.tail)
+                    old.rebuild(&crate::json!({}), snapshot_state, &replay.tail)
                 }
                 None => return, // torn down mid-catch-up; nothing to seed into
             }
@@ -644,7 +644,7 @@ impl ActorSystemCore {
         &self,
         path: ActorPath,
         schema_id: SchemaId,
-        genesis: JsonValue,
+        genesis: Json,
         decision: crate::actor::ForeignDecision,
         fold: crate::actor::ForeignFold,
         opts: SpawnOpts,
@@ -778,7 +778,7 @@ impl ActorSystemCore {
     /// Returns an error when `json` is not a valid schema descriptor.
     pub fn register_schema_json(
         &self,
-        json: JsonValue,
+        json: Json,
     ) -> Result<SchemaId, error_stack::Report<crate::schema::SchemaError>> {
         let mut registry = self.registry.lock();
         registry.register_schema_json(json)
@@ -795,7 +795,7 @@ impl ActorSystemCore {
     /// Deprecated positional flavor — prefer the builder:
     /// [`crate::builder::spawn_es_builder`] (each type said once).
     #[doc(hidden)]
-    pub fn spawn_es<A, F>(&self, path: ActorPath, args: &JsonValue, opts: SpawnOpts, entries: F)
+    pub fn spawn_es<A, F>(&self, path: ActorPath, args: &Json, opts: SpawnOpts, entries: F)
     where
         A: EventSourcedActor,
         F: FnOnce() -> Vec<Arc<dyn CommandEntry>>,
@@ -814,7 +814,7 @@ impl ActorSystemCore {
         state: Box<dyn crate::actor::DynEsActor>,
         entries: Vec<Arc<dyn CommandEntry>>,
         opts: SpawnOpts,
-        args: &JsonValue,
+        args: &Json,
     ) {
         let armed = self.arm_es_erased(path, manifest, state, entries, opts, args);
         armed.start_loop();
@@ -835,7 +835,7 @@ impl ActorSystemCore {
         state: Box<dyn crate::actor::DynEsActor>,
         entries: Vec<Arc<dyn CommandEntry>>,
         opts: SpawnOpts,
-        args: &JsonValue,
+        args: &Json,
     ) -> ArmedEsActor {
         let opts = self.resolve_opts(opts);
         let (tx, rx) = tokio::sync::mpsc::channel::<Envelope>(opts.mailbox_capacity.max(1) * 2);
@@ -937,7 +937,7 @@ impl ActorSystemCore {
         &self,
         path: &ActorPath,
         consumed: &[crate::schema::SchemaId],
-        args: &JsonValue,
+        args: &Json,
         opts: SpawnOpts,
     ) -> ArmedEsActor {
         // handles = consumed (routes + entries), emits = consumed (the
@@ -967,7 +967,7 @@ impl ActorSystemCore {
     pub fn spawn_service<A, F>(
         &self,
         path: ActorPath,
-        args: &JsonValue,
+        args: &Json,
         opts: SpawnOpts,
         entries: F,
     ) where
@@ -992,7 +992,7 @@ impl ActorSystemCore {
         &self,
         path: ActorPath,
         manifest: crate::schema::ActorManifest,
-        args: &JsonValue,
+        args: &Json,
         entries: Vec<Arc<dyn MsgEntry>>,
         opts: SpawnOpts,
         start: ServiceStart,
@@ -1125,7 +1125,7 @@ impl ActorSystemCore {
     where
         C: Schema + serde::Serialize,
     {
-        let payload = serde_json::to_value(value).expect("schema payload serializes");
+        let payload = Json::of(&value);
         self.send(self.envelope(C::schema_id(), dest, payload))
             .await
     }
@@ -1151,7 +1151,7 @@ impl ActorSystemCore {
     where
         M: Schema + serde::Serialize,
     {
-        let payload = serde_json::to_value(value).expect("schema payload serializes");
+        let payload = Json::of(&value);
         let schema = M::schema_id();
         let envelope = Envelope::json(
             schema.clone(),
@@ -1187,11 +1187,11 @@ impl ActorSystemCore {
         dest: ActorPath,
         value: C,
         timeout: std::time::Duration,
-    ) -> Result<JsonValue, error_stack::Report<crate::context::AskError>>
+    ) -> Result<Json, error_stack::Report<crate::context::AskError>>
     where
         C: Schema + serde::Serialize,
     {
-        let payload = serde_json::to_value(value).expect("schema payload serializes");
+        let payload = Json::of(&value);
         let port = crate::kernel::KernelAskPort {
             registry: self.registry.clone(),
             kernel: self.kernel.clone(),
@@ -1226,7 +1226,7 @@ impl ActorSystemCore {
     where
         M: Schema + serde::Serialize,
     {
-        let payload = serde_json::to_value(value).expect("schema payload serializes");
+        let payload = Json::of(&value);
         let schema = M::schema_id();
         let envelope = Envelope::json(
             schema.clone(),
@@ -1244,7 +1244,7 @@ impl ActorSystemCore {
     /// contract as [`ActorSystem::publish`] — every `.handles` declarant
     /// of the schema, zero ⇒ silent no-op. The erased bridge closure's
     /// publish surface.
-    pub async fn publish_value(&self, schema: SchemaId, payload: JsonValue) {
+    pub async fn publish_value(&self, schema: SchemaId, payload: Json) {
         let envelope = Envelope::json(
             schema.clone(),
             Address::Schema(schema.clone()),
@@ -1261,7 +1261,7 @@ impl ActorSystemCore {
     /// silent no-op), Command schemas route to one handler (tell
     /// semantics, silent when unrouted). The declaration site decides;
     /// callers never choose a transport.
-    pub async fn deliver_schema_value(&self, schema: SchemaId, payload: JsonValue) {
+    pub async fn deliver_schema_value(&self, schema: SchemaId, payload: Json) {
         let kind = {
             let reg = self.registry.lock();
             reg.schema(&schema).map(|def| def.kind)
@@ -1288,8 +1288,8 @@ impl ActorSystemCore {
         }
     }
 
-    pub fn envelope(&self, schema: SchemaId, dest: ActorPath, payload: JsonValue) -> Envelope {
-        Envelope::json(schema, Address::Path(dest), payload, TraceCtx::root())
+    pub fn envelope(&self, schema: SchemaId, dest: ActorPath, payload: impl Into<Json>) -> Envelope {
+        Envelope::json(schema, Address::Path(dest), payload.into(), TraceCtx::root())
     }
 
     /// The system's clock (tests use this to reach the [`crate::clock::FakeClock`]).
@@ -1306,7 +1306,7 @@ impl ActorSystemCore {
     pub async fn restart_es(
         &self,
         path: &ActorPath,
-        genesis_args: &JsonValue,
+        genesis_args: &Json,
     ) -> Result<(), error_stack::Report<crate::journal::JournalError>> {
         let loop_ctx = {
             let kernel = self.kernel.lock();
@@ -1777,7 +1777,7 @@ impl ActorSystemCore {
     }
 
     /// The captured ES state of an actor (for export/inspection).
-    pub async fn es_state(&self, path: &ActorPath) -> Option<JsonValue> {
+    pub async fn es_state(&self, path: &ActorPath) -> Option<Json> {
         let state = {
             let kernel = self.kernel.lock();
             kernel.es_state.get(path).cloned()?
@@ -1870,7 +1870,7 @@ impl ActorSystem {
     /// wakes anything: es_state is a peek at in-memory state (None when
     /// cold), projector_state is the complete answer (wake + catch-up +
     /// capture).
-    pub async fn projector_state(&self, path: &ActorPath) -> Option<JsonValue> {
+    pub async fn projector_state(&self, path: &ActorPath) -> Option<Json> {
         // HOT: the projector is live — capture once it has no pending
         // work (a wake copy may still sit queued while its loop spins up;
         // the read waits, bounded, so the capture is the fold of
@@ -2148,7 +2148,7 @@ mod tests {
     use crate::context::CmdCtx;
     use crate::schema::{ActorManifest, FieldDef, FieldTy, SchemaDef, SchemaKind};
     use serde::{Deserialize, Serialize};
-    use serde_json::json;
+    use crate::json;
     use std::collections::HashMap;
 
     #[derive(Serialize, Deserialize)]
@@ -2214,7 +2214,7 @@ mod tests {
                 .emits::<Added>()
                 .kind(ActorKind::EventSourced)
         }
-        fn restore(_args: &JsonValue) -> Self {
+        fn restore(_args: &Json) -> Self {
             Self::default()
         }
         fn apply(&mut self, event: &crate::envelope::Event) {
@@ -2327,7 +2327,7 @@ mod tests {
                 ActorManifest::new().kind(ActorKind::Service)
             }
             async fn start(
-                _args: &JsonValue,
+                _args: &Json,
             ) -> Result<Self, error_stack::Report<crate::registry::RegistryError>> {
                 Ok(Self)
             }
@@ -2627,7 +2627,7 @@ mod tests {
                     .kind(ActorKind::Service)
             }
             async fn start(
-                _args: &JsonValue,
+                _args: &Json,
             ) -> Result<Self, error_stack::Report<crate::registry::RegistryError>> {
                 Ok(Self)
             }
@@ -2646,7 +2646,7 @@ mod tests {
                     .kind(ActorKind::Service)
             }
             async fn start(
-                _args: &JsonValue,
+                _args: &Json,
             ) -> Result<Self, error_stack::Report<crate::registry::RegistryError>> {
                 Ok(Self)
             }
@@ -2781,7 +2781,7 @@ mod tests {
                     .emits::<Added>()
                     .kind(ActorKind::EventSourced)
             }
-            fn restore(_args: &JsonValue) -> Self {
+            fn restore(_args: &Json) -> Self {
                 Self::default()
             }
             fn apply(&mut self, event: &crate::envelope::Event) {
@@ -2812,7 +2812,7 @@ mod tests {
                 factor: 2.0,
             },
             args: json!({}),
-            spawn: Arc::new(|sys: &ActorSystem, path: &ActorPath, args: &JsonValue| {
+            spawn: Arc::new(|sys: &ActorSystem, path: &ActorPath, args: &Json| {
                 sys.spawn_es::<Phoenix, _>(path.clone(), args, SpawnOpts::default(), || {
                     vec![Arc::new(TypedEsAdapter::<Phoenix, Add>::new::<Add>())]
                 });
@@ -2877,7 +2877,7 @@ mod tests {
                     .handles::<Add>()
                     .kind(ActorKind::EventSourced)
             }
-            fn restore(_args: &JsonValue) -> Self {
+            fn restore(_args: &Json) -> Self {
                 Self
             }
             fn apply(&mut self, _event: &crate::envelope::Event) {}
@@ -2901,7 +2901,7 @@ mod tests {
                     .kind(ActorKind::Service)
             }
             async fn start(
-                _args: &JsonValue,
+                _args: &Json,
             ) -> Result<Self, error_stack::Report<crate::registry::RegistryError>> {
                 Ok(Self)
             }
@@ -2962,7 +2962,7 @@ mod tests {
             },
             args: json!({}),
             spawn: Arc::new(
-                move |sys: &ActorSystem, path: &ActorPath, args: &JsonValue| {
+                move |sys: &ActorSystem, path: &ActorPath, args: &Json| {
                     let _ = (&spawner, &system_for_spec);
                     sys.spawn_es::<AlwaysBoom, _>(path.clone(), args, SpawnOpts::default(), || {
                         vec![Arc::new(TypedEsAdapter::<AlwaysBoom, Add>::new::<Add>())]
@@ -3040,7 +3040,7 @@ mod tests {
         // factory (the same closure the supervision engine would run).
         let spawn_closure = {
             let system = system.clone();
-            move |_sys: &ActorSystem, path: &ActorPath, _args: &JsonValue| {
+            move |_sys: &ActorSystem, path: &ActorPath, _args: &Json| {
                 let system = system.clone();
                 let path = path.to_owned();
                 let (idx, sink) = open_sink();
@@ -3157,7 +3157,7 @@ mod tests {
             fn manifest() -> ActorManifest {
                 ActorManifest::new().kind(ActorKind::EventSourced)
             }
-            fn restore(_args: &JsonValue) -> Self {
+            fn restore(_args: &Json) -> Self {
                 Self
             }
             fn apply(&mut self, _event: &crate::envelope::Event) {}
@@ -3175,7 +3175,7 @@ mod tests {
             budget: crate::supervision::RestartBudget::default(),
             backoff: crate::supervision::Backoff::default(),
             args: json!({}),
-            spawn: Arc::new(|sys: &ActorSystem, path: &ActorPath, args: &JsonValue| {
+            spawn: Arc::new(|sys: &ActorSystem, path: &ActorPath, args: &Json| {
                 sys.spawn_es::<Fragile, _>(path.clone(), args, SpawnOpts::default(), || {
                     vec![Arc::new(TypedEsAdapter::<Fragile, Add>::new::<Add>())]
                 });
@@ -3240,7 +3240,7 @@ mod tests {
                     budget: crate::supervision::RestartBudget::default(),
                     backoff: crate::supervision::Backoff::default(),
                     args: json!({}),
-                    spawn: Arc::new(|_sys: &ActorSystem, _path: &ActorPath, _args: &JsonValue| {}),
+                    spawn: Arc::new(|_sys: &ActorSystem, _path: &ActorPath, _args: &Json| {}),
                 },
             );
         }
@@ -3332,7 +3332,7 @@ mod tests {
         }
 
         async fn start(
-            args: &JsonValue,
+            args: &Json,
         ) -> Result<Self, error_stack::Report<crate::registry::RegistryError>> {
             let idx = args["sink"].as_u64().expect("sink index") as usize;
             let sink = sinks().lock()[idx].clone();
@@ -3407,7 +3407,7 @@ mod tests {
                     .kind(ActorKind::Service)
             }
             async fn start(
-                _args: &JsonValue,
+                _args: &Json,
             ) -> Result<Self, error_stack::Report<crate::registry::RegistryError>> {
                 Ok(Self)
             }
@@ -3426,7 +3426,7 @@ mod tests {
                     .kind(ActorKind::Service)
             }
             async fn start(
-                _args: &JsonValue,
+                _args: &Json,
             ) -> Result<Self, error_stack::Report<crate::registry::RegistryError>> {
                 Ok(Self)
             }
@@ -3506,7 +3506,7 @@ mod tests {
                     .kind(ActorKind::Service)
             }
             async fn start(
-                _args: &JsonValue,
+                _args: &Json,
             ) -> Result<Self, error_stack::Report<crate::registry::RegistryError>> {
                 Ok(Self)
             }
@@ -3523,7 +3523,7 @@ mod tests {
                     .kind(ActorKind::Service)
             }
             async fn start(
-                _args: &JsonValue,
+                _args: &Json,
             ) -> Result<Self, error_stack::Report<crate::registry::RegistryError>> {
                 Ok(Self)
             }
@@ -3618,7 +3618,7 @@ mod tests {
                     .kind(ActorKind::Service)
             }
             async fn start(
-                _args: &JsonValue,
+                _args: &Json,
             ) -> Result<Self, error_stack::Report<crate::registry::RegistryError>> {
                 Ok(Self)
             }
@@ -3637,7 +3637,7 @@ mod tests {
                     .kind(ActorKind::Service)
             }
             async fn start(
-                _args: &JsonValue,
+                _args: &Json,
             ) -> Result<Self, error_stack::Report<crate::registry::RegistryError>> {
                 Ok(Self)
             }
@@ -3755,7 +3755,7 @@ mod tests {
                     .kind(ActorKind::Service)
             }
             async fn start(
-                _args: &JsonValue,
+                _args: &Json,
             ) -> Result<Self, error_stack::Report<crate::registry::RegistryError>> {
                 Ok(Self)
             }
@@ -3779,7 +3779,7 @@ mod tests {
                     .kind(ActorKind::Service)
             }
             async fn start(
-                _args: &JsonValue,
+                _args: &Json,
             ) -> Result<Self, error_stack::Report<crate::registry::RegistryError>> {
                 Ok(Self)
             }
@@ -3964,9 +3964,9 @@ mod tests {
                     json!({ "delta": delta }),
                 )]
             }),
-            Arc::new(move |state: &mut JsonValue, ev: &crate::envelope::Event| {
+            Arc::new(move |state: &mut Json, ev: &crate::envelope::Event| {
                 if ev.schema == fact_for_fold {
-                    state["total"] = json!(
+                    state["total"] = serde_json::json!(
                         state["total"].as_i64().unwrap_or(0)
                             + ev.payload["delta"].as_i64().unwrap_or(0)
                     );
@@ -4195,7 +4195,7 @@ mod tests {
                     .handles::<Add>()
                     .kind(ActorKind::EventSourced)
             }
-            fn restore(_args: &JsonValue) -> Self {
+            fn restore(_args: &Json) -> Self {
                 Self
             }
             fn apply(&mut self, _event: &crate::envelope::Event) {}
@@ -4230,7 +4230,7 @@ mod tests {
                     .kind(ActorKind::Service)
             }
             async fn start(
-                _args: &JsonValue,
+                _args: &Json,
             ) -> Result<Self, error_stack::Report<crate::registry::RegistryError>> {
                 Ok(Self)
             }
@@ -4273,7 +4273,7 @@ mod tests {
                 factor: 2.0,
             },
             args: json!({}),
-            spawn: Arc::new(|sys: &ActorSystem, path: &ActorPath, args: &JsonValue| {
+            spawn: Arc::new(|sys: &ActorSystem, path: &ActorPath, args: &Json| {
                 sys.spawn_es::<AlwaysBoom2, _>(path.clone(), args, SpawnOpts::default(), || {
                     vec![Arc::new(TypedEsAdapter::<AlwaysBoom2, Add>::new::<Add>())]
                 });
@@ -4675,7 +4675,7 @@ mod tests {
             fn manifest() -> crate::schema::ActorManifest {
                 ActorManifest::new().kind(crate::actor::ActorKind::EventSourced)
             }
-            fn restore(_args: &JsonValue) -> Self {
+            fn restore(_args: &Json) -> Self {
                 Self {
                     total: 0,
                     doubled: 0,
@@ -4686,13 +4686,13 @@ mod tests {
             }
             fn capture(
                 &self,
-            ) -> Result<JsonValue, error_stack::Report<crate::journal::JournalError>> {
+            ) -> Result<Json, error_stack::Report<crate::journal::JournalError>> {
                 // The cache is not persisted, but capture EXPOSES it when
                 // hydrated — making the hydration hook observable.
                 Ok(json!({ "total": self.total, "doubled": self.doubled }))
             }
             fn restore_from(
-                snap: JsonValue,
+                snap: Json,
             ) -> Result<Self, error_stack::Report<crate::journal::JournalError>> {
                 let total = snap["total"].as_i64().unwrap_or(0);
                 // THE sanctioned hydration: derive the skipped field.
@@ -4852,7 +4852,7 @@ mod tests {
                 .emits::<Added>()
                 .kind(ActorKind::EventSourced)
         }
-        fn restore(_args: &JsonValue) -> Self {
+        fn restore(_args: &Json) -> Self {
             Self::default()
         }
         fn apply(&mut self, event: &crate::envelope::Event) {
@@ -5127,7 +5127,7 @@ mod tests {
         fn manifest() -> ActorManifest {
             ActorManifest::new().kind(ActorKind::EventSourced)
         }
-        fn restore(_args: &JsonValue) -> Self {
+        fn restore(_args: &Json) -> Self {
             Self::default()
         }
         fn apply(&mut self, event: &crate::envelope::Event) {
@@ -5292,9 +5292,9 @@ mod tests {
         };
         let fold: crate::actor::ForeignFold = {
             let f = fact.clone();
-            Arc::new(move |state: &mut JsonValue, ev: &crate::envelope::Event| {
+            Arc::new(move |state: &mut Json, ev: &crate::envelope::Event| {
                 if ev.schema == f {
-                    state["total"] = json!(
+                    state["total"] = serde_json::json!(
                         state["total"].as_i64().unwrap_or(0)
                             + ev.payload["delta"].as_i64().unwrap_or(0)
                     );
@@ -5328,9 +5328,9 @@ mod tests {
         };
         let built_fold: crate::actor::ForeignFold = {
             let f = fact.clone();
-            Arc::new(move |state: &mut JsonValue, ev: &crate::envelope::Event| {
+            Arc::new(move |state: &mut Json, ev: &crate::envelope::Event| {
                 if ev.schema == f {
-                    state["total"] = json!(
+                    state["total"] = serde_json::json!(
                         state["total"].as_i64().unwrap_or(0)
                             + ev.payload["delta"].as_i64().unwrap_or(0)
                     );
@@ -5462,7 +5462,7 @@ mod tests {
         let (system, _clock) = ActorSystem::test();
         let decision: crate::actor::ForeignDecision = Arc::new(|_state, _cmd, _ctx| vec![]);
         let fold: crate::actor::ForeignFold =
-            Arc::new(|_state: &mut JsonValue, _ev: &crate::envelope::Event| {});
+            Arc::new(|_state: &mut Json, _ev: &crate::envelope::Event| {});
         crate::builder::spawn_foreign(&system)
             .at(ActorPath::new("f-reg"))
             .schema(json!({
@@ -5493,7 +5493,7 @@ mod tests {
         total: i64,
     }
     impl EventSourcedActor for DefaultManifestCounter {
-        fn restore(_args: &JsonValue) -> Self {
+        fn restore(_args: &Json) -> Self {
             Self::default()
         }
         fn apply(&mut self, event: &crate::envelope::Event) {
@@ -5556,7 +5556,7 @@ mod tests {
         fn manifest() -> ActorManifest {
             ActorManifest::new().handles_id(Boom::schema_id())
         }
-        fn restore(_args: &JsonValue) -> Self {
+        fn restore(_args: &Json) -> Self {
             Self::default()
         }
         fn apply(&mut self, event: &crate::envelope::Event) {
@@ -5606,7 +5606,7 @@ mod tests {
         struct Echo;
         impl ServiceActor for Echo {
             async fn start(
-                _args: &JsonValue,
+                _args: &Json,
             ) -> Result<Self, error_stack::Report<crate::registry::RegistryError>> {
                 Ok(Self)
             }
@@ -5656,7 +5656,7 @@ mod tests {
         struct Silent;
         impl ServiceActor for Silent {
             async fn start(
-                _args: &JsonValue,
+                _args: &Json,
             ) -> Result<Self, error_stack::Report<crate::registry::RegistryError>> {
                 Ok(Self)
             }
@@ -5716,7 +5716,7 @@ mod tests {
         struct Silent;
         impl ServiceActor for Silent {
             async fn start(
-                _args: &JsonValue,
+                _args: &Json,
             ) -> Result<Self, error_stack::Report<crate::registry::RegistryError>> {
                 Ok(Self)
             }
@@ -5863,9 +5863,9 @@ mod tests {
                         json!({ "delta": cmd["delta"].as_i64().unwrap_or(0) }),
                     )]
                 }),
-                Arc::new(move |state: &mut JsonValue, ev: &crate::envelope::Event| {
+                Arc::new(move |state: &mut Json, ev: &crate::envelope::Event| {
                     if ev.schema == f_fold {
-                        state["total"] = json!(
+                        state["total"] = serde_json::json!(
                             state["total"].as_i64().unwrap_or(0)
                                 + ev.payload["delta"].as_i64().unwrap_or(0)
                         );
@@ -5921,7 +5921,7 @@ mod tests {
                 .emits::<Added>()
                 .kind(ActorKind::EventSourced)
         }
-        fn restore(args: &JsonValue) -> Self {
+        fn restore(args: &Json) -> Self {
             Self {
                 key: args["key"].as_str().unwrap_or_default().to_owned(),
                 total: 0,
@@ -6059,7 +6059,7 @@ mod tests {
         system
             .publish_value(
                 Chatted::schema_id(),
-                serde_json::json!({ "chat_id": chat_id, "text": text }),
+                crate::json!({ "chat_id": chat_id, "text": text }),
             )
             .await;
     }
@@ -6246,7 +6246,7 @@ mod tests {
             .projector_state(&ActorPath::new("proj/chats/7"))
             .await
             .expect("projector activated by broadcast");
-        let log: ChatLog = serde_json::from_value(state).expect("state decodes");
+        let log: ChatLog = state.decode().expect("state decodes");
         assert_eq!(log.messages, 1, "exactly one fold of the single fact");
         // And the sibling key was never activated.
         assert!(
@@ -6297,7 +6297,7 @@ mod tests {
             .projector_state(&path)
             .await
             .expect("woken projector");
-        let log: ChatLog = serde_json::from_value(state).expect("state decodes");
+        let log: ChatLog = state.decode().expect("state decodes");
         assert_eq!(log.messages, 3, "all three facts folded exactly once");
         assert_eq!(
             log.keys_seen,
@@ -6357,7 +6357,7 @@ mod tests {
             .expect("wake returns the fold");
 
         // Then the fold is COMPLETE (not mid-seed) and decodeable.
-        let log: ChatLog = serde_json::from_value(state).expect("state decodes");
+        let log: ChatLog = state.decode().expect("state decodes");
         assert_eq!(log.messages, 2, "both facts folded before capture");
         assert_eq!(log.keys_seen, vec!["a".to_owned(), "b".to_owned()]);
 
@@ -6404,7 +6404,7 @@ mod tests {
         // And the complete read wakes it: the cold projector gap-fills
         // and returns the full fold.
         let state = system.projector_state(&path).await.expect("complete");
-        let log: ChatLog = serde_json::from_value(state).expect("decodes");
+        let log: ChatLog = state.decode().expect("decodes");
         assert_eq!(log.messages, 1, "woken by the complete read alone");
     }
 
@@ -6422,17 +6422,17 @@ mod tests {
             vec![
                 crate::envelope::Event::new(
                     Chatted::schema_id(),
-                    serde_json::json!({ "chat_id": "1", "text": "x" }),
+                    crate::json!({ "chat_id": "1", "text": "x" }),
                 ),
                 crate::envelope::Event::new(
                     Chatted::schema_id(),
-                    serde_json::json!({ "chat_id": "1", "text": "y" }),
+                    crate::json!({ "chat_id": "1", "text": "y" }),
                 ),
             ],
         );
         let path = ActorPath::new("proj/chats/1");
         let state = system.projector_state(&path).await.expect("initial");
-        let log: ChatLog = serde_json::from_value(state).expect("decodes");
+        let log: ChatLog = state.decode().expect("decodes");
         assert_eq!(log.messages, 2);
 
         // When the projector is rebuilt (stop → purge → re-activate →
@@ -6442,7 +6442,7 @@ mod tests {
         // Then the re-fold equals a from-scratch fold: same facts, exactly
         // once each (the purged journal cannot double-count).
         let state = system.projector_state(&path).await.expect("post-rebuild");
-        let log: ChatLog = serde_json::from_value(state).expect("decodes");
+        let log: ChatLog = state.decode().expect("decodes");
         assert_eq!(log.messages, 2, "purge + re-fold == fresh fold");
         assert_eq!(
             log.keys_seen,
@@ -6511,7 +6511,7 @@ mod tests {
         system
             .publish_value(
                 Chatted::schema_id(),
-                serde_json::json!({ "text": "no key" }),
+                crate::json!({ "text": "no key" }),
             )
             .await;
 
@@ -6738,7 +6738,7 @@ mod tests {
                     .kind(ActorKind::Service)
             }
             async fn start(
-                args: &JsonValue,
+                args: &Json,
             ) -> Result<Self, error_stack::Report<crate::registry::RegistryError>> {
                 let (sink, forward_to) = (
                     sinks().lock()[args["sink"].as_u64().expect("sink idx") as usize].clone(),
@@ -6763,7 +6763,7 @@ mod tests {
                 ActorManifest::new().kind(ActorKind::Service)
             }
             async fn start(
-                args: &JsonValue,
+                args: &Json,
             ) -> Result<Self, error_stack::Report<crate::registry::RegistryError>> {
                 Ok(Self {
                     sink: sinks().lock()[args["sink"].as_u64().expect("sink idx") as usize].clone(),
@@ -6846,7 +6846,7 @@ mod tests {
             ActorManifest::new().kind(ActorKind::Service)
         }
         async fn start(
-            args: &JsonValue,
+            args: &Json,
         ) -> Result<Self, error_stack::Report<crate::registry::RegistryError>> {
             let idx = args["sink"].as_u64().expect("sink index") as usize;
             let sink = sinks().lock()[idx].clone();
@@ -6947,7 +6947,7 @@ mod tests {
                 .handles::<Add>()
                 .kind(ActorKind::EventSourced)
         }
-        fn restore(_args: &JsonValue) -> Self {
+        fn restore(_args: &Json) -> Self {
             Self
         }
         fn apply(&mut self, _event: &crate::envelope::Event) {}
@@ -6968,7 +6968,7 @@ mod tests {
         system.register_schema::<Added>();
         let spawner = {
             let system = system.clone();
-            move |sys: &ActorSystem, path: &ActorPath, args: &JsonValue| {
+            move |sys: &ActorSystem, path: &ActorPath, args: &Json| {
                 let system = system.clone();
                 let path = path.clone();
                 let args = args.clone();
@@ -7051,7 +7051,7 @@ mod tests {
             budget: crate::supervision::RestartBudget::default(),
             backoff: crate::supervision::Backoff::default(),
             args: json!({}),
-            spawn: Arc::new(|_sys: &ActorSystem, _path: &ActorPath, _args: &JsonValue| {}),
+            spawn: Arc::new(|_sys: &ActorSystem, _path: &ActorPath, _args: &Json| {}),
         };
         system.spawn(spec);
 
@@ -7152,7 +7152,7 @@ mod tests {
             &self,
             path: &crate::actor::ActorPath,
             seq: crate::journal::SeqNo,
-            state: JsonValue,
+            state: Json,
             now_ms: u64,
         ) -> Result<(), error_stack::Report<crate::journal::JournalError>> {
             self.inner.append_snapshot(path, seq, state, now_ms).await
@@ -7218,7 +7218,7 @@ mod tests {
             &self,
             path: &crate::actor::ActorPath,
             seq: crate::journal::SeqNo,
-            state: JsonValue,
+            state: Json,
             now_ms: u64,
         ) -> Result<(), error_stack::Report<crate::journal::JournalError>> {
             self.inner.append_snapshot(path, seq, state, now_ms).await
@@ -7267,7 +7267,7 @@ mod tests {
                 .emits::<Added>()
                 .kind(ActorKind::EventSourced)
         }
-        fn restore(_args: &JsonValue) -> Self {
+        fn restore(_args: &Json) -> Self {
             Self {
                 total: 0,
                 log: es_hook_log(),
@@ -7306,7 +7306,7 @@ mod tests {
                 .kind(ActorKind::Service)
         }
         async fn start(
-            _args: &JsonValue,
+            _args: &Json,
         ) -> Result<Self, error_stack::Report<crate::registry::RegistryError>> {
             Ok(Self { log: hook_log() })
         }
@@ -7334,7 +7334,7 @@ mod tests {
                     .kind(ActorKind::Service)
             }
             async fn start(
-                _args: &JsonValue,
+                _args: &Json,
             ) -> Result<Self, error_stack::Report<crate::registry::RegistryError>> {
                 Ok(Self)
             }
@@ -7446,7 +7446,7 @@ mod tests {
                 factor: 2.0,
             },
             args: json!({}),
-            spawn: Arc::new(|sys: &ActorSystem, path: &ActorPath, args: &JsonValue| {
+            spawn: Arc::new(|sys: &ActorSystem, path: &ActorPath, args: &Json| {
                 sys.spawn_es::<StopCounter, _>(path.clone(), args, SpawnOpts::default(), || {
                     vec![Arc::new(TypedEsAdapter::<StopCounter, Add>::new::<Add>())]
                 });
@@ -7505,7 +7505,7 @@ mod tests {
                     .kind(ActorKind::Service)
             }
             async fn start(
-                _args: &JsonValue,
+                _args: &Json,
             ) -> Result<Self, error_stack::Report<crate::registry::RegistryError>> {
                 Ok(Self {
                     target: "mirror".to_owned(),
@@ -7563,7 +7563,7 @@ mod tests {
                     .kind(ActorKind::Service)
             }
             async fn start(
-                _args: &JsonValue,
+                _args: &Json,
             ) -> Result<Self, error_stack::Report<crate::registry::RegistryError>> {
                 Ok(Self)
             }
@@ -7621,7 +7621,7 @@ mod tests {
                     .kind(ActorKind::Service)
             }
             async fn start(
-                _args: &JsonValue,
+                _args: &Json,
             ) -> Result<Self, error_stack::Report<crate::registry::RegistryError>> {
                 Ok(Self)
             }
@@ -7832,7 +7832,7 @@ mod tests {
                 factor: 2.0,
             },
             args: json!({}),
-            spawn: Arc::new(|sys: &ActorSystem, path: &ActorPath, args: &JsonValue| {
+            spawn: Arc::new(|sys: &ActorSystem, path: &ActorPath, args: &Json| {
                 sys.spawn_es::<Counter, _>(path.clone(), args, SpawnOpts::default(), || {
                     vec![
                         Arc::new(TypedEsAdapter::<Counter, Add>::new::<Add>()),
@@ -8147,7 +8147,7 @@ mod tests {
             },
             args: json!({}),
             spawn: Arc::new(
-                move |sys: &ActorSystem, path: &ActorPath, args: &JsonValue| {
+                move |sys: &ActorSystem, path: &ActorPath, args: &Json| {
                     sys.spawn_es::<Counter, _>(path.clone(), args, opts.clone(), || {
                         vec![
                             Arc::new(TypedEsAdapter::<Counter, Add>::new::<Add>()),
@@ -8358,7 +8358,7 @@ mod tests {
                     .kind(ActorKind::Service)
             }
             async fn start(
-                args: &JsonValue,
+                args: &Json,
             ) -> Result<Self, error_stack::Report<crate::registry::RegistryError>> {
                 Ok(Self {
                     peer: ActorPath::new(args["peer"].as_str().unwrap_or("a")),
@@ -8427,7 +8427,7 @@ mod tests {
                 factor: 2.0,
             },
             args: json!({}),
-            spawn: Arc::new(|sys: &ActorSystem, path: &ActorPath, args: &JsonValue| {
+            spawn: Arc::new(|sys: &ActorSystem, path: &ActorPath, args: &Json| {
                 sys.spawn_es::<Counter, _>(path.clone(), args, SpawnOpts::default(), || {
                     vec![Arc::new(TypedEsAdapter::<Counter, Add>::new::<Add>())]
                 });
@@ -8561,7 +8561,7 @@ mod tests {
         }
 
         async fn start(
-            args: &JsonValue,
+            args: &Json,
         ) -> Result<Self, error_stack::Report<crate::registry::RegistryError>> {
             let idx = args["sink"].as_u64().expect("sink index") as usize;
             let tag = args["tag"].as_str().expect("tag").to_owned();
@@ -8890,7 +8890,7 @@ mod tests {
                 ActorManifest::new().kind(ActorKind::Service)
             }
             async fn start(
-                _args: &JsonValue,
+                _args: &Json,
             ) -> Result<Self, error_stack::Report<crate::registry::RegistryError>> {
                 Ok(Self)
             }
@@ -8921,7 +8921,7 @@ mod tests {
                     .kind(ActorKind::Service)
             }
             async fn start(
-                _args: &JsonValue,
+                _args: &Json,
             ) -> Result<Self, error_stack::Report<crate::registry::RegistryError>> {
                 Ok(Self)
             }
