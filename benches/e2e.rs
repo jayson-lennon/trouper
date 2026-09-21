@@ -76,16 +76,31 @@ impl trouper::actor::CommandHandler<Tick> for Accum {
     }
 }
 
-/// A command whose payload bulk is `filler` bytes — the payload_size bench
-/// sweeps `filler` across orders of magnitude.
+/// A realistic message: a handful of typed fields, an id string, a small
+/// tag list, and a bulk body. The payload_size bench sweeps `body` across
+/// orders of magnitude — this is the shape application messages actually
+/// have (a few fields, one bulk value), NOT a tree-node stress case.
 #[derive(Clone, Command, serde::Serialize, serde::Deserialize)]
 struct Chunk {
-    filler: Vec<u8>,
+    kind: String,
+    id: String,
+    tags: Vec<String>,
+    seq: u64,
+    body: String,
 }
 
 #[derive(Event, serde::Serialize, serde::Deserialize)]
 struct Chunked {
     bytes: usize,
+}
+
+/// A pathological message: `filler` serializes as a JSON array with one
+/// node PER ELEMENT. A 1MB filler is a ~1M-node tree (~25x the serde cost
+/// of a 1MB string) — kept for the wide_tree bench, which exists to show
+/// the runtime's per-NODE overhead, never to represent a real payload.
+#[derive(Clone, Command, serde::Serialize, serde::Deserialize)]
+struct WideChunk {
+    filler: Vec<u8>,
 }
 
 #[derive(Serialize, Deserialize, Default)]
@@ -114,7 +129,7 @@ impl trouper::actor::CommandHandler<Chunk> for Bytes {
         trouper::envelope::Events::from_vec(vec![trouper::envelope::Event::new(
             Chunked::schema_id(),
             Json::of(&Chunked {
-                bytes: cmd.filler.len(),
+                bytes: cmd.body.len(),
             }),
         )])
     }
@@ -332,10 +347,10 @@ fn producer_scaling(c: &mut Criterion) {
 // ---------------------------------------------------------------------------
 
 // ---------------------------------------------------------------------------
-// payload_size: one 100B / 10KB / 1MB command per measured message — the
-// JSON-waist clone tax, reported PER MESSAGE (Bytes(elem) throughput makes
-// the table's `time` a single tell→fold→ack cycle at that payload size;
-// comparable 1:1 against tell_baseline's per-message number).
+// payload_size: realistic application messages (a few typed fields, a
+// small tag vec, one bulk body string), one tell per measured message.
+// The reported time IS one tell→fold→ack cycle at that body size —
+// comparable 1:1 against tell_baseline's per-message number.
 // ---------------------------------------------------------------------------
 
 fn payload_size(c: &mut Criterion) {
@@ -344,12 +359,19 @@ fn payload_size(c: &mut Criterion) {
 
     let mut group = c.benchmark_group("e2e/payload_size");
     group.sample_size(30);
-    for (label, size) in [("100B", 100usize), ("10KB", 10_000), ("1MB", 1_000_000)] {
-        let chunk = Chunk {
-            filler: vec![0u8; size],
-        };
-        // One message per iteration: the reported time IS one message.
-        group.throughput(criterion::Throughput::Bytes(size as u64));
+    // 2KB is the common ceiling; large bodies are included because the
+    // bench exists to show how cost scales past it.
+    for (label, size) in [
+        ("500B", 500usize),
+        ("2KB", 2_000),
+        ("64KB", 65_536),
+        ("1MB", 1_000_000),
+    ] {
+        let chunk = realistic_chunk(size);
+        // The wire size of one message (body + fields), for honest
+        // MiB/s throughput.
+        let wire = serde_json::to_vec(&chunk).expect("fixture size").len() as u64;
+        group.throughput(criterion::Throughput::Bytes(wire));
         group.bench_function(label, |b| {
             b.iter(|| {
                 rt.block_on(async {
@@ -374,6 +396,112 @@ fn payload_size(c: &mut Criterion) {
         });
     }
     group.finish();
+}
+
+/// A realistic application message with `size` bytes of body: a few
+/// typed fields and a small tag list around one bulk string.
+fn realistic_chunk(body_bytes: usize) -> Chunk {
+    Chunk {
+        kind: "invoice.updated".into(),
+        id: format!("inv_{:016x}", body_bytes),
+        tags: ["prod", "eu-west", "retry-1"].map(String::from).to_vec(),
+        seq: body_bytes as u64,
+        body: "x".repeat(body_bytes),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// wide_tree: the same body size carried as a 1M-element JSON array — a
+// PATHOLOGICAL message construction (one serde_json node per element,
+// ~25x the serde cost of an equal-size string). This bench exists to show
+// the runtime's per-NODE handling cost, never to represent a real
+// payload; read it next to payload_size, not instead of it.
+// ---------------------------------------------------------------------------
+
+fn wide_tree(c: &mut Criterion) {
+    let (system, rt) = spawn_system();
+    let iterations = Iterations(std::sync::atomic::AtomicU64::new(0));
+
+    let mut group = c.benchmark_group("e2e/wide_tree");
+    group.sample_size(20);
+    for (label, elements) in [("100k_nodes", 100_000usize), ("1M_nodes", 1_000_000)] {
+        let chunk = WideChunk {
+            filler: vec![0u8; elements],
+        };
+        let wire = serde_json::to_vec(&chunk).expect("fixture size").len() as u64;
+        group.throughput(criterion::Throughput::Bytes(wire));
+        group.bench_function(label, |b| {
+            b.iter(|| {
+                rt.block_on(async {
+                    let path = iterations.next_path("bench/wide");
+                    system.spawn_es::<Wide, _>(
+                        path.clone(),
+                        &Json::default(),
+                        SpawnOpts::default(),
+                        || {
+                            vec![Arc::new(
+                                trouper::actor::TypedEsAdapter::<Wide, WideChunk>::new::<
+                                    WideChunk,
+                                >(),
+                            )]
+                        },
+                    );
+                    system
+                        .tell(path.clone(), chunk.clone())
+                        .await
+                        .expect("delivered");
+                    // One message per iteration: wait for ITS fold, not
+                    // the element count.
+                    wait_wide_count(&system, &path, 1).await;
+                });
+            });
+        });
+    }
+    group.finish();
+}
+
+#[derive(Serialize, Deserialize, Default)]
+struct Wide {
+    count: u64,
+}
+
+impl EventSourcedActor for Wide {
+    fn manifest() -> ActorManifest {
+        ActorManifest::new()
+            .handles::<WideChunk>()
+            .emits::<Chunked>()
+            .kind(ActorKind::EventSourced)
+    }
+    fn restore(_args: &Json) -> Self {
+        Self::default()
+    }
+    fn apply(&mut self, event: &trouper::envelope::Event) {
+        if event.schema.as_str() == "Chunked@1" {
+            self.count += 1;
+        }
+    }
+}
+impl trouper::actor::CommandHandler<WideChunk> for Wide {
+    fn handle(&self, _cmd: WideChunk, _ctx: &mut CmdCtx<'_>) -> trouper::envelope::Events {
+        trouper::envelope::Events::one(Chunked { bytes: 0 })
+    }
+}
+
+/// Waits until the Wide entity's count reaches `count` (bounded; panics
+/// on stall so a bench fails loudly instead of reporting a fast bogus
+/// time). Must run inside the runtime.
+async fn wait_wide_count(system: &ActorSystem, path: &ActorPath, count: u64) {
+    for _ in 0..300_000 {
+        if system
+            .with_es_state::<Wide, _>(path, |w| w.count)
+            .await
+            .is_some_and(|c| c >= count)
+        {
+            return;
+        }
+        tokio::time::sleep(Duration::from_micros(100)).await;
+    }
+    panic!("entity {path} never reached count {count}");
 }
 
 /// Waits until the Bytes entity's total reaches `total` (bounded; panics
@@ -739,6 +867,7 @@ criterion_group!(
     tell_baseline,
     producer_scaling,
     payload_size,
+    wide_tree,
     fanout,
     overload_block,
     idle_fleet,
