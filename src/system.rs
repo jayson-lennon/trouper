@@ -6075,7 +6075,6 @@ mod tests {
         path: &ActorPath,
         events: Vec<crate::envelope::Event>,
     ) {
-        use crate::journal::JournalStore;
         let store = system.journal_store_trait();
         let store = crate::journal::downcast_in_memory(&store).expect("in-memory store");
         store.append_sync(path, &events).expect("seed append");
@@ -6267,11 +6266,13 @@ mod tests {
         // Given a ChatLog projector set whose projectors passivate after a
         // short idle, one folded fact, and a passivated (evicted) projector.
         let (system, clock) = ActorSystem::test();
-        let mut opts = SpawnOpts::default();
-        opts.passivation = Some(Passivation {
-            idle_for: std::time::Duration::from_millis(50),
-        });
-        system.register_schema::<Chatted>();
+        let opts = SpawnOpts {
+            passivation: Some(Passivation {
+                idle_for: std::time::Duration::from_millis(50),
+            }),
+            ..Default::default()
+        };
+
         let spec = crate::pool::ProjectorSetSpec {
             opts,
             ..install_chat_projector_set_spec(&system, "proj/chats")
@@ -6316,10 +6317,12 @@ mod tests {
         // (a declared consumption is a delivery obligation), so the
         // genuinely-cold precondition needs a passivation cycle first.
         let (system, clock) = ActorSystem::test();
-        let mut opts = SpawnOpts::default();
-        opts.passivation = Some(Passivation {
-            idle_for: std::time::Duration::from_millis(50),
-        });
+        let opts = SpawnOpts {
+            passivation: Some(Passivation {
+                idle_for: std::time::Duration::from_millis(50),
+            }),
+            ..Default::default()
+        };
         let spec = crate::pool::ProjectorSetSpec {
             opts,
             ..install_chat_projector_set_spec(&system, "proj/chats")
@@ -6377,10 +6380,12 @@ mod tests {
         // Given a ChatLog projector whose projector passes cold, folded
         // once, then passivated (true eviction).
         let (system, clock) = ActorSystem::test();
-        let mut opts = SpawnOpts::default();
-        opts.passivation = Some(Passivation {
-            idle_for: std::time::Duration::from_millis(50),
-        });
+        let opts = SpawnOpts {
+            passivation: Some(Passivation {
+                idle_for: std::time::Duration::from_millis(50),
+            }),
+            ..Default::default()
+        };
         let spec = crate::pool::ProjectorSetSpec {
             opts,
             ..install_chat_projector_set_spec(&system, "proj/chats")

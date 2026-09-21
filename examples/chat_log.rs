@@ -139,6 +139,22 @@ async fn main() {
     };
     system.install_partition_set(rooms).expect("install");
 
+    // ---- Write through the entity; the fact fans out to the view ---
+    async fn say(system: &ActorSystem, chat_id: &str, text: &str) {
+        system
+            .send(system.envelope(
+                Say::schema_id(),
+                ActorPath::new("rooms"),
+                json!({ "chat_id": chat_id, "text": text }),
+            ))
+            .await
+            .expect("command routed");
+    }
+    say(&system, "rust", "goodbye borrow checker").await;
+    say(&system, "rust", "hello traits").await;
+    say(&system, "k8s", "pod restarting").await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
     // The views: per-key `chats/<chat_id>` projectors under `chats`
     // (facts), activated on demand, evicted after 200ms idle.
     let spec = ProjectorSetSpec {
@@ -163,23 +179,9 @@ async fn main() {
         },
         consumed: vec![Chatted::schema_id()],
     };
+    // Projector installed after the `say` calls to demonstrate how the projections will "catch up"
+    // to previously emitted events.
     system.install_projector_set(spec).expect("install");
-
-    // ---- Write through the entity; the fact fans out to the view ---
-    async fn say(system: &ActorSystem, chat_id: &str, text: &str) {
-        system
-            .send(system.envelope(
-                Say::schema_id(),
-                ActorPath::new("rooms"),
-                json!({ "chat_id": chat_id, "text": text }),
-            ))
-            .await
-            .expect("command routed");
-    }
-    say(&system, "rust", "goodbye borrow checker").await;
-    say(&system, "rust", "hello traits").await;
-    say(&system, "k8s", "pod restarting").await;
-    tokio::time::sleep(Duration::from_millis(100)).await;
 
     let rust = system
         .projector_state(&ActorPath::new("chats/rust"))
