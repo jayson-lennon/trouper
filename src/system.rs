@@ -838,7 +838,10 @@ impl ActorSystemCore {
         args: &Json,
     ) -> ArmedEsActor {
         let opts = self.resolve_opts(opts);
-        let (tx, rx) = tokio::sync::mpsc::channel::<Envelope>(opts.mailbox_capacity.max(1) * 2);
+        let (tx, rx) = tokio::sync::mpsc::channel::<Envelope>(crate::kernel::door_capacity(
+            opts.mailbox_capacity,
+            opts.mailbox_policy,
+        ));
         // The manifest is the union of what the actor type declares and
         // what its command entries decode: every spawn flavor (positional,
         // builder, foreign) produces identical registry data this way.
@@ -873,6 +876,8 @@ impl ActorSystemCore {
         let cell = Arc::new(ActorCell::new(
             path.clone(),
             Inbox::new(opts.mailbox_capacity.max(1), opts.mailbox_policy),
+            opts.mailbox_capacity.max(1),
+            opts.mailbox_policy,
         ));
         kernel.cells.insert(path.clone(), cell.clone());
         // The time-cadence anchor is kernel-side policy bookkeeping (the
@@ -996,7 +1001,10 @@ impl ActorSystemCore {
         // thread is not done — spawn the start inside the actor task and
         // register the slot immediately so senders never see a gap.
         let opts = self.resolve_opts(opts);
-        let (tx, rx) = tokio::sync::mpsc::channel::<Envelope>(opts.mailbox_capacity.max(1) * 2);
+        let (tx, rx) = tokio::sync::mpsc::channel::<Envelope>(crate::kernel::door_capacity(
+            opts.mailbox_capacity,
+            opts.mailbox_policy,
+        ));
         {
             let mut registry = self.registry.lock();
             registry
@@ -1019,6 +1027,8 @@ impl ActorSystemCore {
         let cell = Arc::new(ActorCell::new(
             path.clone(),
             Inbox::new(opts.mailbox_capacity.max(1), opts.mailbox_policy),
+            opts.mailbox_capacity.max(1),
+            opts.mailbox_policy,
         ));
         kernel.cells.insert(path.clone(), cell.clone());
         kernel.genesis_args.insert(path.clone(), args.clone());
@@ -2487,13 +2497,13 @@ mod tests {
                 .await
             {
                 total = t;
-                if t == 20 {
+                if t == 210 {
                     break;
                 }
             }
             tokio::time::sleep(std::time::Duration::from_millis(2)).await;
         }
-        assert_eq!(total, 20, "all twenty commands processed");
+        assert_eq!(total, 210, "all twenty commands processed (sum of 1..=20)");
         let reasons = system.dead_letter_reasons().await;
         assert!(
             !reasons.iter().any(|r| r.starts_with("InboxRefused")),

@@ -197,6 +197,13 @@ pub(crate) struct ActorCell {
     pub(crate) path: ActorPath,
     /// The runtime-owned inbox (survives endpoint swaps).
     pub(crate) inbox: tokio::sync::Mutex<Inbox>,
+    /// The spawn-configured mailbox capacity. The front door and every
+    /// restart derive their channel depth from it (D4: restarts keep the
+    /// spawn's capacity, not a default).
+    pub(crate) mailbox_capacity: usize,
+    /// The spawn-configured inbox overload policy (drives the front-door
+    /// channel depth and the Block hold-retry).
+    pub(crate) mailbox_policy: crate::inbox::OverloadPolicy,
     /// The running loop's handle, when a task is live.
     pub(crate) handle: tokio::sync::Mutex<Option<ActorHandle>>,
     /// Wakes the actor loop when work arrives (latency optimization; the
@@ -211,10 +218,17 @@ pub(crate) struct ActorCell {
 
 impl ActorCell {
     /// Creates a cell with a fresh inbox; the endpoint arrives on start.
-    pub fn new(path: ActorPath, inbox: Inbox) -> Self {
+    pub fn new(
+        path: ActorPath,
+        inbox: Inbox,
+        mailbox_capacity: usize,
+        mailbox_policy: crate::inbox::OverloadPolicy,
+    ) -> Self {
         Self {
             path,
             inbox: tokio::sync::Mutex::new(inbox),
+            mailbox_capacity,
+            mailbox_policy,
             handle: tokio::sync::Mutex::new(None),
             work: Arc::new(Notify::new()),
             on_stop_done: std::sync::atomic::AtomicBool::new(false),
@@ -682,39 +696,17 @@ async fn deliver_with_retry(endpoint: &Endpoint, envelope: Envelope) -> Result<(
 
 /// The front-door task: drains the mpsc into the runtime-owned inbox.
 ///
-/// Only DropOld/DropNew refusals land here (the mpsc already backpressures
-/// Block); refused/evicted messages are dead-lettered — never lost silently.
+/// Only DropOld/DropNew refusals land here (under Block the channel's
+/// `.send().await` already paced the sender at the same depth as the
+/// inbox); refused/evicted messages are dead-lettered — never lost
+/// silently.
 pub(crate) async fn front_door_loop(
     cell: Arc<ActorCell>,
     kernel: Arc<Mutex<KernelState>>,
     mut rx: mpsc::Receiver<Envelope>,
 ) {
     while let Some(envelope) = rx.recv().await {
-        let accepted = {
-            let mut inbox = cell.inbox.lock().await;
-            match inbox.push(envelope.clone()) {
-                Ok(_) => true,
-                Err(refused) => {
-                    if !refused.queued_anyway() {
-                        dead_letter(
-                            &kernel,
-                            &envelope,
-                            crate::kernel::DeadLetterReason::InboxRefused,
-                            "inbox refused (overload/closed)",
-                        );
-                    } else {
-                        let evicted = refused.into_envelope();
-                        dead_letter(
-                            &kernel,
-                            &evicted,
-                            crate::kernel::DeadLetterReason::InboxRefused,
-                            "inbox evicted oldest (DropOld)",
-                        );
-                    }
-                    false
-                }
-            }
-        };
+        let accepted = push_holding_block(&cell, &kernel, envelope.clone()).await;
         // WATERMARK CHECK (rate-limited): fires on the UP-crossing only;
         // the latch re-arms when the depth falls back to/below the mark.
         let depth = cell.inbox.lock().await.len() as u64;
@@ -737,6 +729,51 @@ pub(crate) async fn front_door_loop(
         if accepted {
             cell.work.notify_one();
         }
+    }
+}
+
+/// How long the front door holds a Block-refused envelope between retry
+/// pushes, and how many retries before dead-lettering as a last resort.
+const BLOCK_HOLD_RETRY_MS: u64 = 2;
+const BLOCK_HOLD_RETRIES: usize = 1_000;
+
+/// Pushes one envelope into the actor's inbox, honoring the Block policy.
+///
+/// A `Refused::Full` under Block is HELD and retried — the sender was
+/// already paced by the channel await, so a refusal here is the in-flight
+/// race between the channel accept and the inbox filling (or a restart
+/// swap), and dead-lettering it would make Block lossy. The hold ends
+/// when a push succeeds (an ack freed room), or — after the retry budget —
+/// dead-letters as a last resort. Closed inboxes and DropNew/DropOld
+/// refusals dead-letter immediately, exactly as before.
+async fn push_holding_block(
+    cell: &ActorCell,
+    kernel: &Mutex<KernelState>,
+    envelope: Envelope,
+) -> bool {
+    let mut attempt = 0usize;
+    loop {
+        let refusal = {
+            let mut inbox = cell.inbox.lock().await;
+            match inbox.push(envelope.clone()) {
+                Ok(_) => return true,
+                Err(refused) => refused,
+            }
+        };
+        let holds = matches!(refusal, crate::inbox::Refused::Full(_))
+            && cell.mailbox_policy == crate::inbox::OverloadPolicy::Block;
+        if !holds || attempt >= BLOCK_HOLD_RETRIES {
+            let detail = if refusal.queued_anyway() {
+                "inbox evicted oldest (DropOld)"
+            } else {
+                "inbox refused (overload/closed)"
+            };
+            let evicted = refusal.into_envelope();
+            dead_letter(kernel, &evicted, crate::kernel::DeadLetterReason::InboxRefused, detail);
+            return false;
+        }
+        attempt += 1;
+        tokio::time::sleep(std::time::Duration::from_millis(BLOCK_HOLD_RETRY_MS)).await;
     }
 }
 
@@ -2060,8 +2097,13 @@ pub(crate) async fn restart_es(
     }
 
     // Fresh endpoint behind the SAME path: senders holding pre-crash
-    // clones never notice (identity = path; slots are swapped, not dropped).
-    let (tx, rx) = mpsc::channel(capacity_hint());
+    // clones never notice (identity = path; slots are swapped, not
+    // dropped). The fresh door matches the spawn's capacity and policy
+    // (the cell carries them), never a default.
+    let (tx, rx) = mpsc::channel(door_capacity(
+        ctx.cell.mailbox_capacity,
+        ctx.cell.mailbox_policy,
+    ));
     let endpoint = Endpoint::new(tx);
     {
         let mut registry = ctx.registry.lock();
@@ -2082,9 +2124,18 @@ pub(crate) async fn restart_es(
     Ok(())
 }
 
-/// The front-door capacity for restarted endpoints.
-fn capacity_hint() -> usize {
-    64
+/// The front-door channel depth for a mailbox: under `Block` the channel
+/// is exactly the inbox's capacity (the channel `.send().await` IS the
+/// block, so senders pace at the configured depth); the lossy policies
+/// keep 2× headroom so bursts actually reach the inbox's own policy.
+pub(crate) fn door_capacity(mailbox_capacity: usize, policy: crate::inbox::OverloadPolicy) -> usize {
+    let capacity = mailbox_capacity.max(1);
+    match policy {
+        crate::inbox::OverloadPolicy::Block => capacity,
+        crate::inbox::OverloadPolicy::DropNew | crate::inbox::OverloadPolicy::DropOld => {
+            capacity * 2
+        }
+    }
 }
 
 /// The supervision engine: one task per supervised child, awaiting the
