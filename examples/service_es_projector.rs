@@ -78,11 +78,10 @@ impl MsgHandler<Checkout> for PoolService {
         let taken = TAKEN.fetch_add(1, Ordering::SeqCst) + 1;
         let returned = RETURNED.load(Ordering::SeqCst);
         println!("[pool] checkout #{taken}");
-        ctx.send(
-            Address::Path(ActorPath::new("pool.log")),
-            &PoolEvent { taken, returned },
-            None,
-        );
+        // The durable hop: tell the LOGGER ENTITY its command; the entity
+        // records the PoolEvent fact (append-before-ack) — that journal
+        // entry IS the durable history.
+        ctx.send(Address::Path(ActorPath::new("pool.log")), &Checkout, None);
     }
 }
 
@@ -91,11 +90,7 @@ impl MsgHandler<Checkin> for PoolService {
         let returned = RETURNED.fetch_add(1, Ordering::SeqCst) + 1;
         let taken = TAKEN.load(Ordering::SeqCst);
         println!("[pool] checkin #{returned}");
-        ctx.send(
-            Address::Path(ActorPath::new("pool.log")),
-            &PoolEvent { taken, returned },
-            None,
-        );
+        ctx.send(Address::Path(ActorPath::new("pool.log")), &Checkin, None);
     }
 }
 
@@ -191,6 +186,8 @@ async fn main() {
     spawn_es_builder::<PoolLog>(&system)
         .at(ActorPath::new("pool.log"))
         .args(json!({}))
+        .handles::<Checkout>()
+        .handles::<Checkin>()
         .start();
 
     // The service: TELLS the logger (tell = the durable hop).
@@ -198,7 +195,8 @@ async fn main() {
         .at(ActorPath::new("pool"))
         .handles::<Checkout>()
         .handles::<Checkin>()
-        .emits::<PoolEvent>() // what the service SENDS onward
+        .emits::<Checkout>() // what the service SENDS onward (the durable hop)
+        .emits::<Checkin>()
         .start();
 
     // ---- Traffic BEFORE the projector exists — and this time it survives.
@@ -208,6 +206,7 @@ async fn main() {
             .await
             .expect("told");
     }
+
     tokio::time::sleep(Duration::from_millis(100)).await;
     println!("\n3 checkouts happened BEFORE the projector went live — journaled by the entity.");
 
@@ -258,7 +257,7 @@ async fn main() {
         .expect("restarted projector");
     println!("pool view after restart: {view:?}");
     println!(
-        "  ^ taken=5, returned=1 survive restart (own-journal replay),\n    and the 3 pre-spawn events are IN there too — unlike\n    service_projector, where history before the projector is gone."
+        "  ^ taken=4, returned=1 survive restart (own-journal replay),\n    and the 3 pre-spawn events are IN there too — unlike\n    service_projector, where history before the projector is gone."
     );
 
     println!(
