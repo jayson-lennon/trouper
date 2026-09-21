@@ -90,3 +90,9 @@ Entries are added or amended **only with human approval**.
 - (queries) Typed reads cover live entities and projectors only: foreign actors read as JSON, passivated entities read None, and service-actor state is not a readable surface.
 - (lifecycle) A projector records a CaughtUp tap fact when its catch-up completes.
 - (docs) The trouper crate's public API documentation follows std rustdoc style — consumer-relevant statements only, no implementation narration — and cargo doc runs warning-free.
+- (runtime) Actor inbox backpressure engages at the spawn-configured mailbox capacity: Block senders await room, and DropNew/DropOld refusals dead-letter through the front door.
+- (lifecycle) A restarted actor's front door is created with the original spawn's mailbox capacity and policy.
+- (queries) A set-owned projector wake completes on a kernel caught-up signal; the tap's CaughtUp fact remains the host-observable marker.
+- (journal) A due-time snapshot check reads kernel-side anchors and loads the journal only when a snapshot is due.
+- (runtime) Ask reply leases are bounded: failed request deliveries cancel the lease and expired slots are pruned.
+- (bench) Criterion benches live in benches/e2e.rs (usage-shaped) and benches/micro.rs (component-shaped), run via cargo bench.
