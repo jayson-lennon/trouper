@@ -27,7 +27,9 @@ use crate::schema::{ActorManifest, Schema, SchemaId};
 /// Implementors get journal-backed restart for free; snapshots are opt-in
 /// via the spawn policy and go through [`EventSourced::capture`] /
 /// [`EventSourced::restore_from`].
-pub trait EventSourcedActor: Send + Sync + Serialize + DeserializeOwned + 'static {
+pub trait EventSourcedActor:
+    Send + Sync + Serialize + DeserializeOwned + Default + 'static
+{
     /// Declares edges and the contract kind (always [`ActorKind::EventSourced`]).
     ///
     /// Defaults to an EMPTY manifest: the typed spawn builder stamps the
@@ -41,8 +43,23 @@ pub trait EventSourcedActor: Send + Sync + Serialize + DeserializeOwned + 'stati
 
     /// Genesis state — a fresh instance (no snapshot exists).
     ///
-    /// `args` are spawn arguments (JSON); use them to seed initial state.
-    fn restore(args: &Json) -> Self;
+    /// `args` are spawn arguments; use them to seed initial state. Decode
+    /// them with [`Json::decode`] into a genesis type:
+    ///
+    /// ```ignore
+    /// fn restore(args: &Json) -> Self {
+    ///     let g: Genesis = args.decode().expect("genesis args");
+    ///     Self { on_hand: g.on_hand }
+    /// }
+    /// ```
+    ///
+    /// The default ignores args and constructs `Self::default()` (the
+    /// trait requires [`Default`] — event-sourced state is snapshot data,
+    /// always constructible empty) — most actors need no override.
+    fn restore(args: &Json) -> Self {
+        let _ = args;
+        Self::default()
+    }
 
     /// THE mutation. Used for live application AND replay — one code path,
     /// so live state and replayed state can never diverge.

@@ -4665,7 +4665,7 @@ mod tests {
     async fn restore_from_hydration_hook_populates_skipped_caches() {
         // Given a counter whose state carries a #[serde(skip)] cache that
         // derives from `total`, with restore_from overridden to rebuild it.
-        #[derive(serde::Serialize, serde::Deserialize)]
+        #[derive(serde::Serialize, serde::Deserialize, Default)]
         struct Cached {
             total: i64,
             #[serde(skip)]
@@ -6123,6 +6123,129 @@ mod tests {
         assert_eq!(system.journal_len(&ActorPath::new("accounts/b")), 1);
     }
 
+    /// A typed-args partition entity: genesis decodes `on_hand` from the
+    /// args template and the shard key from the merged `"key"` field.
+    #[derive(Serialize, Deserialize, Default, Debug)]
+    struct Seeded {
+        on_hand: i64,
+        key: String,
+    }
+    impl EventSourcedActor for Seeded {
+        fn restore(args: &Json) -> Self {
+            args.decode().expect("genesis args decode")
+        }
+        fn apply(&mut self, _event: &crate::envelope::Event) {}
+    }
+    impl CommandHandler<KeyedAdd> for Seeded {
+        fn handle(&self, _cmd: KeyedAdd, _ctx: &mut CmdCtx<'_>) -> crate::envelope::Events {
+            crate::envelope::Events::new()
+        }
+    }
+
+    /// An override-free actor: only `Default` and a handler.
+    #[derive(Serialize, Deserialize, Default, Debug)]
+    struct Bare {
+        seen: i64,
+    }
+    impl EventSourcedActor for Bare {
+        fn apply(&mut self, _event: &crate::envelope::Event) {}
+    }
+    impl CommandHandler<KeyedAdd> for Bare {
+        fn handle(&self, _cmd: KeyedAdd, _ctx: &mut CmdCtx<'_>) -> crate::envelope::Events {
+            crate::envelope::Events::new()
+        }
+    }
+
+    #[tokio::test]
+    async fn typed_args_roundtrip_from_builder_to_restore() {
+        // Given a genesis struct passed to the ES builder as a TYPED value.
+        let (system, _clock) = ActorSystem::test();
+        crate::builder::spawn_es_builder::<Seeded>(&system)
+            .at(ActorPath::new("seeded"))
+            .args(crate::json!({ "on_hand": 41, "key": "ignored" }))
+            .start();
+
+        // When the actor's restored state is read back.
+        let state = system
+            .es_state(&ActorPath::new("seeded"))
+            .await
+            .expect("spawned");
+
+        // Then restore decoded the args (here via the default fold of the
+        // serialized document — the state IS the args shape).
+        assert_eq!(state["on_hand"], 41);
+    }
+
+    #[tokio::test]
+    async fn partition_restore_sees_the_shard_key_as_a_field() {
+        // Given a partition set whose factory passes a TYPED args template
+        // with `on_hand` and whose entity decodes the merged "key" field.
+        let (system, _clock) = ActorSystem::test();
+        system.register_schema::<KeyedAdd>();
+        let spec = crate::pool::PartitionSpec {
+            public: ActorPath::new("vault"),
+            system: system.clone(),
+            factory: Arc::new(|system, path, args| {
+                crate::builder::spawn_es_builder::<Seeded>(system)
+                    .at(path.clone())
+                    .args(args.clone())
+                    .handles::<KeyedAdd>()
+                    .start();
+            }),
+            key_field: "account".to_owned(),
+            args_template: Some(crate::json!({ "on_hand": 100 })),
+            opts: SpawnOpts::default(),
+        };
+        system.install_partition_set(spec).expect("install");
+
+        // When a command for key "k9" activates an entity.
+        let e = system.envelope(
+            KeyedAdd::schema_id(),
+            ActorPath::new("vault"),
+            json!({ "n": 1, "account": "k9" }),
+        );
+        system.send(e).await.expect("delivered");
+        wait_for(|| async {
+            system
+                .es_state(&ActorPath::new("vault/k9"))
+                .await
+                .is_some()
+        })
+        .await;
+
+        // Then the entity's genesis decoded BOTH the template's typed
+        // `on_hand` AND the merged shard key.
+        let state = system
+            .es_state(&ActorPath::new("vault/k9"))
+            .await
+            .expect("activated");
+        let seeded: Seeded = state.decode().expect("state decodes");
+        assert_eq!(seeded.on_hand, 100, "template value decoded");
+        assert_eq!(seeded.key, "k9", "shard key merged as a plain field");
+    }
+
+    #[tokio::test]
+    async fn default_restore_serves_default_actors() {
+        // Given an actor whose state derives Default and overrides NOTHING
+        // (Bare has no `restore` impl at all), spawned with args it ignores.
+        let (system, _clock) = ActorSystem::test();
+        crate::builder::spawn_es_builder::<Bare>(&system)
+            .at(ActorPath::new("plain"))
+            .args(crate::json!({ "seen": 77 }))
+            .start();
+
+        // When its state is read.
+        let state = system
+            .es_state(&ActorPath::new("plain"))
+            .await
+            .expect("spawned without a restore override");
+
+        // Then the default restore served the spawn: the state is
+        // Default::default() (args ignored by design).
+        let bare: Bare = state.decode().expect("state decodes");
+        assert_eq!(bare.seen, 0);
+    }
+
     #[tokio::test]
     async fn partition_same_key_always_same_entity() {
         // Given a partition set over "accounts".
@@ -7259,6 +7382,14 @@ mod tests {
         total: i64,
         #[serde(skip)]
         log: HookLog,
+    }
+    impl Default for StopCounter {
+        fn default() -> Self {
+            Self {
+                total: 0,
+                log: es_hook_log(),
+            }
+        }
     }
     impl EventSourcedActor for StopCounter {
         fn manifest() -> ActorManifest {

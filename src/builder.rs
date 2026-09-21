@@ -100,8 +100,12 @@ impl<A: crate::actor::EventSourcedActor> SpawnBuilder<A> {
     }
 
     /// Genesis arguments (seed state; snapshot restores need no args).
-    pub fn args(mut self, args: Json) -> Self {
-        self.args = args;
+    ///
+    /// Accepts any serializable value — a typed genesis struct or a
+    /// `json!` literal. The value serializes once, here; serialization
+    /// failure panics (a programmer error, not a domain outcome).
+    pub fn args<T: serde::Serialize>(mut self, value: T) -> Self {
+        self.args = Json::of(&value);
         self
     }
 
@@ -229,8 +233,11 @@ impl<A: ServiceActor> ServiceBuilder<A> {
     }
 
     /// Start arguments (I/O allowed inside `start`).
-    pub fn args(mut self, args: Json) -> Self {
-        self.args = args;
+    ///
+    /// Accepts any serializable value; it serializes once, here.
+    /// Serialization failure panics (a programmer error).
+    pub fn args<T: serde::Serialize>(mut self, value: T) -> Self {
+        self.args = Json::of(&value);
         self
     }
 
@@ -395,7 +402,8 @@ impl ForeignBuilder {
         self
     }
 
-    /// Genesis JSON state.
+    /// Genesis JSON state. Accepts a `json!` literal or any `Json`
+    /// (foreign actors seed from the raw document by design).
     pub fn args(mut self, genesis: Json) -> Self {
         self.genesis = genesis;
         self
@@ -526,10 +534,13 @@ impl<P: crate::actor::Projector> ProjectorBuilder<P> {
         self
     }
 
-    /// Spawn arguments (JSON). A projector's genesis is [`Default`]; args
+    /// Spawn arguments. A projector's genesis is [`Default`]; args
     /// are carried for manifests/export only.
-    pub fn args(mut self, args: Json) -> Self {
-        self.args = args;
+    ///
+    /// Accepts any serializable value; it serializes once, here.
+    /// Serialization failure panics (a programmer error).
+    pub fn args<T: serde::Serialize>(mut self, value: T) -> Self {
+        self.args = Json::of(&value);
         self
     }
 
