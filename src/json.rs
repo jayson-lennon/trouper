@@ -238,20 +238,9 @@ mod tests {
         use crate::actor::EventSourcedActor;
         use crate::prelude::*;
 
-        #[derive(serde::Serialize, serde::Deserialize)]
+        #[derive(Event, serde::Serialize, serde::Deserialize)]
         struct Pong {
             n: i64,
-        }
-        impl Schema for Pong {
-            fn schema_def() -> SchemaDef {
-                SchemaDef {
-                    name: "Pong".into(),
-                    version: 1,
-                    kind: SchemaKind::Event,
-                    fields: vec![],
-                    description: None,
-                }
-            }
         }
 
         #[derive(serde::Serialize, serde::Deserialize, Default)]

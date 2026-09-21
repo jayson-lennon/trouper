@@ -24,46 +24,23 @@ use trouper::prelude::*;
 
 // ---- A journaled counter (the entity whose state we read) -------------
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Command, Debug, Deserialize, Serialize)]
+#[schema(description = "Add to the counter.")]
 struct Add {
     n: i64,
 }
-impl Schema for Add {
-    fn schema_def() -> SchemaDef {
-        SchemaDef {
-            name: "Add".into(),
-            version: 1,
-            kind: SchemaKind::Command,
-            fields: vec![FieldDef::required("n", FieldTy::Int)],
-            description: Some("Add to the counter.".into()),
-        }
-    }
-}
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Event, Debug, Deserialize, Serialize)]
 struct Added {
+    // The `key` field is the shard key because this demo's projector
+    // is a SET (per-key `seen/<key>` paths, activated on demand): the
+    // shard key is the routing datum every broadcast copy resolves. The
+    // registry enforces it — install_projector_set rejects the set with
+    // InvalidSpec unless one consumed schema declares the key field. A
+    // standalone projector needs none of this (see examples/try_with.rs).
+    #[schema(shard_key)]
     key: String,
     n: i64,
-}
-// The `key` field carries `.as_shard_key()` because this demo's projector
-// is a SET (per-key `seen/<key>` paths, activated on demand): the shard
-// key is the routing datum every broadcast copy resolves. The registry
-// enforces it — install_projector_set rejects the set with InvalidSpec
-// unless one consumed schema declares the key field. A standalone
-// projector needs none of this (see examples/try_with.rs).
-impl Schema for Added {
-    fn schema_def() -> SchemaDef {
-        SchemaDef {
-            name: "Added".into(),
-            version: 1,
-            kind: SchemaKind::Event,
-            fields: vec![
-                FieldDef::required("key", FieldTy::Str).as_shard_key(),
-                FieldDef::required("n", FieldTy::Int),
-            ],
-            description: None,
-        }
-    }
 }
 
 #[derive(Default, Debug, Serialize, Deserialize)]

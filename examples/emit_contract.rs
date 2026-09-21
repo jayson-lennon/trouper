@@ -12,58 +12,23 @@ use trouper::actor::{CommandHandler, EventSourcedActor};
 use trouper::prelude::*;
 use trouper::tap::FactKind;
 
-#[derive(Deserialize)]
+#[derive(Command, Deserialize)]
 struct Ping {
     n: i64,
 }
 
-impl Schema for Ping {
-    fn schema_def() -> SchemaDef {
-        SchemaDef {
-            name: "Ping".into(),
-            version: 1,
-            kind: SchemaKind::Command,
-            fields: vec![FieldDef::required("n", FieldTy::Int)],
-            description: None,
-        }
-    }
-}
-
-#[derive(Serialize, Deserialize)]
+#[derive(Event, Serialize, Deserialize)]
 struct Ponged {
     #[allow(dead_code)]
     n: i64,
 }
 
-impl Schema for Ponged {
-    fn schema_def() -> SchemaDef {
-        SchemaDef {
-            name: "Ponged".into(),
-            version: 1,
-            kind: SchemaKind::Event,
-            fields: vec![FieldDef::required("n", FieldTy::Int)],
-            description: None,
-        }
-    }
-}
-
 /// NEVER declared in any manifest — the counter emits it anyway.
-#[derive(Serialize, Deserialize)]
+#[derive(Event, Serialize, Deserialize)]
+#[schema(description = "Emitted but never declared (the bug)")]
 struct SecretPing {
     #[allow(dead_code)]
     n: i64,
-}
-
-impl Schema for SecretPing {
-    fn schema_def() -> SchemaDef {
-        SchemaDef {
-            name: "SecretPing".into(),
-            version: 1,
-            kind: SchemaKind::Event,
-            fields: vec![FieldDef::required("n", FieldTy::Int)],
-            description: Some("Emitted but never declared (the bug)".into()),
-        }
-    }
 }
 
 #[derive(Serialize, Deserialize, Default)]

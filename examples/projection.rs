@@ -29,47 +29,21 @@ use trouper::prelude::*;
 // ---- The entity side (the es_entity pattern, compressed) -----------
 
 /// The entity's command.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Command, Debug, Clone, Serialize, Deserialize)]
+#[schema(description = "Adjust one account's balance.")]
 struct AccountCmd {
+    #[schema(shard_key)]
     account: String,
     delta: i64,
-}
-impl Schema for AccountCmd {
-    fn schema_def() -> SchemaDef {
-        SchemaDef {
-            name: "AccountCmd".into(),
-            version: 1,
-            kind: SchemaKind::Command,
-            fields: vec![
-                FieldDef::required("account", FieldTy::Str).as_shard_key(),
-                FieldDef::required("delta", FieldTy::Int),
-            ],
-            description: Some("Adjust one account's balance.".into()),
-        }
-    }
 }
 
 /// The entity's decision event — the fact the projector consumes.
 /// (Carrying `account` in the fact is what makes a GLOBAL fold
 /// possible: the projector reads the key from the payload.)
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Event, Debug, Clone, Serialize, Deserialize)]
 struct AccountAdjusted {
     account: String,
     delta: i64,
-}
-impl Schema for AccountAdjusted {
-    fn schema_def() -> SchemaDef {
-        SchemaDef {
-            name: "AccountAdjusted".into(),
-            version: 1,
-            kind: SchemaKind::Event,
-            fields: vec![
-                FieldDef::required("account", FieldTy::Str),
-                FieldDef::required("delta", FieldTy::Int),
-            ],
-            description: None,
-        }
-    }
 }
 
 /// One account entity: folds its own adjustments.

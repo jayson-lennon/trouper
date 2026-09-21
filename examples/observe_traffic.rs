@@ -33,37 +33,17 @@ fn log(line: impl Into<String>) {
 }
 
 /// A command: fulfillment SHOULD ship the order.
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Command, Debug, Serialize, Deserialize)]
+#[schema(description = "Fulfillment should ship the order.")]
 struct Ship {
     order: String,
 }
-impl Schema for Ship {
-    fn schema_def() -> SchemaDef {
-        SchemaDef {
-            name: "Ship".into(),
-            version: 1,
-            kind: SchemaKind::Command,
-            fields: vec![FieldDef::required("order", FieldTy::Str)],
-            description: Some("Fulfillment should ship the order.".into()),
-        }
-    }
-}
 
 /// An event: the order WAS shipped (announcement).
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Event, Debug, Serialize, Deserialize)]
+#[schema(description = "An order was shipped (announcement).")]
 struct Shipped {
     order: String,
-}
-impl Schema for Shipped {
-    fn schema_def() -> SchemaDef {
-        SchemaDef {
-            name: "Shipped".into(),
-            version: 1,
-            kind: SchemaKind::Event,
-            fields: vec![FieldDef::required("order", FieldTy::Str)],
-            description: Some("An order was shipped (announcement).".into()),
-        }
-    }
 }
 
 /// The primary: handles Ship commands and ANNOUNCES the outcome.

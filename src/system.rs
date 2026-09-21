@@ -2342,59 +2342,26 @@ mod tests {
     use crate::actor::{CommandHandler, MsgHandler, TypedEsAdapter, TypedServiceAdapter};
     use crate::context::CmdCtx;
     use crate::json;
-    use crate::schema::{ActorManifest, FieldDef, FieldTy, SchemaDef, SchemaKind};
+    use crate::schema::{ActorManifest, Command, Event, FieldDef, FieldTy, SchemaDef, SchemaKind};
     use serde::{Deserialize, Serialize};
     use std::collections::HashMap;
 
-    #[derive(Serialize, Deserialize)]
+    #[derive(Command, Serialize, Deserialize)]
     struct Add {
         n: i64,
     }
-    impl Schema for Add {
-        fn schema_def() -> SchemaDef {
-            SchemaDef {
-                name: "Add".into(),
-                version: 1,
-                kind: SchemaKind::Command,
-                fields: vec![FieldDef::required("n", FieldTy::Int)],
-                description: None,
-            }
-        }
-    }
 
-    #[derive(serde::Serialize, serde::Deserialize)]
+    #[derive(Event, serde::Serialize, serde::Deserialize)]
     struct Added {
         n: i64,
-    }
-    impl Schema for Added {
-        fn schema_def() -> SchemaDef {
-            SchemaDef {
-                name: "Added".into(),
-                version: 1,
-                kind: SchemaKind::Event,
-                fields: vec![FieldDef::required("n", FieldTy::Int)],
-                description: None,
-            }
-        }
     }
 
     /// An event schema the test actors NEVER declare (emit-enforcement
     /// fixture: the kernel must drop it).
-    #[derive(serde::Deserialize)]
+    #[derive(Event, serde::Deserialize)]
     struct Smuggled {
         #[allow(dead_code)] // payload shape; the kernel never reads it
         n: i64,
-    }
-    impl Schema for Smuggled {
-        fn schema_def() -> SchemaDef {
-            SchemaDef {
-                name: "Smuggled".into(),
-                version: 1,
-                kind: SchemaKind::Event,
-                fields: vec![FieldDef::required("n", FieldTy::Int)],
-                description: None,
-            }
-        }
     }
 
     #[derive(Serialize, Deserialize, Default)]
@@ -2434,21 +2401,10 @@ mod tests {
     }
 
     /// A command whose handling panics (panic isolation under test).
-    #[derive(Deserialize)]
+    #[derive(Command, Deserialize)]
     struct Boom {
         #[allow(dead_code)] // payload shape; the handler panics before reading
         why: String,
-    }
-    impl Schema for Boom {
-        fn schema_def() -> SchemaDef {
-            SchemaDef {
-                name: "Boom".into(),
-                version: 1,
-                kind: SchemaKind::Command,
-                fields: vec![FieldDef::required("why", FieldTy::Str)],
-                description: None,
-            }
-        }
     }
 
     #[tokio::test]
@@ -2795,22 +2751,11 @@ mod tests {
     async fn tap_causality_chain_links_hops_with_a_shared_trace() {
         // Given A→B→C: a counter whose Add handler forwards to an Echo
         // service, and an Echo service that handles Ping.
-        #[derive(serde::Serialize, serde::Deserialize)]
+        #[derive(Command, serde::Serialize, serde::Deserialize)]
         struct Ping {
             #[serde(default)]
             #[allow(dead_code)] // payload shape; the handler ignores it
             n: i64,
-        }
-        impl Schema for Ping {
-            fn schema_def() -> SchemaDef {
-                SchemaDef {
-                    name: "Ping".into(),
-                    version: 1,
-                    kind: SchemaKind::Command,
-                    fields: vec![FieldDef::required("n", FieldTy::Int)],
-                    description: None,
-                }
-            }
         }
 
         #[derive(Serialize, Deserialize, Default)]
@@ -6168,46 +6113,20 @@ mod tests {
 
     /// The partition test command: an int-typed `n` plus a STRING-TYPED
     /// `account` field marked ShardKey (typed key extraction).
-    #[derive(Debug, Clone, Serialize, Deserialize)]
+    #[derive(Command, Debug, Clone, Serialize, Deserialize)]
     struct KeyedAdd {
         n: i64,
+        #[schema(shard_key)]
         account: String,
-    }
-    impl Schema for KeyedAdd {
-        fn schema_def() -> SchemaDef {
-            SchemaDef {
-                name: "KeyedAdd".into(),
-                version: 1,
-                kind: SchemaKind::Command,
-                fields: vec![
-                    FieldDef::required("n", FieldTy::Int),
-                    FieldDef::required("account", FieldTy::Str).as_shard_key(),
-                ],
-                description: None,
-            }
-        }
     }
 
     /// A fact schema consumed by projector fixtures: a chat message whose
     /// `chat_id` is the shard key.
-    #[derive(Serialize, Deserialize, Clone)]
+    #[derive(Event, Serialize, Deserialize, Clone)]
     struct Chatted {
+        #[schema(shard_key)]
         chat_id: String,
         text: String,
-    }
-    impl Schema for Chatted {
-        fn schema_def() -> SchemaDef {
-            SchemaDef {
-                name: "Chatted".into(),
-                version: 1,
-                kind: SchemaKind::Event,
-                fields: vec![
-                    FieldDef::required("chat_id", FieldTy::Str).as_shard_key(),
-                    FieldDef::required("text", FieldTy::Str),
-                ],
-                description: None,
-            }
-        }
     }
 
     /// A per-chat read model: the count of messages seen (projector
@@ -8782,88 +8701,33 @@ mod tests {
     // ---- schema-addressed publish/subscribe ----------------------------
 
     /// An event the pub/sub fixtures broadcast.
-    #[derive(Serialize, Deserialize, Clone)]
+    #[derive(Event, Serialize, Deserialize, Clone)]
     struct Shipped {
         order: String,
     }
-    impl Schema for Shipped {
-        fn schema_def() -> SchemaDef {
-            SchemaDef {
-                name: "Shipped".into(),
-                version: 1,
-                kind: SchemaKind::Event,
-                fields: vec![FieldDef::required("order", FieldTy::Str)],
-                description: None,
-            }
-        }
-    }
 
     /// A command the pub/sub fixtures dispatch (the disjoint-tables tests).
-    #[derive(Serialize, Deserialize, Clone)]
+    #[derive(Command, Serialize, Deserialize, Clone)]
     struct Pack {
         order: String,
     }
-    impl Schema for Pack {
-        fn schema_def() -> SchemaDef {
-            SchemaDef {
-                name: "Pack".into(),
-                version: 1,
-                kind: SchemaKind::Command,
-                fields: vec![FieldDef::required("order", FieldTy::Str)],
-                description: None,
-            }
-        }
-    }
 
     /// A kick-off command for typed-ctx.ask tests (the caller's entry).
-    #[derive(Serialize, Deserialize, Clone)]
+    #[derive(Command, Serialize, Deserialize, Clone)]
     struct Kick {
         id: String,
-    }
-    impl Schema for Kick {
-        fn schema_def() -> SchemaDef {
-            SchemaDef {
-                name: "Kick".into(),
-                version: 1,
-                kind: SchemaKind::Command,
-                fields: vec![FieldDef::required("id", FieldTy::Str)],
-                description: None,
-            }
-        }
     }
 
     /// The typed-ctx.ask pair: request/reply with unique names so the
     /// first-wins schema table cannot collide with other fixtures.
-    #[derive(Serialize, Deserialize, Clone)]
+    #[derive(Command, Serialize, Deserialize, Clone)]
     struct AskReq {
         n: i64,
     }
-    impl Schema for AskReq {
-        fn schema_def() -> SchemaDef {
-            SchemaDef {
-                name: "AskReq".into(),
-                version: 1,
-                kind: SchemaKind::Command,
-                fields: vec![FieldDef::required("n", FieldTy::Int)],
-                description: None,
-            }
-        }
-    }
 
-    #[derive(Serialize, Deserialize, Clone)]
+    #[derive(Event, Serialize, Deserialize, Clone)]
     struct AskRes {
         n: i64,
-    }
-    impl Schema for AskRes {
-        fn schema_def() -> SchemaDef {
-            SchemaDef {
-                name: "AskRes".into(),
-                version: 1,
-                kind: SchemaKind::Event,
-                fields: vec![FieldDef::required("n", FieldTy::Int)],
-                description: None,
-            }
-        }
     }
 
     /// A recording service actor with configurable edges (which of

@@ -34,55 +34,19 @@ fn record(line: String) {
     sink().lock().push(line);
 }
 
-#[derive(Deserialize)]
+#[derive(Command, Deserialize)]
 struct Tick {}
 
-impl Schema for Tick {
-    fn schema_def() -> SchemaDef {
-        SchemaDef {
-            name: "Tick".into(),
-            version: 1,
-            kind: SchemaKind::Command,
-            fields: vec![],
-            description: None,
-        }
-    }
-}
-
-#[derive(Deserialize)]
+#[derive(Command, Deserialize)]
 struct StrictCmd {
     #[allow(dead_code)]
     n: i64,
 }
 
-impl Schema for StrictCmd {
-    fn schema_def() -> SchemaDef {
-        SchemaDef {
-            name: "StrictCmd".into(),
-            version: 1,
-            kind: SchemaKind::Command,
-            fields: vec![FieldDef::required("n", FieldTy::Int)],
-            description: None,
-        }
-    }
-}
-
-#[derive(Serialize, Deserialize)]
+#[derive(Event, Serialize, Deserialize)]
 struct StrictOk {
     #[allow(dead_code)]
     n: i64,
-}
-
-impl Schema for StrictOk {
-    fn schema_def() -> SchemaDef {
-        SchemaDef {
-            name: "StrictOk".into(),
-            version: 1,
-            kind: SchemaKind::Event,
-            fields: vec![FieldDef::required("n", FieldTy::Int)],
-            description: None,
-        }
-    }
 }
 
 /// An ES actor that handles ONLY StrictCmd (strict schema surface).

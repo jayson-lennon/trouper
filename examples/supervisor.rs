@@ -35,56 +35,26 @@ fn log(line: impl Into<String>) {
 }
 
 /// The work unit: one copy goes to ONE worker per send_to_any.
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Command, Debug, Serialize, Deserialize)]
+#[schema(description = "A unit of work for the worker pool.")]
 struct WorkJob {
     id: u32,
 }
-impl Schema for WorkJob {
-    fn schema_def() -> SchemaDef {
-        SchemaDef {
-            name: "WorkJob".into(),
-            version: 1,
-            kind: SchemaKind::Command,
-            fields: vec![FieldDef::required("id", FieldTy::Int)],
-            description: Some("A unit of work for the worker pool.".into()),
-        }
-    }
-}
 
 /// A worker's completion announcement (published: news, not work).
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Event, Debug, Serialize, Deserialize)]
+#[schema(description = "A worker finished a job.")]
 struct JobDone {
     id: u32,
-}
-impl Schema for JobDone {
-    fn schema_def() -> SchemaDef {
-        SchemaDef {
-            name: "JobDone".into(),
-            version: 1,
-            kind: SchemaKind::Event,
-            fields: vec![FieldDef::required("id", FieldTy::Int)],
-            description: Some("A worker finished a job.".into()),
-        }
-    }
 }
 
 /// The escalation control message the engine SENDS to the declared
 /// parent when a child's budget exhausts. It is an ordinary message —
 /// the parent's handler owns the response.
-#[derive(Debug, Deserialize)]
+#[derive(Command, Debug, Deserialize)]
+#[schema(description = "A supervised child exhausted its budget.")]
 struct Escalated {
     escalated: String,
-}
-impl Schema for Escalated {
-    fn schema_def() -> SchemaDef {
-        SchemaDef {
-            name: "Escalated".into(),
-            version: 1,
-            kind: SchemaKind::Command,
-            fields: vec![FieldDef::required("escalated", FieldTy::Str)],
-            description: Some("A supervised child exhausted its budget.".into()),
-        }
-    }
 }
 
 /// A worker: handles `WorkJob` and announces completion. Every worker

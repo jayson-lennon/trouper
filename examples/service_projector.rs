@@ -33,24 +33,11 @@ use trouper::registry::RegistryError;
 /// kind: Event — it is news for whomever handles it. The service is the
 /// ORIGIN: there is no entity journaling this anywhere (that is the
 /// point of this example).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Event, Debug, Clone, Serialize, Deserialize)]
+#[schema(description = "The pool's live counters changed.")]
 struct PoolDrained {
     taken: u64,
     returned: u64,
-}
-impl Schema for PoolDrained {
-    fn schema_def() -> SchemaDef {
-        SchemaDef {
-            name: "PoolDrained".into(),
-            version: 1,
-            kind: SchemaKind::Event,
-            fields: vec![
-                FieldDef::required("taken", FieldTy::Int),
-                FieldDef::required("returned", FieldTy::Int),
-            ],
-            description: Some("The pool's live counters changed.".into()),
-        }
-    }
 }
 
 /// The service: real work happens in an async handler (here: a global
@@ -89,33 +76,13 @@ impl MsgHandler<Checkin> for PoolService {
     }
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Command, Debug, Serialize, Deserialize)]
+#[schema(description = "Take a connection from the pool.")]
 struct Checkout;
-impl Schema for Checkout {
-    fn schema_def() -> SchemaDef {
-        SchemaDef {
-            name: "Checkout".into(),
-            version: 1,
-            kind: SchemaKind::Command,
-            fields: vec![],
-            description: Some("Take a connection from the pool.".into()),
-        }
-    }
-}
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Command, Debug, Serialize, Deserialize)]
+#[schema(description = "Return a connection to the pool.")]
 struct Checkin;
-impl Schema for Checkin {
-    fn schema_def() -> SchemaDef {
-        SchemaDef {
-            name: "Checkin".into(),
-            version: 1,
-            kind: SchemaKind::Command,
-            fields: vec![],
-            description: Some("Return a connection to the pool.".into()),
-        }
-    }
-}
 
 // ---- The read model: live pool counters ----------------------------
 

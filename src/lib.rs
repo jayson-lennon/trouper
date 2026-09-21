@@ -7,6 +7,11 @@
 //!
 //! See `.plans/actor-runtime-core/plan.md` for the authoritative spec.
 
+// The schema derive macros emit `::trouper::...` paths (so they resolve for
+// downstream consumers); aliasing `self` makes the same paths work inside
+// this crate, where `trouper` is not a dependency of itself.
+extern crate self as trouper;
+
 pub mod actor;
 pub mod builder;
 pub mod clock;

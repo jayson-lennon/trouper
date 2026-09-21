@@ -26,45 +26,21 @@ use trouper::prelude::*;
 // ---- The source of truth: a journaled chat room --------------------
 
 /// The room's command: say something.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Command, Debug, Clone, Serialize, Deserialize)]
+#[schema(description = "Say something in one chat room.")]
 struct Say {
+    #[schema(shard_key)]
     chat_id: String,
     text: String,
-}
-impl Schema for Say {
-    fn schema_def() -> SchemaDef {
-        SchemaDef {
-            name: "Say".into(),
-            version: 1,
-            kind: SchemaKind::Command,
-            fields: vec![
-                FieldDef::required("chat_id", FieldTy::Str).as_shard_key(),
-                FieldDef::required("text", FieldTy::Str),
-            ],
-            description: Some("Say something in one chat room.".into()),
-        }
-    }
 }
 
 /// The decision fact — what the projector set consumes.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Event, Debug, Clone, Serialize, Deserialize)]
+#[schema(description = "One chat message (a fact, not a command).")]
 struct Chatted {
+    #[schema(shard_key)]
     chat_id: String,
     text: String,
-}
-impl Schema for Chatted {
-    fn schema_def() -> SchemaDef {
-        SchemaDef {
-            name: "Chatted".into(),
-            version: 1,
-            kind: SchemaKind::Event,
-            fields: vec![
-                FieldDef::required("chat_id", FieldTy::Str).as_shard_key(),
-                FieldDef::required("text", FieldTy::Str),
-            ],
-            description: Some("One chat message (a fact, not a command).".into()),
-        }
-    }
 }
 
 /// One chat-room entity: journals every message as a `Chatted` fact.

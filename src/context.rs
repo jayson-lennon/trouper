@@ -529,87 +529,32 @@ mod tests {
     use super::*;
     use crate::actor::ActorKind;
     use crate::registry::EndpointInfo;
-    use crate::schema::{ActorManifest, Schema, SchemaDef, SchemaKind};
+    use crate::schema::{ActorManifest, Command, Event, Schema, SchemaKind};
     use parking_lot::Mutex;
     use serde::{Deserialize, Serialize};
 
     /// Typed messages for the effect tests: the schema id comes from the
     /// type, so the assertions prove the derivation.
-    #[derive(Serialize, Deserialize)]
+    #[derive(Command, Serialize, Deserialize)]
     struct ReserveStock {
         qty: i64,
     }
-    impl Schema for ReserveStock {
-        fn schema_def() -> SchemaDef {
-            SchemaDef {
-                name: "ReserveStock".into(),
-                version: 1,
-                kind: SchemaKind::Command,
-                fields: vec![],
-                description: None,
-            }
-        }
-    }
 
-    #[derive(Serialize, Deserialize)]
+    #[derive(Event, Serialize, Deserialize)]
     struct Reserved {
         ok: bool,
     }
-    impl Schema for Reserved {
-        fn schema_def() -> SchemaDef {
-            SchemaDef {
-                name: "Reserved".into(),
-                version: 1,
-                kind: SchemaKind::Event,
-                fields: vec![],
-                description: None,
-            }
-        }
-    }
 
-    #[derive(Serialize, Deserialize)]
+    #[derive(Event, Serialize, Deserialize)]
     struct StockReserved {
         qty: i64,
     }
-    impl Schema for StockReserved {
-        fn schema_def() -> SchemaDef {
-            SchemaDef {
-                name: "StockReserved".into(),
-                version: 1,
-                kind: SchemaKind::Event,
-                fields: vec![],
-                description: None,
-            }
-        }
-    }
 
-    #[derive(Serialize, Deserialize)]
+    #[derive(Command, Serialize, Deserialize)]
     struct Ping;
-    impl Schema for Ping {
-        fn schema_def() -> SchemaDef {
-            SchemaDef {
-                name: "Ping".into(),
-                version: 1,
-                kind: SchemaKind::Command,
-                fields: vec![],
-                description: None,
-            }
-        }
-    }
 
-    #[derive(Serialize, Deserialize)]
+    #[derive(Event, Serialize, Deserialize)]
     struct Pong;
-    impl Schema for Pong {
-        fn schema_def() -> SchemaDef {
-            SchemaDef {
-                name: "Pong".into(),
-                version: 1,
-                kind: SchemaKind::Event,
-                fields: vec![],
-                description: None,
-            }
-        }
-    }
 
     /// A view over static data; tests never touch a real registry.
     struct FakeView {

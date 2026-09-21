@@ -1,0 +1,5 @@
+error: expected integer literal
+ --> tests/ui/bad_version_value.rs:5:20
+  |
+5 | #[schema(version = "two")]
+  |                    ^^^^^

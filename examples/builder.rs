@@ -19,48 +19,19 @@ use trouper::system::SnapshotCadence;
 
 // -- A typed event-sourced actor -------------------------------------------
 
-#[derive(Deserialize)]
+#[derive(Command, Deserialize)]
+#[schema(description = "Add stock")]
 struct Restock {
     sku: String,
     qty: i64,
 }
 
-impl Schema for Restock {
-    fn schema_def() -> SchemaDef {
-        SchemaDef {
-            name: "Restock".into(),
-            version: 1,
-            kind: SchemaKind::Command,
-            fields: vec![
-                FieldDef::required("sku", FieldTy::Str),
-                FieldDef::required("qty", FieldTy::Int),
-            ],
-            description: Some("Add stock".into()),
-        }
-    }
-}
-
-#[derive(Serialize, Deserialize)]
+#[derive(Event, Serialize, Deserialize)]
 struct Restocked {
     #[allow(dead_code)] // folded via raw payload
     sku: String,
     #[allow(dead_code)] // folded via raw payload
     qty: i64,
-}
-
-impl Schema for Restocked {
-    fn schema_def() -> SchemaDef {
-        SchemaDef {
-            name: "Restocked".into(),
-            version: 1,
-            kind: SchemaKind::Event,
-            fields: vec![
-                FieldDef::required("sku", FieldTy::Str),
-                FieldDef::required("qty", FieldTy::Int),
-            ],
-            description: None,
-        }
-    }
 }
 
 #[derive(Serialize, Deserialize, Default)]

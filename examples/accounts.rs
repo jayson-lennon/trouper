@@ -29,117 +29,42 @@ use trouper::tap::FactKind;
 
 // -- Commands -------------------------------------------------------------
 
-#[derive(Deserialize)]
+#[derive(Command, Deserialize)]
 struct Deposit {
     n: i64,
 }
 
-impl Schema for Deposit {
-    fn schema_def() -> SchemaDef {
-        SchemaDef {
-            name: "Deposit".into(),
-            version: 1,
-            kind: SchemaKind::Command,
-            fields: vec![FieldDef::required("n", FieldTy::Int)],
-            description: None,
-        }
-    }
-}
-
-#[derive(Deserialize)]
+#[derive(Command, Deserialize)]
 struct Withdraw {
     n: i64,
-}
-
-impl Schema for Withdraw {
-    fn schema_def() -> SchemaDef {
-        SchemaDef {
-            name: "Withdraw".into(),
-            version: 1,
-            kind: SchemaKind::Command,
-            fields: vec![FieldDef::required("n", FieldTy::Int)],
-            description: None,
-        }
-    }
 }
 
 /// The technical-failure trigger: panics in the handler ONCE — a
 /// transient fault. (A poison that panics every time is a permanent
 /// fault: supervision would burn the budget and stop the actor.)
-#[derive(Deserialize)]
+#[derive(Command, Deserialize)]
 struct Poison {
     n: i64,
 }
 
-impl Schema for Poison {
-    fn schema_def() -> SchemaDef {
-        SchemaDef {
-            name: "Poison".into(),
-            version: 1,
-            kind: SchemaKind::Command,
-            fields: vec![FieldDef::required("n", FieldTy::Int)],
-            description: None,
-        }
-    }
-}
-
 // -- Events ---------------------------------------------------------------
 
-#[derive(Serialize, Deserialize)]
+#[derive(Event, Serialize, Deserialize)]
 struct Deposited {
     n: i64,
 }
 
-impl Schema for Deposited {
-    fn schema_def() -> SchemaDef {
-        SchemaDef {
-            name: "Deposited".into(),
-            version: 1,
-            kind: SchemaKind::Event,
-            fields: vec![FieldDef::required("n", FieldTy::Int)],
-            description: None,
-        }
-    }
-}
-
-#[derive(Serialize, Deserialize)]
+#[derive(Event, Serialize, Deserialize)]
 struct Withdrawn {
     n: i64,
 }
 
-impl Schema for Withdrawn {
-    fn schema_def() -> SchemaDef {
-        SchemaDef {
-            name: "Withdrawn".into(),
-            version: 1,
-            kind: SchemaKind::Event,
-            fields: vec![FieldDef::required("n", FieldTy::Int)],
-            description: None,
-        }
-    }
-}
-
 /// The domain rejection, journaled like any event: a fact about the
 /// world ("a decline happened"), not an error report.
-#[derive(Serialize, Deserialize)]
+#[derive(Event, Serialize, Deserialize)]
 struct WithdrawFailed {
     requested: i64,
     balance: i64,
-}
-
-impl Schema for WithdrawFailed {
-    fn schema_def() -> SchemaDef {
-        SchemaDef {
-            name: "WithdrawFailed".into(),
-            version: 1,
-            kind: SchemaKind::Event,
-            fields: vec![
-                FieldDef::required("requested", FieldTy::Int),
-                FieldDef::required("balance", FieldTy::Int),
-            ],
-            description: None,
-        }
-    }
 }
 
 // -- The account ----------------------------------------------------------

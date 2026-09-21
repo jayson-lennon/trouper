@@ -1,0 +1,5 @@
+error: Event/Command derive does not support generic types; schemas are concrete wire types
+ --> tests/ui/generic_struct.rs:5:13
+  |
+5 | struct Boxed<T> {
+  |             ^^^

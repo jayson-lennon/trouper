@@ -609,20 +609,9 @@ mod events_tests {
     use crate::json;
     use serde::Deserialize;
 
-    #[derive(Serialize, Deserialize)]
+    #[derive(crate::schema::Event, Serialize, Deserialize)]
     struct Deposited {
         n: i64,
-    }
-    impl Schema for Deposited {
-        fn schema_def() -> crate::schema::SchemaDef {
-            crate::schema::SchemaDef {
-                name: "Deposited".into(),
-                version: 1,
-                kind: crate::schema::SchemaKind::Event,
-                fields: vec![],
-                description: None,
-            }
-        }
     }
 
     #[test]
@@ -703,7 +692,7 @@ mod events_tests {
     }
 
     /// A fact whose serialization fails (injected via a hand-rolled impl).
-    #[derive(Clone, Copy)]
+    #[derive(crate::schema::Event, Clone, Copy)]
     #[allow(dead_code)] // the payload value never serializes; that's the test
     struct Unserializable {
         bad: f64,
@@ -712,17 +701,6 @@ mod events_tests {
         fn serialize<S: serde::Serializer>(&self, _serializer: S) -> Result<S::Ok, S::Error> {
             use serde::ser::Error as _;
             Err(S::Error::custom("injected serialize failure"))
-        }
-    }
-    impl Schema for Unserializable {
-        fn schema_def() -> crate::schema::SchemaDef {
-            crate::schema::SchemaDef {
-                name: "Unserializable".into(),
-                version: 1,
-                kind: crate::schema::SchemaKind::Event,
-                fields: vec![],
-                description: None,
-            }
         }
     }
 
@@ -812,35 +790,13 @@ mod events_tests {
         }
     }
 
-    #[derive(Serialize, Deserialize)]
+    #[derive(crate::schema::Command, Serialize, Deserialize)]
     struct ReserveStock {
         qty: i64,
     }
-    impl Schema for ReserveStock {
-        fn schema_def() -> crate::schema::SchemaDef {
-            crate::schema::SchemaDef {
-                name: "ReserveStock".into(),
-                version: 1,
-                kind: crate::schema::SchemaKind::Command,
-                fields: vec![],
-                description: None,
-            }
-        }
-    }
 
-    #[derive(Serialize, Deserialize)]
+    #[derive(crate::schema::Event, Serialize, Deserialize)]
     struct StockReserved {
         qty: i64,
-    }
-    impl Schema for StockReserved {
-        fn schema_def() -> crate::schema::SchemaDef {
-            crate::schema::SchemaDef {
-                name: "StockReserved".into(),
-                version: 1,
-                kind: crate::schema::SchemaKind::Event,
-                fields: vec![],
-                description: None,
-            }
-        }
     }
 }

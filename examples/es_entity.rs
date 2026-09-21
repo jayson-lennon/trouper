@@ -22,60 +22,27 @@ use trouper::prelude::*;
 
 /// The set's command: an int amount plus the STRING shard key. The
 /// kernel reads `account` per envelope (declared via `as_shard_key`).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Command, Debug, Clone, Serialize, Deserialize)]
+#[schema(description = "Adjust one account's balance.")]
 struct AccountCmd {
+    #[schema(shard_key)]
     account: String,
     delta: i64,
 }
-impl Schema for AccountCmd {
-    fn schema_def() -> SchemaDef {
-        SchemaDef {
-            name: "AccountCmd".into(),
-            version: 1,
-            kind: SchemaKind::Command,
-            fields: vec![
-                FieldDef::required("account", FieldTy::Str).as_shard_key(),
-                FieldDef::required("delta", FieldTy::Int),
-            ],
-            description: Some("Adjust one account's balance.".into()),
-        }
-    }
-}
 
 /// The decision event: the only thing the journal stores.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Event, Debug, Clone, Serialize, Deserialize)]
 struct AccountAdjusted {
     delta: i64,
-}
-impl Schema for AccountAdjusted {
-    fn schema_def() -> SchemaDef {
-        SchemaDef {
-            name: "AccountAdjusted".into(),
-            version: 1,
-            kind: SchemaKind::Event,
-            fields: vec![FieldDef::required("delta", FieldTy::Int)],
-            description: None,
-        }
-    }
 }
 
 /// An idle-hour fact entities declare: every LIVE entity receives a
 /// copy when it is published (a published copy dispatches exactly like
 /// a told one — same declaration, same dispatch table).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Event, Debug, Clone, Serialize, Deserialize)]
+#[schema(description = "A market-wide announcement.")]
 struct MarketBell {
     ring: u32,
-}
-impl Schema for MarketBell {
-    fn schema_def() -> SchemaDef {
-        SchemaDef {
-            name: "MarketBell".into(),
-            version: 1,
-            kind: SchemaKind::Event,
-            fields: vec![FieldDef::required("ring", FieldTy::Int)],
-            description: Some("A market-wide announcement.".into()),
-        }
-    }
 }
 
 /// The event-sourced entity: pure decisions, fold-on-apply, keyed

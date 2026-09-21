@@ -125,6 +125,12 @@ impl FieldDef {
         self
     }
 
+    /// Attaches a human-facing description.
+    pub fn with_description(mut self, description: impl Into<String>) -> Self {
+        self.description = Some(description.into());
+        self
+    }
+
     /// Attaches a numeric range.
     pub fn with_range(mut self, range: Range) -> Self {
         self.range = Some(range);
@@ -203,6 +209,10 @@ impl SchemaDef {
 ///
 /// Both paths produce the same [`SchemaDef`], so a schema is identical
 /// whether it arrived from code or from data.
+///
+/// Prefer deriving the impl with [`Event`] / [`Command`] — the derives
+/// generate `schema_def` from the struct's fields. Hand-write the impl
+/// only for complex or foreign descriptors.
 pub trait Schema {
     /// The type's schema descriptor.
     fn schema_def() -> SchemaDef;
@@ -213,6 +223,11 @@ pub trait Schema {
         def.id()
     }
 }
+
+// The derive macros live in the workspace's `trouper_macros` crate; they
+// are re-exported here (and reach the prelude through the glob above) so
+// users write `#[derive(Event)]` next to `#[derive(Serialize)]`.
+pub use trouper_macros::{Command, Event};
 
 /// A type that round-trips the wire: a schema contract with serde on both
 /// ends. The bound for typed effect methods — the schema id comes from the
@@ -377,6 +392,197 @@ mod tests {
 
         // Then it reads name@version.
         assert_eq!(rendered, "ReserveStock@1");
+    }
+
+    #[test]
+    fn derive_event_matches_hand_written_def() {
+        // Given a type with the derive and an identical hand-written def.
+        #[derive(Event, serde::Serialize, serde::Deserialize)]
+        struct StockReserved {
+            sku: String,
+            qty: u64,
+        }
+        let derived = StockReserved::schema_def();
+        let hand = SchemaDef {
+            name: "StockReserved".into(),
+            version: 1,
+            kind: SchemaKind::Event,
+            fields: vec![
+                FieldDef::required("sku", FieldTy::Str),
+                FieldDef::required("qty", FieldTy::Int),
+            ],
+            description: None,
+        };
+
+        // When comparing them.
+        // Then the derive emits exactly the hand-written def.
+        assert_eq!(derived, hand);
+    }
+
+    #[test]
+    fn derive_command_sets_kind() {
+        // Given a command type with the derive.
+        #[derive(Command, serde::Serialize, serde::Deserialize)]
+        struct ReserveStock2 {
+            sku: String,
+        }
+
+        // When reading the def's kind.
+        let def = ReserveStock2::schema_def();
+
+        // Then the Command derive sets SchemaKind::Command (and the name
+        // comes from the ident).
+        assert_eq!(def.kind, SchemaKind::Command);
+        assert_eq!(def.name, "ReserveStock2");
+    }
+
+    #[test]
+    fn field_types_map_to_descriptor_tys() {
+        // Given one type exercising every supported field type.
+        #[derive(Event, serde::Serialize, serde::Deserialize)]
+        #[allow(dead_code)] // descriptor data; exercised via schema_def only
+        struct Kitchen {
+            small: i8,
+            medium: i64,
+            unsign: u32,
+            big: u64,
+            arch: usize,
+            ratio: f64,
+            flag: bool,
+            label: String,
+            id: uuid::Uuid,
+            doc: Json,
+            blob: Vec<u8>,
+            raw: &'static str,
+            file: std::path::PathBuf,
+        }
+
+        // When reading the def's fields.
+        let def = Kitchen::schema_def();
+        let tys: Vec<_> = def.fields.iter().map(|f| f.ty.clone()).collect();
+
+        // Then each maps to the descriptor ty from the spec table.
+        assert_eq!(
+            tys,
+            vec![
+                FieldTy::Int,   // small
+                FieldTy::Int,   // medium
+                FieldTy::Int,   // unsign
+                FieldTy::Int,   // big
+                FieldTy::Int,   // arch
+                FieldTy::Float, // ratio
+                FieldTy::Bool,  // flag
+                FieldTy::Str,   // label
+                FieldTy::Uuid,  // id
+                FieldTy::Json,  // doc
+                FieldTy::Json,  // blob (Vec<u8>)
+                FieldTy::Str,   // raw (&str)
+                FieldTy::Str,   // file (PathBuf serializes as a string)
+            ]
+        );
+    }
+
+    #[test]
+    fn version_and_description_attributes_apply() {
+        // Given a type with container-level version and description.
+        #[derive(Event, serde::Serialize, serde::Deserialize)]
+        #[schema(version = 2, description = "Second edition of the fact.")]
+        struct ReservedV2 {
+            sku: String,
+        }
+
+        // When reading the def.
+        let def = ReservedV2::schema_def();
+
+        // Then both container attributes landed.
+        assert_eq!(def.version, 2);
+        assert_eq!(
+            def.description.as_deref(),
+            Some("Second edition of the fact.")
+        );
+        // And the id embeds the version.
+        assert_eq!(ReservedV2::schema_id().to_string(), "ReservedV2@2");
+    }
+
+    #[test]
+    fn field_description_attribute_applies() {
+        // Given a type with a field-level description.
+        #[derive(Command, serde::Serialize, serde::Deserialize)]
+        struct Report {
+            #[schema(description = "the captured export document")]
+            export: Json,
+        }
+
+        // When reading the def's field.
+        let def = Report::schema_def();
+
+        // Then the field carries the description.
+        assert_eq!(
+            def.fields[0].description.as_deref(),
+            Some("the captured export document")
+        );
+    }
+
+    #[test]
+    fn shard_key_attribute_sets_role() {
+        // Given a type whose second field is the shard key.
+        #[derive(Command, serde::Serialize, serde::Deserialize)]
+        struct Credit {
+            account: String,
+            #[schema(shard_key)]
+            amount: i64,
+        }
+
+        // When reading the def.
+        let def = Credit::schema_def();
+
+        // Then the marked field carries ShardKey and the other does not.
+        assert_eq!(def.fields[1].role, Some(FieldRole::ShardKey));
+        assert_eq!(def.fields[0].role, None);
+        // And the def's role lookup finds it by name.
+        assert_eq!(def.field_with_role(FieldRole::ShardKey), Some("amount"));
+    }
+
+    #[test]
+    fn rename_attribute_renames_descriptor_field_only() {
+        // Given a type whose Rust field name differs from the wire name.
+        #[derive(Event, serde::Serialize, serde::Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct OrderShipped {
+            #[schema(rename = "orderId")]
+            order_id: String,
+        }
+
+        // When reading the def.
+        let def = OrderShipped::schema_def();
+
+        // Then the descriptor uses the renamed wire name...
+        assert_eq!(def.fields[0].name, "orderId");
+        // ...while the payload still serializes under the serde mapping.
+        let payload = Json::of(&OrderShipped {
+            order_id: "o-1".into(),
+        });
+        assert!(payload.get("orderId").is_some());
+        assert!(payload.get("order_id").is_none());
+    }
+
+    #[test]
+    fn ty_json_attribute_forces_the_descriptor_ty() {
+        // Given a type whose field type is not otherwise mappable.
+        #[derive(Event, serde::Serialize, serde::Deserialize)]
+        struct Attachment {
+            #[schema(ty = "json")]
+            bytes: Vec<u8>,
+            #[schema(ty = "json")]
+            custom: std::collections::BTreeMap<String, i64>,
+        }
+
+        // When reading the def's fields.
+        let def = Attachment::schema_def();
+
+        // Then both fields are forced to Json despite the Rust types.
+        assert_eq!(def.fields[0].ty, FieldTy::Json);
+        assert_eq!(def.fields[1].ty, FieldTy::Json);
     }
 
     #[test]

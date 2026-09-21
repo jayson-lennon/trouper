@@ -1,6 +1,6 @@
 [package]
 name = "trouper"
-version = "0.7.0"
+version = "0.8.0"
 edition = "2024"
 description = "A single-machine actor runtime: schema registry, journaled event-sourced and service actors, topics, supervision, and partition sets"
 license = "MIT"
@@ -9,7 +9,11 @@ readme = "README.md"
 keywords = ["actor", "actors", "event-sourcing", "runtime", "concurrency"]
 categories = ["concurrency", "asynchronous"]
 
+[workspace]
+members = ["trouper_macros"]
+
 [dependencies]
+trouper_macros = { path = "trouper_macros" }
 tokio = { version = "1.53", features = ["rt-multi-thread", "sync", "time", "macros", "net", "io-util", "signal"] }
 serde = { version = "1.0", features = ["derive", "rc"] }
 serde_json = "1.0"
@@ -30,6 +34,7 @@ tokio = { version = "1.53", features = ["fs"] }
 rstest = "0.26"
 futures = "0.3"
 tracing-subscriber = "0.3"
+trybuild = "1"
 
 [profile.release]
 lto = true

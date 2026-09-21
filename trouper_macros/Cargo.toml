@@ -1,0 +1,15 @@
+[package]
+name = "trouper_macros"
+version = "0.8.0"
+edition = "2024"
+description = "Proc-macro derives for the trouper actor runtime: #[derive(Event)] and #[derive(Command)] generate SchemaDefs from struct fields"
+license = "MIT"
+repository = "https://github.com/jayson-lennon/trouper"
+
+[lib]
+proc-macro = true
+
+[dependencies]
+syn = "2"
+quote = "1"
+proc-macro2 = "1"

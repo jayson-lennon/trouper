@@ -24,23 +24,13 @@ use trouper::prelude::*;
 
 // ---- A journaled counter (the entity whose state we read) -------------
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Command, Debug, Deserialize, Serialize)]
+#[schema(description = "Add to the counter.")]
 struct Add {
     n: i64,
 }
-impl Schema for Add {
-    fn schema_def() -> SchemaDef {
-        SchemaDef {
-            name: "Add".into(),
-            version: 1,
-            kind: SchemaKind::Command,
-            fields: vec![FieldDef::required("n", FieldTy::Int)],
-            description: Some("Add to the counter.".into()),
-        }
-    }
-}
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Event, Debug, Serialize, Deserialize)]
 struct Added {
     n: i64,
 }
@@ -49,18 +39,7 @@ struct Added {
 // A shard key only matters for projector SETS (per-key `public/<key>`
 // paths, activated on demand): there, the registry REJECTS the set at
 // install unless one consumed schema declares the key field with
-// `.as_shard_key()`. See examples/with.rs for that mode.
-impl Schema for Added {
-    fn schema_def() -> SchemaDef {
-        SchemaDef {
-            name: "Added".into(),
-            version: 1,
-            kind: SchemaKind::Event,
-            fields: vec![FieldDef::required("n", FieldTy::Int)],
-            description: None,
-        }
-    }
-}
+// `#[schema(shard_key)]`. See examples/with.rs for that mode.
 
 #[derive(Default, Debug, Serialize, Deserialize)]
 struct Counter {

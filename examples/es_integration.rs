@@ -27,123 +27,56 @@ use tracing::Level;
 use trouper::actor::{CommandHandler, EventSourcedActor, MsgHandler, ServiceActor};
 use trouper::context::{CmdCtx, MsgCtx};
 use trouper::prelude::*;
-use trouper::schema::{FieldDef, FieldTy, Schema, SchemaDef, SchemaKind};
+
 use trouper::tap::FactKind;
 
 // ---- messages ------------------------------------------------------------
 
 /// Transfer command to the service (its one receive declaration).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Command, Debug, Clone, Serialize, Deserialize)]
+#[schema(description = "Move amount between two accounts.")]
 struct TransferCmd {
     transfer_id: String,
     from: String,
     to: String,
     amount: i64,
 }
-impl Schema for TransferCmd {
-    fn schema_def() -> SchemaDef {
-        SchemaDef {
-            name: "TransferCmd".into(),
-            version: 1,
-            kind: SchemaKind::Command,
-            fields: vec![
-                FieldDef::required("transfer_id", FieldTy::Str),
-                FieldDef::required("from", FieldTy::Str),
-                FieldDef::required("to", FieldTy::Str),
-                FieldDef::required("amount", FieldTy::Int),
-            ],
-            description: Some("Move amount between two accounts.".into()),
-        }
-    }
-}
 
 /// Debit command addressed to an account entity (the `account` field is
 /// the shard key: `accts/<account>`).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Command, Debug, Clone, Serialize, Deserialize)]
+#[schema(description = "Adjust one account's balance.")]
 struct AccountCmd {
+    #[schema(shard_key)]
     account: String,
     delta: i64,
 }
-impl Schema for AccountCmd {
-    fn schema_def() -> SchemaDef {
-        SchemaDef {
-            name: "AccountCmd".into(),
-            version: 1,
-            kind: SchemaKind::Command,
-            fields: vec![
-                FieldDef::required("account", FieldTy::Str).as_shard_key(),
-                FieldDef::required("delta", FieldTy::Int),
-            ],
-            description: Some("Adjust one account's balance.".into()),
-        }
-    }
-}
 
 /// The completion fact an account returns after applying a debit.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Event, Debug, Clone, Serialize, Deserialize)]
+#[schema(description = "A debit settled.")]
 struct TransferCompleted {
     transfer_id: String,
     account: String,
     delta: i64,
     balance: i64,
 }
-impl Schema for TransferCompleted {
-    fn schema_def() -> SchemaDef {
-        SchemaDef {
-            name: "TransferCompleted".into(),
-            version: 1,
-            kind: SchemaKind::Event,
-            fields: vec![
-                FieldDef::required("transfer_id", FieldTy::Str),
-                FieldDef::required("account", FieldTy::Str),
-                FieldDef::required("delta", FieldTy::Int),
-                FieldDef::required("balance", FieldTy::Int),
-            ],
-            description: Some("A debit settled.".into()),
-        }
-    }
-}
 
 /// The rejection fact: a debit that would overdraw the account.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Event, Debug, Clone, Serialize, Deserialize)]
+#[schema(description = "A debit bounced.")]
 struct TransferRejected {
     transfer_id: String,
     account: String,
     delta: i64,
     balance: i64,
 }
-impl Schema for TransferRejected {
-    fn schema_def() -> SchemaDef {
-        SchemaDef {
-            name: "TransferRejected".into(),
-            version: 1,
-            kind: SchemaKind::Event,
-            fields: vec![
-                FieldDef::required("transfer_id", FieldTy::Str),
-                FieldDef::required("account", FieldTy::Str),
-                FieldDef::required("delta", FieldTy::Int),
-                FieldDef::required("balance", FieldTy::Int),
-            ],
-            description: Some("A debit bounced.".into()),
-        }
-    }
-}
 
 /// The ticker's beat (published — news, not a work order).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Event, Debug, Clone, Serialize, Deserialize)]
+#[schema(description = "The scheduler's heartbeat.")]
 struct Tick {
     n: u64,
-}
-impl Schema for Tick {
-    fn schema_def() -> SchemaDef {
-        SchemaDef {
-            name: "Tick".into(),
-            version: 1,
-            kind: SchemaKind::Event,
-            fields: vec![FieldDef::required("n", FieldTy::Int)],
-            description: Some("The scheduler's heartbeat.".into()),
-        }
-    }
 }
 
 // ---- the Account entity ---------------------------------------------------
@@ -199,26 +132,13 @@ impl CommandHandler<AccountCmd> for Account {
 
 /// The account schema WITH the transfer id: the service sends this so
 /// completions can be correlated back to the pending transfer.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Command, Debug, Clone, Serialize, Deserialize)]
+#[schema(description = "A transfer debit against one account.")]
 struct TransferDebit {
+    #[schema(shard_key)]
     account: String,
     transfer_id: String,
     delta: i64,
-}
-impl Schema for TransferDebit {
-    fn schema_def() -> SchemaDef {
-        SchemaDef {
-            name: "TransferDebit".into(),
-            version: 1,
-            kind: SchemaKind::Command,
-            fields: vec![
-                FieldDef::required("account", FieldTy::Str).as_shard_key(),
-                FieldDef::required("transfer_id", FieldTy::Str),
-                FieldDef::required("delta", FieldTy::Int),
-            ],
-            description: Some("A transfer debit against one account.".into()),
-        }
-    }
 }
 
 impl CommandHandler<TransferDebit> for Account {
@@ -271,19 +191,9 @@ impl ServiceActor for Ticker {
 }
 
 /// Internal beat: the tokio loop tells this to the ticker.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Command, Debug, Clone, Serialize, Deserialize)]
+#[schema(description = "Drive one ticker beat.")]
 struct TickBeat;
-impl Schema for TickBeat {
-    fn schema_def() -> SchemaDef {
-        SchemaDef {
-            name: "TickBeat".into(),
-            version: 1,
-            kind: SchemaKind::Command,
-            fields: vec![],
-            description: Some("Drive one ticker beat.".into()),
-        }
-    }
-}
 
 impl MsgHandler<TickBeat> for Ticker {
     async fn handle(&mut self, _msg: TickBeat, ctx: &mut MsgCtx<'_>) {

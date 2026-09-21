@@ -1,0 +1,5 @@
+error: unsupported #[schema(ty = "int42")]; the only override is "json"
+ --> tests/ui/bad_ty_value.rs:6:19
+  |
+6 |     #[schema(ty = "int42")]
+  |                   ^^^^^^^

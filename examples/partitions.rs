@@ -14,46 +14,20 @@ use trouper::kernel::DeadLetterReason;
 use trouper::prelude::*;
 use trouper::tap::FactKind;
 
-#[derive(Deserialize)]
+#[derive(Command, Deserialize)]
 struct KeyedAdd {
+    // The `account` field is the shard key — the kernel reads it
+    // per envelope to derive the entity path.
+    #[schema(shard_key)]
     #[allow(dead_code)] // the kernel reads it as the shard key (JSON side)
     account: String,
     n: i64,
 }
 
-impl Schema for KeyedAdd {
-    fn schema_def() -> SchemaDef {
-        SchemaDef {
-            name: "KeyedAdd".into(),
-            version: 1,
-            kind: SchemaKind::Command,
-            // The `account` field is the shard key — the kernel reads it
-            // per envelope to derive the entity path.
-            fields: vec![
-                FieldDef::required("account", FieldTy::Str).as_shard_key(),
-                FieldDef::required("n", FieldTy::Int),
-            ],
-            description: None,
-        }
-    }
-}
-
-#[derive(Serialize, Deserialize)]
+#[derive(Event, Serialize, Deserialize)]
 struct Added {
     #[allow(dead_code)]
     n: i64,
-}
-
-impl Schema for Added {
-    fn schema_def() -> SchemaDef {
-        SchemaDef {
-            name: "Added".into(),
-            version: 1,
-            kind: SchemaKind::Event,
-            fields: vec![FieldDef::required("n", FieldTy::Int)],
-            description: None,
-        }
-    }
 }
 
 #[derive(Serialize, Deserialize, Default)]

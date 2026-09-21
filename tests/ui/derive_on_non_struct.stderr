@@ -1,0 +1,8 @@
+error: Event/Command derive requires a named-field struct
+ --> tests/ui/derive_on_non_struct.rs:5:1
+  |
+5 | / enum Kind {
+6 | |     A,
+7 | |     B,
+8 | | }
+  | |_^

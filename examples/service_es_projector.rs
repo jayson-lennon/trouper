@@ -27,33 +27,13 @@ use trouper::registry::RegistryError;
 
 // ---- The impure edge (same pool as service_projector.rs) -----------
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Command, Debug, Serialize, Deserialize)]
+#[schema(description = "Take a connection from the pool.")]
 struct Checkout;
-impl Schema for Checkout {
-    fn schema_def() -> SchemaDef {
-        SchemaDef {
-            name: "Checkout".into(),
-            version: 1,
-            kind: SchemaKind::Command,
-            fields: vec![],
-            description: Some("Take a connection from the pool.".into()),
-        }
-    }
-}
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Command, Debug, Serialize, Deserialize)]
+#[schema(description = "Return a connection to the pool.")]
 struct Checkin;
-impl Schema for Checkin {
-    fn schema_def() -> SchemaDef {
-        SchemaDef {
-            name: "Checkin".into(),
-            version: 1,
-            kind: SchemaKind::Command,
-            fields: vec![],
-            description: Some("Return a connection to the pool.".into()),
-        }
-    }
-}
 
 /// The service TELLS the pool log entity (an ES actor) about each
 /// transition. No publish here — the ENTITY records the fact, and its
@@ -98,24 +78,11 @@ impl MsgHandler<Checkin> for PoolService {
 
 /// The fact, as recorded by the ENTITY (kind: Event — it is a fact
 /// about the world the logger observed and journaled).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Event, Debug, Clone, Serialize, Deserialize)]
+#[schema(description = "A pool transition, journaled.")]
 struct PoolEvent {
     taken: u64,
     returned: u64,
-}
-impl Schema for PoolEvent {
-    fn schema_def() -> SchemaDef {
-        SchemaDef {
-            name: "PoolEvent".into(),
-            version: 1,
-            kind: SchemaKind::Event,
-            fields: vec![
-                FieldDef::required("taken", FieldTy::Int),
-                FieldDef::required("returned", FieldTy::Int),
-            ],
-            description: Some("A pool transition, journaled.".into()),
-        }
-    }
 }
 
 /// The logger entity: handle the command, record the fact. Its journal

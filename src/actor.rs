@@ -763,24 +763,13 @@ mod tests {
     use super::*;
     use crate::actor::{ActorKind, ActorPath};
     use crate::json;
+    use crate::schema::Command;
     use crate::schema::{FieldDef, FieldTy, SchemaDef, SchemaKind};
     use serde::Deserialize;
 
-    #[derive(Deserialize)]
+    #[derive(Command, Deserialize)]
     struct ReserveStock {
         qty: u32,
-    }
-
-    impl Schema for ReserveStock {
-        fn schema_def() -> SchemaDef {
-            SchemaDef {
-                name: "ReserveStock".into(),
-                version: 1,
-                kind: SchemaKind::Command,
-                fields: vec![FieldDef::required("qty", FieldTy::Int)],
-                description: None,
-            }
-        }
     }
 
     struct StockReserved;

@@ -160,6 +160,40 @@ it is gone. Do not bring it back in any form (see §12).
 actors it gates which recorded events fan out (undeclared emits are dropped pre-journal).
 It says nothing about how messages arrive.
 
+**Declaring the schema itself** — every `Message` type carries a `SchemaDef` (name,
+version, kind, fields, description) that registers into the schema table at `.handles`
+time. The derive is the primary path; the hand impl is the escape hatch:
+
+```rust
+// The derive: kind from which marker, name from the ident, version 1 by
+// default, field descriptors mapped from the Rust types.
+#[derive(Event, Serialize, Deserialize)]                  // or #[derive(Command, ...)]
+#[schema(version = 2, description = "A debit settled.")]  // container: version, description
+struct TransferSettled {
+    #[schema(shard_key)]          // FieldRole::ShardKey (partition/projector-set routing)
+    account: String,              // i64..u64/isize/usize → Int
+    delta: i64,                   // f32/f64 → Float; bool → Bool; String/&str → Str
+    receipt: Vec<u8>,             // Vec<u8> → Json; uuid::Uuid → Uuid; trouper::Json → Json;
+                                  // PathBuf → Str (serde string)
+    #[schema(rename = "orderId")] // descriptor name only; serde stays untouched
+    order_id: String,
+    #[schema(ty = "json")]        // force Json (escape hatch for exotic types)
+    extra: BTreeMap<String, i64>,
+}
+
+// The escape hatch: hand-written impl for complex or foreign descriptors
+// (unit/range/role builders, JSON-declared schemas, names that differ
+// from the ident):
+impl Schema for Custom {
+    fn schema_def() -> SchemaDef { /* the full SchemaDef, by hand */ }
+}
+```
+
+Unknown field types fail to compile, naming the field and the supported set. Missing
+serde derives surface as a missing-trait bound at first use — `Message` = `Schema +
+Serialize + Deserialize` (schema.rs). The derive only produces the descriptor;
+registration stays the builder's job.
+
 **Schema kind (`Event` / `Command`) does not police the fabric.** The kind is metadata:
 documentation in the schema table, and the default-transport hint for the erased-JSON
 bridge (`deliver_schema_value`: Event-kind broadcasts, Command-kind routes to one
@@ -693,6 +727,12 @@ make sense over a network. If a suggestion below sounds reasonable, it is reason
   replaced; the name persists.
 - **Message** — a typed payload with a registered **schema** (`Name@version`). The only
   thing that crosses the fabric.
+- **`Event`/`Command` derive** — the proc-macro path for declaring a schema: the derive
+  generates the `SchemaDef` from the struct's fields (kind from which marker, name from
+  the ident, `#[schema(...)]` attributes for version/description/shard-key/rename/ty).
+  Lives in the `trouper_macros` crate, re-exported as `trouper::{Event, Command}`. The
+  hand-written `impl Schema` remains the escape hatch for complex or foreign
+  descriptors (§3).
 - **Event (ES)** — a fact an event-sourced actor *recorded* (the handler's return value).
   Provenance, not a wire property. After recording, it travels as an ordinary message.
 - **Events** — the buffer a command handler returns: the decision's facts, in order,

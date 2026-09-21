@@ -31,54 +31,24 @@ fn log(line: impl Into<String>) {
 }
 
 /// The fact: a document was saved somewhere.
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Event, Debug, Serialize, Deserialize)]
+#[schema(description = "A document was saved.")]
 struct DocumentSaved {
     uri: String,
 }
-impl Schema for DocumentSaved {
-    fn schema_def() -> SchemaDef {
-        SchemaDef {
-            name: "DocumentSaved".into(),
-            version: 1,
-            kind: SchemaKind::Event,
-            fields: vec![FieldDef::required("uri", FieldTy::Str)],
-            description: Some("A document was saved.".into()),
-        }
-    }
-}
 
 /// The command the router issues into the parser domain.
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Command, Debug, Serialize, Deserialize)]
+#[schema(description = "Parse this document.")]
 struct ParseDocument {
     uri: String,
 }
-impl Schema for ParseDocument {
-    fn schema_def() -> SchemaDef {
-        SchemaDef {
-            name: "ParseDocument".into(),
-            version: 1,
-            kind: SchemaKind::Command,
-            fields: vec![FieldDef::required("uri", FieldTy::Str)],
-            description: Some("Parse this document.".into()),
-        }
-    }
-}
 
 /// The parser's completion fact.
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Event, Debug, Serialize, Deserialize)]
+#[schema(description = "A document was parsed.")]
 struct DocumentParsed {
     uri: String,
-}
-impl Schema for DocumentParsed {
-    fn schema_def() -> SchemaDef {
-        SchemaDef {
-            name: "DocumentParsed".into(),
-            version: 1,
-            kind: SchemaKind::Event,
-            fields: vec![FieldDef::required("uri", FieldTy::Str)],
-            description: Some("A document was parsed.".into()),
-        }
-    }
 }
 
 /// The router: stateless, on the hot path. It receives the published
@@ -194,20 +164,9 @@ async fn main() {
             });
         }
     }
-    #[derive(Debug, Serialize, Deserialize)]
+    #[derive(Command, Debug, Serialize, Deserialize)]
     struct SaveCmd {
         uri: String,
-    }
-    impl Schema for SaveCmd {
-        fn schema_def() -> SchemaDef {
-            SchemaDef {
-                name: "SaveCmd".into(),
-                version: 1,
-                kind: SchemaKind::Command,
-                fields: vec![FieldDef::required("uri", FieldTy::Str)],
-                description: None,
-            }
-        }
     }
     trouper::builder::spawn_service_builder::<Saver>(&system)
         .at(ActorPath::new("saver"))

@@ -65,45 +65,18 @@ impl FileStore for RealFs {
 /// numbers representation — which is what [`FieldTy::Json`] exists for
 /// ("arbitrary JSON; the escape hatch for payloads a tooling consumer need
 /// not inspect deeply").
-#[derive(Serialize, Deserialize)]
+#[derive(Command, Serialize, Deserialize)]
 struct SaveFile {
     path: std::path::PathBuf,
     contents: Vec<u8>,
 }
 
-impl Schema for SaveFile {
-    fn schema_def() -> SchemaDef {
-        SchemaDef {
-            name: "SaveFile".into(),
-            version: 1,
-            kind: SchemaKind::Command,
-            fields: vec![
-                FieldDef::required("path", FieldTy::Str),
-                FieldDef::required("contents", FieldTy::Json),
-            ],
-            description: None,
-        }
-    }
-}
-
 /// The ack: how many bytes were written. A save that did NOT succeed
 /// never produces this — it produces [`SaveFailed`] instead — so there is
 /// no `ok` flag to lie: the schema of the reply IS the outcome.
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Event, Serialize, Deserialize, Debug)]
 struct SaveAck {
     bytes: i64,
-}
-
-impl Schema for SaveAck {
-    fn schema_def() -> SchemaDef {
-        SchemaDef {
-            name: "SaveAck".into(),
-            version: 1,
-            kind: SchemaKind::Event,
-            fields: vec![FieldDef::required("bytes", FieldTy::Int)],
-            description: None,
-        }
-    }
 }
 
 /// A failed save, as the domain names it: the `io::ErrorKind` reason.
@@ -116,25 +89,10 @@ struct SaveError {
 /// The failure fact: published (and replied to an asker) whenever a
 /// save is declined. This is the recorded decision —
 /// domain outcomes (including failures) are facts, not ok-flags.
-#[derive(Serialize, Deserialize, Clone)]
+#[derive(Event, Serialize, Deserialize, Clone)]
 struct SaveFailed {
     path: String,
     reason: String,
-}
-
-impl Schema for SaveFailed {
-    fn schema_def() -> SchemaDef {
-        SchemaDef {
-            name: "SaveFailed".into(),
-            version: 1,
-            kind: SchemaKind::Event,
-            fields: vec![
-                FieldDef::required("path", FieldTy::Str),
-                FieldDef::required("reason", FieldTy::Str),
-            ],
-            description: None,
-        }
-    }
 }
 
 /// THE minimal actor. The domain logic is `save` — a plain method on a

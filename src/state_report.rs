@@ -16,7 +16,7 @@ use crate::actor::{CommandHandler, EventSourcedActor};
 use crate::context::CmdCtx;
 use crate::envelope::{Event, Events};
 use crate::json::Json;
-use crate::schema::{ActorManifest, FieldDef, FieldTy, Schema, SchemaDef, SchemaKind};
+use crate::schema::{ActorManifest, Command, Event, Schema};
 use serde::Deserialize;
 
 /// Ask the reporter to record the attached export document.
@@ -25,46 +25,22 @@ use serde::Deserialize;
 /// export is async and locks the system, so it cannot happen inside an
 /// event-sourced handler — the async caller captures, then hands the
 /// document over.
-#[derive(Deserialize)]
+#[derive(Command, Deserialize)]
+#[schema(description = "record the attached system export as a fact")]
 pub struct ReportState {
     /// The captured `SystemExport` document.
+    #[schema(description = "the captured SystemExport document")]
     pub export: Json,
-}
-
-impl Schema for ReportState {
-    fn schema_def() -> SchemaDef {
-        SchemaDef {
-            name: "ReportState".into(),
-            version: 1,
-            kind: SchemaKind::Command,
-            fields: vec![{
-                let mut export = FieldDef::required("export", FieldTy::Json);
-                export.description = Some("the captured SystemExport document".into());
-                export
-            }],
-            description: Some("record the attached system export as a fact".into()),
-        }
-    }
 }
 
 /// A system export was recorded. The event payload IS the export document —
 /// a verbatim, replayable record of what the system looked like.
-#[derive(Deserialize)]
+///
+/// (The schema is zero-field: the payload is the export document itself,
+/// not a field of it.)
+#[derive(Event, Deserialize)]
+#[schema(description = "the payload is the SystemExport document itself, not a field of it")]
 pub struct StateReported;
-
-impl Schema for StateReported {
-    fn schema_def() -> SchemaDef {
-        SchemaDef {
-            name: "StateReported".into(),
-            version: 1,
-            kind: SchemaKind::Event,
-            fields: vec![],
-            description: Some(
-                "the payload is the SystemExport document itself, not a field of it".into(),
-            ),
-        }
-    }
-}
 
 /// Event-sourced recorder of system exports.
 ///

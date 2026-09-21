@@ -1,0 +1,5 @@
+error: only one field may be #[schema(shard_key)]; found 2: from, to
+ --> tests/ui/duplicate_shard_key.rs:5:8
+  |
+5 | struct Move {
+  |        ^^^^
