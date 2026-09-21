@@ -7875,6 +7875,13 @@ mod tests {
             state: Json,
             now_ms: u64,
         ) -> Result<(), error_stack::Report<crate::journal::JournalError>> {
+            // Park only for the FIRST snapshot: the idle-arm time-cadence
+            // snapshot holds the loop mid-idle-arm so the test can race a
+            // delivery in (the D3 idle path's store contact is now the
+            // snapshot append itself).
+            if !self.gate.entered() {
+                self.gate.park().await;
+            }
             self.inner.append_snapshot(path, seq, state, now_ms).await
         }
         async fn load(
@@ -7882,19 +7889,9 @@ mod tests {
             path: &crate::actor::ActorPath,
         ) -> Result<Option<crate::journal::Replay>, error_stack::Report<crate::journal::JournalError>>
         {
-            let replay = self.inner.load(path).await?;
-            // Park only when the journal HAS content: boot-time recovery
-            // (empty journal) passes straight through; the idle-arm
-            // time-cadence check (journal non-empty) holds the loop so
-            // the test can race a delivery in.
-            let has_entries = replay
-                .as_ref()
-                .map(|r| !r.tail.is_empty() || r.snapshot.is_some())
-                .unwrap_or(false);
-            if has_entries && !self.gate.entered() {
-                self.gate.park().await;
-            }
-            Ok(replay)
+            // The idle arm no longer loads the journal (D3): load passes
+            // straight through.
+            self.inner.load(path).await
         }
         async fn flush(&self) -> Result<(), error_stack::Report<crate::journal::JournalError>> {
             self.inner.flush().await
@@ -8641,9 +8638,9 @@ mod tests {
 
     #[tokio::test]
     async fn message_racing_passivation_is_processed_not_dead_lettered() {
-        // Given a passivating counter whose store's `load` parks on a
-        // gate — the loop is parked INSIDE the idle arm (snapshot check)
-        // while the racer is delivered.
+        // Given a passivating counter whose store's `append_snapshot`
+        // parks on a gate — the loop is parked INSIDE the idle arm (the
+        // due time-cadence snapshot append) while the racer is delivered.
         let (system, clock) = ActorSystem::test();
         let path = ActorPath::new("racy");
         system.register_schema::<Add>();
@@ -8669,8 +8666,9 @@ mod tests {
             .expect("queued");
         wait_for_cursor(&system, &path, 1).await;
 
-        // When the idle arm runs: it parks inside the store's `load`
-        // (time-cadence check) while the racer lands in the inbox.
+        // When the idle arm runs: it parks inside the store's
+        // `append_snapshot` (the due time-cadence snapshot) while the
+        // racer lands in the inbox.
         clock.advance(std::time::Duration::from_millis(100));
         wait_for(|| async { gate.entered() }).await;
         system
