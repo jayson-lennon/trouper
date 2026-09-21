@@ -11,11 +11,11 @@
 //! [`ActorSystem::es_state`], which is how a bridge detects that a fresh
 //! report has landed.
 
-use crate::json::Json;
 use crate::actor::ActorKind;
 use crate::actor::{CommandHandler, EventSourcedActor};
 use crate::context::CmdCtx;
 use crate::envelope::{Event, Events};
+use crate::json::Json;
 use crate::schema::{ActorManifest, FieldDef, FieldTy, Schema, SchemaDef, SchemaKind};
 use serde::Deserialize;
 
@@ -114,8 +114,8 @@ mod tests {
     use crate::actor::ActorPath;
     use crate::context::{CmdCtx, Outbox, RuntimeView};
     use crate::envelope::TraceCtx;
-    use crate::schema::SchemaId;
     use crate::json;
+    use crate::schema::SchemaId;
 
     fn test_export(actors: usize) -> Json {
         json!({ "actors": [{ "path": format!("actor-{actors}") }] })

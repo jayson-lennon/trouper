@@ -10,9 +10,9 @@ use std::collections::{BTreeMap, HashMap};
 
 use tokio::sync::mpsc;
 
-use crate::json::Json;
 use crate::actor::{ActorKind, ActorPath};
 use crate::envelope::Envelope;
+use crate::json::Json;
 use crate::schema::SchemaId;
 use crate::schema::{ActorManifest, Schema, SchemaDef, SchemaError};
 

@@ -175,7 +175,8 @@ impl SchemaDef {
     /// [`SchemaDef`].
     pub fn from_json(json: Json) -> Result<Self, error_stack::Report<SchemaError>> {
         use error_stack::ResultExt;
-        json.decode::<Self>().change_context(SchemaError::InvalidDescriptor)
+        json.decode::<Self>()
+            .change_context(SchemaError::InvalidDescriptor)
     }
 
     /// The schema's stable identifier (`name@version`).

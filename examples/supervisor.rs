@@ -172,21 +172,19 @@ async fn main() {
             budget: RestartBudget::per(2, std::time::Duration::from_secs(10)),
             backoff: Backoff::default(),
             args: trouper::json!({ "id": id }),
-            spawn: Arc::new(
-                move |sys: &ActorSystem, path: &ActorPath, args: &Json| {
-                    // The factory owns the actor type; the kernel owns the
-                    // naming. Crashy workers (id 2) panic on every job.
-                    if args["id"].as_u64() == Some(2) {
-                        spawn_crashy(sys, path.clone(), args);
-                    } else {
-                        trouper::builder::spawn_service_builder::<Worker>(sys)
-                            .at(path.clone())
-                            .args(args.clone())
-                            .handles::<WorkJob>()
-                            .start();
-                    }
-                },
-            ),
+            spawn: Arc::new(move |sys: &ActorSystem, path: &ActorPath, args: &Json| {
+                // The factory owns the actor type; the kernel owns the
+                // naming. Crashy workers (id 2) panic on every job.
+                if args["id"].as_u64() == Some(2) {
+                    spawn_crashy(sys, path.clone(), args);
+                } else {
+                    trouper::builder::spawn_service_builder::<Worker>(sys)
+                        .at(path.clone())
+                        .args(args.clone())
+                        .handles::<WorkJob>()
+                        .start();
+                }
+            }),
         };
         system.spawn(spec);
     }

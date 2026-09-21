@@ -898,10 +898,7 @@ async fn step_es(ctx: &EsLoop) -> Step {
     let dispatch_result = {
         let state = ctx.state().await;
         let mut state = state.lock().await;
-        let payload = envelope
-            .as_json()
-            .cloned()
-            .unwrap_or(Json::default());
+        let payload = envelope.as_json().cloned().unwrap_or(Json::default());
         let mut cmd_ctx = CmdCtx::new(
             &ctx.path,
             &envelope.trace,
@@ -1225,10 +1222,7 @@ impl crate::context::AskPort for KernelAskPort {
         Box<
             dyn Future<
                     Output = Result<
-                        (
-                            crate::reply::LeaseId,
-                            tokio::sync::oneshot::Receiver<Json>,
-                        ),
+                        (crate::reply::LeaseId, tokio::sync::oneshot::Receiver<Json>),
                         error_stack::Report<crate::context::AskError>,
                     >,
                 > + Send,
@@ -1917,10 +1911,7 @@ async fn step_service(ctx: &ServiceLoop) -> Step {
     };
 
     // 3. DECODE (sync — decode failures dead-letter cleanly).
-    let payload = envelope
-        .as_json()
-        .cloned()
-        .unwrap_or(Json::default());
+    let payload = envelope.as_json().cloned().unwrap_or(Json::default());
     let decoded = match entry.decode(&payload) {
         Ok(msg) => msg,
         Err(report) => {

@@ -14,8 +14,8 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::oneshot;
 use uuid::Uuid;
 
-use crate::json::Json;
 use crate::clock::Timestamp;
+use crate::json::Json;
 
 /// One reply slot: the asker's oneshot plus its expiry.
 pub struct ReplySlot {

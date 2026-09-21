@@ -9,7 +9,6 @@
 use parking_lot::Mutex;
 use std::sync::Arc;
 
-
 use crate::actor::ActorPath;
 use crate::actor::{
     CommandEntry, DynServiceActor, EventSourcedActor, MsgEntry, ServiceActor, TypedEsState,
@@ -21,8 +20,8 @@ use crate::context::RuntimeView;
 use crate::envelope::{Address, Envelope, TraceCtx};
 use crate::inbox::InboxOffset;
 use crate::inbox::{Inbox, OverloadPolicy};
-pub use crate::kernel::DeadLetter;
 use crate::json::Json;
+pub use crate::kernel::DeadLetter;
 use crate::kernel::{ActorCell, EsLoop, KernelState, route};
 use crate::registry::{Endpoint, EndpointInfo, Registry};
 use crate::schema::Schema;
@@ -964,13 +963,8 @@ impl ActorSystemCore {
     /// Deprecated positional flavor — prefer the builder:
     /// [`crate::builder::spawn_service_builder`].
     #[doc(hidden)]
-    pub fn spawn_service<A, F>(
-        &self,
-        path: ActorPath,
-        args: &Json,
-        opts: SpawnOpts,
-        entries: F,
-    ) where
+    pub fn spawn_service<A, F>(&self, path: ActorPath, args: &Json, opts: SpawnOpts, entries: F)
+    where
         A: ServiceActor,
         F: FnOnce() -> Vec<Arc<dyn MsgEntry>>,
     {
@@ -1288,8 +1282,18 @@ impl ActorSystemCore {
         }
     }
 
-    pub fn envelope(&self, schema: SchemaId, dest: ActorPath, payload: impl Into<Json>) -> Envelope {
-        Envelope::json(schema, Address::Path(dest), payload.into(), TraceCtx::root())
+    pub fn envelope(
+        &self,
+        schema: SchemaId,
+        dest: ActorPath,
+        payload: impl Into<Json>,
+    ) -> Envelope {
+        Envelope::json(
+            schema,
+            Address::Path(dest),
+            payload.into(),
+            TraceCtx::root(),
+        )
     }
 
     /// The system's clock (tests use this to reach the [`crate::clock::FakeClock`]).
@@ -2146,9 +2150,9 @@ mod tests {
     use crate::actor::ActorKind;
     use crate::actor::{CommandHandler, MsgHandler, TypedEsAdapter, TypedServiceAdapter};
     use crate::context::CmdCtx;
+    use crate::json;
     use crate::schema::{ActorManifest, FieldDef, FieldTy, SchemaDef, SchemaKind};
     use serde::{Deserialize, Serialize};
-    use crate::json;
     use std::collections::HashMap;
 
     #[derive(Serialize, Deserialize)]
@@ -2228,7 +2232,8 @@ mod tests {
             crate::envelope::Events::from_vec(vec![crate::envelope::Event::new(
                 Added::schema_id(),
                 json!({ "n": cmd.n }),
-            )])        }
+            )])
+        }
     }
 
     impl CommandHandler<Boom> for Counter {
@@ -2961,15 +2966,13 @@ mod tests {
                 factor: 2.0,
             },
             args: json!({}),
-            spawn: Arc::new(
-                move |sys: &ActorSystem, path: &ActorPath, args: &Json| {
-                    let _ = (&spawner, &system_for_spec);
-                    sys.spawn_es::<AlwaysBoom, _>(path.clone(), args, SpawnOpts::default(), || {
-                        vec![Arc::new(TypedEsAdapter::<AlwaysBoom, Add>::new::<Add>())]
-                    });
-                    let _ = &worker_clone;
-                },
-            ),
+            spawn: Arc::new(move |sys: &ActorSystem, path: &ActorPath, args: &Json| {
+                let _ = (&spawner, &system_for_spec);
+                sys.spawn_es::<AlwaysBoom, _>(path.clone(), args, SpawnOpts::default(), || {
+                    vec![Arc::new(TypedEsAdapter::<AlwaysBoom, Add>::new::<Add>())]
+                });
+                let _ = &worker_clone;
+            }),
         };
         system.spawn(spec);
 
@@ -4684,9 +4687,7 @@ mod tests {
             fn apply(&mut self, event: &crate::envelope::Event) {
                 self.total += event.payload["n"].as_i64().unwrap_or(0);
             }
-            fn capture(
-                &self,
-            ) -> Result<Json, error_stack::Report<crate::journal::JournalError>> {
+            fn capture(&self) -> Result<Json, error_stack::Report<crate::journal::JournalError>> {
                 // The cache is not persisted, but capture EXPOSES it when
                 // hydrated — making the hydration hook observable.
                 Ok(json!({ "total": self.total, "doubled": self.doubled }))
@@ -4862,9 +4863,15 @@ mod tests {
     impl CommandHandler<Add> for MixedEmitter {
         fn handle(&self, cmd: Add, _ctx: &mut CmdCtx<'_>) -> crate::envelope::Events {
             let mut events = crate::envelope::Events::new();
-            events.push(crate::envelope::Event::new(Added::schema_id(), json!({ "n": cmd.n })));
+            events.push(crate::envelope::Event::new(
+                Added::schema_id(),
+                json!({ "n": cmd.n }),
+            ));
             // Undeclared: the emit filter must drop this one pre-append.
-            events.push(crate::envelope::Event::new(Smuggled::schema_id(), json!({ "n": cmd.n })));
+            events.push(crate::envelope::Event::new(
+                Smuggled::schema_id(),
+                json!({ "n": cmd.n }),
+            ));
             events
         }
     }
@@ -5139,7 +5146,8 @@ mod tests {
             crate::envelope::Events::from_vec(vec![crate::envelope::Event::new(
                 Added::schema_id(),
                 json!({ "n": cmd.n }),
-            )])        }
+            )])
+        }
     }
 
     /// Reads an actor's registered manifest from the registry (tests).
@@ -5505,7 +5513,8 @@ mod tests {
             crate::envelope::Events::from_vec(vec![crate::envelope::Event::new(
                 Added::schema_id(),
                 json!({ "n": cmd.n }),
-            )])        }
+            )])
+        }
     }
 
     #[tokio::test]
@@ -5568,7 +5577,8 @@ mod tests {
             crate::envelope::Events::from_vec(vec![crate::envelope::Event::new(
                 Added::schema_id(),
                 json!({ "n": cmd.n }),
-            )])        }
+            )])
+        }
     }
 
     #[tokio::test]
@@ -5936,7 +5946,8 @@ mod tests {
             crate::envelope::Events::from_vec(vec![crate::envelope::Event::new(
                 Added::schema_id(),
                 json!({ "n": cmd.n }),
-            )])        }
+            )])
+        }
     }
 
     /// Registers the partition test command (a str shard key field) and
@@ -6205,13 +6216,7 @@ mod tests {
             json!({ "n": 1, "account": "k9" }),
         );
         system.send(e).await.expect("delivered");
-        wait_for(|| async {
-            system
-                .es_state(&ActorPath::new("vault/k9"))
-                .await
-                .is_some()
-        })
-        .await;
+        wait_for(|| async { system.es_state(&ActorPath::new("vault/k9")).await.is_some() }).await;
 
         // Then the entity's genesis decoded BOTH the template's typed
         // `on_hand` AND the merged shard key.
@@ -6632,10 +6637,7 @@ mod tests {
         // When a Chatted copy without its key field is published (a
         // foreign sender bypassing the schema).
         system
-            .publish_value(
-                Chatted::schema_id(),
-                crate::json!({ "text": "no key" }),
-            )
+            .publish_value(Chatted::schema_id(), crate::json!({ "text": "no key" }))
             .await;
 
         // Then the per-set copy dead-letters as ShardKeyMissing and no
@@ -8277,16 +8279,14 @@ mod tests {
                 factor: 2.0,
             },
             args: json!({}),
-            spawn: Arc::new(
-                move |sys: &ActorSystem, path: &ActorPath, args: &Json| {
-                    sys.spawn_es::<Counter, _>(path.clone(), args, opts.clone(), || {
-                        vec![
-                            Arc::new(TypedEsAdapter::<Counter, Add>::new::<Add>()),
-                            Arc::new(TypedEsAdapter::<Counter, Boom>::new::<Boom>()),
-                        ]
-                    });
-                },
-            ),
+            spawn: Arc::new(move |sys: &ActorSystem, path: &ActorPath, args: &Json| {
+                sys.spawn_es::<Counter, _>(path.clone(), args, opts.clone(), || {
+                    vec![
+                        Arc::new(TypedEsAdapter::<Counter, Add>::new::<Add>()),
+                        Arc::new(TypedEsAdapter::<Counter, Boom>::new::<Boom>()),
+                    ]
+                });
+            }),
         };
         system.spawn(spec);
 

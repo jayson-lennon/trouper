@@ -13,10 +13,10 @@
 use crate::actor::ActorPath;
 use crate::clock::Timestamp;
 use crate::envelope::{Address, Envelope, TraceCtx};
+use crate::json::Json;
 use crate::kernel::AskOutcome;
 use crate::schema::Message;
 use crate::schema::SchemaId;
-use crate::json::Json;
 
 /// Read-only runtime view for handlers: registry lookups plus the clock.
 ///
@@ -139,10 +139,7 @@ pub(crate) type AskChannelFuture = std::pin::Pin<
     Box<
         dyn std::future::Future<
                 Output = Result<
-                    (
-                        crate::reply::LeaseId,
-                        tokio::sync::oneshot::Receiver<Json>,
-                    ),
+                    (crate::reply::LeaseId, tokio::sync::oneshot::Receiver<Json>),
                     error_stack::Report<AskError>,
                 >,
             > + Send,

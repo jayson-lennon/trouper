@@ -235,20 +235,18 @@ async fn main() {
             factor: 2.0,
         },
         args: trouper::json!({}),
-        spawn: Arc::new(
-            |sys: &ActorSystem, path: &ActorPath, args: &Json| {
-                trouper::builder::spawn_es_builder::<Account>(sys)
-                    .at(path.clone())
-                    .args(args.clone())
-                    .handles::<Deposit>()
-                    .handles::<Withdraw>()
-                    .handles::<Poison>()
-                    .emits::<Deposited>()
-                    .emits::<Withdrawn>()
-                    .emits::<WithdrawFailed>()
-                    .start();
-            },
-        ),
+        spawn: Arc::new(|sys: &ActorSystem, path: &ActorPath, args: &Json| {
+            trouper::builder::spawn_es_builder::<Account>(sys)
+                .at(path.clone())
+                .args(args.clone())
+                .handles::<Deposit>()
+                .handles::<Withdraw>()
+                .handles::<Poison>()
+                .emits::<Deposited>()
+                .emits::<Withdrawn>()
+                .emits::<WithdrawFailed>()
+                .start();
+        }),
     };
     system.spawn(spec);
     wait(|| async { system.inbox_cursor(&account).is_some() }).await;

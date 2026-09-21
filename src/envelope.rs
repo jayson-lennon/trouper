@@ -178,7 +178,12 @@ pub struct RecordedOrigin {
 
 impl Envelope {
     /// Assembles a JSON envelope — the waist representation.
-    pub fn json(schema: SchemaId, dest: Address, payload: impl Into<Json>, trace: TraceCtx) -> Self {
+    pub fn json(
+        schema: SchemaId,
+        dest: Address,
+        payload: impl Into<Json>,
+        trace: TraceCtx,
+    ) -> Self {
         Self {
             schema,
             dest,
@@ -572,8 +577,12 @@ pub trait IntoEvent: Schema + Serialize + Sized {
     ///
     /// Panics with a named message if serializing the payload fails.
     fn into_event(self) -> Event {
-        self.try_into_event()
-            .unwrap_or_else(|e| panic!("IntoEvent: failed to serialize payload for {}: {e}", Self::schema_id()))
+        self.try_into_event().unwrap_or_else(|e| {
+            panic!(
+                "IntoEvent: failed to serialize payload for {}: {e}",
+                Self::schema_id()
+            )
+        })
     }
 
     /// Builds the event, reporting serialization failure instead of
@@ -584,10 +593,7 @@ pub trait IntoEvent: Schema + Serialize + Sized {
     /// Returns the underlying `serde_json` error if the payload cannot be
     /// serialized.
     fn try_into_event(self) -> Result<Event, serde_json::Error> {
-        Ok(Event::new(
-            Self::schema_id(),
-            serde_json::to_value(&self)?,
-        ))
+        Ok(Event::new(Self::schema_id(), serde_json::to_value(&self)?))
     }
 }
 
@@ -596,12 +602,12 @@ impl<T: Schema + Serialize> IntoEvent for T {}
 #[cfg(test)]
 mod events_tests {
     use super::*;
-    use crate::actor::CommandHandler;
     use crate::actor::CommandEntry as _;
+    use crate::actor::CommandHandler;
     use crate::actor::EventSourcedActor as _;
     use crate::context::CmdCtx;
-    use serde::Deserialize;
     use crate::json;
+    use serde::Deserialize;
 
     #[derive(Serialize, Deserialize)]
     struct Deposited {

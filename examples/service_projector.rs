@@ -131,9 +131,7 @@ impl Projector for PoolView {
     fn apply(&mut self, event: &Event) {
         if event.schema.as_str() == "PoolDrained@1" {
             self.taken = event.payload["taken"].as_u64().unwrap_or(self.taken);
-            self.returned = event.payload["returned"]
-                .as_u64()
-                .unwrap_or(self.returned);
+            self.returned = event.payload["returned"].as_u64().unwrap_or(self.returned);
         }
     }
 }
@@ -156,7 +154,10 @@ async fn main() {
         .start();
 
     for _ in 0..3 {
-        system.tell(ActorPath::new("pool"), Checkout).await.expect("told");
+        system
+            .tell(ActorPath::new("pool"), Checkout)
+            .await
+            .expect("told");
     }
     tokio::time::sleep(Duration::from_millis(100)).await;
     println!("\n3 checkouts happened BEFORE the projector went live.");
@@ -178,8 +179,14 @@ async fn main() {
     println!("  ^ taken=0, returned=0: the 3 pre-spawn checkouts are GONE\n");
 
     // ---- Live tail: everything from here on arrives and STICKS -----
-    system.tell(ActorPath::new("pool"), Checkout).await.expect("told");
-    system.tell(ActorPath::new("pool"), Checkin).await.expect("told");
+    system
+        .tell(ActorPath::new("pool"), Checkout)
+        .await
+        .expect("told");
+    system
+        .tell(ActorPath::new("pool"), Checkin)
+        .await
+        .expect("told");
     tokio::time::sleep(Duration::from_millis(100)).await;
 
     let view = system

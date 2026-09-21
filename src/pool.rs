@@ -58,9 +58,8 @@ pub struct PartitionSpec {
     /// its journal). The factory owns the actor type; the kernel owns the
     /// naming and the activation moment.
     #[allow(clippy::type_complexity)]
-    pub factory: std::sync::Arc<
-        dyn Fn(&crate::system::ActorSystem, &ActorPath, &Json) + Send + Sync,
-    >,
+    pub factory:
+        std::sync::Arc<dyn Fn(&crate::system::ActorSystem, &ActorPath, &Json) + Send + Sync>,
     /// The command field carrying the shard key (extracted per envelope).
     /// Must be marked [`crate::schema::FieldRole::ShardKey`] in at least one
     /// handled command schema — validated at install (refuse-to-lie).
@@ -117,9 +116,8 @@ pub struct ProjectorSetSpec {
     /// read-model type and its consumed schemas; the kernel owns the
     /// naming and the activation moment.
     #[allow(clippy::type_complexity)]
-    pub factory: std::sync::Arc<
-        dyn Fn(&crate::system::ActorSystem, &ActorPath, &Json) + Send + Sync,
-    >,
+    pub factory:
+        std::sync::Arc<dyn Fn(&crate::system::ActorSystem, &ActorPath, &Json) + Send + Sync>,
     /// The consumed-fact field carrying the shard key (extracted per
     /// broadcast copy). Must be marked
     /// [`crate::schema::FieldRole::ShardKey`] in at least one consumed

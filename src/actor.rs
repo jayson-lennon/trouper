@@ -17,9 +17,9 @@ use std::sync::Arc;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::fmt;
 
-use crate::json::Json;
 use crate::context::CmdCtx;
 use crate::journal::JournalError;
+use crate::json::Json;
 use crate::schema::{ActorManifest, Schema, SchemaId};
 
 /// Event-sourced domain actor: pure, journaled, replayable.
@@ -72,7 +72,8 @@ pub trait EventSourcedActor:
     /// Fails when the state cannot be serialized to JSON.
     fn capture(&self) -> Result<Json, error_stack::Report<JournalError>> {
         use error_stack::ResultExt;
-        Ok::<Json, error_stack::Report<JournalError>>(Json::of(self)).change_context(JournalError::Snapshot)
+        Ok::<Json, error_stack::Report<JournalError>>(Json::of(self))
+            .change_context(JournalError::Snapshot)
     }
 
     /// Snapshot seam: rebuild from a snapshot blob. Default = decode JSON.
@@ -344,9 +345,12 @@ where
         ctx: &mut CmdCtx<'_>,
     ) -> Result<crate::envelope::Events, error_stack::Report<DispatchError>> {
         use error_stack::ResultExt;
-        let cmd: C = payload.decode::<C>().change_context(
-            DispatchError::Decode(format!("command {} did not match its schema", self.schema)),
-        )?;
+        let cmd: C = payload
+            .decode::<C>()
+            .change_context(DispatchError::Decode(format!(
+                "command {} did not match its schema",
+                self.schema
+            )))?;
 
         // Safe: the spawn that registered this adapter built the state as
         // the same `A` — a mismatch is a kernel bug, hence a panic.
@@ -388,7 +392,8 @@ impl<P: Projector> DynEsActor for TypedProjectorState<P> {
 
     fn capture_erased(&self) -> Result<Json, error_stack::Report<JournalError>> {
         use error_stack::ResultExt;
-        Ok::<Json, error_stack::Report<JournalError>>(Json::of(&self.state)).change_context(JournalError::Snapshot)
+        Ok::<Json, error_stack::Report<JournalError>>(Json::of(&self.state))
+            .change_context(JournalError::Snapshot)
     }
 
     fn rebuild(
@@ -454,9 +459,8 @@ impl CommandEntry for ConsumeEntry {
 }
 
 /// A foreign actor's decision function: JSON state + JSON command → events.
-pub type ForeignDecision = Arc<
-    dyn Fn(&Json, &Json, &mut CmdCtx<'_>) -> Vec<crate::envelope::Event> + Send + Sync,
->;
+pub type ForeignDecision =
+    Arc<dyn Fn(&Json, &Json, &mut CmdCtx<'_>) -> Vec<crate::envelope::Event> + Send + Sync>;
 
 /// The erased twin for actors defined entirely outside Rust: state is JSON,
 /// decisions are a [`ForeignDecision`] closure.
@@ -653,9 +657,12 @@ where
         payload: &Json,
     ) -> Result<Box<dyn std::any::Any + Send>, error_stack::Report<DispatchError>> {
         use error_stack::ResultExt;
-        let msg: M = payload.decode::<M>().change_context(
-            DispatchError::Decode(format!("message {} did not match its schema", self.schema)),
-        )?;
+        let msg: M = payload
+            .decode::<M>()
+            .change_context(DispatchError::Decode(format!(
+                "message {} did not match its schema",
+                self.schema
+            )))?;
         Ok(Box::new(msg))
     }
 
@@ -694,9 +701,9 @@ impl ServiceAny for dyn DynServiceActor {
 mod tests {
     use super::*;
     use crate::actor::{ActorKind, ActorPath};
+    use crate::json;
     use crate::schema::{FieldDef, FieldTy, SchemaDef, SchemaKind};
     use serde::Deserialize;
-    use crate::json;
 
     #[derive(Deserialize)]
     struct ReserveStock {

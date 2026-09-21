@@ -7,8 +7,8 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-pub use crate::json::Json;
 use crate::envelope::Event;
+pub use crate::json::Json;
 
 /// Why an actor's journal holds a fact.
 ///
@@ -716,8 +716,8 @@ impl std::fmt::Display for SeqNo {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::schema::SchemaId;
     use crate::json;
+    use crate::schema::SchemaId;
 
     fn event(qty: i64) -> Event {
         Event::new(SchemaId::new("StockReserved", 1), json!({ "qty": qty }))

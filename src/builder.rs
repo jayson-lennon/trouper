@@ -13,13 +13,12 @@
 
 use std::sync::Arc;
 
-
-use crate::json::Json;
 use crate::actor::{ActorKind, ActorPath};
 use crate::actor::{
     CommandEntry, ForeignCommandEntry, ForeignDecision, ForeignEsState, ForeignFold, MsgEntry,
     ServiceActor, TypedEsAdapter, TypedServiceAdapter,
 };
+use crate::json::Json;
 use crate::schema::Schema;
 use crate::schema::SchemaId;
 use crate::system::SpawnOpts;

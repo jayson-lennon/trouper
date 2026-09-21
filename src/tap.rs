@@ -9,8 +9,8 @@
 
 use std::collections::VecDeque;
 
-use crate::json::Json;
 use crate::json;
+use crate::json::Json;
 
 use crate::actor::{ActorKind, ActorPath, StopReason};
 use crate::envelope::{Address, TraceCtx};

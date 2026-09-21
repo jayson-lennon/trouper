@@ -78,10 +78,11 @@ impl MsgHandler<Checkout> for PoolService {
         let taken = TAKEN.fetch_add(1, Ordering::SeqCst) + 1;
         let returned = RETURNED.load(Ordering::SeqCst);
         println!("[pool] checkout #{taken}");
-        ctx.send(Address::Path(ActorPath::new("pool.log")), &PoolEvent {
-            taken,
-            returned,
-        }, None);
+        ctx.send(
+            Address::Path(ActorPath::new("pool.log")),
+            &PoolEvent { taken, returned },
+            None,
+        );
     }
 }
 
@@ -90,10 +91,11 @@ impl MsgHandler<Checkin> for PoolService {
         let returned = RETURNED.fetch_add(1, Ordering::SeqCst) + 1;
         let taken = TAKEN.load(Ordering::SeqCst);
         println!("[pool] checkin #{returned}");
-        ctx.send(Address::Path(ActorPath::new("pool.log")), &PoolEvent {
-            taken,
-            returned,
-        }, None);
+        ctx.send(
+            Address::Path(ActorPath::new("pool.log")),
+            &PoolEvent { taken, returned },
+            None,
+        );
     }
 }
 
@@ -172,9 +174,7 @@ impl Projector for PoolView {
     fn apply(&mut self, event: &Event) {
         if event.schema.as_str() == "PoolEvent@1" {
             self.taken = event.payload["taken"].as_u64().unwrap_or(self.taken);
-            self.returned = event.payload["returned"]
-                .as_u64()
-                .unwrap_or(self.returned);
+            self.returned = event.payload["returned"].as_u64().unwrap_or(self.returned);
         }
     }
 }
@@ -203,7 +203,10 @@ async fn main() {
 
     // ---- Traffic BEFORE the projector exists — and this time it survives.
     for _ in 0..3 {
-        system.tell(ActorPath::new("pool"), Checkout).await.expect("told");
+        system
+            .tell(ActorPath::new("pool"), Checkout)
+            .await
+            .expect("told");
     }
     tokio::time::sleep(Duration::from_millis(100)).await;
     println!("\n3 checkouts happened BEFORE the projector went live — journaled by the entity.");
@@ -222,11 +225,19 @@ async fn main() {
         .await
         .expect("live projector");
     println!("pool view right after spawn: {view:?}");
-    println!("  ^ taken=3, returned=0: HISTORY PRESENT. The entity's journal\n    was the origin of truth; catch-up folded all of it.\n");
+    println!(
+        "  ^ taken=3, returned=0: HISTORY PRESENT. The entity's journal\n    was the origin of truth; catch-up folded all of it.\n"
+    );
 
     // ---- Live tail continues.
-    system.tell(ActorPath::new("pool"), Checkout).await.expect("told");
-    system.tell(ActorPath::new("pool"), Checkin).await.expect("told");
+    system
+        .tell(ActorPath::new("pool"), Checkout)
+        .await
+        .expect("told");
+    system
+        .tell(ActorPath::new("pool"), Checkin)
+        .await
+        .expect("told");
     tokio::time::sleep(Duration::from_millis(100)).await;
     let view = system
         .projector_state(&ActorPath::new("proj/pool"))
@@ -246,7 +257,9 @@ async fn main() {
         .await
         .expect("restarted projector");
     println!("pool view after restart: {view:?}");
-    println!("  ^ taken=5, returned=1 survive restart (own-journal replay),\n    and the 3 pre-spawn events are IN there too — unlike\n    service_projector, where history before the projector is gone.");
+    println!(
+        "  ^ taken=5, returned=1 survive restart (own-journal replay),\n    and the 3 pre-spawn events are IN there too — unlike\n    service_projector, where history before the projector is gone."
+    );
 
     println!(
         "\nTHE RULE: history requires an ES actor at (or behind) the origin.\n\

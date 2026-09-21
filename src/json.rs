@@ -200,7 +200,10 @@ mod tests {
     #[test]
     fn json_of_and_decode_roundtrip_a_typed_value() {
         // Given a typed value converted at the boundary.
-        let args = Json::of(&Genesis { key: "a".into(), on_hand: 4 });
+        let args = Json::of(&Genesis {
+            key: "a".into(),
+            on_hand: 4,
+        });
 
         // When decoding it back into the type.
         let decoded: Genesis = args.decode().expect("decode");
