@@ -19,7 +19,6 @@
 
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 use trouper::actor::{CommandHandler, EventSourcedActor, MsgHandler, ServiceActor};
@@ -66,7 +65,7 @@ impl ServiceActor for PoolService {
     fn manifest() -> ActorManifest {
         ActorManifest::new().kind(ActorKind::Service)
     }
-    async fn start(_args: &serde_json::Value) -> Result<Self, error_stack::Report<RegistryError>> {
+    async fn start(_args: &Json) -> Result<Self, error_stack::Report<RegistryError>> {
         Ok(Self)
     }
 }
@@ -124,26 +123,30 @@ impl Schema for PoolEvent {
 
 /// The logger entity: handle the command, record the fact. Its journal
 /// (append-before-ack) is what makes history exist.
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Default)]
 struct PoolLog;
 impl CommandHandler<Checkout> for PoolLog {
-    fn handle(&self, _cmd: Checkout, _ctx: &mut CmdCtx<'_>) -> Vec<Event> {
-        vec![Event::new(
-            PoolEvent::schema_id(),
-            json!({ "taken": TAKEN.load(Ordering::SeqCst), "returned": RETURNED.load(Ordering::SeqCst) }),
-        )]
+    fn handle(&self, _cmd: Checkout, _ctx: &mut CmdCtx<'_>) -> Events {
+        let mut ev = Events::new();
+        ev.push_event(PoolEvent {
+            taken: TAKEN.load(Ordering::SeqCst),
+            returned: RETURNED.load(Ordering::SeqCst),
+        });
+        ev
     }
 }
 impl CommandHandler<Checkin> for PoolLog {
-    fn handle(&self, _cmd: Checkin, _ctx: &mut CmdCtx<'_>) -> Vec<Event> {
-        vec![Event::new(
-            PoolEvent::schema_id(),
-            json!({ "taken": TAKEN.load(Ordering::SeqCst), "returned": RETURNED.load(Ordering::SeqCst) }),
-        )]
+    fn handle(&self, _cmd: Checkin, _ctx: &mut CmdCtx<'_>) -> Events {
+        let mut ev = Events::new();
+        ev.push_event(PoolEvent {
+            taken: TAKEN.load(Ordering::SeqCst),
+            returned: RETURNED.load(Ordering::SeqCst),
+        });
+        ev
     }
 }
 impl EventSourcedActor for PoolLog {
-    fn restore(_args: &serde_json::Value) -> Self {
+    fn restore(_args: &Json) -> Self {
         Self
     }
     fn apply(&mut self, _event: &Event) {
@@ -211,14 +214,14 @@ async fn main() {
     spawn_projector_builder::<PoolView>(&system)
         .at(ActorPath::new("proj/pool"))
         .consumes::<PoolEvent>()
-        .start()
+        .start_and_catchup()
         .await; // returns after catch-up — which replayed ALL history
 
     let view = system
         .projector_state(&ActorPath::new("proj/pool"))
         .await
         .expect("live projector");
-    println!("pool view right after spawn: {view}");
+    println!("pool view right after spawn: {view:?}");
     println!("  ^ taken=3, returned=0: HISTORY PRESENT. The entity's journal\n    was the origin of truth; catch-up folded all of it.\n");
 
     // ---- Live tail continues.
@@ -229,20 +232,20 @@ async fn main() {
         .projector_state(&ActorPath::new("proj/pool"))
         .await
         .expect("live projector");
-    println!("pool view after live traffic: {view}\n");
+    println!("pool view after live traffic: {view:?}\n");
 
     // ---- Restart: replay from the projector's own journal.
     system.stop(&ActorPath::new("proj/pool")).await;
     spawn_projector_builder::<PoolView>(&system)
         .at(ActorPath::new("proj/pool"))
         .consumes::<PoolEvent>()
-        .start()
+        .start_and_catchup()
         .await;
     let view = system
         .projector_state(&ActorPath::new("proj/pool"))
         .await
         .expect("restarted projector");
-    println!("pool view after restart: {view}");
+    println!("pool view after restart: {view:?}");
     println!("  ^ taken=5, returned=1 survive restart (own-journal replay),\n    and the 3 pre-spawn events are IN there too — unlike\n    service_projector, where history before the projector is gone.");
 
     println!(

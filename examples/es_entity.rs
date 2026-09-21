@@ -15,7 +15,6 @@
 //! Run: `cargo run --example es_entity`
 
 use serde::{Deserialize, Serialize};
-use serde_json::json;
 use std::sync::Arc;
 use std::time::Duration;
 use trouper::actor::{CommandHandler, EventSourcedActor};
@@ -87,7 +86,7 @@ struct Account {
 }
 
 impl EventSourcedActor for Account {
-    fn restore(args: &serde_json::Value) -> Self {
+    fn restore(args: &Json) -> Self {
         Account { balance: 0 }.seeded(args)
     }
 
@@ -108,22 +107,18 @@ impl Account {
 }
 
 impl CommandHandler<AccountCmd> for Account {
-    fn handle(&self, cmd: AccountCmd, _ctx: &mut CmdCtx<'_>) -> Vec<Event> {
-        vec![Event::new(
-            AccountAdjusted::schema_id(),
-            json!({ "delta": cmd.delta }),
-        )]
+    fn handle(&self, cmd: AccountCmd, _ctx: &mut CmdCtx<'_>) -> Events {
+        Events::one(AccountAdjusted { delta: cmd.delta })
     }
 }
 
 impl CommandHandler<MarketBell> for Account {
-    fn handle(&self, bell: MarketBell, _ctx: &mut CmdCtx<'_>) -> Vec<Event> {
+    fn handle(&self, bell: MarketBell, _ctx: &mut CmdCtx<'_>) -> Events {
         // A published event is still just an input: the entity decides
         // and journals its response like any other message.
-        vec![Event::new(
-            AccountAdjusted::schema_id(),
-            json!({ "delta": bell.ring as i64 }),
-        )]
+        Events::one(AccountAdjusted {
+            delta: bell.ring as i64,
+        })
     }
 }
 
@@ -151,7 +146,7 @@ async fn main() {
         }),
         key_field: "account".to_owned(),
         // Genesis template: every entity opens at 100, plus its key.
-        args_template: Some(json!({ "opening": 100 })),
+        args_template: Some(trouper::json!({ "opening": 100 })),
         opts: SpawnOpts::default(),
     };
     system
@@ -192,7 +187,7 @@ async fn main() {
         .es_state(&ActorPath::new("accts/bob"))
         .await
         .expect("bob live");
-    println!("after commands:  alice = {alice}, bob = {bob}");
+    println!("after commands:  alice = {alice:?}, bob = {bob:?}");
     println!("  (separate entities, separate journals, one public path)");
 
     // 2. Let them idle out: passivation is the KERNEL's call (60ms).
@@ -232,7 +227,7 @@ async fn main() {
         .es_state(&ActorPath::new("accts/alice"))
         .await
         .expect("reactivated");
-    println!("after re-activation: alice = {alice2} (replay rebuilt 150, then +10)");
+    println!("after re-activation: alice = {alice2:?} (replay rebuilt 150, then +10)");
 
     // 4. A PUBLISHED event: every LIVE entity that declared MarketBell
     //    receives one copy and journals its decision — dispatched
@@ -246,7 +241,7 @@ async fn main() {
         .es_state(&ActorPath::new("accts/alice"))
         .await
         .expect("alice still live");
-    println!("after MarketBell(5): alice = {alice3} (published copy journaled)");
+    println!("after MarketBell(5): alice = {alice3:?} (published copy journaled)");
     assert_eq!(
         alice3["balance"], 165,
         "the published event's decision applied"

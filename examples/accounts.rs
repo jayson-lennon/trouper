@@ -85,9 +85,8 @@ impl Schema for Poison {
 
 // -- Events ---------------------------------------------------------------
 
-#[derive(Deserialize)]
+#[derive(Serialize, Deserialize)]
 struct Deposited {
-    #[allow(dead_code)]
     n: i64,
 }
 
@@ -103,9 +102,8 @@ impl Schema for Deposited {
     }
 }
 
-#[derive(Deserialize)]
+#[derive(Serialize, Deserialize)]
 struct Withdrawn {
-    #[allow(dead_code)]
     n: i64,
 }
 
@@ -123,11 +121,9 @@ impl Schema for Withdrawn {
 
 /// The domain rejection, journaled like any event: a fact about the
 /// world ("a decline happened"), not an error report.
-#[derive(Deserialize)]
+#[derive(Serialize, Deserialize)]
 struct WithdrawFailed {
-    #[allow(dead_code)]
     requested: i64,
-    #[allow(dead_code)]
     balance: i64,
 }
 
@@ -154,44 +150,45 @@ struct Account {
 }
 
 impl EventSourcedActor for Account {
-    fn restore(_args: &serde_json::Value) -> Self {
-        Self::default()
-    }
+    // restore is defaulted: Account derives Default, so genesis needs no
+    // override (spawn args are ignored by default).
 
     fn apply(&mut self, event: &Event) {
-        match event.schema.name() {
-            "Deposited" => self.balance += event.payload["n"].as_i64().unwrap_or(0),
-            "Withdrawn" => self.balance -= event.payload["n"].as_i64().unwrap_or(0),
-            "WithdrawFailed" => {} // a decline changes nothing
-            _ => {}
+        if let Some(e) = event.decode::<Deposited>() {
+            self.balance += e.n;
+        } else if let Some(e) = event.decode::<Withdrawn>() {
+            self.balance -= e.n;
         }
+        // WithdrawFailed: a decline changes nothing; no decode needed.
     }
 }
 
 impl CommandHandler<Deposit> for Account {
-    fn handle(&self, cmd: Deposit, _ctx: &mut CmdCtx<'_>) -> Vec<Event> {
-        vec![Event::new(Deposited::schema_id(), json!({ "n": cmd.n }))]
+    fn handle(&self, cmd: Deposit, _ctx: &mut CmdCtx<'_>) -> Events {
+        Events::one(Deposited { n: cmd.n })
     }
 }
 
 impl CommandHandler<Withdraw> for Account {
-    fn handle(&self, cmd: Withdraw, _ctx: &mut CmdCtx<'_>) -> Vec<Event> {
+    fn handle(&self, cmd: Withdraw, _ctx: &mut CmdCtx<'_>) -> Events {
+        let mut ev = Events::new();
         if self.balance >= cmd.n {
-            vec![Event::new(Withdrawn::schema_id(), json!({ "n": cmd.n }))]
+            ev.push_event(Withdrawn { n: cmd.n });
         } else {
             // Domain rejection as an event: total decision, journaled,
-            // replayed, observable. (The empty-vec alternative is the
+            // replayed, observable. (The empty-buffer alternative is the
             // silent form; the event makes the decline a fact.)
-            vec![Event::new(
-                WithdrawFailed::schema_id(),
-                json!({ "requested": cmd.n, "balance": self.balance }),
-            )]
+            ev.push_event(WithdrawFailed {
+                requested: cmd.n,
+                balance: self.balance,
+            });
         }
+        ev
     }
 }
 
 impl CommandHandler<Poison> for Account {
-    fn handle(&self, cmd: Poison, _ctx: &mut CmdCtx<'_>) -> Vec<Event> {
+    fn handle(&self, cmd: Poison, _ctx: &mut CmdCtx<'_>) -> Events {
         // Technical failure: panic on the FIRST sight (n = 1). The crash
         // is transient — after the supervised restart, the redelivered
         // command passes (the fault is gone) and processing continues.
@@ -199,7 +196,7 @@ impl CommandHandler<Poison> for Account {
         if cmd.n == 1 && !POISONED.swap(true, std::sync::atomic::Ordering::SeqCst) {
             panic!("poison command: simulated technical fault (transient)");
         }
-        vec![]
+        Events::new()
     }
 }
 
@@ -237,9 +234,9 @@ async fn main() {
             max: std::time::Duration::from_millis(80),
             factor: 2.0,
         },
-        args: json!({}),
+        args: trouper::json!({}),
         spawn: Arc::new(
-            |sys: &ActorSystem, path: &ActorPath, args: &serde_json::Value| {
+            |sys: &ActorSystem, path: &ActorPath, args: &Json| {
                 trouper::builder::spawn_es_builder::<Account>(sys)
                     .at(path.clone())
                     .args(args.clone())

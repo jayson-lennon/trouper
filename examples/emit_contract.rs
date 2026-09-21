@@ -29,7 +29,7 @@ impl Schema for Ping {
     }
 }
 
-#[derive(Deserialize)]
+#[derive(Serialize, Deserialize)]
 struct Ponged {
     #[allow(dead_code)]
     n: i64,
@@ -48,7 +48,7 @@ impl Schema for Ponged {
 }
 
 /// NEVER declared in any manifest — the counter emits it anyway.
-#[derive(Deserialize)]
+#[derive(Serialize, Deserialize)]
 struct SecretPing {
     #[allow(dead_code)]
     n: i64,
@@ -80,7 +80,7 @@ impl EventSourcedActor for Counter {
             .kind(ActorKind::EventSourced)
     }
 
-    fn restore(_args: &serde_json::Value) -> Self {
+    fn restore(_args: &Json) -> Self {
         Self::default()
     }
 
@@ -95,11 +95,11 @@ impl CommandHandler<Ping> for Counter {
     /// A MIXED decision: one declared event, one undeclared. The declared
     /// half lands; the undeclared half is dropped pre-append — the step
     /// is not failed, and state stays fold-consistent.
-    fn handle(&self, cmd: Ping, _ctx: &mut CmdCtx<'_>) -> Vec<Event> {
-        vec![
-            Event::new(Ponged::schema_id(), json!({ "n": cmd.n })),
-            Event::new(SecretPing::schema_id(), json!({ "n": cmd.n })),
-        ]
+    fn handle(&self, cmd: Ping, _ctx: &mut CmdCtx<'_>) -> Events {
+        let mut ev = Events::new();
+        ev.push_event(Ponged { n: cmd.n }); // declared: journals + fans out
+        ev.push_event(SecretPing { n: cmd.n }); // undeclared: dropped pre-append
+        ev
     }
 }
 
@@ -142,7 +142,7 @@ async fn main() {
         .es_state(&ActorPath::new("counter"))
         .await
         .expect("state");
-    println!("   declared events applied (seen = 1+2+3): {state}");
+    println!("   declared events applied (seen = 1+2+3): {state:?}");
     let undeclared = system
         .tap_facts()
         .iter()

@@ -38,7 +38,7 @@ impl Schema for KeyedAdd {
     }
 }
 
-#[derive(Deserialize)]
+#[derive(Serialize, Deserialize)]
 struct Added {
     #[allow(dead_code)]
     n: i64,
@@ -62,7 +62,7 @@ struct Account {
 }
 
 impl EventSourcedActor for Account {
-    fn restore(_args: &serde_json::Value) -> Self {
+    fn restore(_args: &Json) -> Self {
         Self::default()
     }
 
@@ -72,8 +72,8 @@ impl EventSourcedActor for Account {
 }
 
 impl CommandHandler<KeyedAdd> for Account {
-    fn handle(&self, cmd: KeyedAdd, _ctx: &mut CmdCtx<'_>) -> Vec<Event> {
-        vec![Event::new(Added::schema_id(), json!({ "n": cmd.n }))]
+    fn handle(&self, cmd: KeyedAdd, _ctx: &mut CmdCtx<'_>) -> Events {
+        Events::one(Added { n: cmd.n })
     }
 }
 

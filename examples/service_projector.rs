@@ -21,7 +21,6 @@
 //! Run: `cargo run --example service_projector`
 
 use serde::{Deserialize, Serialize};
-use serde_json::json;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 use trouper::actor::{MsgHandler, Projector, ServiceActor};
@@ -64,7 +63,7 @@ impl ServiceActor for PoolService {
     fn manifest() -> ActorManifest {
         ActorManifest::new().kind(ActorKind::Service)
     }
-    async fn start(_args: &serde_json::Value) -> Result<Self, error_stack::Report<RegistryError>> {
+    async fn start(_args: &Json) -> Result<Self, error_stack::Report<RegistryError>> {
         Ok(Self)
     }
 }
@@ -168,14 +167,14 @@ async fn main() {
     spawn_projector_builder::<PoolView>(&system)
         .at(ActorPath::new("proj/pool"))
         .consumes::<PoolDrained>()
-        .start()
+        .start_and_catchup()
         .await; // returns after catch-up — which had nothing to replay
 
     let view = system
         .projector_state(&ActorPath::new("proj/pool"))
         .await
         .expect("live projector");
-    println!("pool view right after spawn: {view}");
+    println!("pool view right after spawn: {view:?}");
     println!("  ^ taken=0, returned=0: the 3 pre-spawn checkouts are GONE\n");
 
     // ---- Live tail: everything from here on arrives and STICKS -----
@@ -187,7 +186,7 @@ async fn main() {
         .projector_state(&ActorPath::new("proj/pool"))
         .await
         .expect("live projector");
-    println!("pool view after live traffic: {view}");
+    println!("pool view after live traffic: {view:?}");
     println!("  ^ taken=4, returned=1: only POST-spawn facts are known\n");
 
     // ---- Restarts work — over the projector's OWN journal ----------
@@ -199,13 +198,13 @@ async fn main() {
     spawn_projector_builder::<PoolView>(&system)
         .at(ActorPath::new("proj/pool"))
         .consumes::<PoolDrained>()
-        .start()
+        .start_and_catchup()
         .await;
     let view = system
         .projector_state(&ActorPath::new("proj/pool"))
         .await
         .expect("restarted projector");
-    println!("pool view after restart: {view}");
+    println!("pool view after restart: {view:?}");
     println!("  ^ taken=4, returned=1 survive — replayed from the projector's own journal");
 
     println!(

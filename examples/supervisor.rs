@@ -109,7 +109,7 @@ impl ServiceActor for Worker {
         ActorManifest::new().kind(ActorKind::Service)
     }
 
-    async fn start(args: &serde_json::Value) -> Result<Self, error_stack::Report<RegistryError>> {
+    async fn start(args: &Json) -> Result<Self, error_stack::Report<RegistryError>> {
         Ok(Self::new(args["id"].as_u64().unwrap_or(0) as u32))
     }
 }
@@ -132,7 +132,7 @@ impl ServiceActor for JobSupervisor {
         ActorManifest::new().kind(ActorKind::Service)
     }
 
-    async fn start(_args: &serde_json::Value) -> Result<Self, error_stack::Report<RegistryError>> {
+    async fn start(_args: &Json) -> Result<Self, error_stack::Report<RegistryError>> {
         Ok(Self)
     }
 }
@@ -171,9 +171,9 @@ async fn main() {
             restart: RestartPolicy::Permanent,
             budget: RestartBudget::per(2, std::time::Duration::from_secs(10)),
             backoff: Backoff::default(),
-            args: serde_json::json!({ "id": id }),
+            args: trouper::json!({ "id": id }),
             spawn: Arc::new(
-                move |sys: &ActorSystem, path: &ActorPath, args: &serde_json::Value| {
+                move |sys: &ActorSystem, path: &ActorPath, args: &Json| {
                     // The factory owns the actor type; the kernel owns the
                     // naming. Crashy workers (id 2) panic on every job.
                     if args["id"].as_u64() == Some(2) {
@@ -261,7 +261,7 @@ fn spawn_crashy(sys: &ActorSystem, path: ActorPath, args: &serde_json::Value) {
         fn manifest() -> ActorManifest {
             ActorManifest::new().kind(ActorKind::Service)
         }
-        async fn start(a: &serde_json::Value) -> Result<Self, error_stack::Report<RegistryError>> {
+        async fn start(a: &Json) -> Result<Self, error_stack::Report<RegistryError>> {
             Ok(Crashy {
                 _id: a["id"].as_u64().unwrap_or(0) as u32,
             })

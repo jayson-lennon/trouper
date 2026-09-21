@@ -167,7 +167,7 @@ impl<S: FileStore> FileSaver<S> {
 }
 
 impl<S: FileStore + Default> ServiceActor for FileSaver<S> {
-    async fn start(_args: &serde_json::Value) -> Result<Self, Report<RegistryError>> {
+    async fn start(_args: &Json) -> Result<Self, Report<RegistryError>> {
         Ok(Self {
             store: S::default(),
         })
@@ -208,7 +208,7 @@ static AUDIT: parking_lot::Mutex<Vec<String>> = parking_lot::Mutex::new(Vec::new
 struct SaveAudit;
 
 impl ServiceActor for SaveAudit {
-    async fn start(_args: &serde_json::Value) -> Result<Self, Report<RegistryError>> {
+    async fn start(_args: &Json) -> Result<Self, Report<RegistryError>> {
         Ok(Self)
     }
 }
@@ -293,9 +293,9 @@ async fn run_demo() -> Result<(), Box<dyn std::error::Error>> {
         .expect("acked");
     assert_eq!(
         ack["bytes"], 30,
-        "the ask ack must report the written bytes: {ack}"
+        "the ask ack must report the written bytes: {ack:?}"
     );
-    println!("ask: ack {ack}");
+    println!("ask: ack {ack:?}");
 
     // --- failure, asked: the reply names the reason (point-to-point) ---
     // A path under a directory that does not exist: the domain method
@@ -313,7 +313,7 @@ async fn run_demo() -> Result<(), Box<dyn std::error::Error>> {
         .await;
     match failed {
         Ok(reply) if reply["reason"] == "NotFound" => {
-            println!("failed ask replied the reason: {reply}");
+            println!("failed ask replied the reason: {reply:?}");
         }
         other => panic!("expected a SaveFailed reply, got {other:?}"),
     }

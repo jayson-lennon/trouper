@@ -73,15 +73,15 @@ struct ChatRoom {
     messages: u64,
 }
 impl CommandHandler<Say> for ChatRoom {
-    fn handle(&self, cmd: Say, _ctx: &mut CmdCtx<'_>) -> Vec<Event> {
-        vec![Event::new(
-            Chatted::schema_id(),
-            json!({ "chat_id": cmd.chat_id, "text": cmd.text }),
-        )]
+    fn handle(&self, cmd: Say, _ctx: &mut CmdCtx<'_>) -> Events {
+        Events::one(Chatted {
+            chat_id: cmd.chat_id,
+            text: cmd.text,
+        })
     }
 }
 impl EventSourcedActor for ChatRoom {
-    fn restore(_args: &serde_json::Value) -> Self {
+    fn restore(_args: &Json) -> Self {
         Self::default()
     }
     fn apply(&mut self, event: &Event) {
@@ -187,12 +187,12 @@ async fn main() {
         .projector_state(&ActorPath::new("chats/rust"))
         .await
         .expect("rust");
-    println!("chats/rust   : {rust}");
+    println!("chats/rust   : {rust:?}");
     let k8s = system
         .projector_state(&ActorPath::new("chats/k8s"))
         .await
         .expect("k8s");
-    println!("chats/k8s    : {k8s}");
+    println!("chats/k8s    : {k8s:?}");
     // Each projector folded ONLY its key's facts.
     println!(
         "chats/other  : {:?} (never activated — no key \"other\" fact)",
@@ -219,7 +219,7 @@ async fn main() {
         .projector_state(&ActorPath::new("chats/rust"))
         .await
         .expect("woken");
-    println!("chats/rust woken + gap-filled: {rust}");
+    println!("chats/rust woken + gap-filled: {rust:?}");
 
     // ---- Rebuild = stop + purge + re-activate + catch-up -----------
     // The re-fold equals a from-scratch fold (same scan, same apply).
@@ -231,5 +231,5 @@ async fn main() {
         .projector_state(&ActorPath::new("chats/rust"))
         .await
         .expect("rebuilt");
-    println!("chats/rust rebuilt (fresh fold): {rust}");
+    println!("chats/rust rebuilt (fresh fold): {rust:?}");
 }

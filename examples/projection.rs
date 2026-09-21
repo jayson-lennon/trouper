@@ -78,16 +78,16 @@ struct Account {
     balance: i64,
 }
 impl CommandHandler<AccountCmd> for Account {
-    fn handle(&self, cmd: AccountCmd, _ctx: &mut CmdCtx<'_>) -> Vec<Event> {
-        vec![Event::new(
-            AccountAdjusted::schema_id(),
-            json!({ "account": cmd.account, "delta": cmd.delta }),
-        )]
+    fn handle(&self, cmd: AccountCmd, _ctx: &mut CmdCtx<'_>) -> Events {
+        Events::one(AccountAdjusted {
+            account: cmd.account,
+            delta: cmd.delta,
+        })
     }
 }
 
 impl EventSourcedActor for Account {
-    fn restore(_args: &serde_json::Value) -> Self {
+    fn restore(_args: &Json) -> Self {
         Self::default()
     }
     fn apply(&mut self, event: &Event) {
@@ -171,7 +171,7 @@ async fn main() {
         .await;
 
     let fold = system.projector_state(&balances).await.expect("fold");
-    println!("balances after catch-up: {fold}");
+    println!("balances after catch-up: {fold:?}");
 
     // ---- Live facts fold too, exactly once -------------------------
     system
@@ -185,7 +185,7 @@ async fn main() {
     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
     let fold = system.projector_state(&balances).await.expect("fold");
-    println!("balances after live fact: {fold}");
+    println!("balances after live fact: {fold:?}");
 
     // bob's live fact folded ONCE — the projector re-recorded it into
     // its journal as a checkpoint, and a restart would NOT re-seed it.
@@ -196,7 +196,7 @@ async fn main() {
         .start_and_catchup()
         .await;
     let fold = system.projector_state(&again).await.expect("fold");
-    println!("balances after restart (no double-fold): {fold}");
+    println!("balances after restart (no double-fold): {fold:?}");
 
     // The raw peek: in-memory only, never wakes anything.
     println!(

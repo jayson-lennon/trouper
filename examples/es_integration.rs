@@ -27,7 +27,7 @@ use tracing::Level;
 use trouper::actor::{CommandHandler, EventSourcedActor, MsgHandler, ServiceActor};
 use trouper::context::{CmdCtx, MsgCtx};
 use trouper::prelude::*;
-use trouper::schema::{FieldDef, FieldTy, Schema, SchemaDef, SchemaId, SchemaKind};
+use trouper::schema::{FieldDef, FieldTy, Schema, SchemaDef, SchemaKind};
 use trouper::tap::FactKind;
 
 // ---- messages ------------------------------------------------------------
@@ -157,7 +157,7 @@ struct Account {
 }
 
 impl EventSourcedActor for Account {
-    fn restore(args: &serde_json::Value) -> Self {
+    fn restore(args: &Json) -> Self {
         Account {
             balance: args["opening"].as_i64().unwrap_or(0),
         }
@@ -171,36 +171,29 @@ impl EventSourcedActor for Account {
 }
 
 impl CommandHandler<AccountCmd> for Account {
-    fn handle(&self, cmd: AccountCmd, ctx: &mut CmdCtx<'_>) -> Vec<Event> {
+    fn handle(&self, cmd: AccountCmd, ctx: &mut CmdCtx<'_>) -> Events {
         let transfer_id = "n/a".to_owned(); // plain debits carry none
         let after = self.balance + cmd.delta;
         // THE DECISION IS THE ANNOUNCEMENT: return the fact, the kernel
         // broadcasts it to every .handles observer.
-        let (schema, payload): (SchemaId, serde_json::Value) = if after < 0 {
-            (
-                TransferRejected::schema_id(),
-                serde_json::to_value(&TransferRejected {
-                    transfer_id: transfer_id.clone(),
-                    account: cmd.account.clone(),
-                    delta: cmd.delta,
-                    balance: self.balance,
-                })
-                .expect("fact payload"),
-            )
+        let mut ev = Events::new();
+        if after < 0 {
+            ev.push_event(TransferRejected {
+                transfer_id: transfer_id.clone(),
+                account: cmd.account.clone(),
+                delta: cmd.delta,
+                balance: self.balance,
+            });
         } else {
-            (
-                TransferCompleted::schema_id(),
-                serde_json::to_value(&TransferCompleted {
-                    transfer_id,
-                    account: cmd.account.clone(),
-                    delta: cmd.delta,
-                    balance: after,
-                })
-                .expect("fact payload"),
-            )
-        };
+            ev.push_event(TransferCompleted {
+                transfer_id,
+                account: cmd.account.clone(),
+                delta: cmd.delta,
+                balance: after,
+            });
+        }
         let _ = ctx; // introspection only: lookup/handlers_of/recv_ts/self_path
-        vec![Event::new(schema, payload)]
+        ev
     }
 }
 
@@ -229,34 +222,27 @@ impl Schema for TransferDebit {
 }
 
 impl CommandHandler<TransferDebit> for Account {
-    fn handle(&self, cmd: TransferDebit, _ctx: &mut CmdCtx<'_>) -> Vec<Event> {
+    fn handle(&self, cmd: TransferDebit, _ctx: &mut CmdCtx<'_>) -> Events {
         let after = self.balance + cmd.delta;
         // THE SCHEMA ID CARRIES THE VERDICT: a rejection is a
         // TransferRejected fact, a settlement a TransferCompleted one.
-        let (schema, payload) = if after < 0 {
-            (
-                TransferRejected::schema_id(),
-                serde_json::to_value(&TransferRejected {
-                    transfer_id: cmd.transfer_id.clone(),
-                    account: cmd.account.clone(),
-                    delta: cmd.delta,
-                    balance: self.balance,
-                })
-                .expect("fact payload"),
-            )
+        let mut ev = Events::new();
+        if after < 0 {
+            ev.push_event(TransferRejected {
+                transfer_id: cmd.transfer_id.clone(),
+                account: cmd.account.clone(),
+                delta: cmd.delta,
+                balance: self.balance,
+            });
         } else {
-            (
-                TransferCompleted::schema_id(),
-                serde_json::to_value(&TransferCompleted {
-                    transfer_id: cmd.transfer_id.clone(),
-                    account: cmd.account.clone(),
-                    delta: cmd.delta,
-                    balance: after,
-                })
-                .expect("fact payload"),
-            )
-        };
-        vec![Event::new(schema, payload)]
+            ev.push_event(TransferCompleted {
+                transfer_id: cmd.transfer_id.clone(),
+                account: cmd.account.clone(),
+                delta: cmd.delta,
+                balance: after,
+            });
+        }
+        ev
     }
 }
 
@@ -278,7 +264,7 @@ impl ServiceActor for Ticker {
             .kind(ActorKind::Service)
     }
     async fn start(
-        _args: &serde_json::Value,
+        _args: &Json,
     ) -> Result<Self, error_stack::Report<trouper::registry::RegistryError>> {
         Ok(Self::default())
     }
@@ -346,7 +332,7 @@ impl ServiceActor for TransferService {
             .kind(ActorKind::Service)
     }
     async fn start(
-        _args: &serde_json::Value,
+        _args: &Json,
     ) -> Result<Self, error_stack::Report<trouper::registry::RegistryError>> {
         Ok(Self::default())
     }
@@ -509,7 +495,7 @@ async fn main() {
                     .start();
             }),
             key_field: "account".to_owned(),
-            args_template: Some(json!({ "opening": 100 })),
+            args_template: Some(trouper::json!({ "opening": 100 })),
             opts: SpawnOpts::default(),
         })
         .expect("partition set installs");

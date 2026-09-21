@@ -73,7 +73,7 @@ impl EventSourcedActor for Inventory {
         ActorManifest::new().kind(ActorKind::EventSourced)
     }
 
-    fn restore(_args: &serde_json::Value) -> Self {
+    fn restore(_args: &Json) -> Self {
         Self::default()
     }
 
@@ -85,15 +85,15 @@ impl EventSourcedActor for Inventory {
 }
 
 impl CommandHandler<Restock> for Inventory {
-    fn handle(&self, cmd: Restock, _ctx: &mut CmdCtx<'_>) -> Vec<Event> {
-        vec![Event::new(
-            Restocked::schema_id(),
-            serde_json::to_value(Restocked {
+    fn handle(&self, cmd: Restock, _ctx: &mut CmdCtx<'_>) -> Events {
+        {
+            let mut ev = Events::new();
+            ev.push_event(Restocked {
                 sku: cmd.sku,
                 qty: cmd.qty,
-            })
-            .unwrap(),
-        )]
+            });
+            ev
+        }
     }
 }
 
@@ -133,29 +133,29 @@ async fn main() {
     })
     .await;
     println!(
-        "   state after one restock: {}",
+        "   state after one restock: {:?}",
         system
             .es_state(&ActorPath::new("warehouse"))
             .await
-            .expect("state")
+            .expect("state")["total"]
     );
 
     // -- Foreign spawn: named handle/apply closures, JSON only -------------
     println!("== foreign builder ==");
     let tally = trouper::builder::spawn_foreign(&system)
         .at(ActorPath::new("tally"))
-        .schema(json!({
+        .schema(trouper::json!({
             "name": "TallyAdd", "version": 1, "kind": "command",
             "fields": [{ "name": "delta", "ty": "int" }]
         }))
-        .args(json!({ "total": 0 }))
+        .args(trouper::json!({ "total": 0 }))
         .handle(Arc::new(|_state, cmd, _ctx| {
             vec![Event::new(
                 SchemaId::new("TallyAdded", 1),
                 json!({ "delta": cmd["delta"].as_i64().unwrap_or(0) }),
             )]
         }))
-        .apply(Arc::new(|state: &mut serde_json::Value, ev: &Event| {
+        .apply(Arc::new(|state: &mut Json, ev: &Event| {
             state["total"] = json!(
                 state["total"].as_i64().unwrap_or(0) + ev.payload["delta"].as_i64().unwrap_or(0)
             );
@@ -174,11 +174,11 @@ async fn main() {
         .await
         .expect("delivered");
     wait(|| async {
-        system.es_state(&ActorPath::new("tally")).await == Some(json!({ "total": 9 }))
+        system.es_state(&ActorPath::new("tally")).await == Some(trouper::json!({ "total": 9 }))
     })
     .await;
     println!(
-        "   foreign state after one add: {}",
+        "   foreign state after one add: {:?}",
         system
             .es_state(&ActorPath::new("tally"))
             .await

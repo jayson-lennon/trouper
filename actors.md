@@ -298,7 +298,7 @@ literature, where a hop is a network round-trip with serialization on both ends.
 
 In trouper, a hop through a router is: dequeue an envelope from one in-memory `tokio`
 mpsc, run a handler that constructs a new envelope (the payload is an already-built
-`serde_json::Value` — copied in memory, never re-encoded), enqueue into another
+JSON document (`Json`) — copied in memory, never re-encoded), enqueue into another
 in-memory mpsc. Microseconds. For any workload a single-process host application can
 generate, the router is nowhere near the wall. The actual costs in this runtime are
 handler work and mailbox contention — which exist with or without the router.
@@ -319,23 +319,34 @@ The fabric (§2) never changes for event-sourced actors — same verbs, same env
 ES is a **per-actor discipline for state**:
 
 ```rust
+#[derive(Serialize, Deserialize, Default)]
 struct Account { key: String, balance: i64 }
 
 impl EventSourcedActor for Account {
     fn manifest() -> ActorManifest { ActorManifest::new().kind(ActorKind::EventSourced) }
-    fn restore(args: &JsonValue) -> Self {                      // genesis + replay ctor
-        Self { key: args["key"].as_str().unwrap().into(), balance: 0 }
-    }
+    // restore is DEFAULTED (the trait requires Default): genesis needs no
+    // override unless you seed from spawn args:
+    // fn restore(args: &Json) -> Self { let g: Genesis = args.decode().unwrap(); ... }
     fn apply(&mut self, event: &Event) {                        // fold: fact → state
-        if event.schema.as_str() == "Credited@1" { self.balance += event.payload["delta"].as_i64().unwrap(); }
+        if let Some(e) = event.decode::<Credited>() {           // schema-id matched (name@version)
+            self.balance += e.delta;
+        }
     }
 }
 impl CommandHandler<Credit> for Account {                       // input → facts I record
-    fn handle(&self, cmd: Credit, _ctx: &mut CmdCtx) -> Vec<Event> {
-        vec![Event::new(Credited::schema_id(), json!({ "delta": cmd.amount }))]
+    fn handle(&self, cmd: Credit, _ctx: &mut CmdCtx) -> Events {
+        Events::one(Credited { delta: cmd.amount })             // typed fact → journal-ready event
     }
 }
 ```
+
+Decisions return an **`Events`** buffer (inline for two events, heap beyond —
+the common one-event case never allocates). Build facts with `Events::one` /
+`push_event` from any `Schema + Serialize` type via the blanket
+**`IntoEvent`**; `Events::push(Event)` is the raw escape hatch. Folds decode
+by exact schema id — `event.decode::<T>()` yields `Some` only for
+`T::schema_id()` (`name@version`, version-pinned); `event.is::<T>()` matches
+without decoding.
 
 - `handle` is **sync and pure**: input in, facts out. The kernel appends those facts to
   the journal (one batched `store.append` per message, **awaited before the ack**), then
@@ -384,7 +395,7 @@ system.install_partition_set(PartitionSpec {
             .passivate_after(Duration::from_secs(30))
             .start();
     }),
-    args_template: None,                    // or a JSON seed merged with the shard key
+    args_template: None,                    // or a typed seed (`args<T: Serialize>`) merged with the shard key
     opts: SpawnOpts::default(),
 })?;
 ```
@@ -454,9 +465,9 @@ struct ChatLog { messages: u64, transcript: Vec<String> }
 
 impl Projector for ChatLog {
     fn apply(&mut self, event: &Event) {
-        if event.schema.as_str() == "Chatted@1" {
+        if let Some(c) = event.decode::<Chatted>() {        // schema-id matched fold
             self.messages += 1;
-            if let Some(t) = event.payload["text"].as_str() { self.transcript.push(t.into()); }
+            self.transcript.push(c.text);
         }
     }
 }
@@ -661,6 +672,16 @@ make sense over a network. If a suggestion below sounds reasonable, it is reason
   thing that crosses the fabric.
 - **Event (ES)** — a fact an event-sourced actor *recorded* (the handler's return value).
   Provenance, not a wire property. After recording, it travels as an ordinary message.
+- **Events** — the buffer a command handler returns: the decision's facts, in order,
+  ready to journal (inline for two events; heap beyond). Built from typed facts via
+  `IntoEvent` (`Events::one`, `push_event`); `push(Event)` is the raw escape hatch.
+- **IntoEvent** — the blanket conversion from any `Schema + Serialize` type to an
+  `Event`: the schema id derives from the type, the payload is the serialized fact.
+  `into_event` panics on serialize failure (a programmer error); `try_into_event`
+  reports it.
+- **Json** — the runtime's public value type, a newtype over the internal JSON tree.
+  `serde_json` types never appear in public signatures; reads go through `Deref`, the
+  `json!` macro is re-exported, and `into_inner()` is the escape hatch.
 - **Verb** — the sender's topology choice: `tell` (one path), `send_to_any` (one of the
   handlers of M, round-robin), `publish` (every handler of M). `ask` = tell + reply lease.
 - **`.handles::<M>()`** — the single receive-declaration: "I process M." Installs route

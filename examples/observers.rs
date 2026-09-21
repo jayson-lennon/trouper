@@ -67,7 +67,7 @@ impl Schema for StrictCmd {
     }
 }
 
-#[derive(Deserialize)]
+#[derive(Serialize, Deserialize)]
 struct StrictOk {
     #[allow(dead_code)]
     n: i64,
@@ -96,22 +96,22 @@ impl EventSourcedActor for TickBouncer {
             .emits::<StrictOk>()
             .kind(ActorKind::EventSourced)
     }
-    fn restore(_args: &serde_json::Value) -> Self {
+    fn restore(_args: &Json) -> Self {
         Self
     }
     fn apply(&mut self, _event: &Event) {}
 }
 
 impl CommandHandler<StrictCmd> for TickBouncer {
-    fn handle(&self, cmd: StrictCmd, _ctx: &mut CmdCtx<'_>) -> Vec<Event> {
-        vec![Event::new(StrictOk::schema_id(), json!({ "n": cmd.n }))]
+    fn handle(&self, cmd: StrictCmd, _ctx: &mut CmdCtx<'_>) -> Events {
+        Events::one(StrictOk { n: cmd.n })
     }
 }
 
 struct Ticker;
 
 impl ServiceActor for Ticker {
-    async fn start(_args: &serde_json::Value) -> Result<Self, Report<RegistryError>> {
+    async fn start(_args: &Json) -> Result<Self, Report<RegistryError>> {
         Ok(Self)
     }
 }
