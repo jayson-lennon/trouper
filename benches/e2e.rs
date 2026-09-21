@@ -155,8 +155,7 @@ impl trouper::actor::MsgHandler<Ping> for Echo {
     }
 }
 
-fn spawn_system() -> (ActorSystem, Arc<Runtime>) {
-    let rt = Arc::new(
+fn spawn_system() -> (ActorSystem, Arc<Runtime>) {    let rt = Arc::new(
         tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()
@@ -556,6 +555,170 @@ fn idle_fleet(c: &mut Criterion) {
     group.finish();
 }
 
+// ---------------------------------------------------------------------------
+// swarm: many-to-many at scale — P producers driving R service sinks with
+// round-robin fan. The registry/kernel tables and the poll floor scale with
+// ACTOR COUNT, so this is where the 128–2048 fleet regime shows whether the
+// global locks (or anything else) turn the curve into a cliff.
+// ---------------------------------------------------------------------------
+
+/// A counting service sink whose counter is handed over at start (the
+/// swarm bench's receivers; one AtomicU64 per sink).
+struct SwarmSink {
+    received: Arc<std::sync::atomic::AtomicU64>,
+}
+
+static SWARM_SINKS: std::sync::Mutex<Vec<Arc<std::sync::atomic::AtomicU64>>> =
+    std::sync::Mutex::new(Vec::new());
+
+impl ServiceActor for SwarmSink {
+    fn manifest() -> ActorManifest {
+        ActorManifest::new().kind(ActorKind::Service)
+    }
+    async fn start(_args: &Json) -> Result<Self, error_stack::Report<trouper::registry::RegistryError>> {
+        let counter = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        SWARM_SINKS.lock().expect("sinks").push(counter.clone());
+        Ok(Self { received: counter })
+    }
+}
+impl trouper::actor::MsgHandler<Tick> for SwarmSink {
+    async fn handle(&mut self, _msg: Tick, _ctx: &mut MsgCtx<'_>) {
+        self.received
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+fn swarm(c: &mut Criterion) {
+    let (system, rt) = spawn_system();
+
+    let mut group = c.benchmark_group("e2e/swarm");
+    group.sample_size(10);
+
+    // Square-ish (P, R) samples: spawn-once per R, sustained traffic.
+    let shapes = [(32usize, 128usize), (128, 512), (512, 2048)];
+    for (producers, receivers) in shapes {
+        let paths: Vec<ActorPath> = (0..receivers)
+            .map(|index| ActorPath::new(format!("bench/swarm-{receivers}/{index}")))
+            .collect();
+        let counters_before = SWARM_SINKS.lock().expect("sinks").len();
+
+        rt.block_on(async {
+            for path in &paths {
+                system.spawn_service::<SwarmSink, _>(
+                    path.clone(),
+                    &Json::default(),
+                    SpawnOpts::default(),
+                    || {
+                        vec![Arc::new(
+                            trouper::actor::TypedServiceAdapter::<SwarmSink, Tick>::new::<Tick>(),
+                        )]
+                    },
+                );
+            }
+        });
+        // `start()` runs inside each spawned task, so the counters land in
+        // the registry asynchronously: wait (bounded) for the full band.
+        let counters: Vec<Arc<std::sync::atomic::AtomicU64>> = rt.block_on(async {
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+            loop {
+                let sinks = SWARM_SINKS.lock().expect("sinks");
+                if sinks.len() >= counters_before + receivers {
+                    break sinks[counters_before..].to_vec();
+                }
+                drop(sinks);
+                if tokio::time::Instant::now() >= deadline {
+                    panic!("swarm sinks never registered");
+                }
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+        });
+        assert_eq!(counters.len(), receivers, "swarm counters misaligned");
+
+        // One warmup tell per sink: proves the door is live before the
+        // measured phase. Both the tell and the counter check are bounded
+        // by wall time (spawn registration is async; a tell to an
+        // unregistered path returns Err immediately).
+        rt.block_on(async {
+            // Tell every sink once (doors are registered; a slow loop just
+            // answers later), then wait for the counters to prove liveness.
+            // A shared fleet-wide deadline: per-sink budgets compound into
+            // minutes at r2048 when the runtime is still spinning up loops.
+            for path in &paths {
+                system.tell(path.clone(), Tick { n: 1 }).await.expect("door");
+            }
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+            for (index, path) in paths.iter().enumerate() {
+                let counter = counters[index].clone();
+                while counter.load(std::sync::atomic::Ordering::Relaxed) == 0 {
+                    if tokio::time::Instant::now() >= deadline {
+                        panic!("swarm sink never went live: {path}");
+                    }
+                    tokio::time::sleep(Duration::from_millis(2)).await;
+                }
+            }
+        });
+
+        // 32 tells per sink × receivers sinks.
+        let total: u64 = 32 * receivers as u64;
+        group.throughput(criterion::Throughput::Elements(total));
+        group.bench_function(format!("p{producers}_r{receivers}"), |b| {
+            b.iter(|| {
+                rt.block_on(async {
+                    for counter in &counters {
+                        counter.store(0, std::sync::atomic::Ordering::Relaxed);
+                    }
+                    let barrier = Arc::new(Barrier::new(producers));
+                    let per_producer = receivers / producers;
+                    let per_sink = 32u64;
+                    let mut tasks = Vec::new();
+                    for p in 0..producers {
+                        let system = system.clone();
+                        let paths = paths.clone();
+                        let barrier = barrier.clone();
+                        tasks.push(tokio::spawn(async move {
+                            barrier.wait().await;
+                            let mine = &paths[p * per_producer..(p + 1) * per_producer];
+                            // Each producer owns a disjoint band of sinks;
+                            // 32 tells per sink, round-robin across the band.
+                            for round in 0..per_sink {
+                                for path in mine {
+                                    system
+                                        .tell(path.clone(), Tick { n: round as i64 })
+                                        .await
+                                        .expect("delivered");
+                                }
+                            }
+                        }));
+                    }
+                    for task in tasks {
+                        task.await.expect("producer");
+                    }
+                    // Completion: every sink saw exactly its 32 tells
+                    // (producers own disjoint bands, so 32 per sink).
+                    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+                    loop {
+                        let done = counters
+                            .iter()
+                            .all(|c| c.load(std::sync::atomic::Ordering::Relaxed) >= per_sink);
+                        if done {
+                            break;
+                        }
+                        if tokio::time::Instant::now() >= deadline {
+                            panic!("swarm never settled at p{producers}/r{receivers}");
+                        }
+                        tokio::time::sleep(Duration::from_millis(1)).await;
+                    }
+                    assert_eq!(
+                        system.dead_letter_count().await, 0,
+                        "swarm must be lossless"
+                    );
+                });
+            });
+        });
+    }
+    group.finish();
+}
+
 criterion_group!(
     benches,
     tell_baseline,
@@ -563,6 +726,7 @@ criterion_group!(
     payload_size,
     fanout,
     overload_block,
-    idle_fleet
+    idle_fleet,
+    swarm
 );
 criterion_main!(benches);
