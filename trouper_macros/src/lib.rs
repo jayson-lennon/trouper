@@ -8,7 +8,7 @@
 //! types.
 //!
 //! See the `trouper` crate's `schema` module for the trait these impls
-//! feed and `actors.md` §3 for usage.
+//! feed, and that crate's `examples/` directory for usage.
 
 extern crate proc_macro;
 
@@ -17,14 +17,14 @@ mod expand;
 use proc_macro::TokenStream;
 
 /// Derives `trouper::schema::Schema` for a named-field struct, marking it
-/// as an event (fact) schema — `SchemaKind::Event`.
+/// as an event (fact) schema ([`SchemaKind::Event`](trouper::schema::SchemaKind::Event)).
 #[proc_macro_derive(Event, attributes(schema))]
 pub fn derive_event(input: TokenStream) -> TokenStream {
     expand_derive(input, expand::Kind::Event)
 }
 
 /// Derives `trouper::schema::Schema` for a named-field struct, marking it
-/// as a command schema — `SchemaKind::Command`.
+/// as a command schema ([`SchemaKind::Command`](trouper::schema::SchemaKind::Command)).
 #[proc_macro_derive(Command, attributes(schema))]
 pub fn derive_command(input: TokenStream) -> TokenStream {
     expand_derive(input, expand::Kind::Command)

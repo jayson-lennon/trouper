@@ -1,10 +1,10 @@
 //! The system facade: the single handle through which the runtime is
 //! configured, driven, and observed.
 //!
-//! The registry is kernel, not an actor — owned here behind a lock so
-//! schema registration can never deadlock and survives every actor restart.
-//! The system also implements [`RuntimeView`]: handler-side lookups snapshot
-//! through this read-only surface, never through kernel-mutable locks.
+//! The registry is plain data behind a lock — not an actor — so schema
+//! registration can never deadlock and survives every actor restart.
+//! Handler-side lookups snapshot through a read-only view of it, so user
+//! code never holds the registry lock.
 
 use parking_lot::Mutex;
 use std::sync::Arc;
@@ -245,7 +245,7 @@ impl ActorSystem {
         (Self(std::sync::Arc::new(core.0)), core.1)
     }
 
-    /// Like [`ActorSystem::test`], but with an explicit (tiny) tap ring
+    /// Like [`ActorSystem::test`](crate::system::ActorSystem::test), but with an explicit (tiny) tap ring
     /// capacity — gap/pressure tests flood the ring on purpose.
     pub fn test_with_tap(tap_capacity: usize) -> (Self, Arc<FakeClock>) {
         let core = ActorSystemCore::test_with_tap(tap_capacity);
@@ -266,7 +266,7 @@ impl ActorSystem {
     /// The graceful shutdown sweep: a barrier (no new sends — every
     /// delivery dead-letters with `ShuttingDown`; partition activation is
     /// disabled; supervision engines suspend; passivation stands down),
-    /// then a deadline-bounded PARALLEL drain of every live actor (each
+    /// then a deadline-bounded parallel drain of every live actor (each
     /// loop task closes its door, finishes queued mail, runs its
     /// `on_stop` hook, and tears down its tables), then one store flush
     /// (backends persist buffered journals here), then supervision
@@ -831,7 +831,7 @@ impl ActorSystemCore {
     ///
     /// Registration is synchronous, so from return on, publishes to the
     /// handled schemas are delivered into the actor's inbox (backpressure
-    /// upstream once it fills) while the inbox loop is NOT yet running —
+    /// upstream once it fills) while the inbox loop is not yet running —
     /// the projector builder seeds history between arm and loop start, and
     /// queued live deliveries fold after it, never before.
     pub(crate) fn arm_es_erased(
@@ -939,7 +939,7 @@ impl ActorSystemCore {
     /// event-sourced actor whose consumed schemas are BOTH its handled
     /// inputs (a `ConsumeEntry` each: the fact re-records itself) and its
     /// declared emits (the re-records journal legally). The inbox loop is
-    /// NOT started — [`catch_up_projector`] seeds history first.
+    /// not started — [`catch_up_projector`] seeds history first.
     ///
     /// # Panics
     ///
@@ -970,7 +970,7 @@ impl ActorSystemCore {
     }
 
     /// Spawns a service (edge) actor at `path`: async handlers, I/O and
-    /// `ask` allowed, NOT journaled (at-most-once message semantics).
+    /// `ask` allowed, not journaled (at-most-once message semantics).
     ///
     /// Deprecated positional flavor — prefer the builder:
     /// [`crate::builder::spawn_service_builder`].
@@ -1121,8 +1121,8 @@ impl ActorSystemCore {
 
     /// Typed fire-and-forget: serializes `value` under `C`'s schema and
     /// routes it as a system-root send. Sugar over
-    /// [ActorSystem::send](crate::system::ActorSystem::send) +
-    /// [ActorSystem::envelope](crate::system::ActorSystem::envelope) with
+    /// [ActorSystem::send](crate::system::ActorSystemCore::send) +
+    /// [ActorSystem::envelope](crate::system::ActorSystemCore::envelope) with
     /// the payload built by serde.
     ///
     /// # Errors
@@ -1143,13 +1143,13 @@ impl ActorSystemCore {
             .await
     }
 
-    /// Typed ONE-OF send: serializes `value` under `M`'s schema and
-    /// delivers exactly one copy to ONE of the actors that declared
+    /// Typed one-of send: serializes `value` under `M`'s schema and
+    /// delivers exactly one copy to one of the actors that declared
     /// `.handles::<M>()` — round-robin through the route table (each call
     /// advances the shared rotation; see [`Registry::route`]). Zero
     /// handlers ⇒ the envelope returns as the error (same contract as an
     /// unrouted tell). The receiver cannot distinguish this from a
-    /// direct [ActorSystem::tell](crate::system::ActorSystem::tell).
+    /// direct [ActorSystem::tell](crate::system::ActorSystemCore::tell).
     ///
     /// # Errors
     ///
@@ -1183,7 +1183,7 @@ impl ActorSystemCore {
     /// lands nowhere.
     ///
     /// Trace root is the entry point, matching
-    /// [ActorSystem::send](crate::system::ActorSystem::send).
+    /// [ActorSystem::send](crate::system::ActorSystemCore::send).
     ///
     /// # Errors
     ///
@@ -1226,7 +1226,7 @@ impl ActorSystemCore {
     /// under `M`'s schema and fans it out to EVERY actor that declared
     /// `.handles::<M>()` — one copy each. Zero handlers ⇒ silent no-op:
     /// events are news, not work orders. Trace root is the entry point,
-    /// matching [ActorSystem::send](crate::system::ActorSystem::send).
+    /// matching [ActorSystem::send](crate::system::ActorSystemCore::send).
     ///
     /// Serialization is eager; the returned future borrows only `self`,
     /// so callers' spawned futures stay `Send` without an `M: Sync`
@@ -1255,7 +1255,7 @@ impl ActorSystemCore {
 
     /// Untyped event broadcast from outside the system: the caller has
     /// already serialized the payload under `schema`. Same fan-out
-    /// contract as [ActorSystem::publish](crate::system::ActorSystem::publish)
+    /// contract as [ActorSystem::publish](crate::system::ActorSystemCore::publish)
     /// — every `.handles` declarant of the schema, zero ⇒ silent no-op.
     /// The bridge surface for erased (foreign) callers.
     pub async fn publish_value(&self, schema: SchemaId, payload: Json) {
@@ -1302,6 +1302,9 @@ impl ActorSystemCore {
         }
     }
 
+    /// Builds an envelope for a typed payload addressed to `dest` (pair
+    /// with
+    /// [`ActorSystem::send`](crate::system::ActorSystemCore::send)).
     pub fn envelope(
         &self,
         schema: SchemaId,
@@ -1321,8 +1324,8 @@ impl ActorSystemCore {
         &self.clock
     }
 
-    /// Restarts a crashed ES actor at `path` (supervision calls this; the
-    /// Phase 8 engine adds policy/budget/backoff around it).
+    /// Restarts a crashed ES actor at `path`. Used by the supervision
+    /// engine after a crash.
     ///
     /// # Errors
     ///
@@ -1386,7 +1389,7 @@ impl ActorSystemCore {
     /// # Errors
     ///
     /// [`crate::registry::RegistryError::InvalidSpec`] when no command
-    /// schema declares the spec's key field as the ShardKey (refuse-to-lie:
+    /// schema declares the spec's key field as the shard key (validated:
     /// the set would dead-letter every command).
     pub fn install_partition_set(
         &self,
@@ -1398,15 +1401,15 @@ impl ActorSystemCore {
 
     /// Installs a projector set: per-key projectors derived from a
     /// consumed fact's shard key, activated on demand by broadcast copies
-    /// of the consumed schemas. Projectors are NOT spawned here — the
-    /// first consumed broadcast (or a [`ActorSystem::projector_state`]
+    /// of the consumed schemas. Projectors are not spawned here — the
+    /// first consumed broadcast (or a [`ActorSystem::projector_state`](crate::system::ActorSystem::projector_state)
     /// read) activates them.
     ///
     /// # Errors
     ///
     /// [`crate::registry::RegistryError::InvalidSpec`] when a consumed
     /// schema is missing or a Command, or no consumed schema declares the
-    /// spec's key field as the ShardKey (refuse-to-lie: the set could
+    /// spec's key field as the shard key (validated: the set could
     /// never extract a key and would dead-letter every copy).
     pub fn install_projector_set(
         &self,
@@ -1427,7 +1430,7 @@ impl ActorSystemCore {
         registry.add_rule(rule);
     }
 
-    /// The bounded stop: identical to [`ActorSystem::stop`], but the
+    /// The bounded stop: identical to [`ActorSystem::stop`](crate::system::ActorSystemCore::stop), but the
     /// caller sets the deadline budget instead of the default 5s. Children
     /// stop first (recursion shares one budget); stragglers after expiry
     /// are hard-stopped and their undelivered mail lands in the DLQ
@@ -1441,7 +1444,7 @@ impl ActorSystemCore {
         Box::pin(self.stop_bounded_inner(path, remaining))
     }
 
-    /// The recursive body, boxed by [`Self::stop_bounded`].
+    /// The recursive body, boxed by [`Self::stop_bounded`](crate::system::ActorSystem::stop_bounded).
     async fn stop_bounded_inner(&self, path: &ActorPath, remaining: std::time::Duration) {
         if remaining.is_zero() {
             return;
@@ -1759,7 +1762,6 @@ impl ActorSystemCore {
         }
     }
 
-    /// The cursor of an actor's inbox (inspection; Phase 10 tests).
     /// How many envelopes the runtime could not deliver (inspection).
     pub async fn dead_letter_count(&self) -> usize {
         let kernel = self.kernel.lock();
@@ -1790,6 +1792,7 @@ impl ActorSystemCore {
         }
     }
 
+    /// The cursor of an actor's inbox (inspection).
     pub fn inbox_cursor(&self, path: &ActorPath) -> Option<InboxOffset> {
         let kernel = self.kernel.lock();
         kernel.cells.get(path).map(|cell| {
@@ -1886,11 +1889,11 @@ impl ActorSystem {
     /// projector SET is woken: the set's factory spawns (or re-spawns) the
     /// projector, the call waits — bounded — for the projector's
     /// `CaughtUp` tap fact, and the fold is captured. `None` means the
-    /// path is neither live nor set-owned (a cold STANDALONE projector has
+    /// path is neither live nor set-owned (a cold standalone projector has
     /// no wake path; re-run its builder), or the wake did not reach
     /// `CaughtUp` within the budget.
     ///
-    /// This is deliberately unlike [`ActorSystem::es_state`], which never
+    /// This is deliberately unlike [`ActorSystem::es_state`](crate::system::ActorSystemCore::es_state), which never
     /// wakes anything: es_state is a peek at in-memory state (None when
     /// cold), projector_state is the complete answer (wake + catch-up +
     /// capture).
@@ -1912,21 +1915,21 @@ impl ActorSystem {
         self.es_state(path).await
     }
 
-    /// Typed, ZERO-COPY read of a live entity's state: runs `f` over the
+    /// Typed, zero-copy read of a live entity's state: runs `f` over the
     /// state under its lock — no serialize, no clone.
     ///
-    /// The closure is SYNC (it holds the state lock) and `R` is owned (the
+    /// The closure is sync (it holds the state lock) and `R` is owned (the
     /// guard drops before return — clone the field you need, return it).
     /// `None` means "no `<A>` state at this path right now", which folds
     /// together: no live entry (cold, passivated, or unknown path), the
     /// entry being a different state type (foreign actors' JSON included
-    /// — [`Self::es_state`] remains their read path; the mismatch is
+    /// — [`Self::es_state`](crate::system::ActorSystemCore::es_state) remains their read path; the mismatch is
     /// logged at debug).
     ///
     /// Sync and non-blocking: takes the state lock with `try_lock`, so a
     /// read never stalls a render thread — `None` when the fold currently
     /// holds the lock (the caller keeps its previous frame; never retry
-    /// inside the read). See [`ActorSystem::with_es_state`] for the
+    /// inside the read). See [`ActorSystem::with_es_state`](crate::system::ActorSystem::with_es_state) for the
     /// awaiting variant.
     pub fn try_with_es_state<A: EventSourcedActor, R>(
         &self,
@@ -1951,17 +1954,17 @@ impl ActorSystem {
         }
     }
 
-    /// Typed, ZERO-COPY read of a live projector's fold: runs `f` over the
+    /// Typed, zero-copy read of a live projector's fold: runs `f` over the
     /// read model under its state lock — no serialize, no clone.
     ///
-    /// The closure is SYNC (it holds the state lock) and `R` is owned (the
+    /// The closure is sync (it holds the state lock) and `R` is owned (the
     /// guard drops before return — clone the field you need, return it).
     /// `None` means "no `<P>` fold at this path right now": no live entry,
     /// wrong type (foreign actors' JSON included), or — for the `try_`
     /// pair only — a lock the fold currently holds.
     ///
-    /// Sync and non-blocking like [`ActorSystem::try_with_es_state`]; use
-    /// [`ActorSystem::with_projector_state`] to wake a cold set-owned
+    /// Sync and non-blocking like [`ActorSystem::try_with_es_state`](crate::system::ActorSystem::try_with_es_state); use
+    /// [`ActorSystem::with_projector_state`](crate::system::ActorSystem::with_projector_state) to wake a cold set-owned
     /// projector (a `try_` read never wakes anything).
     pub fn try_with_projector_state<P: crate::actor::Projector, R>(
         &self,
@@ -1986,13 +1989,15 @@ impl ActorSystem {
         }
     }
 
-    /// The awaiting typed twin of [`ActorSystem::es_state`]: runs `f` over
+    /// The awaiting typed twin of [`ActorSystem::es_state`](crate::system::ActorSystemCore::es_state): runs `f` over
     /// a live entity's state under its lock — no serialize, no clone.
     ///
-    /// The closure is SYNC and `R` owned (see [`Self::try_with_es_state`]).
+    /// The closure is sync and `R` owned (see [`Self::try_with_es_state`](crate::system::ActorSystem::try_with_es_state)).
     /// `None` means "no `<A>` state at this path right now": a cold or
-    /// passivated entity (this read NEVER wakes anything, like `es_state`
-    /// — only [`Self::with_projector_state`] has a wake path, and only for
+    /// passivated entity (this read never wakes anything, like `es_state`
+    /// — only
+    /// [`Self::with_projector_state`](crate::system::ActorSystem::with_projector_state)
+    /// has a wake path, and only for
     /// set-owned projectors) or a wrong type at the path (foreign actors'
     /// JSON included; the mismatch is logged at debug).
     pub async fn with_es_state<A: EventSourcedActor, R>(
@@ -2003,12 +2008,12 @@ impl ActorSystem {
         self.read_es(path, f).await
     }
 
-    /// The typed, zero-copy twin of [`ActorSystem::projector_state`]: runs
+    /// The typed, zero-copy twin of [`ActorSystem::projector_state`](crate::system::ActorSystem::projector_state): runs
     /// `f` over the live read model under its state lock — no serialize,
     /// no clone.
     ///
-    /// The closure is SYNC and `R` owned (see [`Self::try_with_es_state`]).
-    /// Wake semantics are IDENTICAL to `projector_state`:
+    /// The closure is sync and `R` owned (see [`Self::try_with_es_state`](crate::system::ActorSystem::try_with_es_state)).
+    /// Wake semantics are identical to `projector_state`:
     ///
     /// - **live projector** — quiesce (a wake copy may still sit queued
     ///   while its loop spins up), then read typed;
@@ -2039,8 +2044,8 @@ impl ActorSystem {
     }
 
     /// Wake a cold set-owned projector and wait — bounded — for its
-    /// catch-up fact. Shared by [`ActorSystem::projector_state`] and
-    /// [`ActorSystem::with_projector_state`]; returns `false` when `path`
+    /// catch-up fact. Shared by [`ActorSystem::projector_state`](crate::system::ActorSystem::projector_state) and
+    /// [`ActorSystem::with_projector_state`](crate::system::ActorSystem::with_projector_state); returns `false` when `path`
     /// is not set-owned or the `CaughtUp` fact never arrives within the
     /// budget. Registry lookups and poll cadence are exactly the
     /// pre-extraction behavior of `projector_state`.
@@ -2118,7 +2123,7 @@ impl ActorSystem {
     }
 
     /// Typed, zero-copy read of a live projector's fold — the projector
-    /// twin of [`ActorSystem::read_es`].
+    /// twin of [`ActorSystem::read_es`](crate::system::ActorSystem::read_es).
     async fn read_projector<P: crate::actor::Projector, R>(
         &self,
         path: &ActorPath,
@@ -2211,7 +2216,7 @@ impl ActorSystem {
     }
 
     /// Purges `path`'s journal and snapshots from the store (host-facing
-    /// primitive). The next spawn re-scans the whole store: a purge IS a
+    /// primitive). The next spawn re-scans the whole store: a purge is a
     /// full rebuild for a projector, and a forget-everything for an
     /// entity. Composition primitive for standalone projectors (the
     /// runtime has no recipe to re-spawn them).
@@ -2228,7 +2233,7 @@ impl ActorSystem {
     }
 
     /// Bounded wait until `path` has no message in flight: the mpsc is
-    /// drained into the inbox AND the inbox is empty. Empty alone is not
+    /// drained into the inbox and the inbox is empty. Empty alone is not
     /// quiescence — a just-armed projector's loop starts after seeding, so
     /// its inbox reads empty while wake copies still sit in the channel.
     /// Checked twice with a yield between (an empty-after-nonempty read
@@ -2379,7 +2384,7 @@ mod tests {
         n: i64,
     }
 
-    /// An event schema the test actors NEVER declare (emit-enforcement
+    /// An event schema the test actors never declare (emit-enforcement
     /// fixture: the kernel must drop it).
     #[derive(Event, serde::Deserialize)]
     struct Smuggled {
@@ -2473,10 +2478,9 @@ mod tests {
             || vec![Arc::new(TypedEsAdapter::<Counter, Add>::new::<Add>())],
         );
         wait_for(|| async {
-            system
-                .tap_facts()
-                .iter()
-                .any(|f| matches!(&f.kind, crate::tap::FactKind::Spawned { path: p, .. } if *p == path))
+            system.tap_facts().iter().any(
+                |f| matches!(&f.kind, crate::tap::FactKind::Spawned { path: p, .. } if *p == path),
+            )
         })
         .await;
 
@@ -2501,10 +2505,7 @@ mod tests {
         assert_eq!(refused, 0, "Block never refuses: {sent:?}");
         let mut total = 0_i64;
         for _ in 0..1_000 {
-            if let Some(t) = system
-                .with_es_state::<Counter, _>(&path, |c| c.total)
-                .await
-            {
+            if let Some(t) = system.with_es_state::<Counter, _>(&path, |c| c.total).await {
                 total = t;
                 if t == 210 {
                     break;
@@ -2543,10 +2544,9 @@ mod tests {
             },
         );
         wait_for(|| async {
-            system
-                .tap_facts()
-                .iter()
-                .any(|f| matches!(&f.kind, crate::tap::FactKind::Spawned { path: p, .. } if *p == path))
+            system.tap_facts().iter().any(
+                |f| matches!(&f.kind, crate::tap::FactKind::Spawned { path: p, .. } if *p == path),
+            )
         })
         .await;
 
@@ -2572,7 +2572,11 @@ mod tests {
         // Then the fresh front door has the SPAWN capacity (256), not
         // the restarted default (64).
         let endpoint = system.registry.lock().resolve(&path).expect("live slot");
-        assert_eq!(endpoint.max_capacity(), 256, "restart honors spawn capacity");
+        assert_eq!(
+            endpoint.max_capacity(),
+            256,
+            "restart honors spawn capacity"
+        );
     }
 
     #[tokio::test]
@@ -4202,20 +4206,27 @@ mod tests {
         system.register_schema::<PingAsk>();
         let path = ActorPath::new("ghost");
         let (tx, rx) = tokio::sync::mpsc::channel::<Envelope>(8);
-        system.registry.lock().insert_slot(
-            path.clone(),
-            crate::schema::ActorManifest::new()
-                .handles::<PingAsk>()
-                .kind(ActorKind::Service),
-            Endpoint::new(tx),
-            OverloadPolicy::Block,
-        )
-        .expect("insert dead slot");
+        system
+            .registry
+            .lock()
+            .insert_slot(
+                path.clone(),
+                crate::schema::ActorManifest::new()
+                    .handles::<PingAsk>()
+                    .kind(ActorKind::Service),
+                Endpoint::new(tx),
+                OverloadPolicy::Block,
+            )
+            .expect("insert dead slot");
         drop(rx);
 
         // When asking through the system's lease-backed ask.
         let result = system
-            .ask(path.clone(), PingAsk { n: 1 }, std::time::Duration::from_secs(1))
+            .ask(
+                path.clone(),
+                PingAsk { n: 1 },
+                std::time::Duration::from_secs(1),
+            )
             .await;
 
         // Then the ask fails fast AND no lease is left behind.
@@ -4261,10 +4272,9 @@ mod tests {
             },
         );
         wait_for(|| async {
-            system
-                .tap_facts()
-                .iter()
-                .any(|f| matches!(&f.kind, crate::tap::FactKind::Spawned { path: p, .. } if *p == path))
+            system.tap_facts().iter().any(
+                |f| matches!(&f.kind, crate::tap::FactKind::Spawned { path: p, .. } if *p == path),
+            )
         })
         .await;
         let _ = system
@@ -5245,7 +5255,7 @@ mod tests {
 
     // ---- dynamic actor primitives (Phase 1: emit enforcement + cadence) ----
 
-    /// A counter whose Add handler emits ONE declared `Added` and ONE
+    /// A counter whose Add handler emits one declared `Added` and one
     /// undeclared `Smuggled` per command (emit-enforcement fixture).
     #[derive(Serialize, Deserialize, Default)]
     struct MixedEmitter {
@@ -5961,7 +5971,7 @@ mod tests {
         );
     }
 
-    /// A counter whose OWN manifest declares an edge the builder does not
+    /// A counter whose own manifest declares an edge the builder does not
     /// (union fixture: explicit manifest and builder edges must merge).
     #[derive(Serialize, Deserialize, Default)]
     struct RichCounter {
@@ -6936,8 +6946,9 @@ mod tests {
         // fact, and the fold is complete.
         flood.abort();
         let _ = flood.await;
-        let state =
-            read.expect("wake completed under the 2s bound").expect("flooded wake returns the fold");
+        let state = read
+            .expect("wake completed under the 2s bound")
+            .expect("flooded wake returns the fold");
         let log: ChatLog = state.decode().expect("state decodes");
         assert_eq!(log.messages, 1, "exactly the stored fact folded");
         assert_eq!(log.keys_seen, vec!["a".to_owned()]);
@@ -7005,16 +7016,20 @@ mod tests {
             &self,
             path: &ActorPath,
             events: &[crate::journal::ScannedEvent],
-        ) -> Result<Vec<Option<crate::journal::SeqNo>>, error_stack::Report<crate::journal::JournalError>>
-        {
+        ) -> Result<
+            Vec<Option<crate::journal::SeqNo>>,
+            error_stack::Report<crate::journal::JournalError>,
+        > {
             self.inner.append_catchup(path, events).await
         }
 
         async fn scan(
             &self,
             schemas: &[SchemaId],
-        ) -> Result<Vec<crate::journal::ScannedEvent>, error_stack::Report<crate::journal::JournalError>>
-        {
+        ) -> Result<
+            Vec<crate::journal::ScannedEvent>,
+            error_stack::Report<crate::journal::JournalError>,
+        > {
             self.inner.scan(schemas).await
         }
 
@@ -7904,7 +7919,7 @@ mod tests {
         }
     }
 
-    /// A JournalStore test double whose `passivated` hint ALWAYS fails:
+    /// A JournalStore test double whose `passivated` hint always fails:
     /// passivation must complete anyway (log-and-continue).
     struct HintFailStore {
         inner: std::sync::Arc<dyn crate::journal::JournalStore>,

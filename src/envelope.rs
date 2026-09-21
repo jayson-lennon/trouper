@@ -67,7 +67,7 @@ pub enum Payload {
     /// A reserved in-process fast path, not yet crossed by production code:
     /// every runtime boundary is JSON today, so no adapter constructs this
     /// arm yet. Kept as the seam for a future zero-copy path; downstream
-    /// code must still handle it ([`Payload::as_json`] treats it as an
+    /// code must still handle it ([`Envelope::as_json`](crate::envelope::Envelope::as_json) treats it as an
     /// error).
     Typed(std::sync::Arc<dyn std::any::Any + Send + Sync>),
     /// Plain JSON.

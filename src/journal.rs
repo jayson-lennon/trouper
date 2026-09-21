@@ -1,4 +1,4 @@
-//! In-memory, seq-anchored journals: lists of [`Event`] and [`Snapshot`]
+//! In-memory, seq-anchored journals: lists of events and snapshots
 //! entries. Restart restores from the latest snapshot plus the tail; command
 //! redelivery is independent of snapshots. Persisted backends implement the
 //! [`JournalStore`] trait; the in-memory store is the default.

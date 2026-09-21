@@ -109,7 +109,7 @@ pub trait CommandHandler<C>: EventSourcedActor {
     /// returned `Events` in the [`EventSourcedActor::apply`] implementation.
     /// Events are automatically saved to the journal.
     ///
-    /// Use [`CmdCtx`](crate::context::CmdCtx) to access meta-information
+    /// Use [`CmdCtx`] to access meta-information
     /// about the command.
     fn handle(&self, cmd: C, ctx: &mut CmdCtx<'_>) -> crate::envelope::Events;
 }
@@ -664,7 +664,8 @@ pub trait MsgEntry: Send + Sync {
     fn schema(&self) -> SchemaId;
 
     /// Decodes the JSON payload into a boxed `Any` of the handler's type
-    /// (the DECODE side runs sync so decode failures dead-letter cleanly).
+    /// (the decode side runs synchronously, so decode failures dead-letter
+    /// cleanly).
     ///
     /// # Errors
     ///

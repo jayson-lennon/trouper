@@ -29,8 +29,8 @@ impl Kind {
 /// attributes (defaults: version 1, no description), kind from the
 /// derive, fields mapped from the Rust types.
 ///
-/// `#[schema(...)]` FIELD attributes are rejected for now (Phase 3
-/// work); the error says so explicitly so early adopters aren't surprised.
+/// `#[schema(...)]` FIELD attributes are rejected; the error says so
+/// explicitly so early adopters aren't surprised.
 pub fn generate(input: TokenStream, kind: Kind) -> syn::Result<TokenStream> {
     let input: DeriveInput = syn::parse2(input)?;
     let ident = &input.ident;

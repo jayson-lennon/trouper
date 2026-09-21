@@ -110,7 +110,7 @@ impl<A: crate::actor::EventSourcedActor> SpawnBuilder<A> {
     }
 
     /// Declares a handled command `C` — the one receive declaration. It
-    /// installs the route AND the dispatch entry together: whether a copy
+    /// installs the route and the dispatch entry together: whether a copy
     /// arrives via `tell`, `send_to_any`, or `publish` is invisible to the
     /// receiver. `C` is written exactly once; registration here is what
     /// makes `C` deliverable to this actor.
@@ -270,7 +270,7 @@ impl<A: ServiceActor> ServiceBuilder<A> {
     }
 
     /// Declares a handled message `M` — the one receive declaration. It
-    /// installs the route AND the dispatch entry together: whether a copy
+    /// installs the route and the dispatch entry together: whether a copy
     /// arrives via `tell`, `send_to_any`, or `publish` is invisible to the
     /// receiver. `M` is written exactly once; registration here is what
     /// makes `M` deliverable to this actor.
@@ -495,7 +495,7 @@ impl ForeignBuilder {
 /// ```
 ///
 /// A projector is an event-sourced actor whose consumed facts are
-/// re-recorded into its OWN journal (the checkpoint): on spawn it replays
+/// re-recorded into its own journal (the checkpoint): on spawn it replays
 /// its journal, scans the store for what it lacks, seeds the gap, and only
 /// then opens its inbox loop — live facts published during seeding queue
 /// up and fold after history. Passivation is deliberately not offered
@@ -545,7 +545,7 @@ impl<P: crate::actor::Projector> ProjectorBuilder<P> {
     }
 
     /// Declares a consumed fact schema `D`: this projector handles `D` (a
-    /// route is installed — broadcast copies included) AND re-records every
+    /// route is installed — broadcast copies included) and re-records every
     /// folded copy into its own journal with a CatchUp origin (the
     /// checkpoint). Repeat per schema; `D` is written exactly once.
     ///
@@ -580,7 +580,7 @@ impl<P: crate::actor::Projector> ProjectorBuilder<P> {
         self
     }
 
-    /// Starts the actor; ARMS synchronously (slot + routes exist the
+    /// Starts the actor; arms synchronously (slot + routes exist the
     /// moment this returns — an activation factory can rely on it) and
     /// returns the path immediately. Catch-up continues in the background:
     /// the fold is complete only after a `CaughtUp { .. }` tap fact for
@@ -590,7 +590,7 @@ impl<P: crate::actor::Projector> ProjectorBuilder<P> {
     ///
     /// Panics when `.at()` was never called, the path is already taken, or
     /// a consumed schema is registered as a Command (a projector folds
-    /// FACTS, not commands). Requires a tokio runtime (the catch-up task
+    /// facts, not commands). Requires a tokio runtime (the catch-up task
     /// spawns onto it).
     pub fn start(self) -> ActorPath {
         let (system, path, consumed, args, opts) = self.validated_parts();
@@ -599,7 +599,7 @@ impl<P: crate::actor::Projector> ProjectorBuilder<P> {
         path
     }
 
-    /// Starts the actor and AWAITS its catch-up: the returned projector
+    /// Starts the actor and awaits its catch-up: the returned projector
     /// has folded every fact the store held at spawn time (later facts
     /// arrive live). A `CaughtUp { path, seeded }` fact records the
     /// outcome.

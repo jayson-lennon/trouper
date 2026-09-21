@@ -51,7 +51,7 @@ pub(crate) enum Intent {
     /// Terminate the handling actor gracefully after this message
     /// commits (performed after the ack, so a crash before it discards the
     /// stop exactly like any other intent — the actor restarts and
-    /// continues). NEVER journaled: replay never synthesizes a stop.
+    /// continues). Not journaled: replay never synthesizes a stop.
     StopSelf,
 }
 
@@ -434,7 +434,7 @@ impl<'a> MsgCtx<'a> {
     /// timeout is required; only service actors can ask (see [`CmdCtx`]).
     ///
     /// The reply arrives as raw JSON this pass, matching
-    /// [`crate::system::ActorSystem::ask`]'s return; decode it with the
+    /// [`crate::system::ActorSystemCore::ask`]'s return; decode it with the
     /// reply schema's type when the contract is known.
     ///
     /// # Errors
@@ -456,7 +456,7 @@ impl<'a> MsgCtx<'a> {
         self.ask_json(dest, M::schema_id(), payload, timeout).await
     }
 
-    /// Records a ONE-OF send (typed): exactly one copy goes to ONE actor
+    /// Records a one-of send (typed): exactly one copy goes to one actor
     /// that declared `.handles::<M>()`, round-robin through the route
     /// table. The delivery happens after the current message is
     /// acknowledged. The typed sibling of [`MsgCtx::publish`] — publish
@@ -753,7 +753,7 @@ mod tests {
     }
 
     /// The silent-drop contract: a reply with no reply_to records nothing.
-    /// It is NEVER a broadcast — the fact is unobservable by definition.
+    /// It is not a broadcast — the fact is unobservable by definition.
     #[test]
     fn reply_without_reply_to_is_dropped_silently() {
         // Given a message context with no reply_to (a tell delivery).

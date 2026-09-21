@@ -101,7 +101,7 @@ pub struct FieldDef {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum FieldRole {
     /// The partition key: partition-set routers extract this field from a
-    /// command OR consumed-fact payload to derive the entity path (a
+    /// command or consumed-fact payload to derive the entity path (a
     /// projector set resolves its per-key projectors through it).
     ShardKey,
 }

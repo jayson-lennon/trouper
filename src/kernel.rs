@@ -124,7 +124,7 @@ pub(crate) struct KernelState {
     pub(crate) failures: HashMap<ActorPath, crate::supervision::FailureWindow>,
     /// Per-actor backpressure watermarks: path → (high watermark, fired).
     /// `fired` latches the up-crossing (down-crossings re-arm it), so a
-    /// sustained overload produces ONE fact, not one per message.
+    /// sustained overload produces one fact, not one per message.
     pub(crate) watermarks: HashMap<ActorPath, (u64, bool)>,
     /// Per-actor passivation config: path → idle window. The companion
     /// `last_work_ms` map carries the injected-clock stamp of the last
@@ -473,7 +473,7 @@ async fn route_inner(
 ///
 /// `Ok(None)` = the dest is not a partition set (fall through). `Ok(Some)`
 /// = the entity path (activated on demand if absent). `Err(envelope)` =
-/// the command lacked its shard key — dead-lettered, NEVER activated.
+/// the command lacked its shard key — dead-lettered, never activated.
 ///
 /// Determinism is structural: the entity path is `public/key`, so the same
 /// key always reaches the same entity and journal. Activation is
@@ -782,7 +782,12 @@ async fn push_holding_block(
                 "inbox refused (overload/closed)"
             };
             let evicted = refusal.into_envelope();
-            dead_letter(kernel, &evicted, crate::kernel::DeadLetterReason::InboxRefused, detail);
+            dead_letter(
+                kernel,
+                &evicted,
+                crate::kernel::DeadLetterReason::InboxRefused,
+                detail,
+            );
             return false;
         }
         attempt += 1;
@@ -890,11 +895,11 @@ enum Step {
     /// The handler panicked; the loop must stop (state is poisoned).
     Crashed,
     /// The handler recorded `stop_self` and the message committed; the
-    /// loop must exit through the GRACEFUL path (on_stop + teardown).
+    /// loop must exit through the graceful path (on_stop + teardown).
     Stop,
 }
 
-/// THE ATOMIC STEP — spec order, no deviations:
+/// The atomic step, in order:
 /// peek → find entry → build ctx → catch_unwind dispatch (decide only)
 /// → journal.append → inbox.ack → apply → outbox flush → emit fan-out
 /// → maybe snapshot.
@@ -1178,7 +1183,7 @@ impl EsLoop {
     }
 
     /// The loop's own graceful exit: run the actor's `on_stop` hook (the
-    /// instance is still alive here — NOT a crash), then hand the table
+    /// instance is still alive here — not a crash), then hand the table
     /// teardown to the system facade. The system race is safe: the
     /// teardown is idempotent (see `ActorSystemCore::teardown_tables`).
     ///
@@ -1585,7 +1590,7 @@ async fn fan_out_emits(
     }
 }
 
-/// The ONE flush-time gate for outbound actor messages: every intent an
+/// The single flush-time gate for outbound actor messages: every intent an
 /// actor recorded must declare its schema in the actor's `.emits`.
 /// Undeclared intents drop at flush — dead-lettered as `UndeclaredEmit`
 /// with the envelope retained, plus a tracing error — and never route.
@@ -2132,10 +2137,13 @@ pub(crate) async fn restart_es(
 }
 
 /// The front-door channel depth for a mailbox: under `Block` the channel
-/// is exactly the inbox's capacity (the channel `.send().await` IS the
+/// is exactly the inbox's capacity (the channel `.send().await` is the
 /// block, so senders pace at the configured depth); the lossy policies
 /// keep 2× headroom so bursts actually reach the inbox's own policy.
-pub(crate) fn door_capacity(mailbox_capacity: usize, policy: crate::inbox::OverloadPolicy) -> usize {
+pub(crate) fn door_capacity(
+    mailbox_capacity: usize,
+    policy: crate::inbox::OverloadPolicy,
+) -> usize {
     let capacity = mailbox_capacity.max(1);
     match policy {
         crate::inbox::OverloadPolicy::Block => capacity,
