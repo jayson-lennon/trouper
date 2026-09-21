@@ -583,9 +583,9 @@ async fn resolve_partition(
 /// Schema-aware shard-key extraction from an envelope's payload.
 fn extract_key(registry: &crate::system::CountingRegistryLock, envelope: &Envelope, key_field: &str) -> Option<String> {
     let reg = registry.lock();
-    let payload = envelope.as_json().cloned().unwrap_or(Json::default());
+    let payload = envelope.payload_json();
     match reg.schema(&envelope.schema) {
-        Some(def) => crate::pool::extract_shard_key(def, key_field, &payload),
+        Some(def) => crate::pool::extract_shard_key(def, key_field, payload),
         None => payload
             .get(key_field)
             .and_then(|v| v.as_str().map(str::to_owned)),
@@ -698,21 +698,28 @@ fn apply_rules(
                 // New causality for the copy, same trace id: a fresh cause
                 // INSIDE the original's trace, never a chain of two hops.
                 trace.causality_id = crate::envelope::CausalityId::new();
-                let Some(payload) = envelope.as_json().cloned() else {
+                // The copy SHARES the payload tree (Arc bump), never a
+                // deep copy. A typed payload is not teeable at the waist.
+                let copy = match envelope.payload {
+                    crate::envelope::Payload::Json(_) => Some(
+                        Envelope::json_shared(
+                            envelope.schema.clone(),
+                            Address::Path(observer.clone()),
+                            envelope,
+                            trace,
+                        )
+                        .from(
+                            envelope
+                                .from
+                                .clone()
+                                .unwrap_or_else(|| ActorPath::new("anonymous")),
+                        ),
+                    ),
+                    crate::envelope::Payload::Typed(_) => None,
+                };
+                let Some(copy) = copy else {
                     return (tee, inline); // typed payload: not teeable at the waist
                 };
-                let copy = Envelope::json(
-                    envelope.schema.clone(),
-                    Address::Path(observer.clone()),
-                    payload,
-                    trace,
-                )
-                .from(
-                    envelope
-                        .from
-                        .clone()
-                        .unwrap_or_else(|| ActorPath::new("anonymous")),
-                );
                 tee = Some((copy, observer.clone(), origin_trace));
             }
             crate::pool::RuleAction::Inline(interposer) => {
@@ -1013,7 +1020,7 @@ async fn step_es(ctx: &EsLoop) -> Step {
     let dispatch_result = {
         let state = ctx.state().await;
         let mut state = state.lock().await;
-        let payload = envelope.as_json().cloned().unwrap_or(Json::default());
+        let payload = envelope.payload_json();
         let mut cmd_ctx = CmdCtx::new(
             &ctx.path,
             &envelope.trace,
@@ -1023,7 +1030,7 @@ async fn step_es(ctx: &EsLoop) -> Step {
         );
 
         std::panic::catch_unwind(AssertUnwindSafe(|| {
-            entry.dispatch(state.as_mut(), &payload, &mut cmd_ctx)
+            entry.dispatch(state.as_mut(), payload, &mut cmd_ctx)
         }))
     };
 
@@ -1090,11 +1097,12 @@ async fn step_es(ctx: &EsLoop) -> Step {
                 );
                 // The dropped EVENT is what died: it is dead-lettered as an
                 // envelope addressed back to the emitting actor (same trace,
-                // so the drop stays causally linked to the command).
-                let dropped = Envelope::json(
+                // so the drop stays causally linked to the command). The
+                // envelope SHARES the event's payload tree (Arc bump).
+                let dropped = Envelope::json_arc(
                     event.schema.clone(),
                     crate::envelope::Address::Path(ctx.path.clone()),
-                    event.payload.clone(),
+                    std::sync::Arc::new(event.payload.clone()),
                     envelope.trace,
                 )
                 .from(ctx.path.clone());
@@ -1222,7 +1230,7 @@ async fn step_es(ctx: &EsLoop) -> Step {
     // plain host publish has no stamp, but its re-record is still just a
     // checkpoint write.
     if !ctx.kernel.lock().projectors.contains(&ctx.path) {
-        fan_out_emits(ctx, &events, &seqs).await;
+        fan_out_emits(ctx, events, &seqs).await;
     }
 
     // 10. MAYBE SNAPSHOT (policy-gated, BETWEEN messages).
@@ -1633,20 +1641,24 @@ async fn resolve_reply(
 /// `.handles` its own fact legally delivers a copy to itself.
 async fn fan_out_emits(
     ctx: &EsLoop,
-    events: &[crate::envelope::Event],
+    events: crate::envelope::Events,
     seqs: &[crate::journal::SeqNo],
 ) {
     let cause = crate::envelope::TraceCtx::root();
-    for (event, seq) in events.iter().zip(seqs.iter()) {
-        let envelope = Envelope::json(
+    for (mut event, seq) in events.into_iter().zip(seqs.iter()) {
+        // The broadcast copy WRAPS the event's payload tree (one Arc
+        // allocation, ZERO deep copies): N subscribers read one tree. The
+        // event is consumed — its owned payload moves into the Arc.
+        let schema = event.schema.clone();
+        let envelope = Envelope::json_arc(
             event.schema.clone(),
             crate::envelope::Address::Schema(event.schema.clone()),
-            event.payload.clone(),
+            std::sync::Arc::new(std::mem::take(&mut event.payload)),
             cause,
         )
         .from(ctx.path.clone())
         .with_recorded_origin(ctx.path.clone(), *seq);
-        broadcast(&ctx.registry, &ctx.kernel, event.schema.clone(), envelope).await;
+        broadcast(&ctx.registry, &ctx.kernel, schema, envelope).await;
     }
 }
 
@@ -2020,9 +2032,10 @@ async fn step_service(ctx: &ServiceLoop) -> Step {
         return Step::Work;
     };
 
-    // 3. DECODE (sync — decode failures dead-letter cleanly).
-    let payload = envelope.as_json().cloned().unwrap_or(Json::default());
-    let decoded = match entry.decode(&payload) {
+    // 3. DECODE (sync — decode failures dead-letter cleanly). The payload
+    // is borrowed: decode reads the shared tree, it never copies it.
+    let payload = envelope.payload_json();
+    let decoded = match entry.decode(payload) {
         Ok(msg) => msg,
         Err(report) => {
             let reason = format!("{report}");

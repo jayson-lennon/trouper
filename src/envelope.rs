@@ -61,7 +61,11 @@ impl TraceCtx {
 ///
 /// Clonable so the runtime can peek a message without consuming it: the
 /// envelope stays at the inbox cursor until acknowledged, which is what
-/// makes redelivery possible. The typed arm is an `Arc` clone (cheap).
+/// makes redelivery possible. The JSON payload is shared (`Arc<Json>`):
+/// a clone of an envelope is a refcount bump, not a deep tree copy — the
+/// many simultaneous owners (the channel copy and the inbox cursor; the
+/// fan-out copies; the journal entry and the outbox intent) all read one
+/// tree. The typed arm is an `Arc` clone (cheap) for the same reason.
 #[derive(Clone)]
 pub enum Payload {
     /// A reserved in-process fast path, not yet crossed by production code:
@@ -70,8 +74,8 @@ pub enum Payload {
     /// code must still handle it ([`Envelope::as_json`](crate::envelope::Envelope::as_json) treats it as an
     /// error).
     Typed(std::sync::Arc<dyn std::any::Any + Send + Sync>),
-    /// Plain JSON.
-    Json(Json),
+    /// Plain JSON, shared by reference count.
+    Json(std::sync::Arc<Json>),
 }
 
 impl std::fmt::Display for Address {
@@ -88,7 +92,7 @@ impl std::fmt::Debug for Payload {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Typed(_) => f.write_str("Payload::Typed(<erased>)"),
-            Self::Json(value) => f.debug_tuple("Payload::Json").field(value).finish(),
+            Self::Json(value) => f.debug_tuple("Payload::Json").field(value.as_ref()).finish(),
         }
     }
 }
@@ -118,9 +122,9 @@ impl Event {
     /// The typed fold for [`crate::actor::EventSourcedActor::apply`] and
     /// [`crate::actor::Projector::apply`]: an event whose schema is not
     /// `T`'s (another fact type, or another VERSION of this one) yields
-    /// `None` without touching the payload; a matching event decodes. The
-    /// payload is cloned (one value copy per decoded event — the same cost
-    /// command dispatch already pays).
+    /// `None` without touching the payload; a matching event decodes —
+    /// borrowing the tree, so no payload copy is paid (the same cost
+    /// command dispatch pays since `Json::decode` borrows).
     ///
     /// Unmatched schemas are simply ignored — one fold can consume several
     /// fact types by stacking `decode` calls.
@@ -128,7 +132,9 @@ impl Event {
         if self.schema != T::schema_id() {
             return None;
         }
-        serde_json::from_value(self.payload.0.clone()).ok()
+        // Borrows: the fold reads the fact's tree in place — it never
+        // copies it (`&Value` IS a serde deserializer).
+        T::deserialize(&self.payload.0).ok()
     }
 
     /// Whether this event's schema is exactly `T`'s (`name@version`).
@@ -192,7 +198,42 @@ impl Envelope {
             from: None,
             reply_to: None,
             trace,
-            payload: Payload::Json(payload.into()),
+            payload: Payload::Json(std::sync::Arc::new(payload.into())),
+            recorded_origin: None,
+        }
+    }
+
+    /// Assembles a JSON-payload envelope that SHARES this envelope's
+    /// payload tree (an `Arc` bump, never a deep copy) — the kernel's
+    /// constructor for tee/fan-out copies of an existing message.
+    pub(crate) fn json_shared(
+        schema: SchemaId,
+        dest: Address,
+        source: &Envelope,
+        trace: TraceCtx,
+    ) -> Self {
+        let payload = match &source.payload {
+            Payload::Json(arc) => std::sync::Arc::clone(arc),
+            Payload::Typed(_) => return Self::typed(schema, dest, (), trace),
+        };
+        Self::json_arc(schema, dest, payload, trace)
+    }
+
+    /// The `Arc`-payload variant of [`Envelope::json`] (kernel-internal:
+    /// the event fan-out wraps an event's payload once for broadcast).
+    pub(crate) fn json_arc(
+        schema: SchemaId,
+        dest: Address,
+        payload: std::sync::Arc<Json>,
+        trace: TraceCtx,
+    ) -> Self {
+        Self {
+            schema,
+            dest,
+            from: None,
+            reply_to: None,
+            trace,
+            payload: Payload::Json(payload),
             recorded_origin: None,
         }
     }
@@ -264,7 +305,7 @@ impl Envelope {
     /// itself — typed payloads have no JSON encoding on this path.
     pub fn into_json(self) -> Result<Json, Payload> {
         match self.payload {
-            Payload::Json(value) => Ok(value),
+            Payload::Json(value) => Ok((*value).clone()),
             typed @ Payload::Typed(_) => Err(typed),
         }
     }

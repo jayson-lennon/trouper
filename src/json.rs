@@ -57,21 +57,10 @@ impl Json {
     /// Returns the underlying `serde_json` error when the tree does not
     /// match `T`'s shape.
     pub fn decode<T: serde::de::DeserializeOwned>(&self) -> Result<T, serde_json::Error> {
-        // TEST PROBE: counts the cloned payload tree this decode pays for
-        // today (`from_value` consumes an owned `Value`, so the clone is
-        // `serde_json`'s, invisible to `Json::clone`). The fix borrows —
-        // the probe must drop to zero. Zero release impact.
-        #[cfg(test)]
-        let cloned = {
-            crate::kernel::bump_deep_clones();
-            self.0.clone()
-        };
-        #[cfg(test)]
-        let result = serde_json::from_value(cloned);
-        #[cfg(test)]
-        return result;
-        #[cfg(not(test))]
-        serde_json::from_value(self.0.clone())
+        // Borrows: `&Value` IS a serde `Deserializer`, so the decode reads
+        // the tree in place — it never copies it (only `T`'s own fields
+        // allocate).
+        T::deserialize(&self.0)
     }
 
     /// Unwraps the raw JSON tree — the escape hatch for code that must own
