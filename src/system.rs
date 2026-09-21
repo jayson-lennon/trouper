@@ -145,6 +145,40 @@ impl SystemConfig {
     }
 }
 
+/// The runtime's shared registry lock, wrapped with a test-build
+/// acquisition counter.
+///
+/// Production: a newtype over `Mutex<Registry>` that derefs exactly like
+/// the mutex — zero behavior change, one struct field. Test builds: every
+/// `lock()` bumps [`crate::kernel::REGISTRY_LOCKS`] before handing out the
+/// guard, so tests can count critical sections per send window (the
+/// Arc-payload work's mechanism deliverable).
+pub(crate) struct CountingRegistryLock(Mutex<Registry>);
+
+impl CountingRegistryLock {
+    /// Acquires the registry, counting the critical section in test
+    /// builds.
+    #[inline]
+    pub(crate) fn lock(&self) -> parking_lot::MutexGuard<'_, Registry> {
+        #[cfg(test)]
+        crate::kernel::bump_registry_locks();
+        self.0.lock()
+    }
+}
+
+impl std::ops::Deref for CountingRegistryLock {
+    type Target = Mutex<Registry>;
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl std::ops::DerefMut for CountingRegistryLock {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
+
 /// The actor fabric's engine: the shared tables and locks one fabric
 /// consists of. Not used directly — [`ActorSystem`] is the public handle;
 /// construction is encapsulated so every handle provably aliases a
@@ -155,7 +189,7 @@ impl SystemConfig {
 /// mutate together.
 pub struct ActorSystemCore {
     /// Routing table: slots, schemas, routes.
-    pub(crate) registry: Arc<Mutex<Registry>>,
+    pub(crate) registry: Arc<CountingRegistryLock>,
     /// Actor tables: cells, journals, ES state, entries, crashes.
     pub(crate) kernel: Arc<Mutex<KernelState>>,
     pub(crate) clock: ClockService,
@@ -667,7 +701,7 @@ impl ActorSystemCore {
     }
     /// Creates the fabric from a config.
     pub(crate) fn new(config: SystemConfig) -> Self {
-        let registry = Arc::new(Mutex::new(Registry::default()));
+        let registry = Arc::new(CountingRegistryLock(Mutex::new(Registry::default())));
         let clock = config.clock.clone();
         let view = Arc::new(NullView {
             registry: registry.clone(),
@@ -1835,7 +1869,7 @@ impl ActorSystemCore {
 /// A read-only snapshot view over the kernel: handler contexts resolve
 /// lookups through a brief lock; they can never mutate anything.
 struct NullView {
-    registry: Arc<Mutex<Registry>>,
+    registry: Arc<CountingRegistryLock>,
     /// The system's clock (the injected/fake clock in tests, the real one
     /// in production) — handler contexts read the CURRENT time through
     /// the same source the kernel stamps with.
@@ -9511,6 +9545,122 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn send_to_a_live_actor_acquires_the_registry_at_most_twice() {
+        // Given a live service handler (no emits — a silent actor, so the
+        // window has no fan-out noise).
+        let (system, _clock) = ActorSystem::test();
+        let path = ActorPath::new("lock-count");
+        system.spawn_service::<crate::system::tests::Pinger, _>(
+            path.clone(),
+            &json!({}),
+            SpawnOpts::default(),
+            || {
+                vec![Arc::new(TypedServiceAdapter::<Pinger, PingAsk>::new::<
+                    PingAsk,
+                >())]
+            },
+        );
+        wait_for(|| async {
+            system.tap_facts().iter().any(
+                |f| matches!(&f.kind, crate::tap::FactKind::Spawned { path: p, .. } if *p == path),
+            )
+        })
+        .await;
+
+        // When ONE tell is sent (registry acquisitions counted over the
+        // send's await — inline atomic reads, no helper machinery).
+        let before = crate::kernel::REGISTRY_LOCKS.load(std::sync::atomic::Ordering::Relaxed);
+        system
+            .send(system.envelope(
+                PingAsk::schema_id(),
+                path.clone(),
+                json!({ "n": 7 }),
+            ))
+            .await
+            .expect("delivered");
+        let after = crate::kernel::REGISTRY_LOCKS.load(std::sync::atomic::Ordering::Relaxed);
+        let acquisitions = after - before;
+
+        // Then the message was DELIVERED (behavior first)...
+        wait_for(|| async {
+            system
+                .tap_facts()
+                .iter()
+                .any(|f| matches!(&f.kind, crate::tap::FactKind::Delivered { to, .. } if *to == path))
+        })
+        .await;
+        // ...and the send acquired the registry at most twice: shard-key
+        // extraction + endpoint resolution (GREEN target: coalesced into
+        // ONE acquisition per send; RED today: 3 — shard key + resolve +
+        // tee rule application).
+        assert!(
+            acquisitions <= 2,
+            "one tell must acquire the registry ≤2 times (acquired {acquisitions})"
+        );
+    }
+
+    #[tokio::test]
+    async fn emit_gate_does_not_clone_the_manifest() {
+        // Given a mixed emitter (declares Added; smuggles Smuggled) — the
+        // emit-enforcement fixture — spawned and given one command.
+        let (system, _clock) = ActorSystem::test();
+        let path = ActorPath::new("gate-clones");
+        system.register_schema::<Add>();
+        system.register_schema::<Added>();
+        system.register_schema::<Smuggled>();
+        system.spawn_es::<MixedEmitter, _>(path.clone(), &json!({}), SpawnOpts::default(), || {
+            vec![Arc::new(TypedEsAdapter::<MixedEmitter, Add>::new::<Add>())]
+        });
+        system
+            .send(system.envelope(Add::schema_id(), path.clone(), json!({ "n": 4 })))
+            .await
+            .expect("delivered");
+        wait_for_cursor(&system, &path, 1).await;
+
+        // When the NEXT command's step runs (manifest clones counted
+        // around the send — inline atomic reads; this step's gate walks
+        // the smuggled event, the clone-heavy path).
+        let before = crate::kernel::MANIFEST_CLONES.load(std::sync::atomic::Ordering::Relaxed);
+        system
+            .send(system.envelope(Add::schema_id(), path.clone(), json!({ "n": 5 })))
+            .await
+            .expect("delivered");
+        wait_for_cursor(&system, &path, 2).await;
+        let after = crate::kernel::MANIFEST_CLONES.load(std::sync::atomic::Ordering::Relaxed);
+        let clones = after - before;
+
+        // Then enforcement is INTACT (behavior first): the smuggled event
+        // was dropped exactly as before (the journal holds only declared
+        // events; a second UndeclaredEvent letter records the drop)...
+        let event_schemas: Vec<_> = system
+            .journal_entries(&path)
+            .iter()
+            .filter_map(|e| e.as_event().map(|ev| ev.schema.clone()))
+            .collect();
+        assert_eq!(
+            event_schemas,
+            [Added::schema_id(), Added::schema_id()],
+            "only declared events journalled, once per command"
+        );
+        let undelivered: usize = {
+            let kernel = system.kernel.lock();
+            kernel
+                .dead_letters
+                .iter()
+                .filter(|d| d.reason == crate::kernel::DeadLetterReason::UndeclaredEvent)
+                .count()
+        };
+        assert_eq!(undelivered, 2, "both smuggled events dropped and recorded");
+        // ...and ZERO manifest clones were paid on the hot path: the
+        // emit gate consults declarations without copying the manifest
+        // (RED today: 2 — one per step's `lookup().manifest` copy).
+        assert_eq!(
+            clones, 0,
+            "emit gate must not clone the manifest (cloned {clones})"
+        );
+    }
+
+    #[tokio::test]
     async fn published_copy_never_dead_letters_for_a_handling_actor() {
         // Given an actor that declared .handles::<Shipped>() — the exact
         // shape that dead-lettered under the old split (broadcast copies
@@ -9532,6 +9682,46 @@ mod tests {
         // UnknownSchema: the route entry carries the dispatch entry.
         wait_for(|| async { sink.lock().len() == 8 }).await;
         assert_eq!(system.dead_letter_count().await, 0);
+    }
+
+    #[tokio::test]
+    async fn broadcast_shares_one_payload_tree_across_the_fan_out() {
+        // Given FOUR actors that declared .handles::<Shipped>() — the
+        // fan-out that today deep-clones the payload per handler.
+        let (system, _clock) = ActorSystem::test();
+        let a = spawn_edged(&system, "arc-a", "a", false, true).await;
+        let b = spawn_edged(&system, "arc-b", "b", false, true).await;
+        let c = spawn_edged(&system, "arc-c", "c", false, true).await;
+        let d = spawn_edged(&system, "arc-d", "d", false, true).await;
+
+        // When exactly one event is published (counter read before/after —
+        // the atomics are read inline, no helper machinery around await).
+        let before = crate::kernel::DEEP_CLONES.load(std::sync::atomic::Ordering::Relaxed);
+        system
+            .publish_value(Shipped::schema_id(), json!({ "order": "o-arc" }))
+            .await;
+        let after = crate::kernel::DEEP_CLONES.load(std::sync::atomic::Ordering::Relaxed);
+        let clones = after - before;
+
+        // Then every handler received its copy with the right payload
+        // (BEHAVIOR first: the mechanism claim is meaningless if delivery
+        // broke).
+        for (sink, tag) in [(&a, "a"), (&b, "b"), (&c, "c"), (&d, "d")] {
+            wait_for(|| async { !sink.lock().is_empty() }).await;
+            assert_eq!(
+                sink.lock().as_slice(),
+                [format!("{tag}:shipped:o-arc")],
+                "exactly one copy for {tag}"
+            );
+        }
+        // ...and ZERO payload trees were deep-copied for the fan-out: a
+        // published message is shared (Arc'd), not copied per handler
+        // (RED: today the window counts deep copies — front-door, inbox,
+        // dispatch, journal paths — one or more per hop per handler).
+        assert_eq!(
+            clones, 0,
+            "publish must share one payload tree across the fan-out (cloned {clones})"
+        );
     }
 
     #[tokio::test]

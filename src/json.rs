@@ -20,8 +20,19 @@ use serde::{Deserialize, Serialize};
 /// other `serde_json::Value` accessor work as-is); construction comes from
 /// literals via the [`json!`](crate::json!) macro, from any [`Serialize`]
 /// value via [`Json::of`], or from a raw tree via `From`.
-#[derive(Debug, Clone, PartialEq, Default)]
+#[derive(Debug, PartialEq, Default)]
 pub struct Json(pub(crate) serde_json::Value);
+
+impl Clone for Json {
+    fn clone(&self) -> Self {
+        // TEST PROBE: the test-build clone counter exists to make deep-tree
+        // copies observable to the mechanism tests (zero release impact —
+        // this arm compiles to the plain clone below).
+        #[cfg(test)]
+        crate::kernel::bump_deep_clones();
+        Self(self.0.clone())
+    }
+}
 
 impl Json {
     /// Builds a `Json` from any serializable value.
@@ -46,6 +57,20 @@ impl Json {
     /// Returns the underlying `serde_json` error when the tree does not
     /// match `T`'s shape.
     pub fn decode<T: serde::de::DeserializeOwned>(&self) -> Result<T, serde_json::Error> {
+        // TEST PROBE: counts the cloned payload tree this decode pays for
+        // today (`from_value` consumes an owned `Value`, so the clone is
+        // `serde_json`'s, invisible to `Json::clone`). The fix borrows —
+        // the probe must drop to zero. Zero release impact.
+        #[cfg(test)]
+        let cloned = {
+            crate::kernel::bump_deep_clones();
+            self.0.clone()
+        };
+        #[cfg(test)]
+        let result = serde_json::from_value(cloned);
+        #[cfg(test)]
+        return result;
+        #[cfg(not(test))]
         serde_json::from_value(self.0.clone())
     }
 
@@ -183,6 +208,55 @@ macro_rules! json_inner {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Builds a JSON object with `n` string keys (a tree big enough that a
+    /// deep clone is unmissable to the probe).
+    fn big_tree(n: usize) -> Json {
+        let map: serde_json::Map<String, serde_json::Value> = (0..n)
+            .map(|i| (format!("k{i}"), serde_json::Value::from(i as u64)))
+            .collect();
+        Json::from(serde_json::Value::Object(map))
+    }
+
+    #[derive(serde::Serialize, serde::Deserialize, PartialEq, Eq, Debug)]
+    struct Wide {
+        k0: u64,
+    }
+
+    #[test]
+    fn decode_borrows_not_clones() {
+        // Given a wide JSON tree (10k keys — a deep-clone would copy every
+        // node) and a probe baseline.
+        let tree = big_tree(10_000);
+
+        // When decoding it into the typed shape.
+        let (decoded, clones) =
+            crate::kernel::deep_clones_in_window(|| -> Result<Wide, _> { tree.decode() });
+
+        // Then the decode is CORRECT...
+        assert_eq!(decoded.expect("decode").k0, 0);
+        // ...and copied ZERO payload trees: decode borrows (the RED run
+        // fails here — today it clones the whole tree through
+        // `from_value`).
+        assert!(
+            clones == 0,
+            "decode must not clone the payload tree (cloned {clones} trees)"
+        );
+    }
+
+    #[test]
+    fn json_clone_is_a_deep_tree_copy_today_probe_counts_it() {
+        // Given the probe counts deep tree copies (RED evidence for the
+        // mechanism: the counter sees real clones, so the fan-out test's
+        // zero-clone assertion is meaningful).
+        let tree = big_tree(1_000);
+
+        // When cloning a Json (an explicit, deliberate copy).
+        let (_copy, clones) = crate::kernel::deep_clones_in_window(|| tree.clone());
+
+        // Then exactly one deep copy was counted.
+        assert_eq!(clones, 1, "Json::clone is one deep tree copy today");
+    }
 
     #[test]
     fn json_reexport_covers_json_macro_and_into_inner() {

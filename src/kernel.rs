@@ -196,6 +196,66 @@ impl KernelState {
     }
 }
 
+// ---------------------------------------------------------------------------
+// TEST PROBES — mechanism counters, compiled ONLY under `cfg(test)`.
+//
+// The Arc-payload / lock-relief work's deliverable IS the mechanism (fewer
+// deep payload-tree copies, fewer registry acquisitions, no manifest clones
+// on the hot path) — allocation and lock behavior no behavioral test can
+// observe. These counters are the designed test seam for it. They live on
+// plain statics; counters NEVER reset inside the runtime, so tests take
+// before/after deltas within their own window (concurrency-safe by
+// construction under nextest's one-process-per-test isolation; under plain
+// `cargo test` the counters are still correct, only shared — the mechanism
+// tests use decisive bounds that tolerate cross-test noise).
+// ---------------------------------------------------------------------------
+
+/// Deep payload-tree copies (test builds only). Bumped by `Json::clone`
+/// and by `Json::decode`'s owned-value bridge.
+#[cfg(test)]
+pub(crate) fn bump_deep_clones() {
+    DEEP_CLONES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+#[cfg(test)]
+pub(crate) static DEEP_CLONES: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// The number of deep payload-tree clones in a test window (sync bodies:
+/// pure closures like `Json::decode` — async windows read the atomics
+/// inline instead).
+#[cfg(test)]
+pub(crate) fn deep_clones_in_window<T>(f: impl FnOnce() -> T) -> (T, u64) {
+    let before = DEEP_CLONES.load(std::sync::atomic::Ordering::Relaxed);
+    let out = f();
+    let after = DEEP_CLONES.load(std::sync::atomic::Ordering::Relaxed);
+    (out, after - before)
+}
+
+/// Live `Registry` critical sections (test builds only). The counting
+/// mutex wraps every registry the runtime builds.
+#[cfg(test)]
+pub(crate) fn bump_registry_locks() {
+    REGISTRY_LOCKS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+#[cfg(test)]
+pub(crate) static REGISTRY_LOCKS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+
+/// `ActorManifest` clones (test builds only). Bumped by the derive's
+/// hand-written `Clone` impl in schema.rs.
+#[cfg(test)]
+pub(crate) fn bump_manifest_clones() {
+    MANIFEST_CLONES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+#[cfg(test)]
+pub(crate) static MANIFEST_CLONES: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+
 /// Kernel-facing handle for one running actor loop.
 pub(crate) struct ActorHandle {
     /// The kill switch: signaled on graceful stop.
@@ -265,7 +325,7 @@ pub(crate) struct EsLoop {
     /// The actor's cell (inbox + front door).
     pub(crate) cell: Arc<ActorCell>,
     /// The shared routing table.
-    pub(crate) registry: Arc<Mutex<Registry>>,
+    pub(crate) registry: Arc<crate::system::CountingRegistryLock>,
     /// The shared actor tables.
     pub(crate) kernel: Arc<Mutex<KernelState>>,
     /// The read-only view handed to handler contexts.
@@ -295,7 +355,7 @@ impl EsLoop {
 /// Returns the delivered path, or the envelope back for dead-lettering
 /// when the destination does not resolve.
 pub(crate) async fn route(
-    registry: &Mutex<Registry>,
+    registry: &crate::system::CountingRegistryLock,
     kernel: &Mutex<KernelState>,
     envelope: Envelope,
 ) -> Result<ActorPath, Envelope> {
@@ -303,7 +363,7 @@ pub(crate) async fn route(
 }
 
 async fn route_inner(
-    registry: &Mutex<Registry>,
+    registry: &crate::system::CountingRegistryLock,
     kernel: &Mutex<KernelState>,
     envelope: Envelope,
 ) -> Result<ActorPath, Envelope> {
@@ -480,7 +540,7 @@ async fn route_inner(
 /// check-then-insert under the registry lock: the loser of a concurrent
 /// same-key race delivers to the winner's entity.
 async fn resolve_partition(
-    registry: &Mutex<Registry>,
+    registry: &crate::system::CountingRegistryLock,
     kernel: &Mutex<KernelState>,
     envelope: &Envelope,
     dest: ActorPath,
@@ -521,7 +581,7 @@ async fn resolve_partition(
 }
 
 /// Schema-aware shard-key extraction from an envelope's payload.
-fn extract_key(registry: &Mutex<Registry>, envelope: &Envelope, key_field: &str) -> Option<String> {
+fn extract_key(registry: &crate::system::CountingRegistryLock, envelope: &Envelope, key_field: &str) -> Option<String> {
     let reg = registry.lock();
     let payload = envelope.as_json().cloned().unwrap_or(Json::default());
     match reg.schema(&envelope.schema) {
@@ -539,7 +599,7 @@ fn extract_key(registry: &Mutex<Registry>, envelope: &Envelope, key_field: &str)
 /// declared consumption, so a broadcast copy aimed at it is not a
 /// delivery obligation — the activation rule is declaration-scoped).
 async fn resolve_projector_set(
-    registry: &Mutex<Registry>,
+    registry: &crate::system::CountingRegistryLock,
     kernel: &Mutex<KernelState>,
     envelope: &Envelope,
     dest: ActorPath,
@@ -1262,7 +1322,7 @@ pub(crate) async fn run_on_stop(ctx: &EsLoop) {
 #[derive(Clone)]
 pub(crate) struct KernelAskPort {
     /// The shared routing table.
-    pub(crate) registry: Arc<Mutex<Registry>>,
+    pub(crate) registry: Arc<crate::system::CountingRegistryLock>,
     /// The shared actor tables (reply leases + ask facts live here).
     pub(crate) kernel: Arc<Mutex<KernelState>>,
     /// The clock for lease expiries.
@@ -1415,7 +1475,7 @@ impl crate::context::AskPort for KernelAskPort {
 /// pairs, deliveries outside the locks. The route cursor is untouched:
 /// publishes never disturb one-of send rotation.
 pub(crate) async fn broadcast(
-    registry: &Mutex<Registry>,
+    registry: &crate::system::CountingRegistryLock,
     kernel: &Mutex<KernelState>,
     schema: SchemaId,
     envelope: Envelope,
@@ -1522,7 +1582,7 @@ pub(crate) async fn broadcast(
 /// (the durable name).
 async fn resolve_reply(
     kernel: &Mutex<KernelState>,
-    registry: &Mutex<Registry>,
+    registry: &crate::system::CountingRegistryLock,
     to: Address,
     schema: SchemaId,
     payload: Json,

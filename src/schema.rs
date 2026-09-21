@@ -246,7 +246,7 @@ impl<T: Schema + Serialize + DeserializeOwned> Message for T {}
 /// JSON-registered schemas are indistinguishable here, which is what makes
 /// declared edges uniform for export. Produced by the [`ActorManifest`]
 /// builder at spawn; the runtime registers routes from it.
-#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+#[derive(Debug, PartialEq, Default, Serialize, Deserialize)]
 pub struct ActorManifest {
     /// Schemas this actor accepts — the one receive declaration. `.handles`
     /// installs both the route and the dispatch entry; whether a message
@@ -308,6 +308,22 @@ impl ActorManifest {
     pub fn kind(mut self, kind: crate::actor::ActorKind) -> Self {
         self.kind = Some(kind);
         self
+    }
+}
+
+impl Clone for ActorManifest {
+    fn clone(&self) -> Self {
+        // TEST PROBE: the hot-path manifest copies (emit-gate lookups,
+        // handler-context reads) are the Arc-payload work's second
+        // mechanism deliverable; this counter makes them observable. Zero
+        // release impact — test builds only.
+        #[cfg(test)]
+        crate::kernel::bump_manifest_clones();
+        Self {
+            handles: self.handles.clone(),
+            emits: self.emits.clone(),
+            kind: self.kind,
+        }
     }
 }
 
