@@ -31,11 +31,12 @@ Entries are added or amended **only with human approval**.
 
 ---
 
-- (identity) trouper is a single-crate Rust repository (edition 2024); the `trouper` package is the single-machine actor runtime and the only crate.
+- (identity) trouper is a two-crate Rust workspace (edition 2024): `trouper`, the single-machine actor runtime, and `trouper_macros`, its proc-macro crate.
 - (runtime) All actor communication is mediated by the runtime: actors never hold channels directly; every send is routed by path or schema through the registry and emits a tap fact.
 - (runtime) Event-sourced actors are pure decision functions (sync `handle(&self)` returning events) with a single `apply` used for both live state application and replay; all other actors may perform side effects and use `ask`.
 - (runtime) The registry is kernel code, not an actor: path→endpoint slots, schema, schema→handler route, partition, projector-set, and router rule tables persist across actor restarts; actor identity is its registered path.
-- (runtime) Message schemas are runtime data: Rust types and external JSON descriptors register into the same schema table; payloads cross the runtime boundary as JSON.
+- (runtime) Message schemas are runtime data: derived Rust types, hand-written impls, and external JSON descriptors register into the same schema table; payloads cross the runtime boundary as JSON.
+- (schemas) Message schemas are declared with the trouper Event/Command derive macros, which generate the SchemaDef from the struct's fields; hand-written Schema impls remain for complex or foreign descriptors.
 - (runtime) Event-sourced journals are in-memory, seq-anchored lists of `Event` and `Snapshot` entries; restart restores from the latest snapshot plus the tail, and command redelivery is independent of snapshots.
 - (runtime) Actor spawning is builder-based: typed actors declare `handles`/`emits` inline; foreign actors supply JSON schema plus handle/apply closures; positional spawn functions remain as alternative entry points.
 - (runtime) Typed and foreign spawn builders register every declared handle and emit schema into the schema table; hand registration remains only where a def must exist before a builder runs (a partition set validates its shard key at install time).
