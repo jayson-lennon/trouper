@@ -53,11 +53,11 @@ codegen-units = 1
 # The envelope rides `Result::Err` back to senders on failed delivery and
 # travels by value through inbox/outbox slots by design — the caller
 # dead-letters exactly what was refused. That makes `Envelope` a large
-# type on purpose: its `Payload::Json` arm is an inline `serde_json::Value`
-# (one allocation per payload read beats a pointer chase on the hot
-# dispatch path), which in turn makes `Result<_, Envelope>` a large Err.
-# Boxing the payloads to quiet the lint would add a memory fetch to every
-# message step for no behavioral gain. Allowed at the workspace level so
-# the trade stays documented in one place instead of eight `#[allow]`s.
+# type on purpose: its `Payload::Json` arm holds `Arc<Json>` — the tree
+# is shared (a payload copy is a refcount bump), so the inline Arc keeps
+# payload reads one pointer hop while `Result<_, Envelope>` stays a
+# large Err. Boxing to quiet the lint would add a fetch to every message
+# step for no behavioral gain. Allowed at the workspace level so the
+# trade stays documented in one place instead of eight `#[allow]`s.
 result_large_err = "allow"
 large_enum_variant = "allow"
