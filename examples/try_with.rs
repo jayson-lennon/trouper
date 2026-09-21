@@ -44,6 +44,12 @@ impl Schema for Add {
 struct Added {
     n: i64,
 }
+// NOTE: no shard key on this fact, and none is needed — this demo uses a
+// STANDALONE projector, which receives broadcast copies by schema alone.
+// A shard key only matters for projector SETS (per-key `public/<key>`
+// paths, activated on demand): there, the registry REJECTS the set at
+// install unless one consumed schema declares the key field with
+// `.as_shard_key()`. See examples/with.rs for that mode.
 impl Schema for Added {
     fn schema_def() -> SchemaDef {
         SchemaDef {
@@ -124,6 +130,11 @@ async fn main() {
         .emits::<Added>()
         .start();
 
+    // A STANDALONE projector: one read model at a fixed path, folding the
+    // broadcast copies of its consumed schema. No key derivation, no wake
+    // path (that's why its builder has no `passivate_after`) — and no
+    // shard key needed on the fact, unlike the projector SET demoed in
+    // examples/with.rs.
     let projector = trouper::builder::spawn_projector_builder::<Totals>(&system)
         .at(ActorPath::new("totals"))
         .args(json!({}))

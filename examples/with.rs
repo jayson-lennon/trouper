@@ -45,6 +45,12 @@ struct Added {
     key: String,
     n: i64,
 }
+// The `key` field carries `.as_shard_key()` because this demo's projector
+// is a SET (per-key `seen/<key>` paths, activated on demand): the shard
+// key is the routing datum every broadcast copy resolves. The registry
+// enforces it — install_projector_set rejects the set with InvalidSpec
+// unless one consumed schema declares the key field. A standalone
+// projector needs none of this (see examples/try_with.rs).
 impl Schema for Added {
     fn schema_def() -> SchemaDef {
         SchemaDef {
@@ -140,6 +146,16 @@ async fn main() {
     // Per-key read models under `seen`: `seen/<key>`, keyed by the
     // `Added` fact's shard-key field (chat_log demos the multi-key story;
     // this demo pins one key).
+    //
+    // The key_field is a HARD requirement, checked at install: every
+    // broadcast copy of a consumed fact resolves `public/<key-value>` to
+    // decide which projector to wake, so the registry rejects the set
+    // (InvalidSpec) unless a consumed schema declares that field with
+    // `.as_shard_key()` — `Added` does, above. The set's opts carry the
+    // passivation window; a wake (below) re-activates an evicted member
+    // and gap-fills it from the store. A STANDALONE projector
+    // (examples/try_with.rs) has none of this: no key field required, no
+    // factory, no wake path — hence no passivation on its builder either.
     let spec = ProjectorSetSpec {
         public: ActorPath::new("seen"),
         system: system.clone(),
