@@ -209,6 +209,9 @@ pub trait DynEsActor: Send {
     /// The live state as `Any` — the downcast seam for adapters.
     fn as_any_mut(&mut self) -> &mut dyn std::any::Any;
 
+    /// The live state as shared `Any` — the seam for typed zero-copy reads.
+    fn as_any(&self) -> &dyn std::any::Any;
+
     /// Applies one event to live state (the ONLY mutation path).
     fn apply_erased(&mut self, event: &crate::envelope::Event);
 
@@ -236,6 +239,39 @@ pub trait DynEsActor: Send {
     /// The erased ES graceful-stop hook: forwards to
     /// [`EventSourcedActor::on_stop`] over the final folded state.
     fn on_stop_es(&self);
+
+    /// The live state type's name — diagnostics for typed-read misses.
+    fn state_type_name(&self) -> &'static str;
+}
+
+/// Downcast seam for a SHARED read of ES state (generic: the reader knows
+/// the state type), mirroring [`ServiceAny`].
+///
+/// Live ES state is always behind
+/// `Arc<tokio::Mutex<Box<dyn DynEsActor>>>`, so a shared borrow cannot
+/// escape the guard; this trait is how a lock-holding closure sees the
+/// typed state without serializing. A [`ForeignEsState`] (or a wrong typed
+/// shell) misses → `None`.
+pub trait EsAny {
+    /// Runs `f` over the live state as `&A`, when this shell holds an
+    /// [`TypedEsState`]`<A>`.
+    fn with_es_state<A: EventSourcedActor, R>(&self, f: impl FnOnce(&A) -> R) -> Option<R>;
+
+    /// Runs `f` over the live read model as `&P`, when this shell holds a
+    /// [`TypedProjectorState`]`<P>`.
+    fn with_projector_state<P: Projector, R>(&self, f: impl FnOnce(&P) -> R) -> Option<R>;
+}
+
+impl EsAny for dyn DynEsActor {
+    fn with_es_state<A: EventSourcedActor, R>(&self, f: impl FnOnce(&A) -> R) -> Option<R> {
+        let typed = self.as_any().downcast_ref::<TypedEsState<A>>()?;
+        Some(f(&typed.state))
+    }
+
+    fn with_projector_state<P: Projector, R>(&self, f: impl FnOnce(&P) -> R) -> Option<R> {
+        let typed = self.as_any().downcast_ref::<TypedProjectorState<P>>()?;
+        Some(f(&typed.state))
+    }
 }
 
 /// Concrete `DynEsActor` for a typed state `A`.
@@ -253,6 +289,14 @@ impl<A: EventSourcedActor> TypedEsState<A> {
 impl<A: EventSourcedActor> DynEsActor for TypedEsState<A> {
     fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
         self
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
+    fn state_type_name(&self) -> &'static str {
+        std::any::type_name::<A>()
     }
 
     fn apply_erased(&mut self, event: &crate::envelope::Event) {
@@ -386,6 +430,14 @@ impl<P: Projector> DynEsActor for TypedProjectorState<P> {
         self
     }
 
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
+    fn state_type_name(&self) -> &'static str {
+        std::any::type_name::<P>()
+    }
+
     fn apply_erased(&mut self, event: &crate::envelope::Event) {
         self.state.apply(event);
     }
@@ -491,6 +543,15 @@ pub type ForeignFold = Arc<dyn Fn(&mut Json, &crate::envelope::Event) + Send + S
 impl DynEsActor for ForeignEsState {
     fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
         self
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
+    fn state_type_name(&self) -> &'static str {
+        // The foreign state IS JSON — name it as such in diagnostics.
+        std::any::type_name::<Json>()
     }
 
     fn apply_erased(&mut self, event: &crate::envelope::Event) {
@@ -1009,6 +1070,86 @@ mod tests {
 
         // Then it is an empty decision.
         assert!(events.is_empty());
+    }
+
+    #[test]
+    fn es_any_reads_typed_es_state_without_capture() {
+        // Given a typed ES state holding a folded counter.
+        let live = TypedEsState::new(Counter { count: 41 });
+        let erased: &dyn DynEsActor = &live;
+
+        // When reading through the shared downcast seam.
+        let seen = erased.with_es_state(|c: &Counter| c.count);
+
+        // Then the closure saw the exact live value.
+        assert_eq!(seen, Some(41));
+    }
+
+    #[test]
+    fn es_any_reads_typed_projector_state() {
+        // Given a typed projector shell wrapping a read model at 7.
+        #[derive(Serialize, Deserialize, Default)]
+        struct View {
+            total: i64,
+        }
+        impl Projector for View {
+            fn apply(&mut self, _event: &crate::envelope::Event) {}
+        }
+        let live = TypedProjectorState::new(View { total: 7 });
+        let erased: &dyn DynEsActor = &live;
+
+        // When reading through the shared downcast seam.
+        let seen = erased.with_projector_state(|v: &View| v.total);
+
+        // Then the closure saw the exact live value.
+        assert_eq!(seen, Some(7));
+    }
+
+    #[test]
+    fn es_any_misses_on_wrong_shell_and_foreign_state() {
+        // Given an erased TypedEsState<Counter>.
+        let live = TypedEsState::new(Counter { count: 1 });
+        let erased: &dyn DynEsActor = &live;
+
+        // When reading it as a different actor type.
+        #[derive(Serialize, Deserialize, Default)]
+        struct Other {
+            x: i64,
+        }
+        impl EventSourcedActor for Other {
+            fn manifest() -> ActorManifest {
+                ActorManifest::new().kind(ActorKind::EventSourced)
+            }
+            fn restore(_args: &Json) -> Self {
+                Self { x: 0 }
+            }
+            fn apply(&mut self, _event: &crate::envelope::Event) {}
+        }
+        let wrong = erased.with_es_state(|_o: &Other| ());
+
+        // Then it is a miss, not a panic.
+        assert_eq!(wrong, None);
+
+        // And a foreign (JSON) state misses the typed seam as well.
+        let noop: ForeignFold = Arc::new(|_state, _event| {});
+        let foreign: &dyn DynEsActor = &ForeignEsState::new(json!({ "count": 9 }), noop);
+        let foreign_read = foreign.with_es_state(|_c: &Counter| ());
+        assert_eq!(foreign_read, None);
+    }
+
+    #[test]
+    fn state_type_name_reports_the_state_type() {
+        // Given shells for a typed entity, a projector, and a foreign actor.
+        let typed = TypedEsState::new(Counter { count: 0 });
+        let foreign = ForeignEsState::new(json!({}), Arc::new(|_s: &mut Json, _e: &crate::envelope::Event| {}));
+
+        // When asking each for its state type name.
+        let typed_name = typed.state_type_name();
+        let foreign_name = foreign.state_type_name();
+
+        // Then the names identify the state types, not the shells.
+        assert_eq!(typed_name, std::any::type_name::<Counter>());
+        assert_eq!(foreign_name, std::any::type_name::<Json>());
     }
 }
 

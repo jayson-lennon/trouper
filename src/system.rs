@@ -11,7 +11,7 @@ use std::sync::Arc;
 
 use crate::actor::ActorPath;
 use crate::actor::{
-    CommandEntry, DynServiceActor, EventSourcedActor, MsgEntry, ServiceActor, TypedEsState,
+    CommandEntry, DynServiceActor, EventSourcedActor, EsAny, MsgEntry, ServiceActor, TypedEsState,
     TypedServiceState,
 };
 use crate::clock::Timestamp;
@@ -1885,9 +1885,124 @@ impl ActorSystem {
         }
         // COLD, SET-OWNED: wake through the set's factory and wait for the
         // catch-up fact (bounded — an observable timeout, never a hang).
+        if !self.wake_projector_until_caught_up(path).await {
+            return None;
+        }
+        self.await_quiescent(path).await;
+        self.es_state(path).await
+    }
+
+    /// Typed, ZERO-COPY read of a live entity's state: runs `f` over the
+    /// state under its lock — no serialize, no clone.
+    ///
+    /// Sync and non-blocking: takes the state lock with `try_lock`, so a
+    /// read never stalls a render thread — `None` when the fold currently
+    /// holds the lock (the caller keeps its previous frame). See
+    /// [`ActorSystem::with_es_state`] for the awaiting variant.
+    pub fn try_with_es_state<A: EventSourcedActor, R>(
+        &self,
+        path: &ActorPath,
+        f: impl FnOnce(&A) -> R,
+    ) -> Option<R> {
+        let state = {
+            let kernel = self.kernel.lock();
+            kernel.es_state.get(path)?.clone()
+        };
+        let state = state.try_lock().ok()?;
+        match state.with_es_state(f) {
+            Some(r) => Some(r),
+            None => {
+                tracing::debug!(
+                    path = %path,
+                    actual = state.state_type_name(),
+                    "typed state read: wrong type at path"
+                );
+                None
+            }
+        }
+    }
+
+    /// Typed, ZERO-COPY read of a live projector's fold: runs `f` over the
+    /// read model under its state lock — no serialize, no clone.
+    ///
+    /// Sync and non-blocking like [`ActorSystem::try_with_es_state`]; use
+    /// [`ActorSystem::with_projector_state`] to wake a cold set-owned
+    /// projector (a `try_` read never wakes anything).
+    pub fn try_with_projector_state<P: crate::actor::Projector, R>(
+        &self,
+        path: &ActorPath,
+        f: impl FnOnce(&P) -> R,
+    ) -> Option<R> {
+        let state = {
+            let kernel = self.kernel.lock();
+            kernel.es_state.get(path)?.clone()
+        };
+        let state = state.try_lock().ok()?;
+        match state.with_projector_state(f) {
+            Some(r) => Some(r),
+            None => {
+                tracing::debug!(
+                    path = %path,
+                    actual = state.state_type_name(),
+                    "typed state read: wrong type at path"
+                );
+                None
+            }
+        }
+    }
+
+    /// The awaiting typed twin of [`ActorSystem::es_state`]: runs `f` over
+    /// a live entity's state under its lock — no serialize, no clone.
+    ///
+    /// Never wakes anything (like `es_state`): a cold or passivated entity
+    /// reads `None` — only [`ActorSystem::with_projector_state`] has a
+    /// wake path, and only for set-owned projectors.
+    pub async fn with_es_state<A: EventSourcedActor, R>(
+        &self,
+        path: &ActorPath,
+        f: impl FnOnce(&A) -> R + Send,
+    ) -> Option<R> {
+        self.read_es(path, f).await
+    }
+
+    /// The typed, zero-copy twin of [`ActorSystem::projector_state`]: runs
+    /// `f` over the live read model under its state lock — no serialize,
+    /// no clone. Wake semantics are IDENTICAL to `projector_state` (hot:
+    /// quiesce then read; cold set-owned: wake + bounded `CaughtUp` wait),
+    /// except a live projector whose state is not `P` also reads `None`.
+    pub async fn with_projector_state<P: crate::actor::Projector, R>(
+        &self,
+        path: &ActorPath,
+        f: impl FnOnce(&P) -> R + Send,
+    ) -> Option<R> {
+        // HOT: the projector is live — quiesce, then read typed under the
+        // state lock (mirrors projector_state's hot branch exactly).
+        if self.es_state(path).await.is_some() {
+            self.await_quiescent(path).await;
+            return self.read_projector(path, f).await;
+        }
+        // COLD, SET-OWNED: wake through the set's factory and wait for the
+        // catch-up fact (bounded — an observable timeout, never a hang).
+        if !self.wake_projector_until_caught_up(path).await {
+            return None;
+        }
+        self.await_quiescent(path).await;
+        self.read_projector(path, f).await
+    }
+
+    /// Wake a cold set-owned projector and wait — bounded — for its
+    /// catch-up fact. Shared by [`ActorSystem::projector_state`] and
+    /// [`ActorSystem::with_projector_state`]; returns `false` when `path`
+    /// is not set-owned or the `CaughtUp` fact never arrives within the
+    /// budget. Registry lookups and poll cadence are exactly the
+    /// pre-extraction behavior of `projector_state`.
+    async fn wake_projector_until_caught_up(&self, path: &ActorPath) -> bool {
         let spec = {
             let registry = self.registry.lock();
-            registry.projector_set_owning(path)?
+            match registry.projector_set_owning(path) {
+                Some(spec) => spec,
+                None => return false,
+            }
         };
         // Delivered-but-unfolded mail wakes the projector but folds AFTER
         // catch-up (the loop starts post-seed). Wait for the mail to
@@ -1915,17 +2030,65 @@ impl ActorSystem {
                     matches!(&fact.kind, crate::tap::FactKind::CaughtUp { path: p, .. } if p == path)
                 })
             {
-                break;
+                return true;
             }
             if tokio::time::Instant::now() >= deadline {
-                return None;
+                return false;
             }
             tokio::time::sleep(std::time::Duration::from_millis(5)).await;
         }
-        // Catch-up is complete; wait out any queued live copies (bounded)
-        // so the capture is the fold of everything delivered so far.
-        self.await_quiescent(path).await;
-        self.es_state(path).await
+    }
+
+    /// Typed, zero-copy read of a live entity's state: runs `f` over the
+    /// state under its lock — no serialize, no clone. `None` propagates:
+    /// no live entry, or wrong type (logged at debug with the state's
+    /// actual type).
+    async fn read_es<A: EventSourcedActor, R>(
+        &self,
+        path: &ActorPath,
+        f: impl FnOnce(&A) -> R + Send,
+    ) -> Option<R> {
+        let state = {
+            let kernel = self.kernel.lock();
+            kernel.es_state.get(path)?.clone()
+        };
+        let state = state.lock().await;
+        match state.with_es_state(f) {
+            Some(r) => Some(r),
+            None => {
+                tracing::debug!(
+                    path = %path,
+                    actual = state.state_type_name(),
+                    "typed state read: wrong type at path"
+                );
+                None
+            }
+        }
+    }
+
+    /// Typed, zero-copy read of a live projector's fold — the projector
+    /// twin of [`ActorSystem::read_es`].
+    async fn read_projector<P: crate::actor::Projector, R>(
+        &self,
+        path: &ActorPath,
+        f: impl FnOnce(&P) -> R + Send,
+    ) -> Option<R> {
+        let state = {
+            let kernel = self.kernel.lock();
+            kernel.es_state.get(path)?.clone()
+        };
+        let state = state.lock().await;
+        match state.with_projector_state(f) {
+            Some(r) => Some(r),
+            None => {
+                tracing::debug!(
+                    path = %path,
+                    actual = state.state_type_name(),
+                    "typed state read: wrong type at path"
+                );
+                None
+            }
+        }
     }
 
     /// Destroys and re-creates a projector set entity: stop → purge its
@@ -9619,5 +9782,362 @@ mod tests {
                 && e.schema == Shipped::schema_id()
                 && e.direction == crate::system::EdgeDirection::Handles
         }));
+    }
+
+    // ---- typed zero-copy state reads (v0.7.x) ---------------------------
+
+    static CAPTURES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+    /// A counter whose snapshot seam counts captures: the typed reads must
+    /// never touch it (zero-serialize proof).
+    #[derive(Serialize, Deserialize, Default, Debug)]
+    struct SpiedCounter {
+        total: i64,
+    }
+    impl EventSourcedActor for SpiedCounter {
+        fn manifest() -> ActorManifest {
+            ActorManifest::new()
+                .handles::<Add>()
+                .emits::<Added>()
+                .kind(ActorKind::EventSourced)
+        }
+        fn restore(_args: &Json) -> Self {
+            Self::default()
+        }
+        fn apply(&mut self, event: &crate::envelope::Event) {
+            if event.schema.as_str() == "Added@1" {
+                self.total += event.payload["n"].as_i64().unwrap_or(0);
+            }
+        }
+        fn capture(&self) -> Result<Json, error_stack::Report<crate::journal::JournalError>> {
+            use error_stack::ResultExt;
+            CAPTURES.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok::<Json, error_stack::Report<crate::journal::JournalError>>(Json::of(self))
+                .change_context(crate::journal::JournalError::Snapshot)
+        }
+    }
+    impl CommandHandler<Add> for SpiedCounter {
+        fn handle(&self, cmd: Add, _ctx: &mut CmdCtx<'_>) -> crate::envelope::Events {
+            crate::envelope::Events::from_vec(vec![crate::envelope::Event::new(
+                Added::schema_id(),
+                json!({ "n": cmd.n }),
+            )])
+        }
+    }
+
+    fn captures() -> usize {
+        CAPTURES.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    #[tokio::test]
+    async fn with_es_state_reads_typed_state_without_capture() {
+        // Given a spawned counter that has folded one Add.
+        let (system, _clock) = ActorSystem::test();
+        let path = ActorPath::new("spied");
+        system.spawn_es::<SpiedCounter, _>(path.clone(), &json!({}), SpawnOpts::default(), || {
+            vec![Arc::new(TypedEsAdapter::<SpiedCounter, Add>::new::<Add>())]
+        });
+        system
+            .send(system.envelope(Add::schema_id(), path.clone(), json!({ "n": 21 })))
+            .await
+            .expect("delivered");
+        wait_for_cursor(&system, &path, 1).await;
+        let before = captures();
+
+        // When reading the state typed (the snapshot seam would run if the
+        // read serialized).
+        let seen = system
+            .with_es_state::<SpiedCounter, _>(&path, |c| c.total)
+            .await;
+
+        // Then the live value came back with ZERO captures.
+        assert_eq!(seen, Some(21));
+        assert_eq!(captures(), before, "typed read must not serialize");
+
+        // And the shape parity holds: the JSON capture says the same thing.
+        assert_eq!(
+            system.es_state(&path).await.and_then(|s| s["total"].as_i64()),
+            Some(21)
+        );
+    }
+
+    #[tokio::test]
+    async fn with_projector_state_reads_typed_fold_hot() {
+        // Given a live ChatLog projector that folded one fact.
+        let (system, _clock) = ActorSystem::test();
+        install_chat_projector_set(&system, "proj/chats").expect("install");
+        publish_chatted(&system, "7", "hello").await;
+        let _ = system
+            .projector_state(&ActorPath::new("proj/chats/7"))
+            .await
+            .expect("warm the projector");
+
+        // When reading the fold typed (hot path — no wake in between).
+        let seen = system
+            .with_projector_state::<ChatLog, _>(&ActorPath::new("proj/chats/7"), |log| {
+                log.messages
+            })
+            .await;
+
+        // Then the typed read matches the JSON capture.
+        assert_eq!(seen, Some(1));
+    }
+
+    #[tokio::test]
+    async fn with_projector_state_wakes_cold_set_projector() {
+        // Given a ChatLog projector set with one stored fact for key "5"
+        // and a passivated (cold) projector, exactly as the JSON wake test
+        // sets it up.
+        let (system, clock) = ActorSystem::test();
+        let opts = SpawnOpts {
+            passivation: Some(Passivation {
+                idle_for: std::time::Duration::from_millis(50),
+            }),
+            ..Default::default()
+        };
+        let spec = crate::pool::ProjectorSetSpec {
+            opts,
+            ..install_chat_projector_set_spec(&system, "proj/chats")
+        };
+        system.install_projector_set(spec).expect("install");
+        publish_chatted(&system, "5", "a").await;
+        let path5 = ActorPath::new("proj/chats/5");
+        wait_for(|| async { system_is_live(&system, &path5) }).await;
+        for _ in 0..500 {
+            if system.es_state(&path5).await.is_some() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        clock.advance(std::time::Duration::from_millis(100));
+        system.stop(&path5).await;
+        assert!(
+            system.es_state(&path5).await.is_none(),
+            "projector evicted before the cold typed read"
+        );
+
+        // When reading typed from COLD (the wake + bounded CaughtUp wait).
+        let seen = system
+            .with_projector_state::<ChatLog, _>(&path5, |log| log.keys_seen.clone())
+            .await;
+
+        // Then the woken projector's fold is complete and typed.
+        assert_eq!(seen, Some(vec!["a".to_owned()]));
+
+        // And an UNKNOWN path reads as None — never a hang.
+        assert!(
+            system
+                .with_projector_state::<ChatLog, _>(&ActorPath::new("proj/nowhere/1"), |_| ())
+                .await
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn try_with_state_returns_none_when_lock_busy() {
+        // Given a spawned counter whose state lock a task holds across a
+        // sleep (the fold-in-progress analogue).
+        let (system, _clock) = ActorSystem::test();
+        let path = ActorPath::new("busy");
+        system.spawn_es::<SpiedCounter, _>(path.clone(), &json!({}), SpawnOpts::default(), || {
+            vec![Arc::new(TypedEsAdapter::<SpiedCounter, Add>::new::<Add>())]
+        });
+        wait_for(|| async { system_is_live(&system, &path) }).await;
+        let held = {
+            let kernel = system.kernel.lock();
+            kernel.es_state.get(&path).cloned().expect("state entry")
+        };
+        let guard_task = tokio::spawn(async move {
+            let _guard = held.lock().await;
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        });
+        wait_for(|| async {
+            // Poll until the lock is confirmed taken (try_lock fails).
+            system
+                .kernel
+                .lock()
+                .es_state
+                .get(&path)
+                .map(|s| s.try_lock().is_err())
+                .unwrap_or(false)
+        })
+        .await;
+
+        // When reading through the sync non-blocking seam.
+        let read = system.try_with_es_state::<SpiedCounter, _>(&path, |c| c.total);
+
+        // Then it returns None promptly (never blocks, never panics) while
+        // the lock is held.
+        assert_eq!(read, None, "busy lock reads None");
+        guard_task.await.expect("guard task joins");
+    }
+
+    #[tokio::test]
+    async fn try_with_state_returns_none_for_wrong_type() {
+        // Given a live Counter entity (the plain fixture).
+        let (system, _clock) = ActorSystem::test();
+        let path = ActorPath::new("counter");
+        system.spawn_es::<Counter, _>(path.clone(), &json!({}), SpawnOpts::default(), || {
+            vec![Arc::new(TypedEsAdapter::<Counter, Add>::new::<Add>())]
+        });
+        wait_for(|| async { system_is_live(&system, &path) }).await;
+
+        // When reading it as a DIFFERENT actor type through both seams.
+        let wrong_es = system
+            .with_es_state::<BareCounter, _>(&path, |_| ())
+            .await;
+        let wrong_try = system.try_with_es_state::<BareCounter, _>(&path, |_| ());
+
+        // Then both miss — None, no panic, no capture.
+        assert_eq!(wrong_es, None);
+        assert_eq!(wrong_try, None);
+    }
+
+    #[tokio::test]
+    async fn typed_reads_return_none_for_missing_or_foreign_paths() {
+        // Given a system with a live foreign (schema-defined) actor and no
+        // actor at some path.
+        let (system, _clock) = ActorSystem::test();
+        let fact = SchemaId::new("tick", 1);
+        let decision: crate::actor::ForeignDecision =
+            Arc::new(|_state: &Json, _cmd: &Json, _ctx: &mut CmdCtx<'_>| Vec::new());
+        let fold: crate::actor::ForeignFold =
+            Arc::new(|_state: &mut Json, _ev: &crate::envelope::Event| {});
+        crate::builder::spawn_foreign(&system)
+            .at(ActorPath::new("foreign"))
+            .schema(json!({
+                "name": "tick", "version": 1, "kind": "command",
+                "fields": [{ "name": "delta", "ty": "int" }]
+            }))
+            .args(json!({ "total": 0 }))
+            .handle(decision)
+            .apply(fold)
+            .emits_id(fact)
+            .start()
+            .expect("foreign starts");
+        wait_for(|| async { system_is_live(&system, &ActorPath::new("foreign")) }).await;
+
+        // When reading typed at the unknown path and at the foreign path.
+        let missing = system
+            .with_es_state::<SpiedCounter, _>(&ActorPath::new("no/such"), |_| ())
+            .await;
+        let foreign = system
+            .with_es_state::<SpiedCounter, _>(&ActorPath::new("foreign"), |_| ())
+            .await;
+
+        // Then both read None — foreign actors' JSON state has no typed
+        // twin by design.
+        assert_eq!(missing, None);
+        assert_eq!(foreign, None);
+    }
+
+    #[tokio::test]
+    async fn with_es_state_returns_none_for_cold_entity() {
+        // Given a spawned counter with passivation that has been evicted.
+        let (system, clock) = ActorSystem::test();
+        let path = ActorPath::new("cold");
+        system.spawn_es::<SpiedCounter, _>(
+            path.clone(),
+            &json!({}),
+            SpawnOpts {
+                passivation: Some(Passivation {
+                    idle_for: std::time::Duration::from_millis(50),
+                }),
+                ..Default::default()
+            },
+            || {
+                vec![Arc::new(TypedEsAdapter::<SpiedCounter, Add>::new::<Add>())]
+            },
+        );
+        wait_for(|| async { system_is_live(&system, &path) }).await;
+        clock.advance(std::time::Duration::from_millis(100));
+        system.stop(&path).await;
+        wait_for(|| async { system.es_state(&path).await.is_none() }).await;
+
+        // When reading typed through both variants (neither wakes).
+        let async_read = system.with_es_state::<SpiedCounter, _>(&path, |_| ()).await;
+        let sync_read = system.try_with_es_state::<SpiedCounter, _>(&path, |_| ());
+
+        // Then both read None — a cold entity has no wake path.
+        assert_eq!(async_read, None);
+        assert_eq!(sync_read, None);
+    }
+
+    #[tokio::test]
+    async fn closure_observes_fold_atomic_state_under_concurrent_folds() {
+        // Given a spawned counter receiving a stream of Add(n = 2) commands
+        // while the reader polls the typed read.
+        let (system, _clock) = ActorSystem::test();
+        let path = ActorPath::new("racy");
+        system.spawn_es::<SpiedCounter, _>(path.clone(), &json!({}), SpawnOpts::default(), || {
+            vec![Arc::new(TypedEsAdapter::<SpiedCounter, Add>::new::<Add>())]
+        });
+        for i in 0..25 {
+            system
+                .send(system.envelope(
+                    Add::schema_id(),
+                    path.clone(),
+                    json!({ "n": 2, "seq": i }),
+                ))
+                .await
+                .expect("delivered");
+        }
+        let reader = {
+            let system = system.clone();
+            let path = path.clone();
+            tokio::spawn(async move {
+                let mut seen = Vec::new();
+                // Poll until the final value (50 = 25 × 2) is observed, so
+                // the reader always overlaps the fold loop AND ends having
+                // seen the completed fold.
+                while seen.last() != Some(&50) {
+                    if let Some(total) =
+                        system.try_with_es_state::<SpiedCounter, _>(&path, |c| c.total)
+                    {
+                        seen.push(total);
+                    }
+                    tokio::task::yield_now().await;
+                }
+                seen
+            })
+        };
+
+        // When the reader runs against the fold loop.
+        let seen = reader.await.expect("reader joins");
+        wait_for_cursor(&system, &path, 25).await;
+
+        // Then every observed value is a completed multiple of 2 — never a
+        // half-applied fold.
+        assert!(
+            !seen.is_empty(),
+            "the reader must observe at least one completed fold"
+        );
+        for total in &seen {
+            assert_eq!(total % 2, 0, "fold-atomic view, got {total}");
+            assert!(*total >= 0 && *total <= 50, "within the fold range");
+        }
+    }
+
+    #[tokio::test]
+    async fn projector_state_json_twin_matches_typed_read_after_extraction() {
+        // Given a live ChatLog projector.
+        let (system, _clock) = ActorSystem::test();
+        install_chat_projector_set(&system, "proj/chats").expect("install");
+        publish_chatted(&system, "7", "hello").await;
+        let path = ActorPath::new("proj/chats/7");
+
+        // When reading both ways (the JSON twin drives the same wake
+        // helper the typed read uses).
+        let json_state = system.projector_state(&path).await.expect("json read");
+        let typed = system
+            .with_projector_state::<ChatLog, _>(&path, |log| log.messages)
+            .await
+            .expect("typed read");
+
+        // Then the two answers agree — the extraction is behavior-
+        // preserving.
+        let log: ChatLog = json_state.decode().expect("decodes");
+        assert_eq!(log.messages, 1);
+        assert_eq!(typed, 1);
     }
 }
