@@ -331,17 +331,25 @@ fn producer_scaling(c: &mut Criterion) {
 // (tracks the Arc<Json> improvement).
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// payload_size: one 100B / 10KB / 1MB command per measured message — the
+// JSON-waist clone tax, reported PER MESSAGE (Bytes(elem) throughput makes
+// the table's `time` a single tell→fold→ack cycle at that payload size;
+// comparable 1:1 against tell_baseline's per-message number).
+// ---------------------------------------------------------------------------
+
 fn payload_size(c: &mut Criterion) {
     let (system, rt) = spawn_system();
     let iterations = Iterations(std::sync::atomic::AtomicU64::new(0));
 
     let mut group = c.benchmark_group("e2e/payload_size");
-    group.sample_size(20);
+    group.sample_size(30);
     for (label, size) in [("100B", 100usize), ("10KB", 10_000), ("1MB", 1_000_000)] {
         let chunk = Chunk {
             filler: vec![0u8; size],
         };
-        group.throughput(criterion::Throughput::Elements(16));
+        // One message per iteration: the reported time IS one message.
+        group.throughput(criterion::Throughput::Bytes(size as u64));
         group.bench_function(label, |b| {
             b.iter(|| {
                 rt.block_on(async {
@@ -356,27 +364,35 @@ fn payload_size(c: &mut Criterion) {
                             )]
                         },
                     );
-                    for _ in 0..16 {
-                        system
-                            .tell(path.clone(), chunk.clone())
-                            .await
-                            .expect("delivered");
-                    }
-                    for _ in 0..30_000 {
-                        if system
-                            .with_es_state::<Bytes, _>(&path, |b| b.total)
-                            .await
-                            .is_some_and(|t| t >= 16 * size as u64)
-                        {
-                            break;
-                        }
-                        tokio::time::sleep(Duration::from_millis(1)).await;
-                    }
+                    system
+                        .tell(path.clone(), chunk.clone())
+                        .await
+                        .expect("delivered");
+                    wait_bytes_total(&system, &path, size as u64).await;
                 });
             });
         });
     }
     group.finish();
+}
+
+/// Waits until the Bytes entity's total reaches `total` (bounded; panics
+/// on stall so a bench fails loudly instead of reporting a fast bogus
+/// time). Must run inside the runtime.
+async fn wait_bytes_total(system: &ActorSystem, path: &ActorPath, total: u64) {
+    for _ in 0..300_000 {
+        if system
+            .with_es_state::<Bytes, _>(path, |b| b.total)
+            .await
+            .is_some_and(|t| t >= total)
+        {
+            return;
+        }
+        // 100µs granularity: the probe's detection latency must stay well
+        // below the per-message times being measured.
+        tokio::time::sleep(Duration::from_micros(100)).await;
+    }
+    panic!("entity {path} never reached total {total}");
 }
 
 // ---------------------------------------------------------------------------
