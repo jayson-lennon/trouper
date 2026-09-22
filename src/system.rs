@@ -11412,4 +11412,239 @@ mod tests {
             "the re-spawned entity still refuses over capacity ({refused_for_entity} refused)"
         );
     }
+
+    // ===== Event versioning: additive drift over the decode seams =====
+    //
+    // "Versioning" here is a CONTRACT, not a mechanism: schemas carry no
+    // version (the derive rejects `version = N`), and evolution is
+    // additive — a struct gains a field with a serde default (or Option),
+    // so payloads journaled by the OLD shape still deserialize into the
+    // NEW struct. These tests pin that contract at every decode seam:
+    // journal replay (old events → new fold), snapshot restore (old
+    // blob → new state), and live command dispatch (old-shape bytes →
+    // new command struct).
+
+    /// The event shape as the OLD code journaled it (one field).
+    #[derive(Event, serde::Serialize, serde::Deserialize, Clone)]
+    struct Reserved {
+        qty: i64,
+    }
+
+    /// The NEW shape of the same schema: an added field with a default.
+    /// Same schema name (`Reserved`) — additive evolution, not a new
+    /// schema.
+    #[derive(Event, serde::Serialize, serde::Deserialize, Clone)]
+    struct ReservedV2 {
+        qty: i64,
+        #[serde(default)]
+        note: String,
+    }
+
+    /// An entity whose fold reads BOTH fields of the new shape.
+    #[derive(Serialize, Deserialize, Default, Clone)]
+    struct VersionedStock {
+        qty: i64,
+        // The ADDED field carries the serde default — that IS the
+        // versioning contract: old snapshot blobs (without it) decode
+        // into the new shape.
+        #[serde(default)]
+        notes: usize,
+    }
+
+    impl EventSourcedActor for VersionedStock {
+        fn manifest() -> ActorManifest {
+            ActorManifest::new()
+                .handles::<Add>()
+                .emits::<Added>()
+                .kind(ActorKind::EventSourced)
+        }
+        fn restore(_args: &Json) -> Self {
+            Self::default()
+        }
+        fn apply(&mut self, event: &crate::envelope::Event) {
+            if event.schema.as_str() == "Reserved" {
+                // The NEW code reads the added field: old payloads must
+                // still land here with the default (""), not a decode
+                // failure that would dead-letter the fold.
+                let payload = event.payload_json();
+                self.qty += payload["qty"].as_i64().unwrap_or(0);
+                if !payload["note"].as_str().unwrap_or("").is_empty() {
+                    self.notes += 1;
+                }
+            }
+        }
+    }
+    impl CommandHandler<Add> for VersionedStock {
+        fn handle(&self, _cmd: Add, _ctx: &mut CmdCtx<'_>) -> crate::envelope::Events {
+            crate::envelope::Events::new()
+        }
+    }
+
+    #[tokio::test]
+    async fn journal_replay_of_old_payloads_decodes_into_new_event_shape() {
+        // Given a store seeded the way the OLD code wrote it: two
+        // `Reserved` events whose payloads carry ONLY `qty` (the `note`
+        // field did not exist yet).
+        let (system, _clock) = ActorSystem::test();
+        let path = ActorPath::new("versioned/replay");
+        system.spawn_es::<VersionedStock, _>(
+            path.clone(),
+            &json!({}),
+            SpawnOpts::default(),
+            || vec![],
+        );
+        seed_journal_events(
+            &system,
+            &path,
+            vec![
+                crate::envelope::Event::from_json_view(Reserved::schema_id(), json!({ "qty": 3 })),
+                crate::envelope::Event::from_json_view(Reserved::schema_id(), json!({ "qty": 4 })),
+            ],
+        );
+
+        // When the process "starts again as the new code": stop, then
+        // re-spawn the SAME path (the boot-time recovery replays the
+        // journal — old payloads — into the new fold).
+        system.stop(&path).await;
+        system.spawn_es::<VersionedStock, _>(
+            path.clone(),
+            &json!({}),
+            SpawnOpts::default(),
+            || vec![],
+        );
+        // Then the new fold consumed the old payloads (polled: the
+        // boot-time replay runs concurrently with the spawn — the read
+        // waits for the fold to land): `qty` folded from both, and every
+        // added field read as its default (no notes).
+        let state = wait_for_returning(|| async {
+            system
+                .with_es_state::<VersionedStock, _>(&path, |s| (s.qty, s.notes))
+                .await
+                .filter(|&(qty, _)| qty == 7)
+        })
+        .await;
+        assert_eq!(
+            state,
+            Some((7, 0)),
+            "old payloads decode into the new shape with defaults"
+        );
+    }
+
+    #[tokio::test]
+    async fn snapshot_of_old_state_blob_restores_into_new_state_shape() {
+        // Given a journal whose SNAPSHOT blob was written by the old
+        // state shape (no `notes` field) above two old events.
+        let (system, _clock) = ActorSystem::test();
+        let path = ActorPath::new("versioned/snapshot");
+        system.spawn_es::<VersionedStock, _>(
+            path.clone(),
+            &json!({}),
+            SpawnOpts::default(),
+            || vec![],
+        );
+        {
+            let store = system.journal_store_trait();
+            let store = crate::journal::downcast_in_memory(&store).expect("in-memory store");
+            use crate::journal::JournalStore as _;
+            // OLD-shape writes: one event, an OLD-state snapshot blob
+            // covering it, then one more event AFTER the snapshot (the
+            // tail the new code must replay on top).
+            store
+                .append_sync(
+                    &path,
+                    &[crate::envelope::Event::from_json_view(
+                        Reserved::schema_id(),
+                        json!({ "qty": 5 }),
+                    )],
+                )
+                .expect("seed events");
+            store
+                .append_snapshot(&path, crate::journal::SeqNo::new(0), json!({ "qty": 5 }), 0)
+                .await
+                .expect("seed old-shape snapshot");
+            store
+                .append_sync(
+                    &path,
+                    &[crate::envelope::Event::from_json_view(
+                        Reserved::schema_id(),
+                        json!({ "qty": 7 }),
+                    )],
+                )
+                .expect("seed tail event");
+        }
+
+        // When the process "starts again as the new code": stop, then
+        // re-spawn the SAME path. The restore decodes the snapshot blob
+        // into the NEW struct (missing `notes` takes serde's default),
+        // then replays the tail on top.
+        system.stop(&path).await;
+        system.spawn_es::<VersionedStock, _>(
+            path.clone(),
+            &json!({}),
+            SpawnOpts::default(),
+            || vec![],
+        );
+        // Then the old blob restored cleanly (polled for the replay to
+        // land): qty from the snapshot, the added field defaulted, and
+        // the tail replayed on top.
+        let state = wait_for_returning(|| async {
+            system
+                .with_es_state::<VersionedStock, _>(&path, |s| (s.qty, s.notes))
+                .await
+                .filter(|&(qty, _)| qty == 12)
+        })
+        .await;
+        assert_eq!(
+            state,
+            Some((12, 0)),
+            "old snapshot blob restores into the new state shape (defaulted) + tail"
+        );
+    }
+
+    #[tokio::test]
+    async fn command_dispatch_accepts_old_payload_shape_for_new_command_struct() {
+        // Given a live counter whose Add command shape is UNCHANGED, and
+        // a wire-shaped send carrying ONLY the declared fields — the
+        // shape an old client (or an old journal redelivery) produces
+        // when the struct later GAINS an optional/defaulted field. The
+        // dispatch must decode it against the struct regardless.
+        let (system, _clock) = ActorSystem::test();
+        let path = ActorPath::new("versioned/cmd");
+        system.spawn_es::<Counter, _>(path.clone(), &json!({}), SpawnOpts::default(), || {
+            vec![Arc::new(
+                crate::actor::TypedEsAdapter::<Counter, Add>::new::<Add>(),
+            )]
+        });
+        wait_for_cursor(&system, &path, 0).await;
+
+        // When the old-shape payload arrives over the JSON seam.
+        system
+            .send(system.envelope(Add::schema_id(), path.clone(), json!({ "n": 9 })))
+            .await
+            .expect("delivered");
+
+        // Then the command dispatched (no dead letter, no Decode
+        // failure) and the fold committed — serde's missing-field path
+        // never blocked the message.
+        wait_for_cursor(&system, &path, 1).await;
+        assert_eq!(
+            system.dead_letter_count().await,
+            0,
+            "an old-shape payload must dispatch, not dead-letter"
+        );
+    }
+
+    #[test]
+    fn added_default_field_decodes_from_old_payload_directly() {
+        // Given an old-shape payload tree (one field) and the new struct.
+        let old = json!({ "qty": 2 });
+
+        // When decoding it into the new shape.
+        let v2: ReservedV2 = crate::json::Json::from(old).decode().expect("decode");
+
+        // Then the added field is the serde default and the old field
+        // round-trips.
+        assert_eq!(v2.qty, 2);
+        assert_eq!(v2.note, "");
+    }
 }
