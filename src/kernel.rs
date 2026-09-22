@@ -461,6 +461,13 @@ pub(crate) struct ActorCell {
     pub(crate) entries: std::sync::RwLock<Vec<Arc<dyn CommandEntry>>>,
     /// The spawn-declared message entries (service tier).
     pub(crate) msg_entries: std::sync::RwLock<Vec<Arc<dyn MsgEntry>>>,
+    /// The declared emit schemas, mirrored from the registry manifest at
+    /// spawn and kept in sync at the single declaration-mutation point —
+    /// so the step's emit gates read HERE, not through the registry lock
+    /// (the registry keeps its own copy for export/manifests). Std RwLock
+    /// like the other spawn-static cell config; the read side is the hot
+    /// side.
+    pub(crate) declared_emits: std::sync::RwLock<Vec<crate::schema::SchemaId>>,
 }
 
 /// Sentinel for "never"/"unanchored" in the cell's millis/seq atomics —
@@ -499,6 +506,7 @@ impl ActorCell {
             passivation: std::sync::RwLock::new(None),
             entries: std::sync::RwLock::new(Vec::new()),
             msg_entries: std::sync::RwLock::new(Vec::new()),
+            declared_emits: std::sync::RwLock::new(Vec::new()),
         }
     }
 
@@ -1552,16 +1560,17 @@ async fn step_es(ctx: &EsLoop) -> Step {
     // CONTINUES with the declared remainder: dropping is a state-consistent
     // outcome (apply runs per appended event), while failing the step would
     // burn restart budget on a static condition redelivery can never heal.
-    // The gate consults declarations WITHOUT copying the manifest: one
-    // lock-held pass partitions the buffer, the lock DROPS, then the
-    // undeclared remainder is dead-lettered (no lock is held across the
+    // The gate consults the CELL-LOCAL mirror (spawn-static config, synced
+    // at the declaration-mutation point): no registry lock, no kernel lock.
+    // One read-held pass partitions the buffer, the read guard DROPS, then
+    // the undeclared remainder is dead-lettered (no lock is held across the
     // async dead-letter work).
     let (declared_events, undeclared) = {
-        let registry_gate = ctx.registry.lock();
+        let declared_emits = ctx.cell.declared_emits.read().expect("declared emits lock");
         let mut declared = crate::envelope::Events::new();
         let mut undeclared = crate::envelope::Events::new();
         for event in events {
-            if registry_gate.declares_emit(&ctx.path, &event.schema) {
+            if declared_emits.contains(&event.schema) {
                 declared.push(event);
             } else {
                 undeclared.push(event);
@@ -2183,22 +2192,20 @@ async fn fan_out_emits(
 /// Returns `true` when the outbox carried `StopSelf` (the caller's step
 /// concludes with `Step::Stop`).
 async fn flush_outbox(ctx: &EsLoop, mut outbox: Outbox) -> bool {
-    // The gate consults declarations WITHOUT copying the manifest: one
-    // lock-held pass splits intents by declaration, the lock DROPS, then
-    // both arms proceed (no lock across the async delivery work).
+    // The gate consults the CELL-LOCAL mirror (spawn-static config, synced
+    // at the declaration-mutation point): no registry lock, no kernel lock.
+    // One read-held pass splits intents by declaration, the read guard
+    // DROPS, then both arms proceed (no lock across the async delivery).
     let (gated, ungated) = {
-        let registry_gate = ctx.registry.lock();
+        let declared_emits = ctx.cell.declared_emits.read().expect("declared emits lock");
         let mut ok = Vec::new();
         let mut dropped = Vec::new();
         for intent in outbox.drain() {
             // THE GATE: every outbound message declares itself. StopSelf
             // is not a message — it passes untouched.
-            let verdict = intent.emitted_schema().map(|schema| {
-                (
-                    schema.clone(),
-                    registry_gate.declares_emit(&ctx.path, schema),
-                )
-            });
+            let verdict = intent
+                .emitted_schema()
+                .map(|schema| (schema.clone(), declared_emits.contains(schema)));
             match verdict {
                 Some((schema, false)) => dropped.push((intent, schema)),
                 _ => ok.push(intent),

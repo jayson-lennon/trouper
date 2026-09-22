@@ -414,6 +414,41 @@ impl ActorSystem {
     pub fn drain_dead_letters(&self) -> Vec<crate::kernel::DeadLetter> {
         std::mem::take(&mut self.kernel.lock().dead_letters)
     }
+
+    /// Declares an emit schema for a live actor — THE declaration
+    /// mutation point: it writes the registry manifest AND the actor's
+    /// cell-local mirror in one critical section, so the step gates (which
+    /// read the mirror) can never diverge from the registry's copy. All
+    /// emit declarations for a spawned actor must flow through here
+    /// (spawn itself seeds the mirror from the manifest).
+    ///
+    /// # Errors
+    ///
+    /// Propagates the registry's `UnknownPath` (no live slot).
+    pub fn declare_emits(
+        &self,
+        path: &ActorPath,
+        schema: crate::schema::SchemaId,
+    ) -> Result<(), error_stack::Report<crate::registry::RegistryError>> {
+        // SEQUENTIAL, not nested: registry guard first, then the kernel's
+        // cells — the codebase never nests these two locks. No reader can
+        // observe a harmful mid-state: the gates read the mirror, and
+        // declarations are a pre-first-step operation.
+        {
+            let mut registry = self.registry.lock();
+            registry.declare_emits(path, schema.clone())?;
+        }
+        // Clone the cell out; the kernel guard drops before the mirror
+        // write (guards never span).
+        let cell = self.kernel.lock().cells.get(path).cloned();
+        if let Some(cell) = cell {
+            let mut mirror = cell.declared_emits.write().expect("declared emits lock");
+            if !mirror.contains(&schema) {
+                mirror.push(schema);
+            }
+        }
+        Ok(())
+    }
 }
 
 /// One actor's row in a system export.
@@ -947,6 +982,12 @@ impl ActorSystemCore {
         // Emit edges are ENFORCED against the manifest (the kernel drops
         // undeclared schemas pre-append) — the builder/foreign paths feed
         // extra declarations through `declare_emits` before the first step.
+        // The CELL MIRROR of the declared emits is stamped here (spawn-
+        // static config, like `entries`): the step gates read the mirror,
+        // keeping the registry lock off the message path. Post-spawn
+        // declarations flow through the same facade this write mirrors.
+        *cell.declared_emits.write().expect("declared emits lock") =
+            manifest.emits.iter().cloned().collect();
         drop(registry);
         // CELL-LOCAL SPAWN CONFIG: the per-actor bookkeeping the loop and
         // the front door will read — dispatch entries, snapshot cadence +
@@ -1120,11 +1161,15 @@ impl ActorSystemCore {
             }
         }
         // CELL-LOCAL SPAWN CONFIG (service tier): message entries,
-        // passivation, birth work stamp, watermark.
+        // passivation, birth work stamp, watermark. The declared-emits
+        // mirror is stamped here too (services CAN declare emits; the
+        // mirror matches the registry manifest either way).
         {
             let mut msg_slot = cell.msg_entries.write().expect("msg entries lock");
             *msg_slot = entries;
         }
+        *cell.declared_emits.write().expect("declared emits lock") =
+            manifest.emits.iter().cloned().collect();
         *cell.passivation.write().expect("passivation lock") = opts.passivation;
         cell.last_work_ms.store(
             self.clock.now().as_millis(),
@@ -4636,12 +4681,9 @@ mod tests {
         );
         // The emit edge the decision closure produces is declared explicitly
         // (emit enforcement drops undeclared schemas, so this is load-bearing).
-        {
-            let mut registry = system.registry.lock();
-            registry
-                .declare_emits(&ActorPath::new("tally-actor"), fact_for_emit)
-                .expect("live slot");
-        }
+        system
+            .declare_emits(&ActorPath::new("tally-actor"), fact_for_emit)
+            .expect("live slot");
 
         // When a JSON command is sent to the foreign actor and the ack
         // settles.
@@ -5836,12 +5878,9 @@ mod tests {
             SpawnOpts::default(),
             || vec![Arc::new(TypedEsAdapter::<BareCounter, Add>::new::<Add>())],
         );
-        {
-            let mut registry = system.registry.lock();
-            registry
-                .declare_emits(&positional_path, Added::schema_id())
-                .expect("declare positional emit edge");
-        }
+        system
+            .declare_emits(&positional_path, Added::schema_id())
+            .expect("declare positional emit edge");
         crate::builder::spawn_es_builder::<BareCounter>(&system)
             .at(builder_path.clone())
             .handles::<Add>()
@@ -5975,12 +6014,9 @@ mod tests {
         );
         // The positional flavor declares its emit edge post-spawn; the
         // builder declares it inline — same table, same enforcement.
-        {
-            let mut registry = system.registry.lock();
-            registry
-                .declare_emits(&ActorPath::new("t-pos"), fact.clone())
-                .expect("live slot");
-        }
+        system
+            .declare_emits(&ActorPath::new("t-pos"), fact.clone())
+            .expect("live slot");
         let built_decision: crate::actor::ForeignDecision = {
             let f = fact.clone();
             Arc::new(move |_state, cmd, _ctx| {
@@ -6529,8 +6565,7 @@ mod tests {
                 }),
                 SpawnOpts::default(),
             );
-            let mut registry = system.registry.lock();
-            registry
+            system
                 .declare_emits(&foreign_path, fact)
                 .expect("declare");
         }
@@ -7632,10 +7667,10 @@ mod tests {
             || vec![Arc::new(TypedEsAdapter::<BareCounter, Add>::new::<Add>())],
         );
         {
-            let mut registry = system.registry.lock();
-            registry
+            system
                 .declare_emits(&counter, Added::schema_id())
                 .expect("declare");
+            let mut registry = system.registry.lock();
             registry.add_rule(crate::pool::Rule {
                 source: None,
                 schema: Some(Add::schema_id()),
