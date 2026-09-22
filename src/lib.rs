@@ -34,6 +34,12 @@ pub mod tap;
 
 pub use crate::json::Json;
 
+// The schema derive macros live in `schema` (the prelude globs them from
+// there); the root re-export lets consumers write `trouper::Event` /
+// `trouper::Command` or `use trouper::{Event, Command}` without reaching
+// through the module or the prelude.
+pub use crate::schema::{Command, Event};
+
 /// Everything a typical actor author needs.
 pub mod prelude {
     pub use crate::actor::{ActorKind, ActorPath, Projector, SnapshotCadence, StopReason};
