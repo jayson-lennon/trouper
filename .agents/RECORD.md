@@ -101,12 +101,14 @@ Entries are added or amended **only with human approval**.
 - (docs) The trouper crate's public API documentation follows std rustdoc style — consumer-relevant statements only, no implementation narration — and cargo doc runs warning-free.
 - (runtime) Actor inbox backpressure engages at the spawn-configured mailbox capacity: Block senders await room, and DropNew/DropOld refusals dead-letter through the front door.
 - (lifecycle) A restarted actor's front door is created with the original spawn's mailbox capacity and policy.
+- (runtime) The front-door task handles only refused deliveries: Block holds, dead letters, and the fallback notify; direct sends push the inbox and notify the loop themselves.
+- (registry) An Endpoint couples the front-door channel sender with the destination's live cell; restarts swap the endpoint while the cell persists across restart.
 - (queries) A set-owned projector wake completes on a kernel caught-up signal; the tap's CaughtUp fact remains the host-observable marker.
 - (journal) A due-time snapshot check reads kernel-side anchors and loads the journal only when a snapshot is due.
 - (runtime) Ask reply leases are bounded: failed request deliveries cancel the lease and expired slots are pruned.
 - (bench) Criterion benches live in benches/e2e.rs (usage-shaped) and benches/micro.rs (component-shaped), run via cargo bench.
 - (bench) The e2e tell_acked bench measures the full send→fold→ack commit at batches of 1/64/512 messages; the fire_and_forget bench measures the sustained send-only price (channel accept + route) at the same cadence — its producer-side wait saturates to commit pace when the Block inbox fills, so it is not a durability or burst number.
-- (runtime) Message delivery wakes the actor's loop through a Notify signal fired by the front door; no fixed-interval polling exists on the message path.
+- (runtime) Message delivery wakes the actor's loop through a Notify signal fired by the sender on the direct-delivery path and by the front door on its fallback path; no fixed-interval polling exists on the message path.
 - (runtime) Per-actor mutable bookkeeping lives on the actor cell as lock-free state; the kernel tables lock guards cross-actor state only (an ES message's happy path acquires it zero times; a send acquires it once for its Sent fact).
 - (runtime) An idle actor's loop sleeps until its next due duty (snapshot cadence or passivation) or the next message, whichever comes first; an actor with no duties armed does not wake at all.
 - (runtime) A supervised child's crash is signaled by a Notify on the child's cell; supervision engines wake on the signal and read the crash flag lock-free instead of polling.

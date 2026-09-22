@@ -22,8 +22,11 @@
 //! There are NO fixed-interval polls anywhere in the runtime. Three wake
 //! mechanisms, all push-driven:
 //!
-//! 1. **Messages**: the front door fires `cell.work.notify_one()` on every
-//!    accepted push; an idle loop parks on `notified()` and wakes instantly.
+//! 1. **Messages**: an accepted delivery wakes the loop directly — the
+//!    sender pushes the inbox and fires `cell.work.notify_one()` itself
+//!    (the fast path); the front-door task fires the same notify on the
+//!    REFUSAL path it lands (Block-held retries, fallback deliveries).
+//!    An idle loop parks on `notified()` and wakes instantly.
 //! 2. **Duties** (snapshot cadence, passivation): the loop sleeps exactly
 //!    until its next due deadline (`next_duty_deadline`, computed from
 //!    cell-local reads). No duties armed ⇒ the loop parks forever — zero
@@ -424,7 +427,11 @@ pub(crate) struct ActorCell {
     pub(crate) watermark_high: std::sync::atomic::AtomicU64,
     /// The watermark latch: `true` from the up-crossing until the depth
     /// falls back to/below the mark, so a sustained overload produces one
-    /// fact, not one per message. Written only by the front door.
+    /// fact, not one per message. Written by BOTH delivery writers (the
+    /// direct-delivery fast path under the inbox guard, and the front
+    /// door's fallback path); the worst race at a crossing is one
+    /// suppressed or one extra `Backpressured` fact — never a lost
+    /// message.
     pub(crate) watermark_fired: std::sync::atomic::AtomicBool,
     /// Injected-clock millis of the last COMPLETED message step (only a
     /// committed step resets the passivation timer). Written by the loop
@@ -701,43 +708,60 @@ async fn route_inner(
             // is absent, so it is re-activated from the factory and the
             // journal replays. Converges: the second attempt cannot hit
             // a second drain (a just-activated actor is not idle).
-            if deliver_with_retry(&endpoint, envelope.clone())
-                .await
-                .is_err()
-            {
-                let retry_path = match resolve_partition(
-                    registry,
-                    kernel,
-                    shutting_down,
-                    &envelope,
-                    path.clone(),
-                    set_specs.0,
-                    set_specs.1,
-                )
-                .await
-                {
-                    Ok(Some(entity)) => entity,
-                    _ => path.clone(),
-                };
-                let retry_endpoint = {
-                    let registry = registry.lock();
-                    registry.resolve(&retry_path)
-                };
-                let Some(retry_endpoint) = retry_endpoint else {
-                    return Err(envelope);
-                };
-                deliver_with_retry(&retry_endpoint, envelope.clone()).await?;
-                return Ok(retry_path);
+            //
+            // DIRECT DELIVERY first: push the inbox and wake the loop
+            // with no front-door hop. A refusal (full, closed, or the
+            // closed inbox of a mid-restart slot) comes back BY VALUE
+            // (never a clone) and takes the front-door channel, which
+            // owns every refusal behavior — including the Closed error
+            // that drives the re-activation retry below. Evictions
+            // (DropOld) never reach the fallback: the push queued the
+            // envelope already, so only the evicted victim dead-letters
+            // (inside `direct_push`).
+            let mut envelope = envelope;
+            // The Sent fact's identity parts, captured before delivery
+            // consumes the envelope (the direct path moves it into the
+            // inbox). TraceCtx is Copy; the from/schema clones are
+            // shallow (schema id + option).
+            let (sent_from, sent_schema, sent_trace) =
+                (envelope.from.clone(), envelope.schema.clone(), envelope.trace);
+            if let Err(refused) = direct_push(&endpoint, envelope, kernel, sent_trace).await {
+                envelope = refused;
+                if deliver_with_retry(&endpoint, envelope.clone()).await.is_err() {
+                    let retry_path = match resolve_partition(
+                        registry,
+                        kernel,
+                        shutting_down,
+                        &envelope,
+                        path.clone(),
+                        set_specs.0,
+                        set_specs.1,
+                    )
+                    .await
+                    {
+                        Ok(Some(entity)) => entity,
+                        _ => path.clone(),
+                    };
+                    let retry_endpoint = {
+                        let registry = registry.lock();
+                        registry.resolve(&retry_path)
+                    };
+                    let Some(retry_endpoint) = retry_endpoint else {
+                        return Err(envelope);
+                    };
+                    deliver_with_retry(&retry_endpoint, envelope.clone()).await?;
+                    return Ok(retry_path);
+                }
             }
             {
                 let mut kernel = kernel.lock();
                 kernel.record_fact(
-                    envelope.trace.causality_id.as_millis_ts(),
+                    sent_trace.causality_id.as_millis_ts(),
                     crate::tap::FactKind::Sent {
-                        from: envelope.from.clone(),
+                        from: sent_from,
                         dest: Address::Path(path.clone()),
-                        schema: envelope.schema.clone(),
-                        trace: envelope.trace,
+                        schema: sent_schema,
+                        trace: sent_trace,
                     },
                 );
             }
@@ -1001,12 +1025,98 @@ async fn deliver_with_retry(endpoint: &Endpoint, envelope: Envelope) -> Result<(
     }
 }
 
+/// The direct-delivery fast path: push the destination's inbox under its
+/// own lock, check the backpressure watermark under the SAME guard, and
+/// fire its work notify — no front-door task hop.
+///
+/// A refusal hands the envelope BACK to the caller, which sends it through
+/// the front-door channel: the door task owns every refusal behavior
+/// (Block holds, dead letters, its own wake), so the fast path never
+/// re-implements policy. The one carve-out is a DropOld eviction: the push
+/// has ALREADY queued the new envelope, so the delivery completes here —
+/// falling back would deliver it twice — and the evicted envelope is
+/// dead-lettered with the same reason and detail the door uses (outside
+/// the inbox guard; inbox→kernel is the runtime's lock order).
+///
+/// WATERMARK: the fire-once latch check runs while still holding the
+/// inbox guard, so a push and its depth observation cannot interleave an
+/// ack between them. The latch is multi-writer now (this path AND the
+/// door) but the atomics were always written from multiple tasks; the
+/// worst race at a crossing is one suppressed or one extra `Backpressured`
+/// fact, never a lost message.
+async fn direct_push(
+    endpoint: &Endpoint,
+    envelope: Envelope,
+    kernel: &CountingKernelLock,
+    trace: crate::envelope::TraceCtx,
+) -> Result<(), Envelope> {
+    use std::sync::atomic::Ordering;
+    let cell = &endpoint.cell;
+    // The push and the recovery are clone-free: `push` moves the envelope
+    // in and a refusal moves it back out by value. `queued` covers both
+    // accepted outcomes (plain Ok and DropOld's queued-anyway eviction) —
+    // the watermark depth includes the new envelope either way.
+    let (evicted, fire_watermark): (Option<Envelope>, Option<u64>) = {
+        let mut inbox = cell.inbox.lock().await;
+        let evicted = match inbox.push(envelope) {
+            Ok(_) => None,
+            Err(refused) if refused.queued_anyway() => Some(refused.into_envelope()),
+            Err(refused) => return Err(refused.into_envelope()),
+        };
+        // LATCH CHECK (same guard): fire on the up-crossing, re-arm at or
+        // below the mark — identical semantics to the door's check.
+        let fire = if cell.has_watermark.load(Ordering::SeqCst) {
+            let depth = inbox.len() as u64;
+            let mark = cell.watermark_high.load(Ordering::Acquire);
+            if depth > mark
+                && !cell
+                    .watermark_fired
+                    .swap(true, Ordering::AcqRel)
+            {
+                Some(depth)
+            } else {
+                if depth <= mark {
+                    cell.watermark_fired.store(false, Ordering::Release);
+                }
+                None
+            }
+        } else {
+            None
+        };
+        (evicted, fire)
+    };
+    if let Some(depth) = fire_watermark {
+        kernel.tap_push(
+            trace.causality_id.as_millis_ts(),
+            crate::tap::FactKind::Backpressured {
+                path: cell.path.clone(),
+                depth,
+            },
+        );
+    }
+    if let Some(evicted) = evicted {
+        dead_letter(
+            kernel,
+            &evicted,
+            crate::kernel::DeadLetterReason::InboxRefused,
+            "inbox evicted oldest (DropOld)",
+        );
+    }
+    // The wake fires AFTER the guard drops (a minimal critical section);
+    // the loop's own push/ack path re-reads the inbox under the lock.
+    cell.work.notify_one();
+    Ok(())
+}
+
 /// The front-door task: drains the mpsc into the runtime-owned inbox.
 ///
-/// Only DropOld/DropNew refusals land here (under Block the channel's
-/// `.send().await` already paced the sender at the same depth as the
-/// inbox); refused/evicted messages are dead-lettered — never lost
-/// silently.
+/// The REFUSAL path only: accepted deliveries push the destination's
+/// inbox directly from the sender (`direct_push`) and never enter the
+/// channel. What lands here is what the fast path refused — a full or
+/// closed inbox — and the door owns every refusal behavior: Block holds
+/// (retry until an ack frees room), dead letters for DropNew/DropOld and
+/// closed inboxes, and the fallback wake + watermark check for the
+/// delivery it lands.
 pub(crate) async fn front_door_loop(
     cell: Arc<ActorCell>,
     kernel: Arc<CountingKernelLock>,
@@ -1064,6 +1174,12 @@ const BLOCK_HOLD_RETRIES: usize = 1_000;
 /// when a push succeeds (an ack freed room), or — after the retry budget —
 /// dead-letters as a last resort. Closed inboxes and DropNew/DropOld
 /// refusals dead-letter immediately, exactly as before.
+///
+/// ORDERING CAVEAT (direct delivery): a Block-refused message held HERE
+/// can be overtaken by the SAME sender's next message — after the hold
+/// ends, the sender's subsequent sends push the inbox directly and
+/// land while msg N still waits for room. Per-sender FIFO holds only in
+/// the no-refusal regime; cross-producer ordering was never guaranteed.
 async fn push_holding_block(
     cell: &ActorCell,
     kernel: &CountingKernelLock,
@@ -2624,7 +2740,9 @@ pub(crate) async fn restart_es(
         ctx.cell.mailbox_capacity,
         ctx.cell.mailbox_policy,
     ));
-    let endpoint = Endpoint::new(tx);
+    // The fresh endpoint couples the fresh channel to the SAME cell (the
+    // inbox is the identity that survives; only the door swaps).
+    let endpoint = Endpoint::new(tx, ctx.cell.clone());
     {
         let mut registry = ctx.registry.lock();
         registry

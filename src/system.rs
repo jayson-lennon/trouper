@@ -912,12 +912,21 @@ impl ActorSystemCore {
                 manifest.handles.push(schema);
             }
         }
+        // The CELL is built first: the endpoint couples the front-door
+        // channel to it (the direct-delivery target), and the kernel
+        // tables register it below.
+        let cell = Arc::new(ActorCell::new(
+            path.clone(),
+            Inbox::new(opts.mailbox_capacity.max(1), opts.mailbox_policy),
+            opts.mailbox_capacity.max(1),
+            opts.mailbox_policy,
+        ));
         let mut registry = self.registry.lock();
         registry
             .insert_slot(
                 path.clone(),
                 manifest.clone(),
-                Endpoint::new(tx),
+                Endpoint::new(tx, cell.clone()),
                 opts.mailbox_policy,
             )
             .expect("path free at spawn");
@@ -932,12 +941,6 @@ impl ActorSystemCore {
         // undeclared schemas pre-append) — the builder/foreign paths feed
         // extra declarations through `declare_emits` before the first step.
         drop(registry);
-        let cell = Arc::new(ActorCell::new(
-            path.clone(),
-            Inbox::new(opts.mailbox_capacity.max(1), opts.mailbox_policy),
-            opts.mailbox_capacity.max(1),
-            opts.mailbox_policy,
-        ));
         // CELL-LOCAL SPAWN CONFIG: the per-actor bookkeeping the loop and
         // the front door will read — dispatch entries, snapshot cadence +
         // anchor, passivation, birth work stamp, watermark — is stamped
@@ -1082,13 +1085,22 @@ impl ActorSystemCore {
             opts.mailbox_capacity,
             opts.mailbox_policy,
         ));
+        // The CELL is built first: the endpoint couples the front-door
+        // channel to it (the direct-delivery target), and the kernel
+        // tables register it below.
+        let cell = Arc::new(ActorCell::new(
+            path.clone(),
+            Inbox::new(opts.mailbox_capacity.max(1), opts.mailbox_policy),
+            opts.mailbox_capacity.max(1),
+            opts.mailbox_policy,
+        ));
         {
             let mut registry = self.registry.lock();
             registry
                 .insert_slot(
                     path.clone(),
                     manifest.clone(),
-                    Endpoint::new(tx),
+                    Endpoint::new(tx, cell.clone()),
                     opts.mailbox_policy,
                 )
                 .expect("path free at spawn");
@@ -1100,12 +1112,6 @@ impl ActorSystemCore {
                 registry.add_route(schema, path.clone());
             }
         }
-        let cell = Arc::new(ActorCell::new(
-            path.clone(),
-            Inbox::new(opts.mailbox_capacity.max(1), opts.mailbox_policy),
-            opts.mailbox_capacity.max(1),
-            opts.mailbox_policy,
-        ));
         // CELL-LOCAL SPAWN CONFIG (service tier): message entries,
         // passivation, birth work stamp, watermark.
         {
@@ -4415,6 +4421,19 @@ mod tests {
         system.register_schema::<PingAsk>();
         let path = ActorPath::new("ghost");
         let (tx, rx) = tokio::sync::mpsc::channel::<Envelope>(8);
+        // The synthetic dead slot: closed inbox + dropped receiver — under
+        // the direct-delivery path a fresh OPEN inbox would accept the ask
+        // silently, changing what this test asserts.
+        let dead_cell = std::sync::Arc::new(crate::kernel::ActorCell::new(
+            path.clone(),
+            {
+                let mut inbox = Inbox::new(8, OverloadPolicy::Block);
+                inbox.close();
+                inbox
+            },
+            8,
+            OverloadPolicy::Block,
+        ));
         system
             .registry
             .lock()
@@ -4423,7 +4442,7 @@ mod tests {
                 crate::schema::ActorManifest::new()
                     .handles::<PingAsk>()
                     .kind(ActorKind::Service),
-                Endpoint::new(tx),
+                Endpoint::new(tx, dead_cell),
                 OverloadPolicy::Block,
             )
             .expect("insert dead slot");
@@ -7773,6 +7792,28 @@ mod tests {
 
     static WORKER_GATE: std::sync::LazyLock<tokio::sync::Notify> =
         std::sync::LazyLock::new(tokio::sync::Notify::new);
+    /// The gate's released flag: notify_waiters alone is memory-less, and
+    /// the handler task may be scheduled after the release fires — the
+    /// flag makes the release observed regardless of ordering.
+    static WORKER_RELEASED: std::sync::atomic::AtomicBool =
+        std::sync::atomic::AtomicBool::new(false);
+
+    /// Parks until the test releases the gate (flag + notify latch).
+    async fn gate_wait() {
+        use std::sync::atomic::Ordering;
+        loop {
+            if WORKER_RELEASED.load(Ordering::SeqCst) {
+                return;
+            }
+            let notified = WORKER_GATE.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if WORKER_RELEASED.load(Ordering::SeqCst) {
+                return;
+            }
+            notified.await;
+        }
+    }
 
     impl ServiceActor for GatedWorker {
         fn manifest() -> ActorManifest {
@@ -7790,7 +7831,7 @@ mod tests {
     impl MsgHandler<Add> for GatedWorker {
         async fn handle(&mut self, msg: Add, _ctx: &mut crate::context::MsgCtx<'_>) {
             if msg.n == 0 {
-                WORKER_GATE.notified().await;
+                gate_wait().await;
             }
             self.sink.lock().push(format!("n={}", msg.n));
         }
@@ -7835,9 +7876,15 @@ mod tests {
                 .any(|f| matches!(&f.kind, crate::tap::FactKind::Backpressured { path, .. } if *path == plain))
         })
         .await;
-        // Release the gate so the worker drains (clean shutdown).
+        // Release the gate so the worker drains (clean shutdown): the
+        // flag is the memory, the notify the wake (either ordering works).
+        WORKER_RELEASED.store(true, std::sync::atomic::Ordering::SeqCst);
         WORKER_GATE.notify_waiters();
-        wait_for(|| async { sink_read(&plain).len() == 4 }).await;
+        wait_for(|| async {
+            let len = sink_read(&plain).len();
+            len == 4
+        })
+        .await;
 
         // Then exactly ONE Backpressured fact fired for the up-crossing
         // (rate-limited: not one per message).
@@ -10849,7 +10896,22 @@ mod tests {
             registry
                 .swap_endpoint(
                     &ActorPath::new("resurr"),
-                    Endpoint::new(tokio::sync::mpsc::channel(1).0),
+                    Endpoint::new(
+                        tokio::sync::mpsc::channel(1).0,
+                        // The mid-restart pretend cell: closed inbox, so the
+                        // direct-delivery fast path refuses exactly like the
+                        // closed channel does (the test asserts the skip).
+                        std::sync::Arc::new(crate::kernel::ActorCell::new(
+                            ActorPath::new("resurr"),
+                            {
+                                let mut inbox = Inbox::new(1, OverloadPolicy::Block);
+                                inbox.close();
+                                inbox
+                            },
+                            1,
+                            OverloadPolicy::Block,
+                        )),
+                    ),
                 )
                 .expect("slot exists");
         }

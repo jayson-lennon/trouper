@@ -89,29 +89,58 @@ pub fn decode_latest<T: Schema + serde::de::DeserializeOwned>(
 /// spawn-configured capacity, so a full mailbox backpressures senders via
 /// `.send().await` at exactly the configured bound.
 ///
+/// The handle also carries the destination's LIVE CELL: a sender may push
+/// straight into the cell's inbox and fire its wake itself (the direct
+/// delivery path), falling back to the front-door channel only when the
+/// inbox refuses. The cell persists across restarts — only the channel
+/// swaps — so the coupling is valid for the endpoint's whole lifetime.
+///
 /// # Known hazard
 ///
 /// True blocking means a cycle of actors whose mailboxes ALL fill up can
 /// deadlock: every member is blocked sending while blocked flushes wait on
 /// blocked peers. Size mailboxes so hot cycles cannot saturate every hop.
-#[derive(Debug)]
 pub struct Endpoint {
     tx: mpsc::Sender<Envelope>,
     /// The channel's total capacity (`pending` derives from it).
     capacity: usize,
+    /// The destination's live cell (its inbox is the direct-delivery
+    /// target; its `work` notify is the direct wake).
+    pub(crate) cell: std::sync::Arc<crate::kernel::ActorCell>,
+}
+
+impl std::fmt::Debug for Endpoint {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // The cell is not Debug (it is loop-internal bookkeeping); the
+        // channel side plus the live queue depth is what debug output
+        // wants.
+        f.debug_struct("Endpoint")
+            .field("capacity", &self.capacity)
+            .field("pending", &self.pending())
+            .finish_non_exhaustive()
+    }
 }
 
 impl Endpoint {
-    /// Wraps the front-door sender.
-    pub fn new(tx: mpsc::Sender<Envelope>) -> Self {
+    /// Wraps the front-door sender and its destination's live cell.
+    pub(crate) fn new(
+        tx: mpsc::Sender<Envelope>,
+        cell: std::sync::Arc<crate::kernel::ActorCell>,
+    ) -> Self {
         Self {
             capacity: tx.max_capacity(),
             tx,
+            cell,
         }
     }
 
     /// Envelopes accepted into the channel but not yet moved into the
     /// inbox by the front door (tests/reads: quiescence detection).
+    ///
+    /// Direct deliveries bypass the channel entirely, so this counts
+    /// only the fallback door's in-flight backlog; the flush quiescence
+    /// check pairs it with the inbox depth read (which covers both
+    /// paths), never on its own.
     pub fn pending(&self) -> usize {
         self.capacity.saturating_sub(self.tx.capacity())
     }
@@ -804,7 +833,14 @@ mod tests {
 
     fn endpoint(capacity: usize) -> (mpsc::Receiver<Envelope>, Endpoint) {
         let (tx, rx) = mpsc::channel(capacity);
-        (rx, Endpoint::new(tx))
+        let path = ActorPath::new("test.cell");
+        let cell = std::sync::Arc::new(crate::kernel::ActorCell::new(
+            path,
+            crate::inbox::Inbox::new(capacity, crate::inbox::OverloadPolicy::DropNew),
+            capacity,
+            crate::inbox::OverloadPolicy::DropNew,
+        ));
+        (rx, Endpoint::new(tx, cell))
     }
 
     fn envelope(n: u32) -> Envelope {
