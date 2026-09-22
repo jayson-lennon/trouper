@@ -12,7 +12,7 @@ use trouper::actor::{CommandHandler, EventSourcedActor};
 use trouper::prelude::*;
 use trouper::tap::FactKind;
 
-#[derive(Command, Serialize, Deserialize)]
+#[derive(Command, Serialize, Deserialize, Clone)]
 struct Ping {
     n: i64,
 }

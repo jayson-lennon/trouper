@@ -34,10 +34,10 @@ fn record(line: String) {
     sink().lock().push(line);
 }
 
-#[derive(Command, Serialize, Deserialize)]
+#[derive(Command, Serialize, Deserialize, Clone)]
 struct Tick {}
 
-#[derive(Command, Serialize, Deserialize)]
+#[derive(Command, Serialize, Deserialize, Clone)]
 struct StrictCmd {
     #[allow(dead_code)]
     n: i64,

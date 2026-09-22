@@ -14,7 +14,7 @@ use trouper::kernel::DeadLetterReason;
 use trouper::prelude::*;
 use trouper::tap::FactKind;
 
-#[derive(Command, Serialize, Deserialize)]
+#[derive(Command, Serialize, Deserialize, Clone)]
 struct KeyedAdd {
     // The `account` field is the shard key — the kernel reads it
     // per envelope to derive the entity path.

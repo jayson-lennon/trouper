@@ -250,8 +250,6 @@ pub(crate) static REGISTRY_LOCKS: std::sync::atomic::AtomicU64 =
 /// `ActorManifest` clones (test builds only). Bumped by the derive's
 /// hand-written `Clone` impl in schema.rs.
 #[cfg(test)]
-
-#[cfg(test)]
 pub(crate) fn bump_manifest_clones() {
     MANIFEST_CLONES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 }
@@ -733,7 +731,7 @@ fn apply_rules(
                 let copy = Envelope::shared_from(
                     envelope.schema.clone(),
                     Address::Path(observer.clone()),
-                    &envelope,
+                    envelope,
                     trace,
                 )
                 .from(envelope.from.clone().unwrap_or_else(|| ActorPath::new("anonymous")));

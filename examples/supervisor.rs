@@ -42,7 +42,7 @@ struct WorkJob {
 }
 
 /// A worker's completion announcement (published: news, not work).
-#[derive(Event, Debug, Serialize, Deserialize)]
+#[derive(Event, Debug, Serialize, Deserialize, Clone)]
 #[schema(description = "A worker finished a job.")]
 struct JobDone {
     id: u32,
@@ -51,7 +51,7 @@ struct JobDone {
 /// The escalation control message the engine SENDS to the declared
 /// parent when a child's budget exhausts. It is an ordinary message —
 /// the parent's handler owns the response.
-#[derive(Command, Debug, Serialize, Deserialize)]
+#[derive(Command, Debug, Serialize, Deserialize, Clone)]
 #[schema(description = "A supervised child exhausted its budget.")]
 struct Escalated {
     escalated: String,

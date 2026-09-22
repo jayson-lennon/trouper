@@ -29,12 +29,12 @@ use trouper::tap::FactKind;
 
 // -- Commands -------------------------------------------------------------
 
-#[derive(Command, Serialize, Deserialize)]
+#[derive(Command, Serialize, Deserialize, Clone)]
 struct Deposit {
     n: i64,
 }
 
-#[derive(Command, Serialize, Deserialize)]
+#[derive(Command, Serialize, Deserialize, Clone)]
 struct Withdraw {
     n: i64,
 }
@@ -42,7 +42,7 @@ struct Withdraw {
 /// The technical-failure trigger: panics in the handler ONCE — a
 /// transient fault. (A poison that panics every time is a permanent
 /// fault: supervision would burn the budget and stop the actor.)
-#[derive(Command, Serialize, Deserialize)]
+#[derive(Command, Serialize, Deserialize, Clone)]
 struct Poison {
     n: i64,
 }

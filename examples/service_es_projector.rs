@@ -27,11 +27,11 @@ use trouper::registry::RegistryError;
 
 // ---- The impure edge (same pool as service_projector.rs) -----------
 
-#[derive(Command, Debug, Serialize, Deserialize)]
+#[derive(Command, Debug, Serialize, Deserialize, Clone)]
 #[schema(description = "Take a connection from the pool.")]
 struct Checkout;
 
-#[derive(Command, Debug, Serialize, Deserialize)]
+#[derive(Command, Debug, Serialize, Deserialize, Clone)]
 #[schema(description = "Return a connection to the pool.")]
 struct Checkin;
 

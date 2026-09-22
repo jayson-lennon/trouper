@@ -809,7 +809,7 @@ mod tests {
         Envelope::from_bytes(
             SchemaId::new("Ping"),
             crate::envelope::Address::Path(ActorPath::new("a")),
-            PayloadBytes::from(Json::from(json!({ "n": n }))),
+            PayloadBytes::from(json!({ "n": n })),
             TraceCtx::root(),
         )
     }

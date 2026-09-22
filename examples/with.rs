@@ -24,7 +24,7 @@ use trouper::prelude::*;
 
 // ---- A journaled counter (the entity whose state we read) -------------
 
-#[derive(Command, Debug, Deserialize, Serialize)]
+#[derive(Command, Debug, Deserialize, Serialize, Clone)]
 #[schema(description = "Add to the counter.")]
 struct Add {
     n: i64,

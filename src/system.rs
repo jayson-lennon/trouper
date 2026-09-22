@@ -5880,23 +5880,6 @@ mod tests {
         assert_eq!(system.journal_len(&ActorPath::new("t-pos")), 1);
     }
 
-    /// Same name+version as Add but a different def body (first-wins
-    /// fixture: the schema table must keep the FIRST registration).
-    #[derive(Deserialize, Clone)]
-    struct AddFirstWins {
-        #[allow(dead_code)] // payload shape; never decoded in the test
-        n: i64,
-    }
-    impl Schema for AddFirstWins {
-        fn schema_def() -> SchemaDef {
-            SchemaDef {
-                name: "Add".into(),
-                                kind: SchemaKind::Command,
-                fields: vec![FieldDef::required("n", FieldTy::Int)],
-                description: Some("hand-first".into()),
-            }
-        }
-    }
 
     #[tokio::test]
     async fn builder_spawns_register_handled_and_emitted_schemas() {
@@ -9800,9 +9783,8 @@ mod tests {
 
     #[tokio::test]
     async fn shard_key_missing_still_dead_letters_the_copy() {
-        // Given a projector-set consumption whose KeyedAdd fact lacks its
-        // key — the behavior contract must survive the typed fabric.
-        let (system, _clock) = ActorSystem::test();
+        // The typed field() read behind shard-key extraction: a missing
+        // key reads as None (the DLQ contract), a present one resolves.
         // (no set installed — the simplest observable: publish a keyed
         // schema to a projector set declared on a key field, with the key
         // absent from the value.)

@@ -19,7 +19,7 @@ use trouper::system::SnapshotCadence;
 
 // -- A typed event-sourced actor -------------------------------------------
 
-#[derive(Command, Serialize, Deserialize)]
+#[derive(Command, Serialize, Deserialize, Clone)]
 #[schema(description = "Add stock")]
 struct Restock {
     sku: String,

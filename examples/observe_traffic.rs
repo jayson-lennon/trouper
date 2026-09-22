@@ -33,7 +33,7 @@ fn log(line: impl Into<String>) {
 }
 
 /// A command: fulfillment SHOULD ship the order.
-#[derive(Command, Debug, Serialize, Deserialize)]
+#[derive(Command, Debug, Serialize, Deserialize, Clone)]
 #[schema(description = "Fulfillment should ship the order.")]
 struct Ship {
     order: String,

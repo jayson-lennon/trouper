@@ -31,21 +31,21 @@ fn log(line: impl Into<String>) {
 }
 
 /// The fact: a document was saved somewhere.
-#[derive(Event, Debug, Serialize, Deserialize)]
+#[derive(Event, Debug, Serialize, Deserialize, Clone)]
 #[schema(description = "A document was saved.")]
 struct DocumentSaved {
     uri: String,
 }
 
 /// The command the router issues into the parser domain.
-#[derive(Command, Debug, Serialize, Deserialize)]
+#[derive(Command, Debug, Serialize, Deserialize, Clone)]
 #[schema(description = "Parse this document.")]
 struct ParseDocument {
     uri: String,
 }
 
 /// The parser's completion fact.
-#[derive(Event, Debug, Serialize, Deserialize)]
+#[derive(Event, Debug, Serialize, Deserialize, Clone)]
 #[schema(description = "A document was parsed.")]
 struct DocumentParsed {
     uri: String,
@@ -164,7 +164,7 @@ async fn main() {
             });
         }
     }
-    #[derive(Command, Debug, Serialize, Deserialize)]
+    #[derive(Command, Debug, Serialize, Deserialize, Clone)]
     struct SaveCmd {
         uri: String,
     }

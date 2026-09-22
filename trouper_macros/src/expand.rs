@@ -215,9 +215,9 @@ fn field_string_read(ty: &Type) -> TokenStream {
     } else if ty_is_stringish(ty) {
         // `&str` (and any other Deref-to-str stringish type): copy out.
         quote! { |v: &#ty| ::std::option::Option::Some(v.to_string()) }
-    } else if ty_is_numeric(ty) {
-        quote! { |v: &#ty| ::std::option::Option::Some(v.to_string()) }
-    } else if path_is(ty, "bool") {
+    } else if ty_is_numeric(ty) || path_is(ty, "bool") {
+        // Numbers and bools render their Display form (the canonical
+        // stringification for a shard key).
         quote! { |v: &#ty| ::std::option::Option::Some(v.to_string()) }
     } else {
         // Json-typed fields (objects, byte blobs) have no canonical

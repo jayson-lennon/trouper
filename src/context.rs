@@ -443,6 +443,9 @@ impl<'a> MsgCtx<'a> {
     /// Escape hatch: records a broadcast with an explicit schema id and
     /// hand-built payload. The envelope's destination is the schema
     /// address itself — the trace's `dest` reads as the fan-out target.
+    /// (Erased-surface seam: exercised by the context tests; the typed
+    /// publish is the production path.)
+    #[allow(dead_code)]
     pub(crate) fn publish_json(&mut self, schema: SchemaId, payload: Json) {
         let envelope = Envelope::raw(
             schema.clone(),
@@ -455,7 +458,10 @@ impl<'a> MsgCtx<'a> {
     }
 
     /// Records a reply with an explicit schema id and hand-built payload.
-    /// Same silent-drop contract as [`MsgCtx::reply`].
+    /// Same silent-drop contract as [`MsgCtx::reply`]. (Erased-surface
+    /// seam: exercised by the context tests; the typed reply is the
+    /// production path.)
+    #[allow(dead_code)]
     pub(crate) fn reply_json(&mut self, schema: SchemaId, payload: Json) {
         if let Some(reply_to) = self.core.reply_to() {
             self.core
