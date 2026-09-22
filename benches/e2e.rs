@@ -955,18 +955,14 @@ fn swarm(c: &mut Criterion) {
 }
 
 // ---------------------------------------------------------------------------
-// projection_read: frontend frame reads over a projector's live fold — the
-// poll → (optionally) commit → draw cycle a UI runs per frame.
-// "Drawing" IS the closure: `try_with_projector_state::<Ledger, _>(path,
-// |ledger| …)` runs over the live fold with zero copies (examples/
-// try_with.rs demos the pattern). Three shapes:
+// projection_read: frontend frame reads over a projector's live fold —
+// the render loop's steady-state read cost. "Drawing" IS the closure:
+// `try_with_projector_state::<Ledger, _>(path, |ledger| …)` runs over
+// the live fold with zero copies (examples/try_with.rs demos the
+// pattern). Two shapes:
 //   hot_typed  — N live projectors, closure read only (the steady frame);
-//   hot_json   — the JSON twin (`projector_state`), serialize + decode;
-//   poll+draw  — the frame loop: most frames read hot; every 8th the
-//                frontend sends one command and waits for the fold to
-//                advance, then draws (read-your-write).
-// Completion is the projector's own fold count (polled to an exact
-// watermark), so the bench measures COMPLETE cycles, not channel accepts.
+//   hot_json   — the JSON twin (`projector_state`), serialize + decode
+//                per read — the typed seam's alternative, priced.
 // ---------------------------------------------------------------------------
 
 fn projection_read(c: &mut Criterion) {
@@ -1076,55 +1072,12 @@ fn projection_read(c: &mut Criterion) {
         });
     });
 
-    // POLL+DRAW: the frame loop. 8 frames per iteration; on the 8th
-    // the frontend tells the source entity and waits for the fold to
-    // advance (read-your-write), then draws. One cycle = 7 hot
-    // frames + 1 commit-and-draw (the interactive shape: a user edits,
-    // the panel redraws).
-    group.bench_function("poll_then_draw_cycle", |b| {
-        b.iter(|| {
-            rt.block_on(async {
-                let entity = ActorPath::new("bench/proj-src-0");
-                let projector = ActorPath::new("bench/proj-read-0");
-                let before = system
-                    .with_projector_state::<Ledger, _>(&projector, |l| l.count)
-                    .await
-                    .unwrap_or(0);
-                // 7 hot frames (most frames draw without new data).
-                for _ in 0..7 {
-                    let _ = system.try_with_projector_state::<Ledger, _>(&projector, |l| l.count);
-                }
-                // The edit: one command, wait for the fold to move.
-                system
-                    .tell(entity.clone(), Tick { n: 1 })
-                    .await
-                    .expect("delivered");
-                let mut settled = false;
-                for _ in 0..30_000 {
-                    if system
-                        .with_projector_state::<Ledger, _>(&projector, |l| l.count)
-                        .await
-                        >= Some(before + 1)
-                    {
-                        settled = true;
-                        break;
-                    }
-                    tokio::time::sleep(Duration::from_millis(1)).await;
-                }
-                assert!(settled, "fold never advanced past {before}");
-                // The draw over the freshly advanced fold.
-                let frame = system
-                    .with_projector_state::<Ledger, _>(&projector, |l| {
-                        (l.count, l.tail.last().copied())
-                    })
-                    .await;
-                assert!(
-                    frame.is_some_and(|(count, _)| count > before),
-                    "draw must observe the new fact"
-                );
-            });
-        });
-    });
+    // NOTE: there is deliberately no "send then wait for the fold to
+    // advance" case here. A GUI never polls for catch-up — its render
+    // loop just re-reads hot each frame (the hot cases above). End-to-end
+    // "when does the edit appear on screen" composes from existing
+    // benches: tell_baseline (commit) + broadcast/fanout (delivery) +
+    // hot_typed (the draw).
 
     group.finish();
 }
