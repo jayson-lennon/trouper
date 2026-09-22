@@ -204,12 +204,12 @@ functionally a command. "Command vs event" is not a wire property; see §7.
 
 ## 4. Schema-addressing, plainly
 
-Every message already carries a registered schema id (`ParseDocument@1`). The three verbs
+Every message already carries a registered schema id (`ParseDocument`). The three verbs
 differ only in what the envelope's destination says:
 
 - `Path("parse/worker-2")` — aimed at a name;
-- `Schema("ParseDocument@1")` + one-of — aimed at "whoever does this job";
-- `Schema("ParseDocument@1")` + broadcast — aimed at "everyone who cares about this."
+- `Schema("ParseDocument")` + one-of — aimed at "whoever does this job";
+- `Schema("ParseDocument")` + broadcast — aimed at "everyone who cares about this."
 
 `send_to_any` is nothing new under the hood: it is the typed wrapper over the existing
 schema-addressed send. The kernel resolves it through the route table — `Single` while
@@ -362,7 +362,7 @@ impl EventSourcedActor for Account {
     // override unless you seed from spawn args:
     // fn restore(args: &Json) -> Self { let g: Genesis = args.decode().unwrap(); ... }
     fn apply(&mut self, event: &Event) {                        // fold: fact → state
-        if let Some(e) = event.decode::<Credited>() {           // schema-id matched (name@version)
+        if let Some(e) = event.as_fact::<Credited>() {           // schema-name matched (downcast)
             self.balance += e.delta;
         }
     }
@@ -378,8 +378,8 @@ Decisions return an **`Events`** buffer (inline for two events, heap beyond —
 the common one-event case never allocates). Build facts with `Events::one` /
 `push_event` from any `Schema + Serialize` type via the blanket
 **`IntoEvent`**; `Events::push(Event)` is the raw escape hatch. Folds decode
-by exact schema id — `event.decode::<T>()` yields `Some` only for
-`T::schema_id()` (`name@version`, version-pinned); `event.is::<T>()` matches
+by schema name — `event.as_fact::<T>()` yields `Some` only for
+`T::schema_id()` (the schema NAME); `event.is::<T>()` matches
 without decoding.
 
 - `handle` is **sync and pure**: input in, facts out. The kernel appends those facts to

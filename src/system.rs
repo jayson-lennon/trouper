@@ -835,7 +835,7 @@ impl ActorSystemCore {
         registry.register_schema_json(json)
     }
 
-    /// The registered descriptor for an exact `name@version` id, if any.
+    /// The registered descriptor for a schema name, if any.
     pub fn schema(&self, id: &SchemaId) -> Option<crate::schema::SchemaDef> {
         let registry = self.registry.lock();
         registry.schema(id).cloned()
@@ -4936,7 +4936,7 @@ mod tests {
         // When registering it as JSON.
         let id = system.register_schema_json(foreign).expect("valid");
 
-        // Then it is retrievable by its name@version id.
+        // Then it is retrievable by its schema name.
         let stored = system.schema(&id).expect("stored");
         assert_eq!(id.to_string(), "ForeignPing");
         assert_eq!(stored.name, "ForeignPing");

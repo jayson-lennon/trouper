@@ -558,7 +558,7 @@ impl Registry {
         use error_stack::IntoReport;
         // The key field must be declared (with the ShardKey role) on at
         // least one COMMAND schema whose route could reach this set. The
-        // schema table is keyed by `name@version`; scan all command
+        // schema table is keyed by name; scan all command
         // schemas for a field with the declared name + role.
         let key_declared = self
             .schemas

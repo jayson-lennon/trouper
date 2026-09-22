@@ -1,9 +1,14 @@
 //! Runtime-internal envelopes and the message shapes that ride in them.
 //!
 //! Users never construct envelopes: the runtime assembles the metadata at the
-//! send boundary. Handlers see typed payloads plus a context. Payloads cross
-//! the runtime boundary as JSON; the typed arm exists only for in-process
-//! zero-copy fast paths, erased exactly once at spawn.
+//! send boundary. Handlers see typed payloads plus a context.
+//!
+//! The fabric invariant: a payload is a LIVE TYPED VALUE behind a shared,
+//! memoizing cell (`Arc<dyn PayloadValue>`). Handlers downcast; nothing on
+//! the message path walks a JSON tree. Serde exists at exactly two doors —
+//! erased ingress ([`PayloadBytes`] from outside the system) and the journal
+//! (the payload's memoized compact encoding) — and every payload value
+//! serializes at most once, however many readers ask.
 
 use std::ops::Deref;
 use std::sync::Arc;
@@ -992,7 +997,7 @@ mod events_tests {
         // When converting it into an event.
         let event = fact.into_event();
 
-        // Then the schema id is derived from the type (name@version) and the
+        // Then the schema id is derived from the type and the
         // payload is the serialized fact.
         assert_eq!(event.schema, Deposited::schema_id());
         assert_eq!(event.schema.as_str(), "Deposited");
