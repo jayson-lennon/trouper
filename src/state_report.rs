@@ -80,7 +80,10 @@ impl CommandHandler<ReportState> for StateReporter {
         // Raw push, deliberately: the payload IS the export document, not a
         // field of a typed fact — there is nothing for IntoEvent to build.
         let mut events = Events::new();
-        events.push(Event::from_json_view(StateReported::schema_id(), cmd.export));
+        events.push(Event::from_json_view(
+            StateReported::schema_id(),
+            cmd.export,
+        ));
         events
     }
 }
@@ -144,7 +147,10 @@ mod tests {
         let first = test_export(1);
         let second = test_export(2);
         for payload in [&first, &second] {
-            reporter.apply(&Event::from_json_view(StateReported::schema_id(), payload.clone()));
+            reporter.apply(&Event::from_json_view(
+                StateReported::schema_id(),
+                payload.clone(),
+            ));
         }
 
         // Then seq counts every applied report and export is the LAST one.
@@ -156,7 +162,10 @@ mod tests {
     fn apply_ignores_foreign_event_schemas() {
         // Given a reporter with one recorded report.
         let mut reporter = StateReporter::default();
-        reporter.apply(&Event::from_json_view(StateReported::schema_id(), test_export(1)));
+        reporter.apply(&Event::from_json_view(
+            StateReported::schema_id(),
+            test_export(1),
+        ));
 
         // When a foreign-schema event is applied.
         let other = SchemaId::new("Foreign");

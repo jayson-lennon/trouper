@@ -128,7 +128,8 @@ async fn main() {
         }))
         .apply(Arc::new(|state: &mut Json, ev: &Event| {
             state["total"] = json!(
-                state["total"].as_i64().unwrap_or(0) + ev.payload_json()["delta"].as_i64().unwrap_or(0)
+                state["total"].as_i64().unwrap_or(0)
+                    + ev.payload_json()["delta"].as_i64().unwrap_or(0)
             );
         }))
         .emits_id(SchemaId::new("TallyAdded"))

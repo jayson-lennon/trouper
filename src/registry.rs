@@ -27,7 +27,8 @@ use crate::schema::{ActorManifest, Schema, SchemaDef, SchemaError};
 ///
 /// Same-type re-claims (the idempotent re-registration case: spawning two
 /// actors that both `.handles::<Add>()`) succeed.
-pub(crate) fn claim_schema_type<S: Schema + 'static>() -> Result<(), error_stack::Report<SchemaError>> {
+pub(crate) fn claim_schema_type<S: Schema + 'static>()
+-> Result<(), error_stack::Report<SchemaError>> {
     use std::collections::hash_map::Entry;
     static OWNERS: std::sync::OnceLock<parking_lot::Mutex<HashMap<String, std::any::TypeId>>> =
         std::sync::OnceLock::new();
@@ -72,12 +73,10 @@ pub fn decode_latest<T: Schema + serde::de::DeserializeOwned>(
 ) -> Result<T, error_stack::Report<SchemaError>> {
     use error_stack::{IntoReport, ResultExt};
     if name.as_str() != T::schema_id().as_str() {
-        return Err(SchemaError::InvalidDescriptor
-            .into_report()
-            .attach(format!(
-                "decode_latest: requested {name} through type {}",
-                std::any::type_name::<T>()
-            )));
+        return Err(SchemaError::InvalidDescriptor.into_report().attach(format!(
+            "decode_latest: requested {name} through type {}",
+            std::any::type_name::<T>()
+        )));
     }
     serde_json::from_slice::<T>(bytes.as_bytes()).change_context(SchemaError::InvalidDescriptor)
 }
@@ -732,7 +731,10 @@ impl Registry {
 
     /// The route pick and its live endpoint in ONE read (a send's single
     /// critical section; returns both `None`s when unrouted).
-    pub fn route_resolved(&mut self, schema: &SchemaId) -> (Option<ActorPath>, Option<std::sync::Arc<Endpoint>>) {
+    pub fn route_resolved(
+        &mut self,
+        schema: &SchemaId,
+    ) -> (Option<ActorPath>, Option<std::sync::Arc<Endpoint>>) {
         match self.route(schema) {
             Some(target) => {
                 let endpoint = self.resolve(&target);

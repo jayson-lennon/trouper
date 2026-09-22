@@ -16,6 +16,45 @@
 //!
 //! Loop discipline (project skill): one loop per function; loop bodies are
 //! named step functions.
+//!
+//! ## Wake contract (deadline idle, no polls)
+//!
+//! There are NO fixed-interval polls anywhere in the runtime. Three wake
+//! mechanisms, all push-driven:
+//!
+//! 1. **Messages**: the front door fires `cell.work.notify_one()` on every
+//!    accepted push; an idle loop parks on `notified()` and wakes instantly.
+//! 2. **Duties** (snapshot cadence, passivation): the loop sleeps exactly
+//!    until its next due deadline (`next_duty_deadline`, computed from
+//!    cell-local reads). No duties armed ⇒ the loop parks forever — zero
+//!    wakeups (probe-counted). Under a fake clock (tests) the sleep races
+//!    the clock watch, so `advance()` recomputes duties instantly.
+//! 3. **Supervision**: a crash stores the cell flag then fires the cell's
+//!    `crash_signal` Notify; the engine parks on it (check-then-park) and
+//!    reads the flag lock-free. An idle engine acquires nothing.
+//!
+//! ## Ownership rule (cell-local vs kernel tables)
+//!
+//! Per-actor bookkeeping that only the actor's own loop (plus its spawn/
+//! restart path) writes lives on the [`ActorCell`] as atomics/`RwLock`s:
+//! crash flag, watermark mark + latch, last-work stamp, last committed seq
+//! (`u64::MAX` = never committed, preserving the seq-0 rule), snapshot
+//! anchor (`u64::MAX` = unanchored), snapshot cadence + passivation config
+//! (an `RwLock`, not `OnceLock`: the projector-set activation arm may
+//! override spawn config before the first idle), and dispatch entries.
+//! Single-flag reads (supervisor, front door) are lock-free Acquire/Release.
+//!
+//! The kernel tables keep ONLY cross-actor state whose observations span
+//! actors: cells, journal store, live state slots (restart swaps them under
+//! the tables lock), specs/failures, replies/asks, projectors, dead letters,
+//! and the tap. The `caught_up` counter stays kernel-side by contract: the
+//! projector cold-wake snapshots it across a re-spawn (which builds a fresh
+//! cell), so a cell-local counter would reset to zero and the wake would
+//! false-succeed on an incomplete fold.
+//!
+//! The message happy path acquires the kernel tables lock ZERO times (tap
+//! and store ride lock-free Arc handles); a send acquires it once (its Sent
+//! fact). Probe-counted under `cfg(test)` (`KERNEL_LOCKS`, `CELL_WAKEUPS`).
 
 use parking_lot::Mutex;
 use std::collections::{HashMap, HashSet};
@@ -260,8 +299,7 @@ pub(crate) fn bump_deep_clones() {
 }
 
 #[cfg(test)]
-pub(crate) static DEEP_CLONES: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
+pub(crate) static DEEP_CLONES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// The number of deep payload-tree clones in a test window (sync bodies:
 /// pure closures like `Json::decode` — async windows read the atomics
@@ -295,8 +333,7 @@ pub(crate) fn bump_kernel_locks() {
 }
 
 #[cfg(test)]
-pub(crate) static KERNEL_LOCKS: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
+pub(crate) static KERNEL_LOCKS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// ES/service loop wakeups that are NOT message deliveries (test builds
 /// only): every iteration that completes the idle select's timer arm.
@@ -308,9 +345,7 @@ pub(crate) fn bump_cell_wakeups() {
 }
 
 #[cfg(test)]
-pub(crate) static CELL_WAKEUPS: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
-
+pub(crate) static CELL_WAKEUPS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// `ActorManifest` clones (test builds only). Bumped by the derive's
 /// hand-written `Clone` impl in schema.rs.
@@ -329,9 +364,7 @@ pub(crate) fn bump_serde_calls() {
 }
 
 #[cfg(test)]
-pub(crate) static SERDE_CALLS: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
-
+pub(crate) static SERDE_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Kernel-facing handle for one running actor loop.
 pub(crate) struct ActorHandle {
@@ -629,7 +662,17 @@ async fn route_inner(
             // ONE entity/projector, derived from the payload's shard key
             // (activated on demand); the specs were pre-read above (one
             // lock for the send's whole registry read).
-            let path = match resolve_partition(registry, kernel, shutting_down, &envelope, path.clone(), set_specs.0.clone(), set_specs.1.clone()).await {
+            let path = match resolve_partition(
+                registry,
+                kernel,
+                shutting_down,
+                &envelope,
+                path.clone(),
+                set_specs.0.clone(),
+                set_specs.1.clone(),
+            )
+            .await
+            {
                 Ok(Some(entity)) => entity,
                 Ok(None) => path,
                 Err(missing_key_envelope) => {
@@ -755,7 +798,8 @@ async fn resolve_partition(
         // Not an entity partition: fall through to the projector-set
         // check (a path belongs to at most one set — both tables are
         // keyed by public path; the caller pre-read BOTH in one lock).
-        return resolve_projector_set(registry, kernel, shutting_down, envelope, projector_spec).await;
+        return resolve_projector_set(registry, kernel, shutting_down, envelope, projector_spec)
+            .await;
     };
     let key = match extract_key(registry, envelope, &spec.key_field) {
         Some(key) => key,
@@ -780,7 +824,11 @@ async fn resolve_partition(
 }
 
 /// Schema-aware shard-key extraction from an envelope's payload.
-fn extract_key(registry: &crate::system::CountingRegistryLock, envelope: &Envelope, key_field: &str) -> Option<String> {
+fn extract_key(
+    registry: &crate::system::CountingRegistryLock,
+    envelope: &Envelope,
+    key_field: &str,
+) -> Option<String> {
     let reg = registry.lock();
     let payload = envelope.payload_json();
     match reg.schema(&envelope.schema) {
@@ -835,8 +883,7 @@ async fn resolve_projector_set(
         let cell = kernel.lock().cells.get(&projector_path).cloned();
         if let Some(cell) = cell {
             *cell.passivation.write().expect("passivation lock") = spec.opts.passivation;
-            *cell.snapshot_policy.write().expect("snapshot policy lock") =
-                spec.opts.snapshot;
+            *cell.snapshot_policy.write().expect("snapshot policy lock") = spec.opts.snapshot;
         }
     }
     Ok(Some(projector_path))
@@ -893,7 +940,12 @@ fn apply_rules(
                     envelope,
                     trace,
                 )
-                .from(envelope.from.clone().unwrap_or_else(|| ActorPath::new("anonymous")));
+                .from(
+                    envelope
+                        .from
+                        .clone()
+                        .unwrap_or_else(|| ActorPath::new("anonymous")),
+                );
                 tee = Some((copy, observer.clone(), origin_trace));
             }
             crate::pool::RuleAction::Inline(interposer) => {
@@ -915,17 +967,14 @@ pub(crate) fn dead_letter(
     reason: crate::kernel::DeadLetterReason,
     detail: &str,
 ) {
-    kernel
-        .lock()
-        .dead_letters
-        .push(DeadLetter {
-            schema: envelope.schema.clone(),
-            dest: envelope.dest.clone(),
-            reason: reason.clone(),
-            detail: detail.to_owned(),
-            trace: envelope.trace,
-            envelope: envelope.clone(),
-        });
+    kernel.lock().dead_letters.push(DeadLetter {
+        schema: envelope.schema.clone(),
+        dest: envelope.dest.clone(),
+        reason: reason.clone(),
+        detail: detail.to_owned(),
+        trace: envelope.trace,
+        envelope: envelope.clone(),
+    });
     // The fact rides the self-locking tap — observation never needs the
     // kernel tables.
     kernel.tap_push(
@@ -975,7 +1024,9 @@ pub(crate) async fn front_door_loop(
         // self-locking tap.
         if cell.has_watermark.load(std::sync::atomic::Ordering::SeqCst) {
             let depth = cell.inbox.lock().await.len() as u64;
-            let wm = cell.watermark_high.load(std::sync::atomic::Ordering::Acquire);
+            let wm = cell
+                .watermark_high
+                .load(std::sync::atomic::Ordering::Acquire);
             if depth > wm
                 && !cell
                     .watermark_fired
@@ -1063,39 +1114,34 @@ impl Idler {
     ///   (the seq-0 rule — an unanchored or never-committed cadence is
     ///   never due, exactly as `maybe_snapshot_on_idle` decides);
     /// - passivation: birth/last-work stamp + idle window.
+    ///
     /// The minimum of the armed duties wins. Mirrors the idle checks'
     /// cell reads verbatim — a deadline and the check that consumes it
     /// can never disagree.
     fn next_duty_due_ms(&self, cell: &ActorCell) -> Option<u64> {
-        let snapshot_due: Option<u64> = match *cell
-            .snapshot_policy
-            .read()
-            .expect("snapshot policy lock")
-        {
-            crate::actor::SnapshotCadence::Time(interval) => {
-                let anchor = cell
-                    .snapshot_anchor_ms
-                    .load(std::sync::atomic::Ordering::Acquire);
-                let committed = cell
-                    .last_event_seq
-                    .load(std::sync::atomic::Ordering::Acquire);
-                if anchor == CELL_SENTINEL || committed == CELL_SENTINEL {
-                    None
-                } else {
-                    Some(anchor.saturating_add(interval.as_millis() as u64))
+        let snapshot_due: Option<u64> =
+            match *cell.snapshot_policy.read().expect("snapshot policy lock") {
+                crate::actor::SnapshotCadence::Time(interval) => {
+                    let anchor = cell
+                        .snapshot_anchor_ms
+                        .load(std::sync::atomic::Ordering::Acquire);
+                    let committed = cell
+                        .last_event_seq
+                        .load(std::sync::atomic::Ordering::Acquire);
+                    if anchor == CELL_SENTINEL || committed == CELL_SENTINEL {
+                        None
+                    } else {
+                        Some(anchor.saturating_add(interval.as_millis() as u64))
+                    }
                 }
-            }
-            _ => None,
-        };
-        let passivation_due: Option<u64> = (*cell
-            .passivation
-            .read()
-            .expect("passivation lock"))
-        .map(|p| {
-            cell.last_work_ms
-                .load(std::sync::atomic::Ordering::Acquire)
-                .saturating_add(p.idle_for.as_millis() as u64)
-        });
+                _ => None,
+            };
+        let passivation_due: Option<u64> = (*cell.passivation.read().expect("passivation lock"))
+            .map(|p| {
+                cell.last_work_ms
+                    .load(std::sync::atomic::Ordering::Acquire)
+                    .saturating_add(p.idle_for.as_millis() as u64)
+            });
         match (snapshot_due, passivation_due) {
             (Some(a), Some(b)) => Some(a.min(b)),
             (a, b) => a.or(b),
@@ -1112,11 +1158,7 @@ impl Idler {
     /// wake; the clock jump is now). No duties armed: park forever in
     /// production (`pending` — zero wakeups, the deliverable), or just
     /// on clock jumps under a fake.
-    async fn idle_wait(
-        &self,
-        cell: &ActorCell,
-        shutdown: &mut watch::Receiver<bool>,
-    ) {
+    async fn idle_wait(&self, cell: &ActorCell, shutdown: &mut watch::Receiver<bool>) {
         let notified = cell.work.notified();
         let fake_watch = self.clock.fake_watch();
         tokio::select! {
@@ -1212,9 +1254,7 @@ pub(crate) async fn es_actor_loop(loop_ctx: EsLoop, mut shutdown: watch::Receive
         let idler = Idler {
             clock: loop_ctx.clock.clone(),
         };
-        idler
-            .idle_wait(&loop_ctx.cell, &mut shutdown)
-            .await;
+        idler.idle_wait(&loop_ctx.cell, &mut shutdown).await;
     }
     drain_inbox_on_stop(&loop_ctx).await;
 }
@@ -1659,7 +1699,10 @@ impl crate::context::AskPort for KernelAskPort {
         Box<
             dyn Future<
                     Output = Result<
-                        (crate::reply::LeaseId, tokio::sync::oneshot::Receiver<crate::envelope::Payload>),
+                        (
+                            crate::reply::LeaseId,
+                            tokio::sync::oneshot::Receiver<crate::envelope::Payload>,
+                        ),
                         error_stack::Report<crate::context::AskError>,
                     >,
                 > + Send,
@@ -1919,7 +1962,10 @@ async fn resolve_reply(
             // Mechanism: complete the lease if it is still live; a dead
             // (expired/pruned) slot just drops the reply — the asker is
             // gone, and the ask timed out on its side already.
-            kernel.lock().replies.complete(&lease, crate::envelope::Payload::json_view(payload));
+            kernel
+                .lock()
+                .replies
+                .complete(&lease, crate::envelope::Payload::json_view(payload));
         }
         Address::Schema(_) => {
             // A schema-addressed reply is an ordinary routed send (the
@@ -1986,7 +2032,14 @@ async fn fan_out_emits(
         )
         .from(ctx.path.clone())
         .with_recorded_origin(ctx.path.clone(), *seq);
-        broadcast(&ctx.registry, &ctx.kernel, &ctx.shutting_down, schema, envelope).await;
+        broadcast(
+            &ctx.registry,
+            &ctx.kernel,
+            &ctx.shutting_down,
+            schema,
+            envelope,
+        )
+        .await;
     }
 }
 
@@ -2012,9 +2065,12 @@ async fn flush_outbox(ctx: &EsLoop, mut outbox: Outbox) -> bool {
         for intent in outbox.drain() {
             // THE GATE: every outbound message declares itself. StopSelf
             // is not a message — it passes untouched.
-            let verdict = intent
-                .emitted_schema()
-                .map(|schema| (schema.clone(), registry_gate.declares_emit(&ctx.path, schema)));
+            let verdict = intent.emitted_schema().map(|schema| {
+                (
+                    schema.clone(),
+                    registry_gate.declares_emit(&ctx.path, schema),
+                )
+            });
             match verdict {
                 Some((schema, false)) => dropped.push((intent, schema)),
                 _ => ok.push(intent),
@@ -2034,7 +2090,9 @@ async fn flush_outbox(ctx: &EsLoop, mut outbox: Outbox) -> bool {
     for intent in gated {
         match intent {
             crate::context::Intent::Send(envelope) => {
-                if let Err(undeliverable) = route(&ctx.registry, &ctx.kernel, &ctx.shutting_down, envelope).await {
+                if let Err(undeliverable) =
+                    route(&ctx.registry, &ctx.kernel, &ctx.shutting_down, envelope).await
+                {
                     dead_letter(
                         &ctx.kernel,
                         &undeliverable,
@@ -2059,7 +2117,16 @@ async fn flush_outbox(ctx: &EsLoop, mut outbox: Outbox) -> bool {
                 payload,
                 trace,
             } => {
-                resolve_reply(&ctx.kernel, &ctx.registry, &ctx.shutting_down, to, schema, payload, trace).await;
+                resolve_reply(
+                    &ctx.kernel,
+                    &ctx.registry,
+                    &ctx.shutting_down,
+                    to,
+                    schema,
+                    payload,
+                    trace,
+                )
+                .await;
             }
             crate::context::Intent::StopSelf => stop_self = true,
         }
@@ -2186,13 +2253,7 @@ async fn maybe_snapshot_on_idle(ctx: &EsLoop) {
     if anchor == CELL_SENTINEL || last_committed == CELL_SENTINEL {
         return;
     }
-    if ctx
-        .clock
-        .now()
-        .as_millis()
-        .saturating_sub(anchor)
-        < interval.as_millis() as u64
-    {
+    if ctx.clock.now().as_millis().saturating_sub(anchor) < interval.as_millis() as u64 {
         return;
     }
     snapshot_now(ctx, crate::journal::SeqNo::new(last_committed)).await;
@@ -2234,10 +2295,7 @@ fn stamp_work(ctx: &EsLoop) {
 async fn maybe_passivate(ctx: &EsLoop) -> bool {
     // The sweep owns termination: passivation stands down (lock-free —
     // the loop holds its own Arc of the barrier).
-    if ctx
-        .shutting_down
-        .load(std::sync::atomic::Ordering::SeqCst)
-    {
+    if ctx.shutting_down.load(std::sync::atomic::Ordering::SeqCst) {
         return false;
     }
     let idle_for = *ctx.cell.passivation.read().expect("passivation lock");
@@ -2331,9 +2389,7 @@ pub(crate) async fn service_actor_loop(loop_ctx: ServiceLoop, mut shutdown: watc
         let idler = Idler {
             clock: loop_ctx.es.clock.clone(),
         };
-        idler
-            .idle_wait(&loop_ctx.es.cell, &mut shutdown)
-            .await;
+        idler.idle_wait(&loop_ctx.es.cell, &mut shutdown).await;
     }
     drain_inbox_on_stop(&loop_ctx.es).await;
 }
@@ -2372,12 +2428,7 @@ async fn step_service(ctx: &ServiceLoop) -> Step {
 
     // 2. FIND the message entry (cell-local spawn-static config).
     let entry = {
-        let entries = ctx
-            .es
-            .cell
-            .msg_entries
-            .read()
-            .expect("msg entries lock");
+        let entries = ctx.es.cell.msg_entries.read().expect("msg entries lock");
         entries
             .iter()
             .find(|e| e.schema() == envelope.schema)

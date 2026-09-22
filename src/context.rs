@@ -302,18 +302,17 @@ pub enum AskError {
 /// Downcasts a reply payload into the asker's declared reply type —
 /// the typed ask's last step. A live value downcasts (zero serde); a
 /// wire/Json reply decodes. Anything else is the named ReplyType error.
-pub(crate) fn downcast_reply<R: crate::schema::Schema + serde::de::DeserializeOwned + Clone + 'static>(
+pub(crate) fn downcast_reply<
+    R: crate::schema::Schema + serde::de::DeserializeOwned + Clone + 'static,
+>(
     reply: crate::envelope::Payload,
 ) -> Result<R, error_stack::Report<AskError>> {
-    reply
-        .inner()
-        .downcast_ref::<R>()
-        .ok_or_else(|| {
-            error_stack::Report::new(AskError::ReplyType(format!(
-                "reply is not a {}",
-                R::schema_id()
-            )))
-        })
+    reply.inner().downcast_ref::<R>().ok_or_else(|| {
+        error_stack::Report::new(AskError::ReplyType(format!(
+            "reply is not a {}",
+            R::schema_id()
+        )))
+    })
 }
 
 pub(crate) async fn ask_via_port(
@@ -428,15 +427,14 @@ impl<'a> MsgCtx<'a> {
     /// slot world is still JSON-shaped (typed slots are a later phase);
     /// the payload materializes its view here — memoized, so the encode
     /// happens at most once.
-    pub(crate) fn reply_payload(
-        &mut self,
-        schema: SchemaId,
-        payload: crate::envelope::Payload,
-    ) {
+    pub(crate) fn reply_payload(&mut self, schema: SchemaId, payload: crate::envelope::Payload) {
         if let Some(reply_to) = self.core.reply_to().cloned() {
-            self.core
-                .outbox
-                .push_reply(reply_to, schema, payload.json().clone(), self.core.child_trace());
+            self.core.outbox.push_reply(
+                reply_to,
+                schema,
+                payload.json().clone(),
+                self.core.child_trace(),
+            );
         }
     }
 
@@ -986,10 +984,7 @@ mod tests {
                 assert_eq!(ea.schema, eb.schema);
                 assert_eq!(ea.schema, StockReserved::schema_id());
                 assert_eq!(ea.dest, eb.dest);
-                assert_eq!(
-                    ea.payload_json().clone(),
-                    eb.payload_json().clone()
-                );
+                assert_eq!(ea.payload_json().clone(), eb.payload_json().clone());
             }
             _ => panic!("expected broadcast intents"),
         }
@@ -1031,10 +1026,7 @@ mod tests {
                 assert_eq!(ea.dest, eb.dest);
                 assert_eq!(ea.schema, ReserveStock::schema_id());
                 assert_eq!(ea.schema, eb.schema);
-                assert_eq!(
-                    ea.payload_json().clone(),
-                    eb.payload_json().clone()
-                );
+                assert_eq!(ea.payload_json().clone(), eb.payload_json().clone());
                 assert_eq!(ea.from, eb.from);
             }
             _ => panic!("expected send intents"),

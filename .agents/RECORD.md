@@ -105,3 +105,8 @@ Entries are added or amended **only with human approval**.
 - (journal) A due-time snapshot check reads kernel-side anchors and loads the journal only when a snapshot is due.
 - (runtime) Ask reply leases are bounded: failed request deliveries cancel the lease and expired slots are pruned.
 - (bench) Criterion benches live in benches/e2e.rs (usage-shaped) and benches/micro.rs (component-shaped), run via cargo bench.
+- (runtime) Message delivery wakes the actor's loop through a Notify signal fired by the front door; no fixed-interval polling exists on the message path.
+- (runtime) Per-actor mutable bookkeeping lives on the actor cell as lock-free state; the kernel tables lock guards cross-actor state only (an ES message's happy path acquires it zero times; a send acquires it once for its Sent fact).
+- (runtime) An idle actor's loop sleeps until its next due duty (snapshot cadence or passivation) or the next message, whichever comes first; an actor with no duties armed does not wake at all.
+- (runtime) A supervised child's crash is signaled by a Notify on the child's cell; supervision engines wake on the signal and read the crash flag lock-free instead of polling.
+- (bench) The idle_fleet bench includes a 10,000-idle-actor case, and examples/idle_burn.rs measures runtime CPU seconds for a duty-armed idle fleet (5,000 actors burn ~0.003 s CPU/s of wall vs ~0.28 s polled before this work).

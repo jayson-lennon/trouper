@@ -136,7 +136,9 @@ impl Projector for PoolView {
     fn apply(&mut self, event: &Event) {
         if event.schema.as_str() == "PoolEvent" {
             self.taken = event.payload_json()["taken"].as_u64().unwrap_or(self.taken);
-            self.returned = event.payload_json()["returned"].as_u64().unwrap_or(self.returned);
+            self.returned = event.payload_json()["returned"]
+                .as_u64()
+                .unwrap_or(self.returned);
         }
     }
 }

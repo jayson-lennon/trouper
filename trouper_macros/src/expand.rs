@@ -67,9 +67,8 @@ pub fn generate(input: TokenStream, kind: Kind) -> syn::Result<TokenStream> {
                 description = Some(lit.value());
                 Ok(())
             } else {
-                Err(meta.error(
-                    "unknown #[schema(...)] container attribute; supported: description",
-                ))
+                Err(meta
+                    .error("unknown #[schema(...)] container attribute; supported: description"))
             }
         })?;
     }
@@ -117,10 +116,8 @@ pub fn generate(input: TokenStream, kind: Kind) -> syn::Result<TokenStream> {
         // (serde serializes under the serde rename; this derive's rename
         // attribute mirrors it). Struct field access goes through the
         // Rust ident.
-        let rust_ident = quote::format_ident!(
-            "{}",
-            field_name.strip_prefix("r#").unwrap_or(&field_name)
-        );
+        let rust_ident =
+            quote::format_ident!("{}", field_name.strip_prefix("r#").unwrap_or(&field_name));
         let read_expr = field_string_read(&f.ty);
         let desc_name = descriptor_name(f, &field_name)?;
         let desc_lit = syn::LitStr::new(&desc_name, f.span());
@@ -255,8 +252,17 @@ fn ty_is_numeric(ty: &Type) -> bool {
                 let pivot = path.segments.last()?.ident.to_string();
                 Some(matches!(
                     pivot.as_str(),
-                    "i8" | "i16" | "i32" | "i64" | "u8" | "u16" | "u32" | "u64" | "usize"
-                        | "isize" | "f32" | "f64"
+                    "i8" | "i16"
+                        | "i32"
+                        | "i64"
+                        | "u8"
+                        | "u16"
+                        | "u32"
+                        | "u64"
+                        | "usize"
+                        | "isize"
+                        | "f32"
+                        | "f64"
                 ))
             }
             Type::Reference(ty_ref) => check(&ty_ref.elem),

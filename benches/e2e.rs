@@ -71,7 +71,9 @@ impl EventSourcedActor for Accum {
 }
 impl trouper::actor::CommandHandler<Tick> for Accum {
     fn handle(&self, _cmd: Tick, _ctx: &mut CmdCtx<'_>) -> trouper::envelope::Events {
-        trouper::envelope::Events::from_vec(vec![trouper::envelope::Event::from_json_view(Ticked::schema_id(), Json::of(&Ticked { n: 1 }),
+        trouper::envelope::Events::from_vec(vec![trouper::envelope::Event::from_json_view(
+            Ticked::schema_id(),
+            Json::of(&Ticked { n: 1 }),
         )])
     }
 }
@@ -126,7 +128,9 @@ impl EventSourcedActor for Bytes {
 }
 impl trouper::actor::CommandHandler<Chunk> for Bytes {
     fn handle(&self, cmd: Chunk, _ctx: &mut CmdCtx<'_>) -> trouper::envelope::Events {
-        trouper::envelope::Events::from_vec(vec![trouper::envelope::Event::from_json_view(Chunked::schema_id(), Json::of(&Chunked {
+        trouper::envelope::Events::from_vec(vec![trouper::envelope::Event::from_json_view(
+            Chunked::schema_id(),
+            Json::of(&Chunked {
                 bytes: cmd.body.len(),
             }),
         )])
@@ -156,7 +160,9 @@ impl ServiceActor for Echo {
             .emits::<Pong>()
             .kind(ActorKind::Service)
     }
-    async fn start(_args: &Json) -> Result<Self, error_stack::Report<trouper::registry::RegistryError>> {
+    async fn start(
+        _args: &Json,
+    ) -> Result<Self, error_stack::Report<trouper::registry::RegistryError>> {
         Ok(Self)
     }
 }
@@ -168,7 +174,8 @@ impl trouper::actor::MsgHandler<Ping> for Echo {
     }
 }
 
-fn spawn_system() -> (ActorSystem, Arc<Runtime>) {    let rt = Arc::new(
+fn spawn_system() -> (ActorSystem, Arc<Runtime>) {
+    let rt = Arc::new(
         tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()
@@ -182,7 +189,9 @@ fn spawn_system() -> (ActorSystem, Arc<Runtime>) {    let rt = Arc::new(
 /// (the loop task is live). Must run inside the runtime.
 async fn spawn_accum(system: &ActorSystem, path: &ActorPath) {
     system.spawn_es::<Accum, _>(path.clone(), &Json::default(), SpawnOpts::default(), || {
-        vec![Arc::new(trouper::actor::TypedEsAdapter::<Accum, Tick>::new::<Tick>())]
+        vec![Arc::new(
+            trouper::actor::TypedEsAdapter::<Accum, Tick>::new::<Tick>(),
+        )]
     });
     wait_entity_exists(system, path).await;
 }
@@ -257,9 +266,7 @@ async fn drive_and_settle_watermark(system: &ActorSystem, path: &ActorPath, coun
 struct Iterations(std::sync::atomic::AtomicU64);
 impl Iterations {
     fn next_path(&self, prefix: &str) -> ActorPath {
-        let n = self
-            .0
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let n = self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         ActorPath::new(format!("{prefix}-{n}"))
     }
 }
@@ -437,9 +444,8 @@ fn wide_tree(c: &mut Criterion) {
                         SpawnOpts::default(),
                         || {
                             vec![Arc::new(
-                                trouper::actor::TypedEsAdapter::<Wide, WideChunk>::new::<
-                                    WideChunk,
-                                >(),
+                                trouper::actor::TypedEsAdapter::<Wide, WideChunk>::new::<WideChunk>(
+                                ),
                             )]
                         },
                     );
@@ -555,7 +561,11 @@ fn fanout(c: &mut Criterion) {
                 let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
                 loop {
                     match system
-                        .ask(path.clone(), Ping { filler: Vec::new() }, Duration::from_secs(1))
+                        .ask(
+                            path.clone(),
+                            Ping { filler: Vec::new() },
+                            Duration::from_secs(1),
+                        )
                         .await
                     {
                         Ok(_) => break,
@@ -576,7 +586,11 @@ fn fanout(c: &mut Criterion) {
                     for _ in 0..32 {
                         for path in &paths {
                             system
-                                .ask(path.clone(), Ping { filler: Vec::new() }, Duration::from_secs(5))
+                                .ask(
+                                    path.clone(),
+                                    Ping { filler: Vec::new() },
+                                    Duration::from_secs(5),
+                                )
                                 .await
                                 .expect("echo");
                         }
@@ -608,7 +622,9 @@ fn overload_block(c: &mut Criterion) {
                 passivation: None,
             },
             || {
-                vec![Arc::new(trouper::actor::TypedEsAdapter::<Accum, Tick>::new::<Tick>())]
+                vec![Arc::new(
+                    trouper::actor::TypedEsAdapter::<Accum, Tick>::new::<Tick>(),
+                )]
             },
         );
         wait_entity_exists(&system, &path).await;
@@ -649,7 +665,8 @@ fn overload_block(c: &mut Criterion) {
                 // by whatever already folded).
                 wait_entity(&system, &path, before + 512).await;
                 assert_eq!(
-                    system.dead_letter_count().await, 0,
+                    system.dead_letter_count().await,
+                    0,
                     "Block overload must be lossless (post-D1)"
                 );
             });
@@ -669,9 +686,16 @@ fn idle_fleet(c: &mut Criterion) {
         let fleet = 1_000usize;
         for index in 0..fleet {
             let path = ActorPath::new(format!("bench/idle-{index}"));
-            system.spawn_es::<Accum, _>(path.clone(), &Json::default(), SpawnOpts::default(), || {
-                vec![Arc::new(trouper::actor::TypedEsAdapter::<Accum, Tick>::new::<Tick>())]
-            });
+            system.spawn_es::<Accum, _>(
+                path.clone(),
+                &Json::default(),
+                SpawnOpts::default(),
+                || {
+                    vec![Arc::new(
+                        trouper::actor::TypedEsAdapter::<Accum, Tick>::new::<Tick>(),
+                    )]
+                },
+            );
         }
         for index in 0..fleet {
             let path = ActorPath::new(format!("bench/idle-{index}"));
@@ -703,9 +727,16 @@ fn idle_fleet(c: &mut Criterion) {
     rt.block_on(async {
         for index in 0..fleet {
             let path = ActorPath::new(format!("bench/idle-10k-{index}"));
-            system.spawn_es::<Accum, _>(path.clone(), &Json::default(), SpawnOpts::default(), || {
-                vec![Arc::new(trouper::actor::TypedEsAdapter::<Accum, Tick>::new::<Tick>())]
-            });
+            system.spawn_es::<Accum, _>(
+                path.clone(),
+                &Json::default(),
+                SpawnOpts::default(),
+                || {
+                    vec![Arc::new(
+                        trouper::actor::TypedEsAdapter::<Accum, Tick>::new::<Tick>(),
+                    )]
+                },
+            );
         }
         for index in 0..fleet {
             let path = ActorPath::new(format!("bench/idle-10k-{index}"));
@@ -750,7 +781,9 @@ impl ServiceActor for SwarmSink {
     fn manifest() -> ActorManifest {
         ActorManifest::new().kind(ActorKind::Service)
     }
-    async fn start(_args: &Json) -> Result<Self, error_stack::Report<trouper::registry::RegistryError>> {
+    async fn start(
+        _args: &Json,
+    ) -> Result<Self, error_stack::Report<trouper::registry::RegistryError>> {
         let counter = Arc::new(std::sync::atomic::AtomicU64::new(0));
         SWARM_SINKS.lock().expect("sinks").push(counter.clone());
         Ok(Self { received: counter })
@@ -784,9 +817,10 @@ fn swarm(c: &mut Criterion) {
                     &Json::default(),
                     SpawnOpts::default(),
                     || {
-                        vec![Arc::new(
-                            trouper::actor::TypedServiceAdapter::<SwarmSink, Tick>::new::<Tick>(),
-                        )]
+                        vec![Arc::new(trouper::actor::TypedServiceAdapter::<
+                            SwarmSink,
+                            Tick,
+                        >::new::<Tick>())]
                     },
                 );
             }
@@ -818,7 +852,10 @@ fn swarm(c: &mut Criterion) {
             // A shared fleet-wide deadline: per-sink budgets compound into
             // minutes at r2048 when the runtime is still spinning up loops.
             for path in &paths {
-                system.tell(path.clone(), Tick { n: 1 }).await.expect("door");
+                system
+                    .tell(path.clone(), Tick { n: 1 })
+                    .await
+                    .expect("door");
             }
             let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
             for (index, path) in paths.iter().enumerate() {
@@ -883,7 +920,8 @@ fn swarm(c: &mut Criterion) {
                         tokio::time::sleep(Duration::from_millis(1)).await;
                     }
                     assert_eq!(
-                        system.dead_letter_count().await, 0,
+                        system.dead_letter_count().await,
+                        0,
                         "swarm must be lossless"
                     );
                 });

@@ -3,12 +3,12 @@
 //! redelivery is independent of snapshots. Persisted backends implement the
 //! [`JournalStore`] trait; the in-memory store is the default.
 
+use crate::envelope::{Event, PayloadBytes};
+pub use crate::json::Json;
+use crate::schema::SchemaId;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
-use crate::envelope::{Event, PayloadBytes};
-use crate::schema::SchemaId;
-pub use crate::json::Json;
 
 /// Why an actor's journal holds a fact.
 ///
@@ -159,9 +159,7 @@ impl TryFrom<WireJournalEntry> for JournalEntry {
                 origin,
                 ingest_seq,
             }),
-            WireJournalEntry::Snapshot { seq, state } => {
-                Ok(JournalEntry::Snapshot { seq, state })
-            }
+            WireJournalEntry::Snapshot { seq, state } => Ok(JournalEntry::Snapshot { seq, state }),
         }
     }
 }
@@ -198,7 +196,12 @@ impl JournalEntry {
     #[cfg(test)]
     pub(crate) fn to_json_view(&self) -> Json {
         match self {
-            JournalEntry::Event { seq, event, ingest_seq, .. } => {
+            JournalEntry::Event {
+                seq,
+                event,
+                ingest_seq,
+                ..
+            } => {
                 crate::json!({
                     "Event": {
                         "seq": seq.0,
@@ -913,7 +916,10 @@ mod tests {
     fn journal_payload_is_valid_json_text_and_queryable() {
         // Given a typed fact appended through the wire door.
         use crate::envelope::Payload;
-        let fact = StockReservedWire { qty: 7, sku: "w-1".into() };
+        let fact = StockReservedWire {
+            qty: 7,
+            sku: "w-1".into(),
+        };
         let wire = WireEvent::from(&Event::new(
             StockReservedWire::schema_id(),
             Payload::value(fact),
@@ -965,7 +971,8 @@ mod tests {
 
         // When the boundary decode runs and fails.
         let event = Event::try_from(wire).expect("wire -> event (bytes are valid JSON)");
-        let decoded = serde_json::from_slice::<StockReservedWire>(event.payload.json_text().as_ref());
+        let decoded =
+            serde_json::from_slice::<StockReservedWire>(event.payload.json_text().as_ref());
 
         // Then the failure is surfaceable as the named Decode error
         // carrying schema + seq (the loud-rebuild contract).
@@ -975,7 +982,10 @@ mod tests {
             seq,
         };
         let rendered = format!("{err}");
-        assert!(rendered.contains("StockReserved"), "names the schema: {rendered}");
+        assert!(
+            rendered.contains("StockReserved"),
+            "names the schema: {rendered}"
+        );
         assert!(rendered.contains("41"), "names the seq: {rendered}");
     }
 

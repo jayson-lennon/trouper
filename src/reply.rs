@@ -104,7 +104,10 @@ mod tests {
         let (lease, receiver) = table.open(Duration::from_secs(10), Timestamp::from_millis(0));
 
         // When completing it.
-        let delivered = table.complete(&lease, crate::envelope::Payload::from(crate::json!({ "ok": true })));
+        let delivered = table.complete(
+            &lease,
+            crate::envelope::Payload::from(crate::json!({ "ok": true })),
+        );
 
         // Then the asker receives the payload and the slot is consumed.
         assert!(delivered);

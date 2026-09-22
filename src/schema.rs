@@ -318,9 +318,7 @@ impl ActorManifest {
     /// program bug, not a runtime outcome).
     fn expect_claim<S: Schema + 'static>() {
         if let Err(report) = crate::registry::claim_schema_type::<S>() {
-            panic!(
-                "schema TypeId claim failed (one Rust type per schema name): {report:?}"
-            );
+            panic!("schema TypeId claim failed (one Rust type per schema name): {report:?}");
         }
     }
 

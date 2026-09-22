@@ -969,7 +969,8 @@ impl ActorSystemCore {
         if let Some(wm) = opts.high_watermark {
             cell.watermark_high
                 .store(wm, std::sync::atomic::Ordering::Release);
-            cell.has_watermark.store(true, std::sync::atomic::Ordering::SeqCst);
+            cell.has_watermark
+                .store(true, std::sync::atomic::Ordering::SeqCst);
         }
         let mut kernel = self.kernel.lock();
         kernel.cells.insert(path.clone(), cell.clone());
@@ -1119,7 +1120,8 @@ impl ActorSystemCore {
         if let Some(wm) = opts.high_watermark {
             cell.watermark_high
                 .store(wm, std::sync::atomic::Ordering::Release);
-            cell.has_watermark.store(true, std::sync::atomic::Ordering::SeqCst);
+            cell.has_watermark
+                .store(true, std::sync::atomic::Ordering::SeqCst);
         }
         let mut kernel = self.kernel.lock();
         kernel.cells.insert(path.clone(), cell.clone());
@@ -1218,12 +1220,7 @@ impl ActorSystemCore {
     where
         C: Schema + serde::Serialize + Send + Sync + crate::envelope::PayloadValue + 'static,
     {
-        let envelope = Envelope::json(
-            C::schema_id(),
-            Address::Path(dest),
-            value,
-            TraceCtx::root(),
-        );
+        let envelope = Envelope::json(C::schema_id(), Address::Path(dest), value, TraceCtx::root());
         self.send(envelope).await
     }
 
@@ -1246,7 +1243,13 @@ impl ActorSystemCore {
     /// fails on pathological map keys), not a domain outcome.
     pub async fn send_to_any<M>(&self, value: &M) -> Result<ActorPath, Envelope>
     where
-        M: Schema + serde::Serialize + Clone + Send + Sync + crate::envelope::PayloadValue + 'static,
+        M: Schema
+            + serde::Serialize
+            + Clone
+            + Send
+            + Sync
+            + crate::envelope::PayloadValue
+            + 'static,
     {
         let schema = M::schema_id();
         let envelope = Envelope::json(
@@ -1321,7 +1324,13 @@ impl ActorSystemCore {
     /// fails on pathological map keys), not a domain outcome.
     pub fn publish<M>(&self, value: &M) -> impl std::future::Future<Output = ()> + Send + '_
     where
-        M: Schema + serde::Serialize + Clone + Send + Sync + crate::envelope::PayloadValue + 'static,
+        M: Schema
+            + serde::Serialize
+            + Clone
+            + Send
+            + Sync
+            + crate::envelope::PayloadValue
+            + 'static,
     {
         let schema = M::schema_id();
         let envelope = Envelope::json(
@@ -1331,7 +1340,14 @@ impl ActorSystemCore {
             TraceCtx::root(),
         );
         async move {
-            crate::kernel::broadcast(&self.registry, &self.kernel, &self.shutting_down, schema, envelope).await;
+            crate::kernel::broadcast(
+                &self.registry,
+                &self.kernel,
+                &self.shutting_down,
+                schema,
+                envelope,
+            )
+            .await;
         }
     }
 
@@ -1384,7 +1400,14 @@ impl ActorSystemCore {
             PayloadBytes::from(payload),
             TraceCtx::root(),
         );
-        crate::kernel::broadcast(&self.registry, &self.kernel, &self.shutting_down, schema, envelope).await;
+        crate::kernel::broadcast(
+            &self.registry,
+            &self.kernel,
+            &self.shutting_down,
+            schema,
+            envelope,
+        )
+        .await;
     }
 
     /// Untyped schema-kind dispatch from outside the system: the bridge
@@ -1476,7 +1499,7 @@ impl ActorSystemCore {
             shutting_down: self.shutting_down.clone(),
             view: self.view.clone(),
             clock: self.clock.clone(),
-            is_projector: self.kernel.lock().projectors.contains(&path),
+            is_projector: self.kernel.lock().projectors.contains(path),
         };
         crate::kernel::restart_es(&ctx, genesis_args).await
     }
@@ -1602,10 +1625,7 @@ impl ActorSystemCore {
             let settled = {
                 let kernel = self.kernel.lock();
                 kernel.services.contains_key(path)
-                    || kernel
-                        .cells
-                        .get(path)
-                        .is_some_and(|cell| cell.is_crashed())
+                    || kernel.cells.get(path).is_some_and(|cell| cell.is_crashed())
             };
             if settled {
                 break;
@@ -1656,7 +1676,7 @@ impl ActorSystemCore {
                 if let Some(cell) = on_stop_cell
                     && cell.claim_on_stop()
                 {
-                    let is_projector = self.kernel.lock().projectors.contains(&path);
+                    let is_projector = self.kernel.lock().projectors.contains(path);
                     let ctx = crate::kernel::EsLoop {
                         path: path.clone(),
                         cell,
@@ -2546,7 +2566,9 @@ mod tests {
     }
     impl CommandHandler<Add> for Counter {
         fn handle(&self, cmd: Add, _ctx: &mut CmdCtx<'_>) -> crate::envelope::Events {
-            crate::envelope::Events::from_vec(vec![crate::envelope::Event::from_json_view(Added::schema_id(), json!({ "n": cmd.n }),
+            crate::envelope::Events::from_vec(vec![crate::envelope::Event::from_json_view(
+                Added::schema_id(),
+                json!({ "n": cmd.n }),
             )])
         }
     }
@@ -2951,7 +2973,10 @@ mod tests {
             assert!(system.journal_entries(&path).is_empty());
             let kernel = system.kernel.lock();
             assert!(
-                kernel.cells.get(&path).is_some_and(|cell| cell.is_crashed()),
+                kernel
+                    .cells
+                    .get(&path)
+                    .is_some_and(|cell| cell.is_crashed()),
                 "the panic was recorded on the cell"
             );
             assert!(kernel.dead_letters.is_empty());
@@ -3262,7 +3287,9 @@ mod tests {
                     // First sight only: crash once, then recover.
                     panic!("transient fault");
                 }
-                crate::envelope::Events::from_vec(vec![crate::envelope::Event::from_json_view(Added::schema_id(), json!({ "n": cmd.n }),
+                crate::envelope::Events::from_vec(vec![crate::envelope::Event::from_json_view(
+                    Added::schema_id(),
+                    json!({ "n": cmd.n }),
                 )])
             }
         }
@@ -3380,7 +3407,7 @@ mod tests {
             fn schema_def() -> SchemaDef {
                 SchemaDef {
                     name: "Escalated".into(),
-                                        kind: SchemaKind::Command,
+                    kind: SchemaKind::Command,
                     fields: vec![FieldDef::required("escalated", FieldTy::Str)],
                     description: None,
                 }
@@ -4324,7 +4351,10 @@ mod tests {
             .open(std::time::Duration::from_secs(60), system.clock.now());
 
         // When completing the long lease and pruning past the short one.
-        assert!(kernel.replies.complete(&long_lease, crate::envelope::Payload::from(json!({ "ok": true }))));
+        assert!(kernel.replies.complete(
+            &long_lease,
+            crate::envelope::Payload::from(json!({ "ok": true }))
+        ));
         drop(long_rx);
         kernel.replies.prune(crate::clock::Timestamp::from_millis(
             system.clock.now().as_millis() + 10,
@@ -4333,7 +4363,11 @@ mod tests {
         // Then the short lease is gone (expired), the long one was
         // consumed by its reply, and the table is empty — no leaks.
         assert!(kernel.replies.is_empty(), "lease leaked");
-        assert!(!kernel.replies.complete(&short_lease, crate::envelope::Payload::from(json!({}))));
+        assert!(
+            !kernel
+                .replies
+                .complete(&short_lease, crate::envelope::Payload::from(json!({})))
+        );
     }
 
     #[tokio::test]
@@ -4772,7 +4806,7 @@ mod tests {
             fn schema_def() -> SchemaDef {
                 SchemaDef {
                     name: "Escalated".into(),
-                                        kind: SchemaKind::Command,
+                    kind: SchemaKind::Command,
                     fields: vec![FieldDef::required("escalated", FieldTy::Str)],
                     description: None,
                 }
@@ -4978,7 +5012,7 @@ mod tests {
         let system = ActorSystem::new(SystemConfig::production());
         let foreign = json!({
             "name": "ForeignPing",
-            
+
             "kind": "command",
             "fields": []
         });
@@ -5417,10 +5451,14 @@ mod tests {
     impl CommandHandler<Add> for MixedEmitter {
         fn handle(&self, cmd: Add, _ctx: &mut CmdCtx<'_>) -> crate::envelope::Events {
             let mut events = crate::envelope::Events::new();
-            events.push(crate::envelope::Event::from_json_view(Added::schema_id(), json!({ "n": cmd.n }),
+            events.push(crate::envelope::Event::from_json_view(
+                Added::schema_id(),
+                json!({ "n": cmd.n }),
             ));
             // Undeclared: the emit filter must drop this one pre-append.
-            events.push(crate::envelope::Event::from_json_view(Smuggled::schema_id(), json!({ "n": cmd.n }),
+            events.push(crate::envelope::Event::from_json_view(
+                Smuggled::schema_id(),
+                json!({ "n": cmd.n }),
             ));
             events
         }
@@ -5693,7 +5731,9 @@ mod tests {
     }
     impl CommandHandler<Add> for BareCounter {
         fn handle(&self, cmd: Add, _ctx: &mut CmdCtx<'_>) -> crate::envelope::Events {
-            crate::envelope::Events::from_vec(vec![crate::envelope::Event::from_json_view(Added::schema_id(), json!({ "n": cmd.n }),
+            crate::envelope::Events::from_vec(vec![crate::envelope::Event::from_json_view(
+                Added::schema_id(),
+                json!({ "n": cmd.n }),
             )])
         }
     }
@@ -5930,7 +5970,6 @@ mod tests {
         assert_eq!(system.journal_len(&ActorPath::new("t-pos")), 1);
     }
 
-
     #[tokio::test]
     async fn builder_spawns_register_handled_and_emitted_schemas() {
         // Given a fresh system whose schema table starts empty.
@@ -5989,11 +6028,7 @@ mod tests {
         // Then the export holds exactly ONE def for the name, and it is
         // the FIRST one (schemas are agreed facts, not config).
         let export = system.export().await;
-        let defs: Vec<&SchemaDef> = export
-            .schemas
-            .iter()
-            .filter(|s| s.name == "Add")
-            .collect();
+        let defs: Vec<&SchemaDef> = export.schemas.iter().filter(|s| s.name == "Add").collect();
         assert_eq!(defs.len(), 1, "no duplicate def for one name");
         assert_eq!(
             defs[0].description.as_deref(),
@@ -6050,7 +6085,9 @@ mod tests {
     }
     impl CommandHandler<Add> for DefaultManifestCounter {
         fn handle(&self, cmd: Add, _ctx: &mut CmdCtx<'_>) -> crate::envelope::Events {
-            crate::envelope::Events::from_vec(vec![crate::envelope::Event::from_json_view(Added::schema_id(), json!({ "n": cmd.n }),
+            crate::envelope::Events::from_vec(vec![crate::envelope::Event::from_json_view(
+                Added::schema_id(),
+                json!({ "n": cmd.n }),
             )])
         }
     }
@@ -6112,7 +6149,9 @@ mod tests {
     }
     impl CommandHandler<Add> for RichCounter {
         fn handle(&self, cmd: Add, _ctx: &mut CmdCtx<'_>) -> crate::envelope::Events {
-            crate::envelope::Events::from_vec(vec![crate::envelope::Event::from_json_view(Added::schema_id(), json!({ "n": cmd.n }),
+            crate::envelope::Events::from_vec(vec![crate::envelope::Event::from_json_view(
+                Added::schema_id(),
+                json!({ "n": cmd.n }),
             )])
         }
     }
@@ -6246,7 +6285,10 @@ mod tests {
         {
             let kernel = system.kernel.lock();
             assert!(
-                !kernel.replies.complete(&late_lease, crate::envelope::Payload::from(json!({ "echo": 1 }))),
+                !kernel.replies.complete(
+                    &late_lease,
+                    crate::envelope::Payload::from(json!({ "echo": 1 }))
+                ),
                 "a dead lease must not accept a late reply"
             );
         }
@@ -6479,7 +6521,9 @@ mod tests {
     }
     impl CommandHandler<KeyedAdd> for KeyCounter {
         fn handle(&self, cmd: KeyedAdd, _ctx: &mut CmdCtx<'_>) -> crate::envelope::Events {
-            crate::envelope::Events::from_vec(vec![crate::envelope::Event::from_json_view(Added::schema_id(), json!({ "n": cmd.n }),
+            crate::envelope::Events::from_vec(vec![crate::envelope::Event::from_json_view(
+                Added::schema_id(),
+                json!({ "n": cmd.n }),
             )])
         }
     }
@@ -8146,7 +8190,9 @@ mod tests {
             if cmd.n == 666 {
                 panic!("poison add");
             }
-            crate::envelope::Events::from_vec(vec![crate::envelope::Event::from_json_view(Added::schema_id(), json!({ "n": cmd.n }),
+            crate::envelope::Events::from_vec(vec![crate::envelope::Event::from_json_view(
+                Added::schema_id(),
+                json!({ "n": cmd.n }),
             )])
         }
     }
@@ -9653,11 +9699,7 @@ mod tests {
         // send's await — inline atomic reads, no helper machinery).
         let before = crate::kernel::REGISTRY_LOCKS.load(std::sync::atomic::Ordering::Relaxed);
         system
-            .send(system.envelope(
-                PingAsk::schema_id(),
-                path.clone(),
-                json!({ "n": 7 }),
-            ))
+            .send(system.envelope(PingAsk::schema_id(), path.clone(), json!({ "n": 7 })))
             .await
             .expect("delivered");
         let after = crate::kernel::REGISTRY_LOCKS.load(std::sync::atomic::Ordering::Relaxed);
@@ -9665,10 +9707,9 @@ mod tests {
 
         // Then the message was DELIVERED (behavior first)...
         wait_for(|| async {
-            system
-                .tap_facts()
-                .iter()
-                .any(|f| matches!(&f.kind, crate::tap::FactKind::Delivered { to, .. } if *to == path))
+            system.tap_facts().iter().any(
+                |f| matches!(&f.kind, crate::tap::FactKind::Delivered { to, .. } if *to == path),
+            )
         })
         .await;
         // ...and the send acquired the registry at most twice: shard-key
@@ -9994,7 +10035,12 @@ mod tests {
         // When the command is told (a live value rides the fabric).
         let before = crate::kernel::SERDE_CALLS.load(std::sync::atomic::Ordering::Relaxed);
         system
-            .tell(ActorPath::new("no-serde"), Pack { order: "ns-1".into() })
+            .tell(
+                ActorPath::new("no-serde"),
+                Pack {
+                    order: "ns-1".into(),
+                },
+            )
             .await
             .expect("delivered");
         let after = crate::kernel::SERDE_CALLS.load(std::sync::atomic::Ordering::Relaxed);
@@ -10030,7 +10076,10 @@ mod tests {
             None,
             "a missing key field reads as None through the typed payload"
         );
-        let payload = crate::envelope::Payload::value(KeyedAdd { n: 1, account: "k-9".into() });
+        let payload = crate::envelope::Payload::value(KeyedAdd {
+            n: 1,
+            account: "k-9".into(),
+        });
         assert_eq!(
             payload.field("account"),
             Some("k-9".to_owned()),
@@ -10124,12 +10173,18 @@ mod tests {
         );
         // And the memoized encoding IS the correct durable form.
         let entries = system.journal_entries(&path);
-        let event = entries.iter().find_map(|e| match e {
-            crate::journal::JournalEntry::Event { event, .. } => Some(event),
-            _ => None,
-        })
-        .expect("appended");
-        assert_eq!(event.payload_json()["n"], 5, "the stored payload round-trips");
+        let event = entries
+            .iter()
+            .find_map(|e| match e {
+                crate::journal::JournalEntry::Event { event, .. } => Some(event),
+                _ => None,
+            })
+            .expect("appended");
+        assert_eq!(
+            event.payload_json()["n"],
+            5,
+            "the stored payload round-trips"
+        );
         let state = system.es_state(&path).await.expect("live");
         assert_eq!(state["total"], json!(5));
     }
@@ -10841,7 +10896,9 @@ mod tests {
     }
     impl CommandHandler<Add> for SpiedCounter {
         fn handle(&self, cmd: Add, _ctx: &mut CmdCtx<'_>) -> crate::envelope::Events {
-            crate::envelope::Events::from_vec(vec![crate::envelope::Event::from_json_view(Added::schema_id(), json!({ "n": cmd.n }),
+            crate::envelope::Events::from_vec(vec![crate::envelope::Event::from_json_view(
+                Added::schema_id(),
+                json!({ "n": cmd.n }),
             )])
         }
     }

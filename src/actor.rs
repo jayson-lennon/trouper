@@ -721,15 +721,12 @@ where
     ) -> Result<Box<dyn std::any::Any + Send>, error_stack::Report<DispatchError>> {
         // Downcast first (zero serde on the live path); only wire bytes
         // that arrived without a value decode here.
-        let msg: M = payload
-            .inner()
-            .downcast_ref::<M>()
-            .ok_or_else(|| {
-                error_stack::Report::new(DispatchError::Decode(format!(
-                    "message {} did not match its schema",
-                    self.schema
-                )))
-            })?;
+        let msg: M = payload.inner().downcast_ref::<M>().ok_or_else(|| {
+            error_stack::Report::new(DispatchError::Decode(format!(
+                "message {} did not match its schema",
+                self.schema
+            )))
+        })?;
         Ok(Box::new(msg))
     }
 
@@ -767,8 +764,8 @@ impl ServiceAny for dyn DynServiceActor {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::envelope::Payload;
     use crate::actor::{ActorKind, ActorPath};
+    use crate::envelope::Payload;
     use crate::json;
     use crate::schema::Command;
     use crate::schema::{FieldDef, FieldTy, SchemaDef, SchemaKind};
@@ -785,7 +782,7 @@ mod tests {
         fn schema_def() -> SchemaDef {
             SchemaDef {
                 name: "StockReserved".into(),
-                                kind: SchemaKind::Event,
+                kind: SchemaKind::Event,
                 fields: vec![FieldDef::required("qty", FieldTy::Int)],
                 description: None,
             }
@@ -837,9 +834,13 @@ mod tests {
         let mut live = TypedEsState::new(Counter::restore(&json!({})));
 
         // When applying two events through the erased shell.
-        live.apply_erased(&crate::envelope::Event::from_json_view(StockReserved::schema_id(), json!({ "qty": 2 }),
+        live.apply_erased(&crate::envelope::Event::from_json_view(
+            StockReserved::schema_id(),
+            json!({ "qty": 2 }),
         ));
-        live.apply_erased(&crate::envelope::Event::from_json_view(StockReserved::schema_id(), json!({ "qty": 5 }),
+        live.apply_erased(&crate::envelope::Event::from_json_view(
+            StockReserved::schema_id(),
+            json!({ "qty": 5 }),
         ));
 
         // Then the fold matches a hand-computed total.
@@ -923,7 +924,11 @@ mod tests {
 
         // When dispatching a well-formed command.
         let events = adapter
-            .dispatch(&mut state, &Payload::value(ReserveStock { qty: 4 }), &mut ctx)
+            .dispatch(
+                &mut state,
+                &Payload::value(ReserveStock { qty: 4 }),
+                &mut ctx,
+            )
             .expect("dispatch");
 
         // Then one event came back — DECIDED but not yet applied (the loop
@@ -968,7 +973,11 @@ mod tests {
         let mut ctx = CmdCtx::new(&path, &trace, None, &NullView, &mut outbox);
 
         // When dispatching a malformed payload.
-        let result = adapter.dispatch(&mut state, &Payload::from(json!({ "nope": true })), &mut ctx);
+        let result = adapter.dispatch(
+            &mut state,
+            &Payload::from(json!({ "nope": true })),
+            &mut ctx,
+        );
 
         // Then it is a Decode error and the state is untouched.
         let report = result.expect_err("must not decode");
@@ -981,7 +990,9 @@ mod tests {
         // Given a foreign state and entry (decision: echo qty; fold: add it).
         let schema = ReserveStock::schema_id();
         let decision: ForeignDecision = Arc::new(|_state, cmd, _ctx| {
-            vec![crate::envelope::Event::from_json_view(StockReserved::schema_id(), json!({ "qty": cmd["qty"] }),
+            vec![crate::envelope::Event::from_json_view(
+                StockReserved::schema_id(),
+                json!({ "qty": cmd["qty"] }),
             )]
         });
         let fold: ForeignFold = Arc::new(|state, event| {
@@ -1011,7 +1022,11 @@ mod tests {
 
         // When dispatching a JSON command (no Rust type involved).
         let events = entry
-            .dispatch(&mut state, &Payload::value(ReserveStock { qty: 6 }), &mut ctx)
+            .dispatch(
+                &mut state,
+                &Payload::value(ReserveStock { qty: 6 }),
+                &mut ctx,
+            )
             .expect("dispatch");
 
         // Then the event came back decided, not applied.

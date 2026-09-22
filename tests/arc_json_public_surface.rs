@@ -24,7 +24,9 @@ fn decode_matches_the_tree_without_consuming_it() {
 
     // When decoding it twice.
     #[derive(serde::Deserialize, PartialEq, Eq, Debug)]
-    struct N { n: i64 }
+    struct N {
+        n: i64,
+    }
     let a: N = value.decode().expect("decode a");
     let b: N = value.decode().expect("decode b");
 

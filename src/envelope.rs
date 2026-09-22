@@ -97,9 +97,10 @@ impl std::fmt::Debug for Payload {
                 .debug_tuple("Payload::Value")
                 .field(&value.as_any().type_id())
                 .finish(),
-            AnyPayload::Bytes(bytes) => {
-                f.debug_tuple("Payload::Bytes").field(&bytes.as_str()).finish()
-            }
+            AnyPayload::Bytes(bytes) => f
+                .debug_tuple("Payload::Bytes")
+                .field(&bytes.as_str())
+                .finish(),
             AnyPayload::Json(view) => f.debug_tuple("Payload::Json").field(view).finish(),
         }
     }
@@ -170,10 +171,7 @@ impl Payload {
         if let AnyPayload::Bytes(bytes) = &self.0.inner {
             return Arc::clone(&bytes.0); // bytes ARE the wire encoding
         }
-        self.0
-            .wire
-            .get_or_init(|| self.0.inner.json_text())
-            .clone()
+        self.0.wire.get_or_init(|| self.0.inner.json_text()).clone()
     }
 
     /// The wire encoding as [`PayloadBytes`] (the journal entry's shape).
@@ -358,7 +356,9 @@ impl From<Json> for Payload {
 impl From<&Json> for PayloadBytes {
     fn from(value: &Json) -> Self {
         bump_serde_calls();
-        Self(Arc::from(serde_json::to_vec(&value).expect("Json tree always serializes")))
+        Self(Arc::from(
+            serde_json::to_vec(&value).expect("Json tree always serializes"),
+        ))
     }
 }
 
@@ -1123,7 +1123,11 @@ mod events_tests {
 
         // When dispatching the command.
         let events = adapter
-            .dispatch(&mut state, &Payload::value(ReserveStock { qty: 4 }), &mut ctx)
+            .dispatch(
+                &mut state,
+                &Payload::value(ReserveStock { qty: 4 }),
+                &mut ctx,
+            )
             .expect("dispatch");
 
         // Then the buffer holds exactly the decided events, in order, ready

@@ -256,8 +256,8 @@ mod tests {
     use super::*;
     use crate::actor::ActorPath;
     use crate::envelope::Envelope;
-    use crate::envelope::TraceCtx;
     use crate::envelope::PayloadBytes;
+    use crate::envelope::TraceCtx;
     use crate::json::Json;
     use crate::schema::SchemaId;
     use serde_json::json;

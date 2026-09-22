@@ -147,9 +147,7 @@ async fn main() {
     let env = Envelope::from_bytes(
         Ship::schema_id(),
         Address::Schema(Ship::schema_id()),
-        PayloadBytes::from(trouper::Json::of(
-            &serde_json::json!({ "order": "ord-2" }),
-        )),
+        PayloadBytes::from(trouper::Json::of(&serde_json::json!({ "order": "ord-2" }))),
         TraceCtx::root(),
     );
     system.send(env).await.expect("schema delivery");
