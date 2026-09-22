@@ -2,11 +2,21 @@
 //! `trouper::schema::Schema` impl plus the `trouper::envelope::PayloadValue`
 //! impl (downcast dispatch, field-by-name reads, memoized JSON-text
 //! encoding) for the derived struct.
+//!
+//! The derive's only job is emitting those two impl blocks; the descriptor
+//! they produce is presentation data. Exactly three facts in it are
+//! load-bearing at runtime: the schema name (identity and routing), the
+//! kind (Event broadcast vs Command route-to-one), and the shard-key
+//! field's name and flat type (partition path rendering). Accordingly the
+//! derive inspects exactly one thing per struct — which field (if any) is
+//! the `#[schema(shard_key)]` — and maps EVERY other field to
+//! `FieldTy::Json` regardless of its Rust type. No field type is a
+//! compile error; the value side belongs to serde entirely.
 
 use proc_macro2::TokenStream;
-use quote::{ToTokens, quote};
+use quote::quote;
 use syn::spanned::Spanned;
-use syn::{Data, DeriveInput, Fields, GenericArgument, Path, PathArguments, Type, TypePath};
+use syn::{Data, DeriveInput, Fields, Type, TypePath};
 
 /// Which derive marker was used — selects the `SchemaKind` of the
 /// generated `SchemaDef`.
@@ -28,18 +38,16 @@ impl Kind {
 
 /// Generates the `Schema` impl for the derived struct: name from the
 /// struct ident, description from the `#[schema(...)]` container
-/// attribute (default: no description), kind from the
-/// derive, fields mapped from the Rust types.
+/// attribute (default: no description), kind from the derive, and field
+/// descriptors — `FieldTy::Json` for every field except the shard key,
+/// which maps its real flat type from the Rust type.
 ///
 /// Also generates the `PayloadValue` impl: `as_any` (the downcast
-/// dispatch core), `field` (string reads of declared fields by their
-/// DESCRIPTOR name — the rename-aware one serde respects), and
+/// dispatch core), `field` (a string read of the shard-key field only —
+/// the one runtime reader is partition-key extraction), and
 /// `to_json_bytes` (compact JSON text, memoized in a `OnceLock` so the
 /// value serializes at most once no matter how many readers ask — the
 /// journal door's single-serialization contract).
-///
-/// `#[schema(...)]` FIELD attributes are rejected; the error says so
-/// explicitly so early adopters aren't surprised.
 pub fn generate(input: TokenStream, kind: Kind) -> syn::Result<TokenStream> {
     let input: DeriveInput = syn::parse2(input)?;
     let ident = &input.ident;
@@ -103,29 +111,6 @@ pub fn generate(input: TokenStream, kind: Kind) -> syn::Result<TokenStream> {
         ));
     }
 
-    // Map each Rust field type to its descriptor `FieldDef` expression,
-    // honoring the field-level `#[schema(...)]` attributes:
-    // `shard_key`, `rename = "..."`, `ty = "json"`, `description = "..."`.
-    let mut field_defs: Vec<TokenStream> = Vec::new();
-    let mut field_reads: Vec<TokenStream> = Vec::new();
-    for f in fields {
-        let name = f.ident.as_ref().expect("named fields");
-        let field_name = name.to_string();
-        field_defs.push(field_def_expr(f, &field_name)?);
-        // The RUNTIME field name — the descriptor name the rename produces
-        // (serde serializes under the serde rename; this derive's rename
-        // attribute mirrors it). Struct field access goes through the
-        // Rust ident.
-        let rust_ident =
-            quote::format_ident!("{}", field_name.strip_prefix("r#").unwrap_or(&field_name));
-        let read_expr = field_string_read(&f.ty);
-        let desc_name = descriptor_name(f, &field_name)?;
-        let desc_lit = syn::LitStr::new(&desc_name, f.span());
-        field_reads.push(quote! {
-            #desc_lit => (#read_expr)(&self.#rust_ident),
-        });
-    }
-
     // At most ONE field may be the shard key.
     let has_shard_key = |f: &syn::Field| {
         let mut found = false;
@@ -156,6 +141,32 @@ pub fn generate(input: TokenStream, kind: Kind) -> syn::Result<TokenStream> {
                 shard_keys.join(", ")
             ),
         ));
+    }
+
+    // One pass per field: a `FieldDef` descriptor expression for every
+    // field, plus a `field()` match arm for the shard key only. Field
+    // types are never inspected for validity — every non-key field is
+    // `FieldTy::Json`.
+    let mut field_defs: Vec<TokenStream> = Vec::new();
+    let mut field_reads: Vec<TokenStream> = Vec::new();
+    for f in fields {
+        let (field_def, is_shard_key) = field_def_expr(f)?;
+        field_defs.push(field_def);
+        if !is_shard_key {
+            continue;
+        }
+        // The shard-key arm reads under the Rust ident (raw-ident `r#`
+        // prefixes stripped) — the name the runtime looks up in the wire
+        // JSON. A serde rename on the shard key breaks that lookup;
+        // documented as unsupported for this one field.
+        let field_name = f.ident.as_ref().expect("named fields").to_string();
+        let desc_name = field_name.strip_prefix("r#").unwrap_or(&field_name);
+        let desc_lit = syn::LitStr::new(desc_name, f.span());
+        let rust_ident = quote::format_ident!("{}", desc_name);
+        let read_expr = field_string_read(&f.ty);
+        field_reads.push(quote! {
+            #desc_lit => (#read_expr)(&self.#rust_ident),
+        });
     }
 
     let kind_variant = quote::format_ident!("{}", kind.variant());
@@ -199,9 +210,10 @@ pub fn generate(input: TokenStream, kind: Kind) -> syn::Result<TokenStream> {
     })
 }
 
-/// The string-read EXPRESSION GENERATOR for one field type: returns code
-/// that turns `&T` into `Option<String>`, mirroring the descriptor type
-/// table. Unsupported (non-stringable) descriptor types read as `None`.
+/// The string-read EXPRESSION GENERATOR for the shard-key field's type:
+/// returns code that turns `&T` into `Option<String>`, mirroring the
+/// descriptor type table. Non-stringable types read as `None` — the
+/// shard-key read then reports the key as absent.
 fn field_string_read(ty: &Type) -> TokenStream {
     if path_ends_with(ty, "PathBuf") {
         quote! { |v: &#ty| ::std::option::Option::Some(v.to_string_lossy().into_owned()) }
@@ -274,59 +286,22 @@ fn ty_is_numeric(ty: &Type) -> bool {
     check(ty).unwrap_or(false)
 }
 
-/// The field's DESCRIPTOR name (the rename, or the Rust name with raw
-///-ident prefixes stripped) — the same name `field()` matches against.
-/// Re-parses the attributes fully (same grammar as `field_def_expr`) so
-/// no key is left unconsumed.
-fn descriptor_name(f: &syn::Field, rust_name: &str) -> syn::Result<String> {
-    let mut rename: Option<String> = None;
-    for attr in &f.attrs {
-        if !attr.path().is_ident("schema") {
-            continue;
-        }
-        attr.parse_nested_meta(|meta| {
-            if meta.path.is_ident("rename") {
-                if rename.is_some() {
-                    return Err(meta.error("duplicate `rename` in #[schema(...)]"));
-                }
-                let lit: syn::LitStr = meta.value()?.parse()?;
-                rename = Some(lit.value());
-                Ok(())
-            } else if meta.path.is_ident("shard_key") {
-                // A flag (no value), consumed by `field_def_expr`.
-                Ok(())
-            } else if meta.path.is_ident("ty") || meta.path.is_ident("description") {
-                // Consumed by `field_def_expr`; skip its value.
-                let _ = meta.value()?.parse::<syn::Expr>();
-                Ok(())
-            } else {
-                Err(meta.error(
-                    "unknown #[schema(...)] field attribute; supported: shard_key, rename, ty, description",
-                ))
-            }
-        })?;
-    }
-    Ok(rename.unwrap_or_else(|| {
-        rust_name
-            .strip_prefix("r#")
-            .unwrap_or(rust_name)
-            .to_string()
-    }))
-}
-
 /// Builds the `FieldDef` constructor expression for one struct field,
-/// applying its `#[schema(...)]` attributes.
+/// applying its `#[schema(...)]` attributes, and reports whether the
+/// field is the shard key.
 ///
 /// Accepted keys (each at most once per field):
 /// - `shard_key` (flag) → `FieldRole::ShardKey`
-/// - `rename = "x"` → the DESCRIPTOR field name only (serde untouched)
-/// - `ty = "json"` → force `FieldTy::Json` (escape hatch for exotic types)
+/// - `ty = "bool"|"int"|"float"|"str"|"uuid"|"json"` → force that
+///   descriptor `FieldTy`
 /// - `description = "..."` → `FieldDef.description`
-fn field_def_expr(f: &syn::Field, rust_name: &str) -> syn::Result<TokenStream> {
-    let mut rename: Option<String> = None;
+///
+/// No rename attribute: descriptor names are the Rust field idents;
+/// renames are serde's concern alone.
+fn field_def_expr(f: &syn::Field) -> syn::Result<(TokenStream, bool)> {
     let mut description: Option<String> = None;
     let mut shard_key = false;
-    let mut force_json = false;
+    let mut ty_override: Option<&'static str> = None;
 
     for attr in &f.attrs {
         if !attr.path().is_ident("schema") {
@@ -339,28 +314,29 @@ fn field_def_expr(f: &syn::Field, rust_name: &str) -> syn::Result<TokenStream> {
                 }
                 shard_key = true;
                 Ok(())
-            } else if meta.path.is_ident("rename") {
-                if rename.is_some() {
-                    return Err(meta.error("duplicate `rename` in #[schema(...)]"));
-                }
-                let lit: syn::LitStr = meta.value()?.parse()?;
-                rename = Some(lit.value());
-                Ok(())
             } else if meta.path.is_ident("ty") {
-                if force_json {
+                if ty_override.is_some() {
                     return Err(meta.error("duplicate `ty` in #[schema(...)]"));
                 }
                 let lit: syn::LitStr = meta.value()?.parse()?;
-                if lit.value() != "json" {
-                    return Err(syn::Error::new(
-                        lit.span(),
-                        format!(
-                            "unsupported #[schema(ty = {:?})]; the only override is \"json\"",
-                            lit.value()
-                        ),
-                    ));
+                match lit.value().as_str() {
+                    "bool" => ty_override = Some("Bool"),
+                    "int" => ty_override = Some("Int"),
+                    "float" => ty_override = Some("Float"),
+                    "str" => ty_override = Some("Str"),
+                    "uuid" => ty_override = Some("Uuid"),
+                    "json" => ty_override = Some("Json"),
+                    _ => {
+                        return Err(syn::Error::new(
+                            lit.span(),
+                            format!(
+                                "unsupported #[schema(ty = {:?})]; supported: \"bool\", \"int\", \
+                                 \"float\", \"str\", \"uuid\", \"json\"",
+                                lit.value()
+                            ),
+                        ));
+                    }
                 }
-                force_json = true;
                 Ok(())
             } else if meta.path.is_ident("description") {
                 if description.is_some() {
@@ -371,27 +347,27 @@ fn field_def_expr(f: &syn::Field, rust_name: &str) -> syn::Result<TokenStream> {
                 Ok(())
             } else {
                 Err(meta.error(
-                    "unknown #[schema(...)] field attribute; supported: shard_key, rename, ty, description",
+                    "unknown #[schema(...)] field attribute; supported: shard_key, ty, description",
                 ))
             }
         })?;
     }
 
-    // Descriptor name: the rename, or the Rust field name (raw-ident `r#`
-    // prefixes are stripped — descriptors are wire names).
-    let desc_name = rename.unwrap_or_else(|| {
-        rust_name
-            .strip_prefix("r#")
-            .unwrap_or(rust_name)
-            .to_string()
-    });
-
-    // The field's `FieldTy`: forced override, else the type mapping.
-    let ty_expr = if force_json {
-        quote! { ::trouper::schema::FieldTy::Json }
+    // Descriptor `FieldTy`: the `ty` override wins; the shard key maps its
+    // real flat type (partition routing reads it); every other field is
+    // `Json` — the descriptor is presentation data, not a compile contract.
+    let variant = ty_override.unwrap_or(if shard_key {
+        flat_ty_variant(&f.ty)
     } else {
-        map_field_ty(&f.ty, rust_name)?
-    };
+        "Json"
+    });
+    let variant = quote::format_ident!("{}", variant);
+    let ty_expr = quote! { ::trouper::schema::FieldTy::#variant };
+
+    // Descriptor name: the Rust field name (raw-ident `r#` prefixes are
+    // stripped — descriptors are wire names).
+    let field_name = f.ident.as_ref().expect("named fields").to_string();
+    let desc_name = field_name.strip_prefix("r#").unwrap_or(&field_name);
 
     // Builder chain: required → role → description.
     let role_expr = if shard_key {
@@ -404,89 +380,48 @@ fn field_def_expr(f: &syn::Field, rust_name: &str) -> syn::Result<TokenStream> {
         None => quote! {},
     };
 
-    Ok(quote! {
-        ::trouper::schema::FieldDef::required(#desc_name, #ty_expr)
-            #role_expr
-            #desc_expr
-    })
+    Ok((
+        quote! {
+            ::trouper::schema::FieldDef::required(#desc_name, #ty_expr)
+                #role_expr
+                #desc_expr
+        },
+        shard_key,
+    ))
 }
 
-/// Maps one Rust field type to the `::trouper::schema::FieldTy` expression.
-///
-/// The pivot is the LAST path segment of the type:
-/// - `i64/u64/i32/u32/i16/u16/i8/u8/isize/usize` → `Int`
-/// - `f32/f64` → `Float`
-/// - `bool` → `Bool`
-/// - `String`/`&str` → `Str`
-/// - any path ending in `Uuid` → `Uuid`
-/// - `Json`/`Value` → `Json`; `PathBuf` → `Str` (serde string);
-///   `Vec<u8>`/`[u8]` → `Json`
-/// - unknown → spanned error naming the field and the supported set.
-fn map_field_ty(ty: &Type, field_name: &str) -> syn::Result<TokenStream> {
+/// The descriptor `FieldTy` VARIANT NAME for the shard-key field's Rust
+/// type. The pivot is the LAST path segment (references, `Group`, and
+/// `Paren` unwrap to their inner type): integers → `Int`, `f32/f64` →
+/// `Float`, `bool` → `Bool`, `str/String` → `Str`, `Uuid` → `Uuid`,
+/// anything else → `Json`. Total by design — no shard-key type is an
+/// error — but only flat strings and numbers actually read back at
+/// partition routing.
+fn flat_ty_variant(ty: &Type) -> &'static str {
+    match pivot_ident(ty).as_deref() {
+        Some("i8" | "i16" | "i32" | "i64" | "u8" | "u16" | "u32" | "u64" | "usize" | "isize") => {
+            "Int"
+        }
+        Some("f32" | "f64") => "Float",
+        Some("bool") => "Bool",
+        Some("str" | "String") => "Str",
+        Some("Uuid") => "Uuid",
+        _ => "Json",
+    }
+}
+
+/// The last path segment's ident, unwrapping references and invisible
+/// delimiter groups (`&String` → `String`).
+fn pivot_ident(ty: &Type) -> Option<String> {
     match ty {
-        Type::Path(TypePath { qself: None, path }) => map_path_ty(path, ty, field_name),
-        Type::Reference(ty_ref) => {
-            // `&str` → Str; other references delegate to the referent.
-            if let Type::Path(TypePath { qself: None, path }) = &*ty_ref.elem
-                && path.is_ident("str")
-            {
-                return Ok(quote! { ::trouper::schema::FieldTy::Str });
-            }
-            map_field_ty(&ty_ref.elem, field_name)
+        Type::Path(TypePath { qself: None, path }) => {
+            path.segments.last().map(|s| s.ident.to_string())
         }
-        Type::Slice(elem) => {
-            // `[u8]` → Json (bytes ride as opaque JSON payloads); other
-            // slices delegate to their element type.
-            if path_is(&elem.elem, "u8") {
-                return Ok(quote! { ::trouper::schema::FieldTy::Json });
-            }
-            map_field_ty(&elem.elem, field_name)
-        }
-        Type::Group(group) => {
-            // Invisible-delimiter groups (macro-emitted types) delegate.
-            map_field_ty(&group.elem, field_name)
-        }
-        Type::Paren(inner) => map_field_ty(&inner.elem, field_name),
-        _ => Err(unsupported_ty_error(ty, field_name)),
+        Type::Reference(ty_ref) => pivot_ident(&ty_ref.elem),
+        Type::Group(group) => pivot_ident(&group.elem),
+        Type::Paren(inner) => pivot_ident(&inner.elem),
+        _ => None,
     }
-}
-
-/// Maps a bare path type. `Vec<u8>` is special-cased to `Json` (the
-/// `contents: Vec<u8>` byte-payload precedent) BEFORE the generic pivot
-/// match; `Vec<T>` otherwise delegates to `T`.
-fn map_path_ty(path: &Path, ty: &Type, field_name: &str) -> syn::Result<TokenStream> {
-    // Vec<u8> → Json (raw bytes serialize as a JSON array of numbers).
-    if let Some(segment) = path.segments.last()
-        && segment.ident == "Vec"
-        && let PathArguments::AngleBracketed(args) = &segment.arguments
-        && let Some(GenericArgument::Type(inner)) = args.args.first()
-    {
-        if path_is(inner, "u8") {
-            return Ok(quote! { ::trouper::schema::FieldTy::Json });
-        }
-        return map_field_ty(inner, field_name);
-    }
-
-    let pivot = path
-        .segments
-        .last()
-        .map(|s| s.ident.to_string())
-        .unwrap_or_default();
-    let field_ty = match pivot.as_str() {
-        "i8" | "i16" | "i32" | "i64" | "u8" | "u16" | "u32" | "u64" | "usize" | "isize" => "Int",
-        "f32" | "f64" => "Float",
-        "bool" => "Bool",
-        "String" => "Str",
-        "Uuid" => "Uuid",
-        // PathBuf serializes as a JSON string (serde), so the truthful
-        // descriptor is Str — matching the hand-written impls this
-        // derive replaces.
-        "PathBuf" => "Str",
-        "Json" | "Value" => "Json",
-        _ => return Err(unsupported_ty_error(ty, field_name)),
-    };
-    let variant = quote::format_ident!("{}", field_ty);
-    Ok(quote! { ::trouper::schema::FieldTy::#variant })
 }
 
 /// True when the type is exactly the named primitive path (e.g. `u8`).
@@ -507,18 +442,4 @@ fn path_ends_with(ty: &Type, name: &str) -> bool {
         Type::Paren(inner) => path_ends_with(&inner.elem, name),
         _ => false,
     }
-}
-
-/// The spanned "unsupported type" error: names the field, shows the type,
-/// lists the supported set, and points at the `#[schema(ty)]` escape hatch.
-fn unsupported_ty_error(ty: &Type, field_name: &str) -> syn::Error {
-    let ty_render = ty.to_token_stream().to_string();
-    syn::Error::new(
-        ty.span(),
-        format!(
-            "unsupported schema field type `{ty_render}` for field `{field_name}`; \
-             supported: integers, floats, bool, String, uuid::Uuid, Json \
-             (or override with #[schema(ty = \"json\")])"
-        ),
-    )
 }

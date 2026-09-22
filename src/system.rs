@@ -11498,7 +11498,7 @@ mod tests {
             path.clone(),
             &json!({}),
             SpawnOpts::default(),
-            || vec![],
+            Vec::<::std::sync::Arc<dyn crate::actor::CommandEntry>>::new,
         );
         seed_journal_events(
             &system,
@@ -11517,7 +11517,7 @@ mod tests {
             path.clone(),
             &json!({}),
             SpawnOpts::default(),
-            || vec![],
+            Vec::<::std::sync::Arc<dyn crate::actor::CommandEntry>>::new,
         );
         // Then the new fold consumed the old payloads (polled: the
         // boot-time replay runs concurrently with the spawn — the read
@@ -11547,7 +11547,7 @@ mod tests {
             path.clone(),
             &json!({}),
             SpawnOpts::default(),
-            || vec![],
+            Vec::<::std::sync::Arc<dyn crate::actor::CommandEntry>>::new,
         );
         {
             let store = system.journal_store_trait();
@@ -11589,7 +11589,7 @@ mod tests {
             path.clone(),
             &json!({}),
             SpawnOpts::default(),
-            || vec![],
+            Vec::<::std::sync::Arc<dyn crate::actor::CommandEntry>>::new,
         );
         // Then the old blob restored cleanly (polled for the replay to
         // land): qty from the snapshot, the added field defaulted, and
@@ -11647,7 +11647,7 @@ mod tests {
         let old = json!({ "qty": 2 });
 
         // When decoding it into the new shape.
-        let v2: ReservedV2 = crate::json::Json::from(old).decode().expect("decode");
+        let v2: ReservedV2 = old.decode().expect("decode");
 
         // Then the added field is the serde default and the old field
         // round-trips.

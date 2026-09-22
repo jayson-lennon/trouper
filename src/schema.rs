@@ -451,14 +451,15 @@ mod tests {
             name: "StockReserved".into(),
             kind: SchemaKind::Event,
             fields: vec![
-                FieldDef::required("sku", FieldTy::Str),
-                FieldDef::required("qty", FieldTy::Int),
+                FieldDef::required("sku", FieldTy::Json),
+                FieldDef::required("qty", FieldTy::Json),
             ],
             description: None,
         };
 
         // When comparing them.
-        // Then the derive emits exactly the hand-written def.
+        // Then the derive emits exactly the hand-written def: non-key
+        // fields are Json — the descriptor is presentation data.
         assert_eq!(derived, hand);
     }
 
@@ -481,18 +482,16 @@ mod tests {
 
     #[test]
     fn field_types_map_to_descriptor_tys() {
-        // Given one type exercising every supported field type.
+        // Given one type exercising arbitrary field types beside a shard
+        // key — the macro inspects only the shard-key attribute.
         #[derive(Event, serde::Serialize, serde::Deserialize, Clone)]
         #[allow(dead_code)] // descriptor data; exercised via schema_def only
         struct Kitchen {
+            #[schema(shard_key)]
+            sku: String,
             small: i8,
-            medium: i64,
-            unsign: u32,
-            big: u64,
-            arch: usize,
             ratio: f64,
             flag: bool,
-            label: String,
             id: uuid::Uuid,
             doc: Json,
             blob: Vec<u8>,
@@ -504,23 +503,20 @@ mod tests {
         let def = Kitchen::schema_def();
         let tys: Vec<_> = def.fields.iter().map(|f| f.ty.clone()).collect();
 
-        // Then each maps to the descriptor ty from the spec table.
+        // Then the shard key maps its real flat type (partition routing
+        // reads it) and EVERY other field is Json, whatever its Rust type.
         assert_eq!(
             tys,
             vec![
-                FieldTy::Int,   // small
-                FieldTy::Int,   // medium
-                FieldTy::Int,   // unsign
-                FieldTy::Int,   // big
-                FieldTy::Int,   // arch
-                FieldTy::Float, // ratio
-                FieldTy::Bool,  // flag
-                FieldTy::Str,   // label
-                FieldTy::Uuid,  // id
-                FieldTy::Json,  // doc
-                FieldTy::Json,  // blob (Vec<u8>)
-                FieldTy::Str,   // raw (&str)
-                FieldTy::Str,   // file (PathBuf serializes as a string)
+                FieldTy::Str,  // sku (shard key — flat string)
+                FieldTy::Json, // small
+                FieldTy::Json, // ratio
+                FieldTy::Json, // flag
+                FieldTy::Json, // id
+                FieldTy::Json, // doc
+                FieldTy::Json, // blob (Vec<u8>)
+                FieldTy::Json, // raw (&str)
+                FieldTy::Json, // file (PathBuf)
             ]
         );
     }
@@ -586,24 +582,24 @@ mod tests {
     }
 
     #[test]
-    fn rename_attribute_renames_descriptor_field_only() {
-        // Given a type whose Rust field name differs from the wire name.
+    fn serde_rename_leaves_the_descriptor_name_alone() {
+        // Given a field the serde mapping renames on the wire (no macro
+        // rename attribute exists; renames are serde's concern alone).
         #[derive(Event, serde::Serialize, serde::Deserialize, Clone)]
         #[serde(rename_all = "camelCase")]
         struct OrderShipped {
-            #[schema(rename = "orderId")]
             order_id: String,
         }
 
-        // When reading the def.
+        // When reading the def and serializing the value.
         let def = OrderShipped::schema_def();
-
-        // Then the descriptor uses the renamed wire name...
-        assert_eq!(def.fields[0].name, "orderId");
-        // ...while the payload still serializes under the serde mapping.
         let payload = Json::of(&OrderShipped {
             order_id: "o-1".into(),
         });
+
+        // Then the descriptor keeps the Rust field ident...
+        assert_eq!(def.fields[0].name, "order_id");
+        // ...while the payload serializes under the serde mapping.
         assert!(payload.get("orderId").is_some());
         assert!(payload.get("order_id").is_none());
     }
