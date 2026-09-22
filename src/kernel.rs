@@ -554,6 +554,12 @@ pub(crate) struct EsLoop {
     /// spawn — the set only changes at spawn/teardown, never mid-step).
     /// Lets step 9 skip the kernel lock.
     pub(crate) is_projector: bool,
+    /// The loop's live state shell, captured at spawn and cloned out per
+    /// step — the tables lookup leaves the message path. `None` only for
+    /// loops that never step ES (the service tier wraps one of these for
+    /// its shared plumbing). Rebound on boot recovery and restart, the
+    /// only two moments the table's Arc is replaced.
+    pub(crate) state: Option<Arc<tokio::sync::Mutex<Box<dyn DynEsActor>>>>,
 }
 
 impl EsLoop {
@@ -1328,12 +1334,16 @@ impl Idler {
 /// the idle tail parks on the notify, the shutdown watch, or the next due
 /// duty (deadline idle — no fixed poll; a duty-armed actor wakes exactly
 /// when its earliest duty is due, an actor with no duties never wakes).
-pub(crate) async fn es_actor_loop(loop_ctx: EsLoop, mut shutdown: watch::Receiver<bool>) {
+pub(crate) async fn es_actor_loop(
+    mut loop_ctx: EsLoop,
+    mut shutdown: watch::Receiver<bool>,
+) {
     // SPAWN-TIME RECOVERY: a re-activated entity (partition re-spawn,
     // or any spawn onto a journaled path) replays its journal before the
     // first step — passivation is lossless for the ES tier. A fresh
-    // genesis spawn has no journal; the store answers None.
-    recover_at_boot(&loop_ctx).await;
+    // genesis spawn has no journal; the store answers None. Recovery may
+    // REPLACE the table's Arc — rebind the loop's cache here.
+    recover_at_boot(&mut loop_ctx).await;
     loop {
         if *shutdown.borrow_and_update() {
             break;
@@ -1379,7 +1389,7 @@ pub(crate) async fn es_actor_loop(loop_ctx: EsLoop, mut shutdown: watch::Receive
 /// from the store's replay (snapshot + tail) when this path has a
 /// journal. Runs BEFORE the first step; no command is processed
 /// unrecovered.
-async fn recover_at_boot(ctx: &EsLoop) {
+async fn recover_at_boot(ctx: &mut EsLoop) {
     let replay = {
         let store = ctx.kernel.lock().journal_store.clone();
         match store.load(&ctx.path).await {
@@ -1416,10 +1426,12 @@ async fn recover_at_boot(ctx: &EsLoop) {
         old.rebuild(&genesis_args, snapshot_state, &tail).ok()
     };
     if let Some(fresh) = fresh {
+        let state = Arc::new(tokio::sync::Mutex::new(fresh));
         let mut kernel = ctx.kernel.lock();
-        kernel
-            .es_state
-            .insert(ctx.path.clone(), Arc::new(tokio::sync::Mutex::new(fresh)));
+        kernel.es_state.insert(ctx.path.clone(), state.clone());
+        // Rebind the loop's cache: the table's Arc was just replaced, and
+        // every step after this reads the cache, not the table.
+        ctx.state = Some(state);
     }
 }
 
@@ -1486,7 +1498,7 @@ async fn step_es(ctx: &EsLoop) -> Step {
     // mutation, no journal write, no ack inside the handler.
     let mut outbox = Outbox::new();
     let dispatch_result = {
-        let state = ctx.state().await;
+        let state = ctx.state();
         let mut state = state.lock().await;
         let mut cmd_ctx = CmdCtx::new(
             &ctx.path,
@@ -1672,7 +1684,7 @@ async fn step_es(ctx: &EsLoop) -> Step {
     // 7. APPLY (the same fold replay uses; state may now lag the journal
     // only if the process dies before this line — rebuild covers that).
     {
-        let state = ctx.state().await;
+        let state = ctx.state();
         let mut state = state.lock().await;
         for event in events.iter() {
             state.apply_erased(event);
@@ -1707,14 +1719,14 @@ async fn step_es(ctx: &EsLoop) -> Step {
 }
 
 impl EsLoop {
-    /// The live state shell.
-    async fn state(&self) -> Arc<tokio::sync::Mutex<Box<dyn DynEsActor>>> {
-        let kernel = self.kernel.lock();
-        kernel
-            .es_state
-            .get(&self.path)
-            .cloned()
-            .expect("es state present for a running loop")
+    /// The live state shell — the Arc captured at spawn (rebound at boot
+    /// recovery / restart / projector catch-up, the only moments the
+    /// table's Arc changes). LOCK-FREE: the kernel tables lock leaves the
+    /// message path entirely.
+    fn state(&self) -> Arc<tokio::sync::Mutex<Box<dyn DynEsActor>>> {
+        self.state
+            .clone()
+            .expect("es state cached for a running ES loop")
     }
 
     /// The loop's own graceful exit: run the actor's `on_stop` hook (the
@@ -2306,7 +2318,7 @@ async fn snapshot_now(ctx: &EsLoop, last: crate::journal::SeqNo) {
     // the store await (the erased state shell is not Send; no lock may be
     // held across the store call).
     let captured = {
-        let state = ctx.state().await;
+        let state = ctx.state();
         let state = state.lock().await;
         state.capture_erased().ok()
     };
@@ -2651,7 +2663,7 @@ async fn step_service(ctx: &ServiceLoop) -> Step {
 ///
 /// Propagates rebuild failures (a corrupt snapshot or undecodable state).
 pub(crate) async fn restart_es(
-    ctx: &EsLoop,
+    ctx: &mut EsLoop,
     genesis_args: &Json,
 ) -> Result<(), error_stack::Report<JournalError>> {
     // Replay input comes from the STORE (load reflects buffered state).
@@ -2699,10 +2711,13 @@ pub(crate) async fn restart_es(
     // re-derived from the replay (the journal's head; the seq is the
     // journal's, not the loop's, at this moment).
     {
+        let state = Arc::new(tokio::sync::Mutex::new(fresh));
         let mut kernel = ctx.kernel.lock();
-        kernel
-            .es_state
-            .insert(ctx.path.clone(), Arc::new(tokio::sync::Mutex::new(fresh)));
+        kernel.es_state.insert(ctx.path.clone(), state.clone());
+        // The supervised restart reuses THIS ctx for the fresh loop
+        // (spawned below) — rebind the cache so the new loop reads the
+        // fresh instance, not the replaced shell.
+        ctx.state = Some(state);
         ctx.cell.clear_crashed();
         let now_ms = ctx.clock.now().as_millis();
         ctx.cell
@@ -2901,7 +2916,7 @@ pub(crate) async fn supervise_child(
             // Journal-anchored recovery: rebuild from snapshot-or-genesis,
             // apply the tail, swap the endpoint under the SAME path, and
             // reopen the inbox (redelivery resumes from the cursor).
-            let ctx = crate::kernel::EsLoop {
+            let mut ctx = crate::kernel::EsLoop {
                 path: spec.path.clone(),
                 cell: {
                     let kernel = system.kernel.lock();
@@ -2917,6 +2932,13 @@ pub(crate) async fn supervise_child(
                 view: system.view.clone(),
                 clock: system.clock.clone(),
                 is_projector: false,
+                // The pre-restart shell (replaced under the OLD loop, which
+                // has exited); restart_es REBINDS this cache to the fresh
+                // instance's Arc before the new loop spawns.
+                state: {
+                    let kernel = system.kernel.lock();
+                    kernel.es_state.get(&spec.path).cloned()
+                },
             };
             let genesis_args = {
                 let kernel = system.kernel.lock();
@@ -2926,7 +2948,7 @@ pub(crate) async fn supervise_child(
                     .cloned()
                     .unwrap_or_else(|| crate::json!({}))
             };
-            restart_es(&ctx, &genesis_args)
+            restart_es(&mut ctx, &genesis_args)
                 .await
                 .expect("supervised ES child restart");
             // restart_es already cleared the crash flag.

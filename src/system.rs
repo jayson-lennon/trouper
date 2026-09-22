@@ -518,7 +518,7 @@ pub struct SystemExport {
 /// starts — no gap, no duplicate, per-source order preserved.
 pub(crate) async fn catch_up_projector(
     system: ActorSystem,
-    armed: ArmedEsActor,
+    mut armed: ArmedEsActor,
     consumed: Vec<crate::schema::SchemaId>,
 ) {
     let path = armed.path.clone();
@@ -661,7 +661,14 @@ pub(crate) async fn catch_up_projector(
     }
 
     // 3. GO LIVE: the loop starts NOW — queued live copies fold after
-    //    history, never before it.
+    //    history, never before it. The seeding above may have REPLACED
+    //    the table's Arc (journal replay rebuilds the instance): rebind
+    //    the loop's cache so the fresh loop folds into the rebuilt
+    //    instance, not the spawn shell.
+    {
+        let kernel = system.kernel.lock();
+        armed.loop_ctx.state = kernel.es_state.get(&path).cloned().or(armed.loop_ctx.state);
+    }
     armed.start_loop();
 
     // 4. The observable completion marker: the kernel's caught-up counter
@@ -977,9 +984,8 @@ impl ActorSystemCore {
         }
         let mut kernel = self.kernel.lock();
         kernel.cells.insert(path.clone(), cell.clone());
-        kernel
-            .es_state
-            .insert(path.clone(), Arc::new(tokio::sync::Mutex::new(state)));
+        let state = Arc::new(tokio::sync::Mutex::new(state));
+        kernel.es_state.insert(path.clone(), state.clone());
         // Genesis args anchor every rebuild-from-journal (supervised
         // restarts AND boot recovery): without them a replay restarts
         // from `restore({})` instead of the spawn's genesis.
@@ -1005,6 +1011,7 @@ impl ActorSystemCore {
             view: self.view.clone(),
             clock: self.clock.clone(),
             is_projector,
+            state: Some(state),
         };
         ArmedEsActor { path, loop_ctx, rx }
     }
@@ -1142,6 +1149,9 @@ impl ActorSystemCore {
         );
         drop(kernel);
 
+        // The service tier wraps this loop ONLY for its shared plumbing
+        // (front door, cell, routing): `step_service` runs against
+        // `kernel.services`, never `es_state`, so its state shell is None.
         let loop_ctx = EsLoop {
             path: path.clone(),
             cell: cell.clone(),
@@ -1151,6 +1161,7 @@ impl ActorSystemCore {
             view: self.view.clone(),
             clock: self.clock.clone(),
             is_projector: false,
+            state: None,
         };
         let started_path = path.clone();
         let view = self.view.clone();
@@ -1497,7 +1508,7 @@ impl ActorSystemCore {
             use error_stack::IntoReport;
             return Err(crate::journal::JournalError::Restore.into_report());
         };
-        let ctx = EsLoop {
+        let mut ctx = EsLoop {
             path: path.clone(),
             cell,
             registry: self.registry.clone(),
@@ -1506,8 +1517,9 @@ impl ActorSystemCore {
             view: self.view.clone(),
             clock: self.clock.clone(),
             is_projector: self.kernel.lock().projectors.contains(path),
+            state: None,
         };
-        crate::kernel::restart_es(&ctx, genesis_args).await
+        crate::kernel::restart_es(&mut ctx, genesis_args).await
     }
 
     /// A snapshot of tap facts from an offset (inspection/tests).
@@ -1699,6 +1711,7 @@ impl ActorSystemCore {
                         view: self.view.clone(),
                         clock: self.clock.clone(),
                         is_projector,
+                        state: None,
                     };
                     crate::kernel::run_on_stop(&ctx).await;
                 }
