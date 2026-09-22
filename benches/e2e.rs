@@ -328,13 +328,7 @@ impl Iterations {
 /// advances the cursor it borrows, so completion windows never overlap
 /// across iterations.
 fn seed_cursor(system: &ActorSystem) -> std::cell::Cell<u64> {
-    std::cell::Cell::new(
-        system
-            .tap_facts()
-            .last()
-            .map(|f| f.offset + 1)
-            .unwrap_or(0),
-    )
+    std::cell::Cell::new(system.tap_facts().last().map(|f| f.offset + 1).unwrap_or(0))
 }
 
 // ---------------------------------------------------------------------------
@@ -816,16 +810,11 @@ fn overload_block(c: &mut Criterion) {
 async fn spawn_fleet(system: &ActorSystem, prefix: &str, fleet: usize, busy: &ActorPath) {
     for index in 0..fleet {
         let path = ActorPath::new(format!("{prefix}-{index}"));
-        system.spawn_es::<Accum, _>(
-            path.clone(),
-            &Json::default(),
-            SpawnOpts::default(),
-            || {
-                vec![Arc::new(
-                    trouper::actor::TypedEsAdapter::<Accum, Tick>::new::<Tick>(),
-                )]
-            },
-        );
+        system.spawn_es::<Accum, _>(path.clone(), &Json::default(), SpawnOpts::default(), || {
+            vec![Arc::new(
+                trouper::actor::TypedEsAdapter::<Accum, Tick>::new::<Tick>(),
+            )]
+        });
     }
     for index in 0..fleet {
         let path = ActorPath::new(format!("{prefix}-{index}"));

@@ -986,8 +986,7 @@ impl ActorSystemCore {
         // static config, like `entries`): the step gates read the mirror,
         // keeping the registry lock off the message path. Post-spawn
         // declarations flow through the same facade this write mirrors.
-        *cell.declared_emits.write().expect("declared emits lock") =
-            manifest.emits.iter().cloned().collect();
+        *cell.declared_emits.write().expect("declared emits lock") = manifest.emits.to_vec();
         drop(registry);
         // CELL-LOCAL SPAWN CONFIG: the per-actor bookkeeping the loop and
         // the front door will read — dispatch entries, snapshot cadence +
@@ -1168,8 +1167,7 @@ impl ActorSystemCore {
             let mut msg_slot = cell.msg_entries.write().expect("msg entries lock");
             *msg_slot = entries;
         }
-        *cell.declared_emits.write().expect("declared emits lock") =
-            manifest.emits.iter().cloned().collect();
+        *cell.declared_emits.write().expect("declared emits lock") = manifest.emits.to_vec();
         *cell.passivation.write().expect("passivation lock") = opts.passivation;
         cell.last_work_ms.store(
             self.clock.now().as_millis(),
@@ -6565,9 +6563,7 @@ mod tests {
                 }),
                 SpawnOpts::default(),
             );
-            system
-                .declare_emits(&foreign_path, fact)
-                .expect("declare");
+            system.declare_emits(&foreign_path, fact).expect("declare");
         }
 
         // When all three receive mail.
@@ -9897,6 +9893,84 @@ mod tests {
         assert!(
             acquisitions <= 1,
             "one tell+step must acquire the kernel ≤1 time (acquired {acquisitions})"
+        );
+    }
+
+    /// The cached state Arc keeps the STEP's dispatch/apply lookups off
+    /// the kernel tables: a full tell→fold→ack window acquires the kernel
+    /// at most TWICE — once for the send's `Sent` fact, once for the
+    /// step's commit point. Before the state cache this window read the
+    /// `es_state` table twice MORE (dispatch + apply through `ctx.state()`),
+    /// so this probe goes RED (≤ 2 becomes 4) if the state lookup ever
+    /// returns to the message path.
+    #[tokio::test]
+    async fn state_arc_cache_keeps_the_step_off_the_kernel_tables() {
+        // Given a live ES counter that has settled from its spawn (spawn
+        // bookkeeping happens outside the counted window).
+        let (system, _clock) = ActorSystem::test();
+        let path = ActorPath::new("state-cache-probe");
+        system.spawn_es::<Counter, _>(path.clone(), &json!({}), SpawnOpts::default(), || {
+            vec![Arc::new(TypedEsAdapter::<Counter, Add>::new::<Add>())]
+        });
+        wait_for(|| async {
+            system.tap_facts().iter().any(
+                |f| matches!(&f.kind, crate::tap::FactKind::Spawned { path: p, .. } if *p == path),
+            )
+        })
+        .await;
+
+        // The cell Arc is fetched BEFORE the window opens (that lookup
+        // itself takes the tables lock); the window then closes on the
+        // cell's committed-seq ATOMIC — lock-free, so the completion spin
+        // contributes zero acquisitions. wait_for_cursor is unusable here:
+        // every poll takes the tables lock and would pollute the count.
+        let cell = {
+            let kernel = system.kernel.lock();
+            kernel.cells.get(&path).cloned().expect("live cell")
+        };
+        let before_seq = cell
+            .last_event_seq
+            .load(std::sync::atomic::Ordering::Acquire);
+
+        // QUIESCE: background spawn-settle tasks share the global counter;
+        // wait until it holds still for a few consecutive samples before
+        // opening the window.
+        let mut before = crate::kernel::KERNEL_LOCKS.load(std::sync::atomic::Ordering::Relaxed);
+        loop {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            let now = crate::kernel::KERNEL_LOCKS.load(std::sync::atomic::Ordering::Relaxed);
+            if now == before {
+                break;
+            }
+            before = now;
+        }
+
+        // When ONE command flows through tell + atomic step.
+        system
+            .send(system.envelope(Add::schema_id(), path.clone(), json!({ "n": 9 })))
+            .await
+            .expect("delivered");
+        // The committed seq flips INSIDE the commit critical section, so
+        // once it moves, the step's acquisitions are already counted.
+        while cell
+            .last_event_seq
+            .load(std::sync::atomic::Ordering::Acquire)
+            == before_seq
+        {
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+        let after = crate::kernel::KERNEL_LOCKS.load(std::sync::atomic::Ordering::Relaxed);
+        let acquisitions = after - before;
+
+        // Then the behavior is intact (one Add committed)...
+        let total = system.with_es_state::<Counter, _>(&path, |c| c.total).await;
+        assert_eq!(total, Some(9), "the command committed");
+        // ...and the window acquired the kernel at most TWICE: the send's
+        // Sent fact + the step's commit point. Dispatch/apply read the
+        // loop's cached state Arc — never the tables.
+        assert!(
+            acquisitions <= 2,
+            "tell→fold→ack must acquire the kernel ≤2 times (acquired {acquisitions})"
         );
     }
 

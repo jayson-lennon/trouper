@@ -745,11 +745,17 @@ async fn route_inner(
             // consumes the envelope (the direct path moves it into the
             // inbox). TraceCtx is Copy; the from/schema clones are
             // shallow (schema id + option).
-            let (sent_from, sent_schema, sent_trace) =
-                (envelope.from.clone(), envelope.schema.clone(), envelope.trace);
+            let (sent_from, sent_schema, sent_trace) = (
+                envelope.from.clone(),
+                envelope.schema.clone(),
+                envelope.trace,
+            );
             if let Err(refused) = direct_push(&endpoint, envelope, kernel, sent_trace).await {
                 envelope = refused;
-                if deliver_with_retry(&endpoint, envelope.clone()).await.is_err() {
+                if deliver_with_retry(&endpoint, envelope.clone())
+                    .await
+                    .is_err()
+                {
                     let retry_path = match resolve_partition(
                         registry,
                         kernel,
@@ -1090,11 +1096,7 @@ async fn direct_push(
         let fire = if cell.has_watermark.load(Ordering::SeqCst) {
             let depth = inbox.len() as u64;
             let mark = cell.watermark_high.load(Ordering::Acquire);
-            if depth > mark
-                && !cell
-                    .watermark_fired
-                    .swap(true, Ordering::AcqRel)
-            {
+            if depth > mark && !cell.watermark_fired.swap(true, Ordering::AcqRel) {
                 Some(depth)
             } else {
                 if depth <= mark {
@@ -1350,10 +1352,7 @@ impl Idler {
 /// the idle tail parks on the notify, the shutdown watch, or the next due
 /// duty (deadline idle — no fixed poll; a duty-armed actor wakes exactly
 /// when its earliest duty is due, an actor with no duties never wakes).
-pub(crate) async fn es_actor_loop(
-    mut loop_ctx: EsLoop,
-    mut shutdown: watch::Receiver<bool>,
-) {
+pub(crate) async fn es_actor_loop(mut loop_ctx: EsLoop, mut shutdown: watch::Receiver<bool>) {
     // SPAWN-TIME RECOVERY: a re-activated entity (partition re-spawn,
     // or any spawn onto a journaled path) replays its journal before the
     // first step — passivation is lossless for the ES tier. A fresh
