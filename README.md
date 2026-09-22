@@ -17,13 +17,15 @@ are the mean of the current baseline; treat them as shape and scale,
 not absolute promises — rerun `cargo bench` locally for your hardware.
 (The Rate column names the unit per bench — msg, ask roundtrip, or
 frame read — rather than criterion's generic "elem"; map back to
-criterion's `Elements` count when comparing against a local run.)
+criterion's `Elements` count when comparing against a local run.
+Where the bench measures a BATCH per iteration, Mean is shown per
+message — the per-batch time is Mean × the case's message count.)
 
 ### e2e — full send → done cycles
 
 | Bench | Case | Mean | Rate |
 |---|---|---:|---:|
-| tell_baseline | 64_messages | 2.20 ms | 29.1 K msg/s |
+| tell_baseline | 1 message | **34.3 µs** | 29.1 K msg/s |
 | producer_scaling | 1 producer | 4.48 ms | 28.6 K msg/s |
 | | 2 | 4.63 ms | 27.6 K msg/s |
 | | 4 | 4.65 ms | 27.5 K msg/s |
@@ -49,7 +51,7 @@ criterion's `Elements` count when comparing against a local run.)
 What the shapes mean:
 
 - **tell_baseline** — the floor: one message through send→fold→ack,
-  ~34 µs.
+  ~34 µs. (64 per iteration; Mean shown per message.)
 - **producer_scaling** — 1/2/4/8 producers on one entity. The rate
   holds as producers grow (no single-lock funnel).
 - **payload_size** — one message per commit at 500 B → 1 MB payloads.
