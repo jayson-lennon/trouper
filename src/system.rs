@@ -2078,9 +2078,12 @@ impl ActorSystem {
     /// logged at debug).
     ///
     /// Sync and non-blocking: takes the state lock with `try_lock`, so a
-    /// read never stalls a render thread — `None` when the fold currently
-    /// holds the lock (the caller keeps its previous frame; never retry
-    /// inside the read). See [`ActorSystem::with_es_state`](crate::system::ActorSystem::with_es_state) for the
+    /// read never stalls a render thread. A read is always a snapshot of
+    /// the live fold AT THE MOMENT OF THE CALL — `None` means no snapshot
+    /// was taken this call (the fold currently holds the lock, the path is
+    /// cold/unknown, or the state type mismatches); the method has no
+    /// memory and returns nothing else. Never retry inside the read. See
+    /// [`ActorSystem::with_es_state`](crate::system::ActorSystem::with_es_state) for the
     /// awaiting variant.
     pub fn try_with_es_state<A: EventSourcedActor, R>(
         &self,
@@ -2110,9 +2113,10 @@ impl ActorSystem {
     ///
     /// The closure is sync (it holds the state lock) and `R` is owned (the
     /// guard drops before return — clone the field you need, return it).
-    /// `None` means "no `<P>` fold at this path right now": no live entry,
-    /// wrong type (foreign actors' JSON included), or — for the `try_`
-    /// pair only — a lock the fold currently holds.
+    /// `Some(r)` is a snapshot of the live fold at the moment of the call;
+    /// `None` means no snapshot was taken this call: no live entry, wrong
+    /// type (foreign actors' JSON included), or — for the `try_` pair
+    /// only — a lock the fold currently holds.
     ///
     /// Sync and non-blocking like [`ActorSystem::try_with_es_state`](crate::system::ActorSystem::try_with_es_state); use
     /// [`ActorSystem::with_projector_state`](crate::system::ActorSystem::with_projector_state) to wake a cold set-owned

@@ -4,13 +4,14 @@
 //! The `try_` reads run a sync closure over the LIVE state under its
 //! lock — no serialize, no clone, no decode — and never block: the lock
 //! is taken with `try_lock`, so a read that races the fold (microseconds)
-//! reads `None` and the caller keeps its previous frame. That is the
-//! render-loop pattern: a GUI thread reads projection state per frame
-//! without awaiting anything.
+//! reads `None` — no snapshot this call — and the caller keeps drawing
+//! whatever it last drew (its own view state; the method returns nothing
+//! else). That is the render-loop pattern: a GUI thread reads projection
+//! state per frame without awaiting anything.
 //!
-//! `None` is "no `<A>` state at this path right now" — no live entry
-//! (unknown or cold path), a wrong type (this demo reads the counter as a
-//! different type), or a busy lock.
+//! `None` means no snapshot was taken this call: no live entry (unknown or
+//! cold path), a wrong type (this demo reads the counter as a different
+//! type), or a busy lock.
 //!
 //! Run: `cargo run --example try_with`
 //!
@@ -133,8 +134,9 @@ async fn main() {
     let mut frames = 0;
     let mut last: Option<i64> = None;
     while last != Some(60) {
-        // NEVER blocks: if the fold holds the lock right now, this frame
-        // keeps the previous value (None on the very first frame).
+        // NEVER blocks: `Some` = a fresh snapshot of the fold right now;
+        // `None` = no snapshot this call (busy lock / no state yet), and
+        // `last` stays whatever the previous snapshot returned.
         if let Some(total) = system.try_with_es_state::<Counter, _>(&counter, |c| c.total) {
             last = Some(total);
         }
