@@ -110,3 +110,6 @@ Entries are added or amended **only with human approval**.
 - (runtime) An idle actor's loop sleeps until its next due duty (snapshot cadence or passivation) or the next message, whichever comes first; an actor with no duties armed does not wake at all.
 - (runtime) A supervised child's crash is signaled by a Notify on the child's cell; supervision engines wake on the signal and read the crash flag lock-free instead of polling.
 - (bench) The idle_fleet bench includes a 10,000-idle-actor case, and examples/idle_burn.rs measures runtime CPU seconds for a duty-armed idle fleet (5,000 actors burn ~0.003 s CPU/s of wall vs ~0.28 s polled before this work).
+- (schemas) The Event/Command derive maps every non-shard-key field to FieldTy::Json without inspecting its Rust type; no field type is a compile error.
+- (schemas) The Event/Command derive maps a #[schema(shard_key)] field to its real flat descriptor type, since shard keys are string or number values read at partition routing.
+- (schemas) The derive's schema name is the struct ident and descriptor field names are the Rust field idents; renames are serde's concern only, and the shard-key field must not be serde-renamed.
