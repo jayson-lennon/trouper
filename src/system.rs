@@ -1304,6 +1304,43 @@ impl ActorSystemCore {
         }
     }
 
+    /// Typed ask: sends `value` and downcasts the reply into the
+    /// declared reply type `R`. A reply that does not fit `R` is the
+    /// named [`crate::context::AskError::ReplyType`].
+    ///
+    /// # Errors
+    ///
+    /// [`crate::context::AskError::Unresolved`] when the destination does
+    /// not resolve or the ask times out; [`crate::context::AskError::ReplyType`]
+    /// on a wrong-shaped reply.
+    pub async fn ask_typed<C, R>(
+        &self,
+        dest: ActorPath,
+        value: C,
+        timeout: std::time::Duration,
+    ) -> Result<R, error_stack::Report<crate::context::AskError>>
+    where
+        C: Schema + serde::Serialize + Clone + Send + Sync + 'static,
+        R: Schema + crate::envelope::PayloadValue + Clone + serde::de::DeserializeOwned + 'static,
+    {
+        let payload = Json::of(&value);
+        let port = crate::kernel::KernelAskPort {
+            registry: self.registry.clone(),
+            kernel: self.kernel.clone(),
+            clock: self.clock.clone(),
+        };
+        let reply = crate::context::ask_via_port_payload(
+            &port,
+            Address::Path(dest),
+            C::schema_id(),
+            payload,
+            timeout,
+            TraceCtx::root(),
+        )
+        .await?;
+        crate::context::downcast_reply::<R>(reply)
+    }
+
     /// Untyped event broadcast from outside the system: the caller has
     /// already serialized the payload under `schema`. Same fan-out
     /// contract as [ActorSystem::publish](crate::system::ActorSystemCore::publish)
@@ -4237,7 +4274,7 @@ mod tests {
             .open(std::time::Duration::from_secs(60), system.clock.now());
 
         // When completing the long lease and pruning past the short one.
-        assert!(kernel.replies.complete(&long_lease, json!({ "ok": true })));
+        assert!(kernel.replies.complete(&long_lease, crate::envelope::Payload::from(json!({ "ok": true }))));
         drop(long_rx);
         kernel.replies.prune(crate::clock::Timestamp::from_millis(
             system.clock.now().as_millis() + 10,
@@ -4246,7 +4283,7 @@ mod tests {
         // Then the short lease is gone (expired), the long one was
         // consumed by its reply, and the table is empty — no leaks.
         assert!(kernel.replies.is_empty(), "lease leaked");
-        assert!(!kernel.replies.complete(&short_lease, json!({})));
+        assert!(!kernel.replies.complete(&short_lease, crate::envelope::Payload::from(json!({}))));
     }
 
     #[tokio::test]
@@ -6176,7 +6213,7 @@ mod tests {
         {
             let kernel = system.kernel.lock();
             assert!(
-                !kernel.replies.complete(&late_lease, json!({ "echo": 1 })),
+                !kernel.replies.complete(&late_lease, crate::envelope::Payload::from(json!({ "echo": 1 }))),
                 "a dead lease must not accept a late reply"
             );
         }
@@ -9885,6 +9922,69 @@ mod tests {
         assert_eq!(event.payload_json()["n"], 5, "the stored payload round-trips");
         let state = system.es_state(&path).await.expect("live");
         assert_eq!(state["total"], json!(5));
+    }
+
+    #[tokio::test]
+    async fn typed_ask_roundtrips_and_names_a_reply_mismatch() {
+        // Given an Echo answering AskReq with AskRes — and a caller using
+        // the TYPED ask (declared reply type).
+        let (system, _clock) = ActorSystem::test();
+        struct Echo;
+        impl ServiceActor for Echo {
+            fn manifest() -> ActorManifest {
+                ActorManifest::new().kind(ActorKind::Service)
+            }
+            async fn start(
+                _args: &Json,
+            ) -> Result<Self, error_stack::Report<crate::registry::RegistryError>> {
+                Ok(Self)
+            }
+        }
+        impl MsgHandler<AskReq> for Echo {
+            async fn handle(&mut self, msg: AskReq, ctx: &mut crate::context::MsgCtx<'_>) {
+                ctx.reply(AskRes { n: msg.n });
+            }
+        }
+        crate::builder::spawn_service_builder::<Echo>(&system)
+            .at(ActorPath::new("echo-typed"))
+            .handles::<AskReq>()
+            .emits::<AskRes>()
+            .start();
+        wait_for(|| async { system.inbox_cursor(&ActorPath::new("echo-typed")).is_some() }).await;
+
+        // When the typed ask round-trips (reply type declared as AskRes).
+        let reply: AskRes = system
+            .ask_typed(
+                ActorPath::new("echo-typed"),
+                AskReq { n: 9 },
+                std::time::Duration::from_secs(2),
+            )
+            .await
+            .expect("replied");
+
+        // Then the reply is the LIVE typed value (no decode contract).
+        assert_eq!(reply.n, 9);
+
+        // When the asker declares the WRONG reply type.
+        let mismatch = system
+            .ask_typed::<AskReq, Kick>(
+                ActorPath::new("echo-typed"),
+                AskReq { n: 9 },
+                std::time::Duration::from_secs(2),
+            )
+            .await;
+
+        // Then the mismatch is the NAMED reply-type error.
+        let Err(err) = mismatch else {
+            panic!("must mismatch");
+        };
+        assert!(
+            matches!(
+                err.current_context(),
+                crate::context::AskError::ReplyType(_)
+            ),
+            "a wrong-shaped reply must be ReplyType, got {err}"
+        );
     }
 
     #[tokio::test]

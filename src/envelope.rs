@@ -100,6 +100,12 @@ impl std::fmt::Debug for Payload {
     }
 }
 
+impl Default for Payload {
+    fn default() -> Self {
+        Self::json_view(Json::default())
+    }
+}
+
 impl Payload {
     /// Wraps a live value (the typed send edge's constructor).
     pub(crate) fn value<T: PayloadValue>(value: T) -> Self {

@@ -138,7 +138,10 @@ pub(crate) type AskChannelFuture = std::pin::Pin<
     Box<
         dyn std::future::Future<
                 Output = Result<
-                    (crate::reply::LeaseId, tokio::sync::oneshot::Receiver<Json>),
+                    (
+                        crate::reply::LeaseId,
+                        tokio::sync::oneshot::Receiver<crate::envelope::Payload>,
+                    ),
                     error_stack::Report<AskError>,
                 >,
             > + Send,
@@ -283,6 +286,10 @@ pub enum AskError {
     /// destination (`SpawnBuilder::handles` was never called for it),
     /// or nothing is registered at the destination at all.
     Unresolved(String),
+    /// The reply did not decode into the asker's declared reply type —
+    /// the responder answered, but with the wrong shape (a contract
+    /// violation, named by the reply schema).
+    ReplyType(String),
 }
 
 /// The ask machinery shared by [`MsgCtx::ask`] (in-actor asks) and
@@ -292,6 +299,23 @@ pub enum AskError {
 ///
 /// The timeout produces an [`AskOutcome::Timeout`] fact; a late reply lands
 /// nowhere (the lease is dropped before the receiver is).
+/// Downcasts a reply payload into the asker's declared reply type —
+/// the typed ask's last step. A live value downcasts (zero serde); a
+/// wire/Json reply decodes. Anything else is the named ReplyType error.
+pub(crate) fn downcast_reply<R: crate::schema::Schema + serde::de::DeserializeOwned + Clone + 'static>(
+    reply: crate::envelope::Payload,
+) -> Result<R, error_stack::Report<AskError>> {
+    reply
+        .inner()
+        .downcast_ref::<R>()
+        .ok_or_else(|| {
+            error_stack::Report::new(AskError::ReplyType(format!(
+                "reply is not a {}",
+                R::schema_id()
+            )))
+        })
+}
+
 pub(crate) async fn ask_via_port(
     port: &dyn AskPort,
     dest: Address,
@@ -300,6 +324,22 @@ pub(crate) async fn ask_via_port(
     timeout: std::time::Duration,
     trace: TraceCtx,
 ) -> Result<Json, error_stack::Report<AskError>> {
+    ask_via_port_payload(port, dest, schema, payload, timeout, trace)
+        .await
+        .map(|reply| reply.json().clone())
+}
+
+/// The payload-returning ask engine (the typed ask's core): the reply
+/// stays erasure-free so the caller can downcast it into the declared
+/// reply type.
+pub(crate) async fn ask_via_port_payload(
+    port: &dyn AskPort,
+    dest: Address,
+    schema: SchemaId,
+    payload: Json,
+    timeout: std::time::Duration,
+    trace: TraceCtx,
+) -> Result<crate::envelope::Payload, error_stack::Report<AskError>> {
     use error_stack::ResultExt;
     let dest_label = format!("{dest:?}");
     let (lease, mut receiver) = port
@@ -308,7 +348,7 @@ pub(crate) async fn ask_via_port(
         .change_context(AskError::Unresolved(format!("{dest:?}")))?;
     let outcome = match tokio::time::timeout(timeout, &mut receiver).await {
         Ok(Ok(reply)) => Some((AskOutcome::Replied, reply)),
-        Ok(Err(_)) => Some((AskOutcome::Failed, Json::default())),
+        Ok(Err(_)) => Some((AskOutcome::Failed, crate::envelope::Payload::default())),
         Err(_) => None,
     };
     match outcome {
@@ -487,6 +527,38 @@ impl<'a> MsgCtx<'a> {
     ) -> Result<Json, error_stack::Report<AskError>> {
         let payload = Json::of(req);
         self.ask_json(dest, M::schema_id(), payload, timeout).await
+    }
+
+    /// Typed ask: sends `req` and downcasts the reply into the declared
+    /// reply type `R` (a live value: no decode when the responder replied
+    /// in kind). A reply that does not fit `R` is the named
+    /// [`AskError::ReplyType`] — the responder answered wrongly.
+    ///
+    /// # Errors
+    ///
+    /// [`AskError::Unresolved`] when the destination does not resolve or
+    /// the ask times out; [`AskError::ReplyType`] on a wrong-shaped reply.
+    ///
+    /// # Panics
+    ///
+    /// Panics when there is no ask port (service tier required).
+    pub async fn ask_typed<M: Message, R: Message + crate::envelope::PayloadValue + Clone>(
+        &mut self,
+        dest: Address,
+        req: &M,
+        timeout: std::time::Duration,
+    ) -> Result<R, error_stack::Report<AskError>> {
+        let port = self.port.expect("ask requires a port (service tier)");
+        let reply = ask_via_port_payload(
+            port,
+            dest,
+            M::schema_id(),
+            Json::of(req),
+            timeout,
+            *self.core.trace,
+        )
+        .await?;
+        downcast_reply::<R>(reply)
     }
 
     /// Records a one-of send (typed): exactly one copy goes to one actor

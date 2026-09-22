@@ -1371,7 +1371,7 @@ impl crate::context::AskPort for KernelAskPort {
         Box<
             dyn Future<
                     Output = Result<
-                        (crate::reply::LeaseId, tokio::sync::oneshot::Receiver<Json>),
+                        (crate::reply::LeaseId, tokio::sync::oneshot::Receiver<crate::envelope::Payload>),
                         error_stack::Report<crate::context::AskError>,
                     >,
                 > + Send,
@@ -1631,7 +1631,7 @@ async fn resolve_reply(
             // Mechanism: complete the lease if it is still live; a dead
             // (expired/pruned) slot just drops the reply — the asker is
             // gone, and the ask timed out on its side already.
-            kernel.lock().replies.complete(&lease, payload);
+            kernel.lock().replies.complete(&lease, crate::envelope::Payload::json_view(payload));
         }
         Address::Schema(_) => {
             // A schema-addressed reply is an ordinary routed send (the
