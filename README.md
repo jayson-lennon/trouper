@@ -14,13 +14,13 @@ Usage-shaped end-to-end cycles (`cargo bench --bench e2e`) and component
 costs (`cargo bench --bench micro`), run with criterion on the
 development machine (Intel i5-10400, Linux, release profile). Numbers
 are the mean of the current baseline; treat them as shape and scale,
-not absolute promises — rerun `cargo bench` locally for your hardware.
+not absolute promises; rerun `cargo bench` locally for your hardware.
 (The "Criterion time" column is the raw mean per iteration, exactly as
 `cargo bench` prints it; "Per message" divides by the case's element
-count; "Rate" names the unit per bench — msg, ask roundtrip, or frame
-read — instead of criterion's generic "elem".)
+count; "Rate" names the unit per bench (msg, ask roundtrip, or frame
+read) instead of criterion's generic "elem".)
 
-### e2e — full send → done cycles
+### e2e: full send → done cycles
 
 | Bench | Case | Criterion time | Per message | Rate |
 |---|---|---:|---:|---:|
@@ -49,25 +49,25 @@ read — instead of criterion's generic "elem".)
 
 What the shapes mean:
 
-- **tell_baseline** — the floor: one message through send→fold→ack,
+- **tell_baseline**: the floor, one message through send→fold→ack,
   ~34 µs.
-- **producer_scaling** — 1/2/4/8 producers on one entity. Per-message
+- **producer_scaling**: 1/2/4/8 producers on one entity. Per-message
   cost holds as producers grow (no single-lock funnel).
-- **payload_size** — one message per commit at 500 B → 1 MB payloads.
-- **wide_tree** — one commit with a huge JSON-tree payload (100k / 1M
-  nodes): 1,230 → 1,310 µs shows tree width barely matters.
-- **fanout** — ask roundtrips (request + reply); per-roundtrip cost
+- **payload_size**: one message per commit, 500 B to 1 MB payloads.
+- **wide_tree**: one commit with a huge JSON-tree payload (100k / 1M
+  nodes); 1.23 → 1.31 ms shows tree width barely matters.
+- **fanout**: ask roundtrips (request + reply); per-roundtrip cost
   with 1/8/64 live echo services.
-- **overload_block** — 16 producers into a full `Block` inbox:
+- **overload_block**: 16 producers into a full `Block` inbox,
   backpressure, no loss.
-- **idle_fleet** — one busy entity among 1k / 10k idle actors. Same
-  per-message time as tell_baseline: idle actors cost nothing.
-- **swarm** — many-to-many at fleet scale (32 tells × every receiver);
+- **idle_fleet**: one busy entity among 1k / 10k idle actors. Same
+  per-message time as tell_baseline; idle actors cost nothing.
+- **swarm**: many-to-many at fleet scale (32 tells × every receiver),
   per-message cost at 4k/64k/1M messages in flight.
-- **projection_read** — how fast a UI can read a projector's state:
+- **projection_read**: how fast a UI can read a projector's state,
   typed closure vs JSON decode, per read.
 
-### micro — journal component costs
+### micro: journal component costs
 
 | Bench | Case | Mean |
 |---|---|---:|
@@ -78,6 +78,6 @@ What the shapes mean:
 | | journal_10000 | 595 µs |
 | | repeat_load_10k | 738 µs |
 
-Also see `examples/idle_burn.rs` — a CPU-seconds probe for idle fleets
+Also see `examples/idle_burn.rs`, a CPU-seconds probe for idle fleets
 (5,000 duty-armed idle actors burn ~0.003 CPU-seconds per second of
 wall; ~100× less than a polled runtime).
