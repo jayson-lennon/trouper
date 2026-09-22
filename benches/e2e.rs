@@ -3,10 +3,17 @@
 //!
 //! Every bench measures COMPLETE processing, never bare `tell` loops (a
 //! tell resolves at channel accept; without a completion barrier the
-//! number is a channel benchmark, not an actor one). Completion comes
-//! from a per-iteration FRESH entity whose fold is polled to an exact
-//! count, or from a lease-backed `ask` roundtrip. Fresh entities keep
-//! criterion iterations independent — no cross-iteration accounting.
+//! number is a channel benchmark, not an actor one). Completion is
+//! PUSH-DRIVEN, uniformly: a per-iteration FRESH entity's commit is
+//! observed through its Acked tap fact (`wait_acked`, no timed sleep —
+//! detection at scheduler scale), and `ask` benches settle on the
+//! reply itself. Fresh entities keep criterion iterations independent —
+//! no cross-iteration accounting.
+//!
+//! Message benches share one matrix: batches of 1, 64, and 512 (the
+//! swarm keeps its declared 32×receivers shape; payload_size and
+//! wide_tree are single-message by design — they price payload width,
+//! not batching).
 //!
 //! Structure: setup runs inside `rt.block_on`; the measured `b.iter`
 //! bodies hop into the runtime via `rt.block_on` (criterion's thread is
@@ -219,21 +226,36 @@ async fn spawn_accum(system: &ActorSystem, path: &ActorPath) {
     wait_entity_exists(system, path).await;
 }
 
-/// Waits until the entity's count reaches `count` (bounded; panics on
-/// stall so a bench fails loudly instead of reporting a fast bogus time).
-/// Must run inside the runtime.
-async fn wait_entity(system: &ActorSystem, path: &ActorPath, count: u64) {
-    for _ in 0..30_000 {
-        if system
-            .with_es_state::<Accum, _>(path, |a| a.count)
-            .await
-            .is_some_and(|c| c >= count)
-        {
-            return;
+/// Waits (push-driven, NO timed sleep) until `count` Acked tap facts
+/// for `path` appear at/after `from` — the scheduler-scale completion
+/// signal. `Acked` is recorded at the kernel's commit point (journal
+/// append + inbox ack), so this waits for COMPLETE processing, same
+/// contract as the file-wide rule. Returns the next tap offset so
+/// callers can chain windows. Must run inside the runtime.
+///
+/// The loop is PEEK-then-DRAIN: spin on the ring's O(1) next-offset
+/// watermark and only call `tap_facts_from` once enough facts have
+/// landed. Draining on every round would scan the whole retained ring
+/// under the same mutex the commit point pushes with — the waiter
+/// would throttle the very acks it waits for.
+async fn wait_acked(system: &ActorSystem, from: u64, path: &ActorPath, count: u64) -> u64 {
+    let mut cursor = from;
+    let mut arrived = 0u64;
+    for _ in 0..200_000_000 {
+        if system.tap_next_offset() >= cursor + (count - arrived) {
+            for fact in system.tap_facts_from(cursor) {
+                cursor = fact.offset + 1;
+                if matches!(&fact.kind, trouper::tap::FactKind::Acked { to, .. } if to == path) {
+                    arrived += 1;
+                    if arrived == count {
+                        return cursor;
+                    }
+                }
+            }
         }
-        tokio::time::sleep(Duration::from_millis(1)).await;
+        tokio::task::yield_now().await;
     }
-    panic!("entity {path} never reached count {count}");
+    panic!("ack wait stalled: {arrived}/{count} for {path}");
 }
 
 /// Liveness probe: the entity's state is readable.
@@ -251,35 +273,40 @@ async fn wait_entity_exists(system: &ActorSystem, path: &ActorPath) {
     panic!("actor never went live: {path}");
 }
 
-/// Drives `count` tells at a fresh entity and waits for the exact fold
-/// count. Must run inside the runtime.
 /// Tells `count` commands at a JUST-SPAWNED entity and waits for the
-/// exact fold count. The spawn must happen in the same iteration (fresh
-/// path): telling a path nobody owns resolves to `Err` immediately.
-/// Must run inside the runtime.
-async fn drive_and_settle(system: &ActorSystem, path: &ActorPath, count: u64) {
+/// acks (push-driven). The spawn must happen in the same iteration
+/// (fresh path): telling a path nobody owns resolves to `Err`
+/// immediately. Must run inside the runtime.
+async fn drive_and_settle(
+    system: &ActorSystem,
+    cursor: &std::cell::Cell<u64>,
+    path: &ActorPath,
+    count: u64,
+) {
     for n in 0..count as i64 {
         if let Err(envelope) = system.tell(path.clone(), Tick { n }).await {
             panic!("tell to {path} refused: {envelope:?}");
         }
     }
-    wait_entity(system, path, count).await;
+    cursor.set(wait_acked(system, cursor.get(), path, count).await);
 }
 
-/// Tells `count` commands at a PERSISTENT entity, waiting until its fold
-/// has grown by exactly `count` from the watermark captured BEFORE the
-/// tells. Must run inside the runtime.
-async fn drive_and_settle_watermark(system: &ActorSystem, path: &ActorPath, count: u64) {
-    let before = system
-        .with_es_state::<Accum, _>(path, |a| a.count)
-        .await
-        .unwrap_or(0);
+/// Tells `count` commands at a PERSISTENT entity, waiting for exactly
+/// `count` acks since the tap cursor captured BEFORE the tells (the
+/// entity persists across iterations; the cursor makes the window
+/// this-iteration-only). Must run inside the runtime.
+async fn drive_and_settle_watermark(
+    system: &ActorSystem,
+    cursor: &std::cell::Cell<u64>,
+    path: &ActorPath,
+    count: u64,
+) {
     for n in 0..count as i64 {
         if let Err(envelope) = system.tell(path.clone(), Tick { n }).await {
             panic!("tell to {path} refused: {envelope:?}");
         }
     }
-    wait_entity(system, path, before + count).await;
+    cursor.set(wait_acked(system, cursor.get(), path, count).await);
 }
 
 /// Per-iteration entity paths: criterion iterates each bench thousands of
@@ -294,6 +321,20 @@ impl Iterations {
     }
 }
 
+/// Seeds a push-wait cursor: the offset just past the newest retained
+/// tap fact (sync, unmeasured setup). Each iteration's `wait_acked`
+/// advances the cursor it borrows, so completion windows never overlap
+/// across iterations.
+fn seed_cursor(system: &ActorSystem) -> std::cell::Cell<u64> {
+    std::cell::Cell::new(
+        system
+            .tap_facts()
+            .last()
+            .map(|f| f.offset + 1)
+            .unwrap_or(0),
+    )
+}
+
 // ---------------------------------------------------------------------------
 // tell_baseline: one producer, one fresh entity, full send→fold→ack cycle.
 // ---------------------------------------------------------------------------
@@ -301,21 +342,26 @@ impl Iterations {
 fn tell_baseline(c: &mut Criterion) {
     let (system, rt) = spawn_system();
     let iterations = Iterations(std::sync::atomic::AtomicU64::new(0));
+    let cursor = seed_cursor(&system);
 
     let mut group = c.benchmark_group("e2e/tell_baseline");
     // ONE ELEMENT = one message, send→fold→ack COMPLETE (the file-wide
     // rule: never a bare tell). So criterion's elem/s reads as msg/s.
-    group.throughput(criterion::Throughput::Elements(64));
+    // 1 = the true single-message floor (the push-wait detects its ack
+    // at scheduler scale); 64 and 512 are the batch shapes.
     group.sample_size(30);
-    group.bench_function("64_messages", |b| {
-        b.iter(|| {
-            rt.block_on(async {
-                let path = iterations.next_path("bench/tell-baseline");
-                spawn_accum(&system, &path).await;
-                drive_and_settle(&system, &path, 64).await;
+    for size in [1u64, 64, 512] {
+        group.throughput(criterion::Throughput::Elements(size));
+        group.bench_function(format!("{size}_messages"), |b| {
+            b.iter(|| {
+                rt.block_on(async {
+                    let path = iterations.next_path("bench/tell-baseline");
+                    spawn_accum(&system, &path).await;
+                    drive_and_settle(&system, &cursor, &path, size).await;
+                });
             });
         });
-    });
+    }
     group.finish();
 }
 
@@ -327,48 +373,72 @@ fn tell_baseline(c: &mut Criterion) {
 fn producer_scaling(c: &mut Criterion) {
     let (system, rt) = spawn_system();
     let iterations = Iterations(std::sync::atomic::AtomicU64::new(0));
+    let cursor = seed_cursor(&system);
 
     let mut group = c.benchmark_group("e2e/producer_scaling");
-    // ONE ELEMENT = one message committed to the shared entity (128
-    // messages per iteration split across the producers). elem/s = msg/s.
-    group.throughput(criterion::Throughput::Elements(128));
+    // ONE ELEMENT = one message committed to the shared entity. elem/s
+    // = msg/s. Matrix: P producers × batch size; the 1-message case
+    // runs with ONE producer only (distributing a single message across
+    // producers measures nothing).
     group.sample_size(20);
+
+    // The single-message floor: one producer, one fresh entity, one
+    // full send→fold→ack cycle.
+    group.throughput(criterion::Throughput::Elements(1));
+    group.bench_function("producers_1_1_message", |b| {
+        b.iter(|| {
+            rt.block_on(async {
+                let path = iterations.next_path("bench/scaling");
+                spawn_accum(&system, &path).await;
+                drive_and_settle(&system, &cursor, &path, 1).await;
+            });
+        });
+    });
+
     for producers in [1usize, 2, 4, 8] {
-        group.bench_with_input(
-            criterion::BenchmarkId::from_parameter(producers),
-            &producers,
-            |b, &p| {
-                b.iter(|| {
-                    rt.block_on(async {
-                        // Fresh entity per iteration: each producer sends
-                        // its share, completion is the exact total count.
-                        let path = iterations.next_path("bench/scaling");
-                        spawn_accum(&system, &path).await;
-                        let per = 128 / p;
-                        let barrier = Arc::new(Barrier::new(p));
-                        let mut tasks = Vec::new();
-                        for _ in 0..p {
-                            let system = system.clone();
-                            let path = path.clone();
-                            let barrier = barrier.clone();
-                            tasks.push(tokio::spawn(async move {
-                                barrier.wait().await;
-                                for _ in 0..per {
-                                    system
-                                        .tell(path.clone(), Tick { n: 1 })
-                                        .await
-                                        .expect("delivered");
-                                }
-                            }));
-                        }
-                        for task in tasks {
-                            task.await.expect("producer");
-                        }
-                        wait_entity(&system, &path, 128).await;
+        for size in [64u64, 512] {
+            group.throughput(criterion::Throughput::Elements(size));
+            group.bench_with_input(
+                criterion::BenchmarkId::new(format!("{size}_messages"), producers),
+                &producers,
+                |b, &p| {
+                    b.iter(|| {
+                        rt.block_on(async {
+                            // Fresh entity per iteration: each producer
+                            // sends its share, completion is the exact
+                            // ack count (push-wait on the shared
+                            // cursor; acks may interleave across the
+                            // producers, so they are COUNTED, never
+                            // sequenced).
+                            let path = iterations.next_path("bench/scaling");
+                            spawn_accum(&system, &path).await;
+                            let per = size / p as u64;
+                            let barrier = Arc::new(Barrier::new(p));
+                            let mut tasks = Vec::new();
+                            for _ in 0..p {
+                                let system = system.clone();
+                                let path = path.clone();
+                                let barrier = barrier.clone();
+                                tasks.push(tokio::spawn(async move {
+                                    barrier.wait().await;
+                                    for _ in 0..per {
+                                        system
+                                            .tell(path.clone(), Tick { n: 1 })
+                                            .await
+                                            .expect("delivered");
+                                    }
+                                }));
+                            }
+                            for task in tasks {
+                                task.await.expect("producer");
+                            }
+                            let next = wait_acked(&system, cursor.get(), &path, size).await;
+                            cursor.set(next);
+                        });
                     });
-                });
-            },
-        );
+                },
+            );
+        }
     }
     group.finish();
 }
@@ -388,6 +458,7 @@ fn producer_scaling(c: &mut Criterion) {
 fn payload_size(c: &mut Criterion) {
     let (system, rt) = spawn_system();
     let iterations = Iterations(std::sync::atomic::AtomicU64::new(0));
+    let cursor = seed_cursor(&system);
 
     let mut group = c.benchmark_group("e2e/payload_size");
     group.sample_size(30);
@@ -424,7 +495,10 @@ fn payload_size(c: &mut Criterion) {
                         .tell(path.clone(), chunk.clone())
                         .await
                         .expect("delivered");
-                    wait_bytes_total(&system, &path, size as u64).await;
+                    // One message per iteration: its Acked fact IS the
+                    // completion (push-wait, scheduler scale).
+                    let next = wait_acked(&system, cursor.get(), &path, 1).await;
+                    cursor.set(next);
                 });
             });
         });
@@ -454,6 +528,7 @@ fn realistic_chunk(body_bytes: usize) -> Chunk {
 fn wide_tree(c: &mut Criterion) {
     let (system, rt) = spawn_system();
     let iterations = Iterations(std::sync::atomic::AtomicU64::new(0));
+    let cursor = seed_cursor(&system);
 
     let mut group = c.benchmark_group("e2e/wide_tree");
     group.sample_size(20);
@@ -484,9 +559,10 @@ fn wide_tree(c: &mut Criterion) {
                         .tell(path.clone(), chunk.clone())
                         .await
                         .expect("delivered");
-                    // One message per iteration: wait for ITS fold, not
-                    // the element count.
-                    wait_wide_count(&system, &path, 1).await;
+                    // One message per iteration: its Acked fact IS the
+                    // completion (push-wait, scheduler scale).
+                    let next = wait_acked(&system, cursor.get(), &path, 1).await;
+                    cursor.set(next);
                 });
             });
         });
@@ -521,42 +597,6 @@ impl trouper::actor::CommandHandler<WideChunk> for Wide {
     }
 }
 
-/// Waits until the Wide entity's count reaches `count` (bounded; panics
-/// on stall so a bench fails loudly instead of reporting a fast bogus
-/// time). Must run inside the runtime.
-async fn wait_wide_count(system: &ActorSystem, path: &ActorPath, count: u64) {
-    for _ in 0..300_000 {
-        if system
-            .with_es_state::<Wide, _>(path, |w| w.count)
-            .await
-            .is_some_and(|c| c >= count)
-        {
-            return;
-        }
-        tokio::time::sleep(Duration::from_micros(100)).await;
-    }
-    panic!("entity {path} never reached count {count}");
-}
-
-/// Waits until the Bytes entity's total reaches `total` (bounded; panics
-/// on stall so a bench fails loudly instead of reporting a fast bogus
-/// time). Must run inside the runtime.
-async fn wait_bytes_total(system: &ActorSystem, path: &ActorPath, total: u64) {
-    for _ in 0..300_000 {
-        if system
-            .with_es_state::<Bytes, _>(path, |b| b.total)
-            .await
-            .is_some_and(|t| t >= total)
-        {
-            return;
-        }
-        // 100µs granularity: the probe's detection latency must stay well
-        // below the per-message times being measured.
-        tokio::time::sleep(Duration::from_micros(100)).await;
-    }
-    panic!("entity {path} never reached total {total}");
-}
-
 // ---------------------------------------------------------------------------
 // fanout: one publisher, H `.handles` echo sinks — ask RTT per sink makes
 // completion exact without counters (tracks per-handler clone/decode).
@@ -567,9 +607,10 @@ fn fanout(c: &mut Criterion) {
 
     let mut group = c.benchmark_group("e2e/fanout");
     // ONE ELEMENT = one ASK ROUNDTRIP (request delivered + reply
-    // received through one of N echo services), 32 per iteration. NOT a
-    // broadcast fan-out despite the name. elem/s = roundtrips/s.
-    group.throughput(criterion::Throughput::Elements(32));
+    // received through one of N echo services). NOT a broadcast fan-out
+    // despite the name. elem/s = roundtrips/s. Matrix: H handlers ×
+    // asks per iteration. Completion is the reply itself — already
+    // push, no wait mechanism involved at any ask count.
     group.sample_size(20);
     for handlers in [1usize, 8, 64] {
         // Spawns are idempotent-free: each handler count gets its own
@@ -614,24 +655,27 @@ fn fanout(c: &mut Criterion) {
             }
         });
 
-        group.bench_function(format!("handlers_{handlers}"), |b| {
-            b.iter(|| {
-                rt.block_on(async {
-                    for _ in 0..32 {
-                        for path in &paths {
-                            system
-                                .ask(
-                                    path.clone(),
-                                    Ping { filler: Vec::new() },
-                                    Duration::from_secs(5),
-                                )
-                                .await
-                                .expect("echo");
+        for asks in [1u64, 64, 512] {
+            group.throughput(criterion::Throughput::Elements(asks));
+            group.bench_function(format!("handlers_{handlers}_{asks}_asks"), |b| {
+                b.iter(|| {
+                    rt.block_on(async {
+                        for _ in 0..asks {
+                            for path in &paths {
+                                system
+                                    .ask(
+                                        path.clone(),
+                                        Ping { filler: Vec::new() },
+                                        Duration::from_secs(5),
+                                    )
+                                    .await
+                                    .expect("echo");
+                            }
                         }
-                    }
+                    });
                 });
             });
-        });
+        }
     }
     group.finish();
 }
@@ -644,6 +688,7 @@ fn fanout(c: &mut Criterion) {
 fn overload_block(c: &mut Criterion) {
     let (system, rt) = spawn_system();
     let path = ActorPath::new("bench/overloaded");
+    let cursor = seed_cursor(&system);
     rt.block_on(async {
         system.spawn_es::<Accum, _>(
             path.clone(),
@@ -665,142 +710,128 @@ fn overload_block(c: &mut Criterion) {
     });
 
     let mut group = c.benchmark_group("e2e/overload_block");
-    // ONE ELEMENT = one message delivered into the Block inbox (512 per
-    // iteration from 16 producers; lossless — the pre-batch watermark
-    // gates completion). elem/s = msg/s.
-    group.throughput(criterion::Throughput::Elements(512));
+    // ONE ELEMENT = one message delivered into the Block inbox; elem/s
+    // = msg/s. Sizes 64 and 512 fill the inbox from 16 producers
+    // (32/producer and 4/producer respectively). The 1-message case
+    // exercises the Block inbox UNFILLED — a plain, never-backpressured
+    // tell — the no-backpressure datapoint the batch cases are measured
+    // against. Lossless in every case: the dead-letter assert stays.
     group.sample_size(15);
-    group.bench_function("16_producers_512_messages", |b| {
-        b.iter(|| {
-            rt.block_on(async {
-                let before = system
-                    .with_es_state::<Accum, _>(&path, |a| a.count)
-                    .await
-                    .unwrap_or(0);
-                let barrier = Arc::new(Barrier::new(16));
-                let mut tasks = Vec::new();
-                for _ in 0..16 {
-                    let system = system.clone();
-                    let path = path.clone();
-                    let barrier = barrier.clone();
-                    tasks.push(tokio::spawn(async move {
-                        barrier.wait().await;
-                        for _ in 0..32 {
-                            system
-                                .tell(path.clone(), Tick { n: 1 })
-                                .await
-                                .expect("delivered");
-                        }
-                    }));
-                }
-                for task in tasks {
-                    task.await.expect("producer");
-                }
-                // Completion: this iteration's 512 all folded, counted
-                // from the pre-batch watermark (the entity persists
-                // across iterations; a post-batch read would over-count
-                // by whatever already folded).
-                wait_entity(&system, &path, before + 512).await;
-                assert_eq!(
-                    system.dead_letter_count().await,
-                    0,
-                    "Block overload must be lossless (post-D1)"
-                );
+    for (size, producers, per) in [(1u64, 1usize, 1u64), (64, 16, 4), (512, 16, 32)] {
+        group.throughput(criterion::Throughput::Elements(size));
+        group.bench_function(format!("producers_{producers}_{size}_messages"), |b| {
+            b.iter(|| {
+                rt.block_on(async {
+                    let barrier = Arc::new(Barrier::new(producers));
+                    let mut tasks = Vec::new();
+                    for _ in 0..producers {
+                        let system = system.clone();
+                        let path = path.clone();
+                        let barrier = barrier.clone();
+                        tasks.push(tokio::spawn(async move {
+                            barrier.wait().await;
+                            for _ in 0..per {
+                                system
+                                    .tell(path.clone(), Tick { n: 1 })
+                                    .await
+                                    .expect("delivered");
+                            }
+                        }));
+                    }
+                    for task in tasks {
+                        task.await.expect("producer");
+                    }
+                    // Completion: this iteration's `size` messages all
+                    // acked (push-wait; the entity persists across
+                    // iterations, the cursor keeps the window
+                    // this-iteration-only).
+                    let next = wait_acked(&system, cursor.get(), &path, size).await;
+                    cursor.set(next);
+                    assert_eq!(
+                        system.dead_letter_count().await,
+                        0,
+                        "Block overload must be lossless (post-D1)"
+                    );
+                });
             });
         });
-    });
+    }
     group.finish();
 }
 
 // ---------------------------------------------------------------------------
-// idle_fleet: throughput on ONE busy actor while 1_000 idle actors poll —
-// the polling-floor tax (tracks the polling-removal improvement).
+// idle_fleet: throughput on ONE busy actor while 1k / 10k idle actors sit
+// alongside — the polling-floor tax (tracks the polling-removal
+// improvement). Both fleets drive the same 1/64/512-message cases; the
+// idle fleet's cost is the wall-clock delta vs tell_baseline, never the
+// element count.
 // ---------------------------------------------------------------------------
+
+/// Spawns `fleet` idle `Accum` entities under `prefix` (liveness-probed,
+/// unmeasured) plus the busy entity the cases will drive. Must be called
+/// inside the runtime.
+async fn spawn_fleet(system: &ActorSystem, prefix: &str, fleet: usize, busy: &ActorPath) {
+    for index in 0..fleet {
+        let path = ActorPath::new(format!("{prefix}-{index}"));
+        system.spawn_es::<Accum, _>(
+            path.clone(),
+            &Json::default(),
+            SpawnOpts::default(),
+            || {
+                vec![Arc::new(
+                    trouper::actor::TypedEsAdapter::<Accum, Tick>::new::<Tick>(),
+                )]
+            },
+        );
+    }
+    for index in 0..fleet {
+        let path = ActorPath::new(format!("{prefix}-{index}"));
+        wait_entity_exists(system, &path).await;
+    }
+    spawn_accum(system, busy).await;
+}
+
+/// The 1/64/512-message cases on one busy entity, labeled
+/// `{fleet_label}_idle_{size}_messages` (spawn is one-per-path, so the
+/// fleet itself is fixture: the sample size drops for the 10k fleet to
+/// keep total wall time sane, like the file's other heavy cases).
+fn drive_fleet_cases(
+    group: &mut criterion::BenchmarkGroup<'_, criterion::measurement::WallTime>,
+    system: &ActorSystem,
+    rt: &Arc<Runtime>,
+    fleet_label: &str,
+    busy: &ActorPath,
+    sample_size: usize,
+) {
+    let cursor = seed_cursor(system);
+    group.sample_size(sample_size);
+    for size in [1u64, 64, 512] {
+        group.throughput(criterion::Throughput::Elements(size));
+        group.bench_function(format!("{fleet_label}_idle_{size}_messages"), |b| {
+            b.iter(|| {
+                rt.block_on(async {
+                    drive_and_settle_watermark(system, &cursor, busy, size).await;
+                });
+            });
+        });
+    }
+}
 
 fn idle_fleet(c: &mut Criterion) {
     let (system, rt) = spawn_system();
-    rt.block_on(async {
-        let fleet = 1_000usize;
-        for index in 0..fleet {
-            let path = ActorPath::new(format!("bench/idle-{index}"));
-            system.spawn_es::<Accum, _>(
-                path.clone(),
-                &Json::default(),
-                SpawnOpts::default(),
-                || {
-                    vec![Arc::new(
-                        trouper::actor::TypedEsAdapter::<Accum, Tick>::new::<Tick>(),
-                    )]
-                },
-            );
-        }
-        for index in 0..fleet {
-            let path = ActorPath::new(format!("bench/idle-{index}"));
-            wait_entity_exists(&system, &path).await;
-        }
-        // The measured body's target: one busy entity among the idlers.
-        let busy = ActorPath::new("bench/busy");
-        spawn_accum(&system, &busy).await;
-    });
 
     let mut group = c.benchmark_group("e2e/idle_fleet");
-    // ONE ELEMENT = one message committed to the BUSY entity (64 tells
-    // per iteration; the idle fleet just sits alongside — its cost is
-    // the wall-clock delta vs tell_baseline, not the element count).
-    // elem/s = msg/s on the busy path.
-    group.throughput(criterion::Throughput::Elements(64));
-    group.sample_size(20);
-    group.bench_function("1000_idle_producers_1", |b| {
-        b.iter(|| {
-            rt.block_on(async {
-                let path = ActorPath::new("bench/busy");
-                drive_and_settle_watermark(&system, &path, 64).await;
-            });
-        });
-    });
+    // ONE ELEMENT = one message committed to the BUSY entity; elem/s =
+    // msg/s on the busy path.
+    let busy_1k = ActorPath::new("bench/busy-1k");
+    rt.block_on(spawn_fleet(&system, "bench/idle", 1_000, &busy_1k));
+    drive_fleet_cases(&mut group, &system, &rt, "1k", &busy_1k, 20);
 
-    // 10k_idle: the same shape an order of magnitude wider — one busy
-    // entity keeping its steady 64-tell trickle while 10_000 idlers
-    // poll. Spawn is one-per-path, so the fixture is its own cost: the
-    // sample size drops to the criterion floor (10) to keep total wall
-    // time sane, exactly like the file's other heavy cases (swarm, wide_tree).
-    let fleet = 10_000usize;
-    rt.block_on(async {
-        for index in 0..fleet {
-            let path = ActorPath::new(format!("bench/idle-10k-{index}"));
-            system.spawn_es::<Accum, _>(
-                path.clone(),
-                &Json::default(),
-                SpawnOpts::default(),
-                || {
-                    vec![Arc::new(
-                        trouper::actor::TypedEsAdapter::<Accum, Tick>::new::<Tick>(),
-                    )]
-                },
-            );
-        }
-        for index in 0..fleet {
-            let path = ActorPath::new(format!("bench/idle-10k-{index}"));
-            wait_entity_exists(&system, &path).await;
-        }
-        // A SECOND busy entity for this case (the 1k case's target keeps
-        // its own trickle below, isolated from the 10k run).
-        let busy = ActorPath::new("bench/busy-10k");
-        spawn_accum(&system, &busy).await;
-    });
-
-    // Same element rule as the 1k case: one message on the busy entity
-    // (elem/s = msg/s); the 10k idlers are the ambient load.
-    group.throughput(criterion::Throughput::Elements(64));
-    group.sample_size(10);
-    group.bench_function("10k_idle", |b| {
-        b.iter(|| {
-            rt.block_on(async {
-                let path = ActorPath::new("bench/busy-10k");
-                drive_and_settle_watermark(&system, &path, 64).await;
-            });
-        });
-    });
+    // The same shape an order of magnitude wider: its own busy entity,
+    // isolated from the 1k run.
+    let busy_10k = ActorPath::new("bench/busy-10k");
+    rt.block_on(spawn_fleet(&system, "bench/idle-10k", 10_000, &busy_10k));
+    drive_fleet_cases(&mut group, &system, &rt, "10k", &busy_10k, 10);
     group.finish();
 }
 

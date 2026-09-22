@@ -1510,6 +1510,13 @@ impl ActorSystemCore {
         kernel.tap.subscribe(from).1
     }
 
+    /// The tap ring's next-offset watermark: the offset the next fact
+    /// will carry. An O(1) peek — an observer can wait for facts to
+    /// EXIST without draining the ring on every check.
+    pub fn tap_next_offset(&self) -> u64 {
+        self.kernel.lock().tap.next_offset()
+    }
+
     /// All retained tap facts (inspection/tests).
     pub fn tap_facts(&self) -> Vec<crate::tap::Fact> {
         self.tap_facts_from(0)
