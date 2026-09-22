@@ -35,7 +35,12 @@ Entries are added or amended **only with human approval**.
 - (runtime) All actor communication is mediated by the runtime: actors never hold channels directly; every send is routed by path or schema through the registry and emits a tap fact.
 - (runtime) Event-sourced actors are pure decision functions (sync `handle(&self)` returning events) with a single `apply` used for both live state application and replay; all other actors may perform side effects and use `ask`.
 - (runtime) The registry is kernel code, not an actor: path→endpoint slots, schema, schema→handler route, partition, projector-set, and router rule tables persist across actor restarts; actor identity is its registered path.
-- (runtime) Message schemas are runtime data: derived Rust types, hand-written impls, and external JSON descriptors register into the same schema table; payloads cross the runtime boundary as JSON.
+- (runtime) Message schemas are runtime data: derived Rust types, hand-written impls, and external JSON descriptors register into the same schema table.
+- (payloads) Envelope payloads are live typed values behind Arc<dyn PayloadValue>; handlers downcast and no JSON tree exists anywhere on the message path.
+- (payloads) Every declared message type generates field-by-name reads and a lazy memoized JSON-text encoding from its derive.
+- (payloads) Bytes exist only at two doors — erased ingress and the journal — wrapped in the PayloadBytes newtype.
+- (schemas) Message identity is the schema name alone; schemas carry no version marker.
+- (schemas) One Rust type per schema name is enforced at registration by TypeId uniqueness.
 - (schemas) Message schemas are declared with the trouper Event/Command derive macros, which generate the SchemaDef from the struct's fields; hand-written Schema impls remain for complex or foreign descriptors.
 - (runtime) Event-sourced journals are in-memory, seq-anchored lists of `Event` and `Snapshot` entries; restart restores from the latest snapshot plus the tail, and command redelivery is independent of snapshots.
 - (runtime) Actor spawning is builder-based: typed actors declare `handles`/`emits` inline; foreign actors supply JSON schema plus handle/apply closures; positional spawn functions remain as alternative entry points.
@@ -59,7 +64,11 @@ Entries are added or amended **only with human approval**.
 - (runtime) Handler effects are typed: ctx reply/publish/send take Message values (Schema + serde), derive the schema id from the type, and serialize at intent time; raw value escape hatches remain (\*\_json methods, Event::new, into_inner).
 - (values) The runtime's public value type is trouper::Json, a newtype over the internal JSON tree; serde_json types do not appear in public signatures.
 - (runtime) Command handlers return an Events buffer (inline for two events, heap beyond) and construct events from typed values via IntoEvent.
-- (runtime) Event folds decode payloads by schema id via Event::decode::<T>(); unmatched schemas are ignored.
+- (runtime) Event folds extract payloads by schema name via Event::as_fact::<T>() (downcast; a replayed event decodes from its bytes); unmatched schemas are ignored.
+- (journal) Event payloads persist as compact JSON text written once at append; replay decodes bytes straight into the declared struct.
+- (journal) Payload evolution follows the additive-fields contract; a payload that fails boundary decode dead-letters as Decode and fails rebuild loudly.
+- (routing) A declared edge accepts any payload under its schema name, delivered as the registered type.
+- (queries) Typed asks deliver typed replies through lease slots; a reply type mismatch surfaces as a named ask error.
 - (runtime) Spawn arguments are provided as typed Serialize values on builders and decoded in restore via Json; partition entities receive the shard key merged as a "key" field.
 - (contexts) MsgCtx exposes typed send/publish/send_to_any/ask/reply/stop_self, all emits-gated at flush; CmdCtx is pure introspection — an event-sourced entity announces only by returning facts from its decision.
 - (lifecycle) A trouper actor's on_stop hook runs on graceful stop, self-stop, passivation, and the shutdown sweep; never on crash or hard shutdown.

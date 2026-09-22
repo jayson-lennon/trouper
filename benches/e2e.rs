@@ -13,9 +13,11 @@
 //! never a runtime worker; the runtime lives in an Arc so `block_on`
 //! works from anywhere outside it).
 //!
-//! Improvements these track (see .plans/perf-fixes/plan.md):
-//! `producer_scaling` → lock/atomicbool improvements · `payload_size` →
-//! Arc<Json> payloads · `idle_fleet` → polling removal.
+//! The runtime rides the TYPED PAYLOAD FABRIC: every `tell` wraps a live
+//! value (zero serde on the dispatch path); the journal door memoizes
+//! one compact encoding per payload. `payload_size` now measures the
+//! fabric's per-message cost across body sizes — the old JSON-tree
+//! waist (per-node walk + deep clone) no longer exists.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -407,11 +409,10 @@ fn realistic_chunk(body_bytes: usize) -> Chunk {
 }
 
 // ---------------------------------------------------------------------------
-// wide_tree: the same body size carried as a 1M-element JSON array — a
-// PATHOLOGICAL message construction (one serde_json node per element,
-// ~25x the serde cost of an equal-size string). This bench exists to show
-// the runtime's per-NODE handling cost, never to represent a real
-// payload; read it next to payload_size, not instead of it.
+// wide_tree: a WIDE message (one huge array field). On the typed fabric
+// the message is one live struct — the runtime never walks it per node,
+// so this now measures the fabric + single-encode cost of an unusually
+// wide value (kept as a shape extreme next to payload_size).
 // ---------------------------------------------------------------------------
 
 fn wide_tree(c: &mut Criterion) {
