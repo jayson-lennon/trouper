@@ -303,6 +303,8 @@ fn tell_baseline(c: &mut Criterion) {
     let iterations = Iterations(std::sync::atomic::AtomicU64::new(0));
 
     let mut group = c.benchmark_group("e2e/tell_baseline");
+    // ONE ELEMENT = one message, send→fold→ack COMPLETE (the file-wide
+    // rule: never a bare tell). So criterion's elem/s reads as msg/s.
     group.throughput(criterion::Throughput::Elements(64));
     group.sample_size(30);
     group.bench_function("64_messages", |b| {
@@ -327,6 +329,8 @@ fn producer_scaling(c: &mut Criterion) {
     let iterations = Iterations(std::sync::atomic::AtomicU64::new(0));
 
     let mut group = c.benchmark_group("e2e/producer_scaling");
+    // ONE ELEMENT = one message committed to the shared entity (128
+    // messages per iteration split across the producers). elem/s = msg/s.
     group.throughput(criterion::Throughput::Elements(128));
     group.sample_size(20);
     for producers in [1usize, 2, 4, 8] {
@@ -397,7 +401,9 @@ fn payload_size(c: &mut Criterion) {
     ] {
         let chunk = realistic_chunk(size);
         // The wire size of one message (body + fields), for honest
-        // MiB/s throughput.
+        // MiB/s throughput. ONE BYTE-ELEMENT = one payload byte of one
+        // committed message (Bytes throughput, not Elements — the time
+        // is per message; criterion reports MiB/s from this).
         let wire = serde_json::to_vec(&chunk).expect("fixture size").len() as u64;
         group.throughput(criterion::Throughput::Bytes(wire));
         group.bench_function(label, |b| {
@@ -455,6 +461,8 @@ fn wide_tree(c: &mut Criterion) {
         let chunk = WideChunk {
             filler: vec![0u8; elements],
         };
+        // Same Bytes rule as payload_size: one byte-element = one filler
+        // byte of one committed wide message (criterion reports MiB/s).
         let wire = serde_json::to_vec(&chunk).expect("fixture size").len() as u64;
         group.throughput(criterion::Throughput::Bytes(wire));
         group.bench_function(label, |b| {
@@ -558,6 +566,9 @@ fn fanout(c: &mut Criterion) {
     let (system, rt) = spawn_system();
 
     let mut group = c.benchmark_group("e2e/fanout");
+    // ONE ELEMENT = one ASK ROUNDTRIP (request delivered + reply
+    // received through one of N echo services), 32 per iteration. NOT a
+    // broadcast fan-out despite the name. elem/s = roundtrips/s.
     group.throughput(criterion::Throughput::Elements(32));
     group.sample_size(20);
     for handlers in [1usize, 8, 64] {
@@ -654,6 +665,9 @@ fn overload_block(c: &mut Criterion) {
     });
 
     let mut group = c.benchmark_group("e2e/overload_block");
+    // ONE ELEMENT = one message delivered into the Block inbox (512 per
+    // iteration from 16 producers; lossless — the pre-batch watermark
+    // gates completion). elem/s = msg/s.
     group.throughput(criterion::Throughput::Elements(512));
     group.sample_size(15);
     group.bench_function("16_producers_512_messages", |b| {
@@ -730,6 +744,10 @@ fn idle_fleet(c: &mut Criterion) {
     });
 
     let mut group = c.benchmark_group("e2e/idle_fleet");
+    // ONE ELEMENT = one message committed to the BUSY entity (64 tells
+    // per iteration; the idle fleet just sits alongside — its cost is
+    // the wall-clock delta vs tell_baseline, not the element count).
+    // elem/s = msg/s on the busy path.
     group.throughput(criterion::Throughput::Elements(64));
     group.sample_size(20);
     group.bench_function("1000_idle_producers_1", |b| {
@@ -771,6 +789,8 @@ fn idle_fleet(c: &mut Criterion) {
         spawn_accum(&system, &busy).await;
     });
 
+    // Same element rule as the 1k case: one message on the busy entity
+    // (elem/s = msg/s); the 10k idlers are the ambient load.
     group.throughput(criterion::Throughput::Elements(64));
     group.sample_size(10);
     group.bench_function("10k_idle", |b| {
@@ -894,6 +914,10 @@ fn swarm(c: &mut Criterion) {
 
         // 32 tells per sink × receivers sinks.
         let total: u64 = 32 * receivers as u64;
+        // ONE ELEMENT = one tell to one sink, commit complete. NOTE the
+        // count is 32 × RECEIVERS (every producer drives every sink), so
+        // elem/s here is aggregate many-to-many msg/s — NOT the rate of
+        // one producer, and NOT producers × receivers.
         group.throughput(criterion::Throughput::Elements(total));
         group.bench_function(format!("p{producers}_r{receivers}"), |b| {
             b.iter(|| {
@@ -1030,6 +1054,8 @@ fn projection_read(c: &mut Criterion) {
     });
 
     let mut group = c.benchmark_group("e2e/projection_read");
+    // ONE ELEMENT = one FRAME READ over a projector's live fold (64 per
+    // iteration) — a state READ, no message involved. elem/s = reads/s.
     group.throughput(criterion::Throughput::Elements(64));
     group.sample_size(20);
 

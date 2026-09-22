@@ -31,6 +31,9 @@ fn seed(store: &InMemoryJournalStore, path: &ActorPath, events: u64) {
 fn journal_append(c: &mut Criterion) {
     let mut group = c.benchmark_group("micro/journal_append");
     for batch in [1u64, 8, 64] {
+        // ONE ELEMENT = one EVENT appended in the batch (not one
+        // message): elem/s = events/s through the store, isolated from
+        // the runtime.
         group.throughput(criterion::Throughput::Elements(batch));
         group.bench_function(format!("batch_{batch}"), |b| {
             let store = InMemoryJournalStore::new();
@@ -56,6 +59,8 @@ fn journal_replay_restart(c: &mut Criterion) {
         .expect("rt");
     let mut group = c.benchmark_group("micro/journal_replay_restart");
     for history in [1_000u64, 10_000] {
+        // ONE ELEMENT = one EVENT replayed by load() (snapshot + tail +
+        // history): elem/s = replayed events/s — the restart-cost view.
         group.throughput(criterion::Throughput::Elements(history));
         group.bench_function(format!("journal_{history}"), |b| {
             let store = Arc::new(InMemoryJournalStore::new());
@@ -88,6 +93,7 @@ fn journal_repeated_load(c: &mut Criterion) {
     let path = ActorPath::new("bench/repeated");
     seed(&store, &path, 10_000);
     let mut group = c.benchmark_group("micro/journal_replay_restart");
+    // Same element rule as journal_N: one replayed EVENT (10k history).
     group.bench_function("repeat_load_10k", |b| {
         b.iter(|| {
             let store = store.clone();
