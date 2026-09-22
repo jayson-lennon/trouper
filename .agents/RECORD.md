@@ -110,3 +110,6 @@ Entries are added or amended **only with human approval**.
 - (runtime) An idle actor's loop sleeps until its next due duty (snapshot cadence or passivation) or the next message, whichever comes first; an actor with no duties armed does not wake at all.
 - (runtime) A supervised child's crash is signaled by a Notify on the child's cell; supervision engines wake on the signal and read the crash flag lock-free instead of polling.
 - (bench) The idle_fleet bench includes a 10,000-idle-actor case, and examples/idle_burn.rs measures runtime CPU seconds for a duty-armed idle fleet (5,000 actors burn ~0.003 s CPU/s of wall vs ~0.28 s polled before this work).
+- (bench) Every e2e bench that commits messages measures batches of 1, 64, and 512 messages; swarm keeps its own declared per-case counts, and payload_size/wide_tree measure single committed messages.
+- (bench) Bench completion waits are push-driven: benches await Acked tap facts and ask replies, never poll actor state on a timer — the exception is swarm, whose measured body settles on hand-registered sink counters polled on a timer, out of scope for the push-wait conversion.
+- (bench) Criterion throughput Elements equal the number of messages each iteration commits.
