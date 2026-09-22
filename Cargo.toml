@@ -1,6 +1,6 @@
 [package]
 name = "trouper"
-version = "0.8.1"
+version = "0.8.2"
 edition = "2024"
 description = "A single-machine actor runtime: schema registry, journaled event-sourced and service actors, topics, supervision, and partition sets"
 license = "MIT"
@@ -16,7 +16,15 @@ members = ["trouper_macros"]
 # path for the workspace build, version for the published manifest
 # (crates.io rejects a dependency without a version requirement).
 trouper_macros = { path = "trouper_macros", version = "0.8.0" }
-tokio = { version = "1.53", features = ["rt-multi-thread", "sync", "time", "macros", "net", "io-util", "signal"] }
+tokio = { version = "1.53", features = [
+    "rt-multi-thread",
+    "sync",
+    "time",
+    "macros",
+    "net",
+    "io-util",
+    "signal",
+] }
 serde = { version = "1.0", features = ["derive", "rc"] }
 serde_json = "1.0"
 uuid = { version = "1.26", features = ["v7", "serde"] }
