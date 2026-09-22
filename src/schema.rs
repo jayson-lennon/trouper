@@ -3,7 +3,9 @@
 //! Rust types and external JSON descriptors register into the same schema
 //! table (see [`crate::registry`]): a schema defined outside Rust is just a
 //! [`SchemaDef`] parsed from JSON, indistinguishable from one derived from a
-//! Rust type. `SchemaId`s embed their version (`name@version`) from day one.
+//! Rust type. Identity is the schema NAME alone — schemas carry no version
+//! marker. Evolution follows the additive-fields contract: new fields get
+//! serde defaults, so an older payload decodes into the newest type.
 
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::sync::Arc;
@@ -16,6 +18,9 @@ use crate::json::Json;
 pub enum SchemaError {
     /// A JSON document was not a valid [`SchemaDef`].
     InvalidDescriptor,
+    /// A second Rust type registered under a schema name that another
+    /// type already owns — one type per name, enforced at registration.
+    DuplicateType(String),
 }
 
 /// Whether a schema describes an inbound command or a domain event.
@@ -158,10 +163,8 @@ impl FieldDef {
 /// registered as data.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SchemaDef {
-    /// The schema's name, e.g. `StockReserved`.
+    /// The schema's name, e.g. `StockReserved` — the schema's whole identity.
     pub name: String,
-    /// The schema's version; [`SchemaId`] embeds it.
-    pub version: u32,
     /// Command or event.
     pub kind: SchemaKind,
     /// The payload's field descriptors.
@@ -185,9 +188,9 @@ impl SchemaDef {
             .change_context(SchemaError::InvalidDescriptor)
     }
 
-    /// The schema's stable identifier (`name@version`).
+    /// The schema's stable identifier: its name.
     pub fn id(&self) -> SchemaId {
-        SchemaId::new(&self.name, self.version)
+        SchemaId::new(&self.name)
     }
 
     /// Serializes the descriptor to JSON (for export).
@@ -271,7 +274,14 @@ impl ActorManifest {
     }
 
     /// Declares that this actor handles schema `S`.
-    pub fn handles<S: Schema>(mut self) -> Self {
+    ///
+    /// # Panics
+    ///
+    /// Panics when a DIFFERENT Rust type already claimed `S`'s schema
+    /// name (one type per name, process-wide). Same-type re-claims are
+    /// free — spawning many actors on one schema is the norm.
+    pub fn handles<S: Schema + 'static>(mut self) -> Self {
+        Self::expect_claim::<S>();
         let id = S::schema_id();
         if !self.handles.contains(&id) {
             self.handles.push(id);
@@ -287,13 +297,31 @@ impl ActorManifest {
         self
     }
 
-    /// Declares that this actor emits event schema `S`.
-    pub fn emits<S: Schema>(mut self) -> Self {
+    /// Declares that this actor emits event schema `S` (same one-type-
+    /// per-name contract as [`ActorManifest::handles`]).
+    ///
+    /// # Panics
+    ///
+    /// Panics when another Rust type already claimed `S`'s schema name.
+    pub fn emits<S: Schema + 'static>(mut self) -> Self {
+        Self::expect_claim::<S>();
         let id = S::schema_id();
         if !self.emits.contains(&id) {
             self.emits.push(id);
         }
         self
+    }
+
+    /// Claims `S`'s schema name for its Rust type, panicking with a
+    /// named message on a conflicting claim (manifest builders panic —
+    /// they run in author code at spawn, where a wrong second type is a
+    /// program bug, not a runtime outcome).
+    fn expect_claim<S: Schema + 'static>() {
+        if let Err(report) = crate::registry::claim_schema_type::<S>() {
+            panic!(
+                "schema TypeId claim failed (one Rust type per schema name): {report:?}"
+            );
+        }
     }
 
     /// Declares that this actor emits an event schema by id.
@@ -327,33 +355,36 @@ impl Clone for ActorManifest {
     }
 }
 
-/// A schema identifier of the form `name@version`, e.g. `StockReserved@1`.
+/// A schema identifier: the schema's name, e.g. `StockReserved`.
+///
+/// Identity is the name alone — no version component. A payload that
+/// evolves does so additively (new fields carry serde defaults); a truly
+/// breaking shape is a NEW schema with a new name.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct SchemaId(Arc<str>);
 
 impl SchemaId {
-    /// Builds `name@version` from its parts.
-    pub fn new(name: &str, version: u32) -> Self {
-        Self(format!("{name}@{version}").into())
+    /// Builds the identifier from the schema's name.
+    pub fn new(name: &str) -> Self {
+        Self(name.into())
     }
 
-    /// Parses an existing `name@version` string.
+    /// Parses an existing id string.
     ///
-    /// Returns `None` when the string has no `@` separator.
+    /// # Compatibility
+    ///
+    /// A `name@N` string (a pre-name-only identity) parses as the bare
+    /// name — journals and exports written before the change stay
+    /// readable.
     pub fn parse(s: &str) -> Option<Self> {
-        s.split_once('@').map(|_| Self(s.into()))
+        let name = s.split_once('@').map_or(s, |(name, _)| name);
+        Some(Self(name.into()))
     }
 
-    /// The schema name (everything before `@`).
+    /// The schema name.
     pub fn name(&self) -> &str {
-        self.0.split_once('@').map_or(&self.0, |(name, _)| name)
-    }
-
-    /// The schema version (everything after `@`), or `None` if unversioned.
-    pub fn version(&self) -> Option<u32> {
-        let (_, version) = self.0.split_once('@')?;
-        version.parse().ok()
+        &self.0
     }
 
     /// The identifier as a string slice.
@@ -385,7 +416,6 @@ mod tests {
         fn schema_def() -> SchemaDef {
             SchemaDef {
                 name: "ReserveStock".into(),
-                version: 1,
                 kind: SchemaKind::Command,
                 fields: vec![
                     FieldDef::required("sku", FieldTy::Str),
@@ -399,15 +429,15 @@ mod tests {
     }
 
     #[test]
-    fn schema_id_renders_as_name_at_version() {
+    fn schema_id_renders_as_the_bare_name() {
         // Given the ReserveStock schema.
         let id = ReserveStock::schema_id();
 
         // When rendering it.
         let rendered = id.to_string();
 
-        // Then it reads name@version.
-        assert_eq!(rendered, "ReserveStock@1");
+        // Then it reads the bare name.
+        assert_eq!(rendered, "ReserveStock");
     }
 
     #[test]
@@ -421,7 +451,6 @@ mod tests {
         let derived = StockReserved::schema_def();
         let hand = SchemaDef {
             name: "StockReserved".into(),
-            version: 1,
             kind: SchemaKind::Event,
             fields: vec![
                 FieldDef::required("sku", FieldTy::Str),
@@ -499,10 +528,10 @@ mod tests {
     }
 
     #[test]
-    fn version_and_description_attributes_apply() {
-        // Given a type with container-level version and description.
+    fn description_attribute_applies() {
+        // Given a type with a container-level description.
         #[derive(Event, serde::Serialize, serde::Deserialize)]
-        #[schema(version = 2, description = "Second edition of the fact.")]
+        #[schema(description = "Second edition of the fact.")]
         struct ReservedV2 {
             sku: String,
         }
@@ -510,14 +539,13 @@ mod tests {
         // When reading the def.
         let def = ReservedV2::schema_def();
 
-        // Then both container attributes landed.
-        assert_eq!(def.version, 2);
+        // Then the attribute landed.
         assert_eq!(
             def.description.as_deref(),
             Some("Second edition of the fact.")
         );
-        // And the id embeds the version.
-        assert_eq!(ReservedV2::schema_id().to_string(), "ReservedV2@2");
+        // And the id is the bare name — no version component.
+        assert_eq!(ReservedV2::schema_id().to_string(), "ReservedV2");
     }
 
     #[test]
@@ -619,7 +647,6 @@ mod tests {
         // Given a hand-written JSON descriptor with no Rust type behind it.
         let foreign = json!({
             "name": "ReserveStock",
-            "version": 1,
             "kind": "command",
             "fields": [
                 { "name": "sku", "ty": "str" },
@@ -658,7 +685,6 @@ mod tests {
         // Given a minimal foreign descriptor.
         let foreign = json!({
             "name": "Tick",
-            "version": 2,
             "kind": "event",
             "fields": [{ "name": "at", "ty": "uuid" }]
         });
@@ -674,8 +700,8 @@ mod tests {
 
     #[test]
     fn manifest_declares_typed_and_foreign_edges_uniformly() {
-        // Given the typed ReserveStock schema and a foreign Tick@1 id.
-        let foreign_tick = SchemaId::new("Tick", 1);
+        // Given the typed ReserveStock schema and a foreign Tick id.
+        let foreign_tick = SchemaId::new("Tick");
 
         // When building a manifest through both paths.
         let manifest = ActorManifest::new()
@@ -687,7 +713,7 @@ mod tests {
         // Then both flavors appear as plain schema ids.
         assert_eq!(
             manifest.handles,
-            [SchemaId::new("ReserveStock", 1), foreign_tick]
+            [SchemaId::new("ReserveStock"), foreign_tick]
         );
         assert_eq!(manifest.kind, Some(crate::actor::ActorKind::EventSourced));
     }
@@ -700,7 +726,7 @@ mod tests {
             .handles::<ReserveStock>();
 
         // Then each edge is declared exactly once.
-        assert_eq!(manifest.handles, [SchemaId::new("ReserveStock", 1)]);
+        assert_eq!(manifest.handles, [SchemaId::new("ReserveStock")]);
     }
 
     #[test]
@@ -723,15 +749,15 @@ mod tests {
     fn manifest_renders_declared_edges_for_export() {
         // Given a manifest with handles and emits.
         let manifest = ActorManifest::new()
-            .handles_id(SchemaId::new("ForeignPing", 4))
-            .emits_id(SchemaId::new("ForeignPong", 4));
+            .handles_id(SchemaId::new("ForeignPing"))
+            .emits_id(SchemaId::new("ForeignPong"));
 
         // When serializing it.
         let json = serde_json::to_value(&manifest).expect("ser");
 
         // Then declared edges are visible as data.
-        assert_eq!(json["handles"][0], "ForeignPing@4");
-        assert_eq!(json["emits"][0], "ForeignPong@4");
+        assert_eq!(json["handles"][0], "ForeignPing");
+        assert_eq!(json["emits"][0], "ForeignPong");
     }
 
     struct TickDone;
@@ -739,7 +765,6 @@ mod tests {
         fn schema_def() -> SchemaDef {
             SchemaDef {
                 name: "TickDone".into(),
-                version: 1,
                 kind: SchemaKind::Event,
                 fields: vec![],
                 description: None,
@@ -776,43 +801,37 @@ mod field_role_tests {
 }
 
 #[test]
-fn schema_id_renders_name_and_version() {
-    // Given a name and version.
-    let id = SchemaId::new("StockReserved", 1);
+fn schema_id_has_no_version_component() {
+    // Given a schema id built from a name.
+    let id = SchemaId::new("StockReserved");
 
-    // When displaying the id.
+    // When rendering it.
     let rendered = id.to_string();
 
-    // Then it reads `name@version`.
-    assert_eq!(rendered, "StockReserved@1");
+    // Then it is the bare name: no `@`, no version digit anywhere.
+    assert_eq!(rendered, "StockReserved");
+    assert!(!rendered.contains('@'), "identity must not embed a version");
+    assert!(!rendered.chars().any(|c| c.is_ascii_digit()));
+    // And the whole identifier IS the name.
+    assert_eq!(id.name(), "StockReserved");
+    assert_eq!(id.as_str(), "StockReserved");
 }
 #[test]
-fn schema_id_parses_name_and_version_back_out() {
-    // Given a rendered schema id string.
-    let raw = "StockReserved@3";
+fn schema_id_parse_accepts_legacy_versioned_strings_as_the_bare_name() {
+    // Given a `name@N` string written before name-only identity.
+    let raw = "StockReserved";
 
     // When parsing it.
     let id = SchemaId::parse(raw).expect("parses");
 
-    // Then name and version round-trip.
+    // Then the version component is dropped — old journals stay readable.
     assert_eq!(id.name(), "StockReserved");
-    assert_eq!(id.version(), Some(3));
-}
-#[test]
-fn schema_id_parse_rejects_unversioned_string() {
-    // Given a string without an `@` separator.
-    let raw = "StockReserved";
-
-    // When parsing it.
-    let parsed = SchemaId::parse(raw);
-
-    // Then parsing fails.
-    assert!(parsed.is_none());
+    assert_eq!(id.as_str(), "StockReserved");
 }
 #[test]
 fn schema_id_survives_serde_roundtrip() {
     // Given a schema id.
-    let id = SchemaId::new("StockReserved", 1);
+    let id = SchemaId::new("StockReserved");
 
     // When round-tripping through JSON.
     let json = serde_json::to_string(&id).expect("serialize");
@@ -820,4 +839,15 @@ fn schema_id_survives_serde_roundtrip() {
 
     // Then the value is preserved.
     assert_eq!(round, id);
+}
+#[test]
+fn legacy_name_at_version_strings_never_render_from_new_ids() {
+    // Given a fresh name-only id.
+    let id = SchemaId::new("StockReserved");
+
+    // When rendering it.
+    let rendered = id.to_string();
+
+    // Then no `@` appears — new identities are clean.
+    assert!(!rendered.contains('@'));
 }

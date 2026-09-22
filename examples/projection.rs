@@ -65,8 +65,8 @@ impl EventSourcedActor for Account {
         Self::default()
     }
     fn apply(&mut self, event: &Event) {
-        if event.schema.as_str() == "AccountAdjusted@1" {
-            self.balance += event.payload["delta"].as_i64().unwrap_or(0);
+        if event.schema.as_str() == "AccountAdjusted" {
+            self.balance += event.payload_json()["delta"].as_i64().unwrap_or(0);
         }
     }
     fn manifest() -> ActorManifest {
@@ -89,11 +89,11 @@ impl Projector for Balances {
     /// THE fold. The same code path folds history (catch-up), live
     /// broadcast copies, and restart replay.
     fn apply(&mut self, event: &Event) {
-        if event.schema.as_str() != "AccountAdjusted@1" {
+        if event.schema.as_str() != "AccountAdjusted" {
             return;
         }
-        let name = event.payload["account"].as_str().unwrap_or("?");
-        let delta = event.payload["delta"].as_i64().unwrap_or(0);
+        let name = event.payload_json()["account"].as_str().unwrap_or("?");
+        let delta = event.payload_json()["delta"].as_i64().unwrap_or(0);
         *self.by_account.entry(name.to_owned()).or_default() += delta;
     }
 }

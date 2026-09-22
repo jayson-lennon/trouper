@@ -65,7 +65,7 @@ impl FileStore for RealFs {
 /// numbers representation — which is what [`FieldTy::Json`] exists for
 /// ("arbitrary JSON; the escape hatch for payloads a tooling consumer need
 /// not inspect deeply").
-#[derive(Command, Serialize, Deserialize)]
+#[derive(Command, Serialize, Deserialize, Clone)]
 struct SaveFile {
     path: std::path::PathBuf,
     contents: Vec<u8>,

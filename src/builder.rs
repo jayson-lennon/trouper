@@ -140,7 +140,7 @@ impl<A: crate::actor::EventSourcedActor> SpawnBuilder<A> {
     /// `E`'s schema descriptor is registered into the schema table here,
     /// at the declaration site (idempotent — see
     /// [`crate::registry::SchemaTable::register`]).
-    pub fn emits<E: Schema>(mut self) -> Self {
+    pub fn emits<E: Schema + 'static>(mut self) -> Self {
         self.system.register_schema::<E>();
         let id = E::schema_id();
         if !self.emits.contains(&id) {
@@ -303,7 +303,7 @@ impl<A: ServiceActor> ServiceBuilder<A> {
     ///
     /// `E`'s schema descriptor is registered into the schema table here,
     /// at the declaration site.
-    pub fn emits<E: Schema>(mut self) -> Self {
+    pub fn emits<E: Schema + 'static>(mut self) -> Self {
         self.system.register_schema::<E>();
         if !self.emits.contains(&E::schema_id()) {
             self.emits.push(E::schema_id());
@@ -551,7 +551,7 @@ impl<P: crate::actor::Projector> ProjectorBuilder<P> {
     ///
     /// `D`'s descriptor is registered into the schema table here, at the
     /// declaration site.
-    pub fn consumes<D: Schema>(mut self) -> Self {
+    pub fn consumes<D: Schema + 'static>(mut self) -> Self {
         self.system.register_schema::<D>();
         let id = D::schema_id();
         if !self.consumed.contains(&id) {

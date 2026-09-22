@@ -17,7 +17,7 @@ use crate::actor::{
 use crate::clock::Timestamp;
 use crate::clock::{ClockService, FakeClock, SystemClock};
 use crate::context::RuntimeView;
-use crate::envelope::{Address, Envelope, TraceCtx};
+use crate::envelope::{Address, Envelope, PayloadBytes, TraceCtx};
 use crate::inbox::InboxOffset;
 use crate::inbox::{Inbox, OverloadPolicy};
 use crate::json::Json;
@@ -814,9 +814,11 @@ impl ActorSystemCore {
     ///
     /// Idempotent per name+version: the first registration wins, and the
     /// returned id is stable across repeat registrations.
-    pub fn register_schema<S: Schema>(&self) -> SchemaId {
+    pub fn register_schema<S: Schema + 'static>(&self) -> SchemaId {
         let mut registry = self.registry.lock();
-        registry.register_schema_of::<S>()
+        registry
+            .register_schema_of::<S>()
+            .expect("schema TypeId claim: one Rust type per schema name")
     }
 
     /// Registers a schema from a JSON descriptor — the foreign flavor, for
@@ -1183,11 +1185,15 @@ impl ActorSystemCore {
     /// fails on pathological map keys), not a domain outcome.
     pub async fn tell<C>(&self, dest: ActorPath, value: C) -> Result<ActorPath, Envelope>
     where
-        C: Schema + serde::Serialize,
+        C: Schema + serde::Serialize + Send + Sync + crate::envelope::PayloadValue + 'static,
     {
-        let payload = Json::of(&value);
-        self.send(self.envelope(C::schema_id(), dest, payload))
-            .await
+        let envelope = Envelope::json(
+            C::schema_id(),
+            Address::Path(dest),
+            value,
+            TraceCtx::root(),
+        );
+        self.send(envelope).await
     }
 
     /// Typed one-of send: serializes `value` under `M`'s schema and
@@ -1209,14 +1215,13 @@ impl ActorSystemCore {
     /// fails on pathological map keys), not a domain outcome.
     pub async fn send_to_any<M>(&self, value: &M) -> Result<ActorPath, Envelope>
     where
-        M: Schema + serde::Serialize,
+        M: Schema + serde::Serialize + Clone + Send + Sync + crate::envelope::PayloadValue + 'static,
     {
-        let payload = Json::of(&value);
         let schema = M::schema_id();
         let envelope = Envelope::json(
             schema.clone(),
             Address::Schema(schema.clone()),
-            payload,
+            value.clone(),
             TraceCtx::root(),
         );
         self.send(envelope).await
@@ -1250,7 +1255,7 @@ impl ActorSystemCore {
         timeout: std::time::Duration,
     ) -> Result<Json, error_stack::Report<crate::context::AskError>>
     where
-        C: Schema + serde::Serialize,
+        C: Schema + serde::Serialize + Clone + Send + Sync + 'static,
     {
         let payload = Json::of(&value);
         let port = crate::kernel::KernelAskPort {
@@ -1285,14 +1290,13 @@ impl ActorSystemCore {
     /// fails on pathological map keys), not a domain outcome.
     pub fn publish<M>(&self, value: &M) -> impl std::future::Future<Output = ()> + Send + '_
     where
-        M: Schema + serde::Serialize,
+        M: Schema + serde::Serialize + Clone + Send + Sync + crate::envelope::PayloadValue + 'static,
     {
-        let payload = Json::of(&value);
         let schema = M::schema_id();
         let envelope = Envelope::json(
             schema.clone(),
             Address::Schema(schema.clone()),
-            payload,
+            value.clone(),
             TraceCtx::root(),
         );
         async move {
@@ -1306,10 +1310,10 @@ impl ActorSystemCore {
     /// — every `.handles` declarant of the schema, zero ⇒ silent no-op.
     /// The bridge surface for erased (foreign) callers.
     pub async fn publish_value(&self, schema: SchemaId, payload: Json) {
-        let envelope = Envelope::json(
+        let envelope = Envelope::from_bytes(
             schema.clone(),
             Address::Schema(schema.clone()),
-            payload,
+            PayloadBytes::from(payload),
             TraceCtx::root(),
         );
         crate::kernel::broadcast(&self.registry, &self.kernel, &self.shutting_down, schema, envelope).await;
@@ -1341,8 +1345,12 @@ impl ActorSystemCore {
                 // Unrouted command: nothing to do (the caller's contract
                 // is fire-and-forget).
                 if let Some(path) = dest {
-                    let envelope =
-                        Envelope::json(schema, Address::Path(path), payload, TraceCtx::root());
+                    let envelope = Envelope::from_bytes(
+                        schema,
+                        Address::Path(path),
+                        PayloadBytes::from(payload),
+                        TraceCtx::root(),
+                    );
                     let _ = self.send(envelope).await;
                 }
             }
@@ -1358,10 +1366,10 @@ impl ActorSystemCore {
         dest: ActorPath,
         payload: impl Into<Json>,
     ) -> Envelope {
-        Envelope::json(
+        Envelope::from_bytes(
             schema,
             Address::Path(dest),
-            payload.into(),
+            PayloadBytes::from(payload.into()),
             TraceCtx::root(),
         )
     }
@@ -2423,19 +2431,19 @@ mod tests {
     use serde::{Deserialize, Serialize};
     use std::collections::HashMap;
 
-    #[derive(Command, Serialize, Deserialize)]
+    #[derive(Command, Serialize, Deserialize, Clone)]
     struct Add {
         n: i64,
     }
 
-    #[derive(Event, serde::Serialize, serde::Deserialize)]
+    #[derive(Event, serde::Serialize, serde::Deserialize, Clone)]
     struct Added {
         n: i64,
     }
 
     /// An event schema the test actors never declare (emit-enforcement
     /// fixture: the kernel must drop it).
-    #[derive(Event, serde::Deserialize)]
+    #[derive(Event, serde::Serialize, serde::Deserialize, Clone)]
     struct Smuggled {
         #[allow(dead_code)] // payload shape; the kernel never reads it
         n: i64,
@@ -2457,16 +2465,14 @@ mod tests {
             Self::default()
         }
         fn apply(&mut self, event: &crate::envelope::Event) {
-            if event.schema.as_str() == "Added@1" {
-                self.total += event.payload["n"].as_i64().unwrap_or(0);
+            if event.schema.as_str() == "Added" {
+                self.total += event.payload_json()["n"].as_i64().unwrap_or(0);
             }
         }
     }
     impl CommandHandler<Add> for Counter {
         fn handle(&self, cmd: Add, _ctx: &mut CmdCtx<'_>) -> crate::envelope::Events {
-            crate::envelope::Events::from_vec(vec![crate::envelope::Event::new(
-                Added::schema_id(),
-                json!({ "n": cmd.n }),
+            crate::envelope::Events::from_vec(vec![crate::envelope::Event::from_json_view(Added::schema_id(), json!({ "n": cmd.n }),
             )])
         }
     }
@@ -2478,14 +2484,14 @@ mod tests {
     }
 
     /// A command whose handling panics (panic isolation under test).
-    #[derive(Command, Deserialize)]
+    #[derive(Command, Serialize, Deserialize, Clone)]
     struct Boom {
         #[allow(dead_code)] // payload shape; the handler panics before reading
         why: String,
     }
 
     /// A serializable ask command (the `system.ask` fixture).
-    #[derive(Command, serde::Serialize, serde::Deserialize)]
+    #[derive(Command, serde::Serialize, serde::Deserialize, Clone)]
     struct PingAsk {
         n: i64,
     }
@@ -2988,7 +2994,7 @@ mod tests {
     async fn tap_causality_chain_links_hops_with_a_shared_trace() {
         // Given A→B→C: a counter whose Add handler forwards to an Echo
         // service, and an Echo service that handles Ping.
-        #[derive(Command, serde::Serialize, serde::Deserialize)]
+        #[derive(Command, serde::Serialize, serde::Deserialize, Clone)]
         struct Ping {
             #[serde(default)]
             #[allow(dead_code)] // payload shape; the handler ignores it
@@ -3163,7 +3169,7 @@ mod tests {
                 Self::default()
             }
             fn apply(&mut self, event: &crate::envelope::Event) {
-                self.total += event.payload["n"].as_i64().unwrap_or(0);
+                self.total += event.payload_json()["n"].as_i64().unwrap_or(0);
             }
         }
         impl CommandHandler<Add> for Phoenix {
@@ -3172,9 +3178,7 @@ mod tests {
                     // First sight only: crash once, then recover.
                     panic!("transient fault");
                 }
-                crate::envelope::Events::from_vec(vec![crate::envelope::Event::new(
-                    Added::schema_id(),
-                    json!({ "n": cmd.n }),
+                crate::envelope::Events::from_vec(vec![crate::envelope::Event::from_json_view(Added::schema_id(), json!({ "n": cmd.n }),
                 )])
             }
         }
@@ -3292,8 +3296,7 @@ mod tests {
             fn schema_def() -> SchemaDef {
                 SchemaDef {
                     name: "Escalated".into(),
-                    version: 1,
-                    kind: SchemaKind::Command,
+                                        kind: SchemaKind::Command,
                     fields: vec![FieldDef::required("escalated", FieldTy::Str)],
                     description: None,
                 }
@@ -4401,7 +4404,7 @@ mod tests {
         let (system, _clock) = ActorSystem::test();
         let schema = system
             .register_schema_json(json!({
-                "name": "tally", "version": 1, "kind": "command",
+                "name": "tally", "kind": "command",
                 "fields": [
                     {"name": "delta", "ty": "int"}
                 ]
@@ -4412,7 +4415,7 @@ mod tests {
         // under the automatic fact broadcast (a self-feedback loop).
         let fact = system
             .register_schema_json(json!({
-                "name": "tallied", "version": 1, "kind": "event",
+                "name": "tallied", "kind": "event",
                 "fields": [
                     {"name": "delta", "ty": "int"}
                 ]
@@ -4427,7 +4430,7 @@ mod tests {
             json!({ "total": 0 }),
             Arc::new(move |_state, cmd, _ctx| {
                 let delta = cmd["delta"].as_i64().unwrap_or(0);
-                vec![crate::envelope::Event::new(
+                vec![crate::envelope::Event::from_json_view(
                     fact_for_actor.clone(),
                     json!({ "delta": delta }),
                 )]
@@ -4436,7 +4439,7 @@ mod tests {
                 if ev.schema == fact_for_fold {
                     state["total"] = serde_json::json!(
                         state["total"].as_i64().unwrap_or(0)
-                            + ev.payload["delta"].as_i64().unwrap_or(0)
+                            + ev.payload_json()["delta"].as_i64().unwrap_or(0)
                     );
                 }
             }),
@@ -4682,8 +4685,7 @@ mod tests {
             fn schema_def() -> SchemaDef {
                 SchemaDef {
                     name: "Escalated".into(),
-                    version: 1,
-                    kind: SchemaKind::Command,
+                                        kind: SchemaKind::Command,
                     fields: vec![FieldDef::required("escalated", FieldTy::Str)],
                     description: None,
                 }
@@ -4830,7 +4832,7 @@ mod tests {
 
         // When four schema-addressed sends go out.
         for n in 1..=4_i64 {
-            let envelope = crate::envelope::Envelope::json(
+            let envelope = crate::envelope::Envelope::from_bytes_wrapped(
                 Add::schema_id(),
                 Address::Schema(Add::schema_id()),
                 json!({ "n": n }),
@@ -4889,7 +4891,7 @@ mod tests {
         let system = ActorSystem::new(SystemConfig::production());
         let foreign = json!({
             "name": "ForeignPing",
-            "version": 4,
+            
             "kind": "command",
             "fields": []
         });
@@ -4899,7 +4901,7 @@ mod tests {
 
         // Then it is retrievable by its name@version id.
         let stored = system.schema(&id).expect("stored");
-        assert_eq!(id.to_string(), "ForeignPing@4");
+        assert_eq!(id.to_string(), "ForeignPing");
         assert_eq!(stored.name, "ForeignPing");
     }
 
@@ -5093,7 +5095,7 @@ mod tests {
     fn rebuild_from_snapshot_over_k_events_equals_full_fold(#[case] k: usize) {
         // Given a journal of k Added events folded from genesis.
         let events: Vec<crate::envelope::Event> = (1..=k as i64)
-            .map(|n| crate::envelope::Event::new(Added::schema_id(), json!({ "n": n })))
+            .map(|n| crate::envelope::Event::from_json_view(Added::schema_id(), json!({ "n": n })))
             .collect();
         let mut folded = Counter::restore(&json!({}));
         for event in &events {
@@ -5150,7 +5152,7 @@ mod tests {
                 }
             }
             fn apply(&mut self, event: &crate::envelope::Event) {
-                self.total += event.payload["n"].as_i64().unwrap_or(0);
+                self.total += event.payload_json()["n"].as_i64().unwrap_or(0);
             }
             fn capture(&self) -> Result<Json, error_stack::Report<crate::journal::JournalError>> {
                 // The cache is not persisted, but capture EXPOSES it when
@@ -5188,8 +5190,8 @@ mod tests {
         assert_eq!(captured["total"], json!(21));
 
         // And folding the tail on top keeps the total invariant.
-        let tail = vec![crate::envelope::Event::new(
-            SchemaId::new("Added", 1),
+        let tail = vec![crate::envelope::Event::from_json_view(
+            SchemaId::new("Added"),
             json!({ "n": 3 }),
         )];
         let with_tail: Box<dyn crate::actor::DynEsActor> =
@@ -5322,20 +5324,16 @@ mod tests {
             Self::default()
         }
         fn apply(&mut self, event: &crate::envelope::Event) {
-            self.total += event.payload["n"].as_i64().unwrap_or(0);
+            self.total += event.payload_json()["n"].as_i64().unwrap_or(0);
         }
     }
     impl CommandHandler<Add> for MixedEmitter {
         fn handle(&self, cmd: Add, _ctx: &mut CmdCtx<'_>) -> crate::envelope::Events {
             let mut events = crate::envelope::Events::new();
-            events.push(crate::envelope::Event::new(
-                Added::schema_id(),
-                json!({ "n": cmd.n }),
+            events.push(crate::envelope::Event::from_json_view(Added::schema_id(), json!({ "n": cmd.n }),
             ));
             // Undeclared: the emit filter must drop this one pre-append.
-            events.push(crate::envelope::Event::new(
-                Smuggled::schema_id(),
-                json!({ "n": cmd.n }),
+            events.push(crate::envelope::Event::from_json_view(Smuggled::schema_id(), json!({ "n": cmd.n }),
             ));
             events
         }
@@ -5603,14 +5601,12 @@ mod tests {
             Self::default()
         }
         fn apply(&mut self, event: &crate::envelope::Event) {
-            self.total += event.payload["n"].as_i64().unwrap_or(0);
+            self.total += event.payload_json()["n"].as_i64().unwrap_or(0);
         }
     }
     impl CommandHandler<Add> for BareCounter {
         fn handle(&self, cmd: Add, _ctx: &mut CmdCtx<'_>) -> crate::envelope::Events {
-            crate::envelope::Events::from_vec(vec![crate::envelope::Event::new(
-                Added::schema_id(),
-                json!({ "n": cmd.n }),
+            crate::envelope::Events::from_vec(vec![crate::envelope::Event::from_json_view(Added::schema_id(), json!({ "n": cmd.n }),
             )])
         }
     }
@@ -5741,7 +5737,7 @@ mod tests {
         let (system, _clock) = ActorSystem::test();
         let schema = system
             .register_schema_json(json!({
-                "name": "tally2", "version": 1, "kind": "command",
+                "name": "tally2", "kind": "command",
                 "fields": [{ "name": "delta", "ty": "int" }]
             }))
             .expect("valid");
@@ -5749,7 +5745,7 @@ mod tests {
         // loop back to the handler under the automatic fact broadcast.
         let fact = system
             .register_schema_json(json!({
-                "name": "tallied2", "version": 1, "kind": "event",
+                "name": "tallied2", "kind": "event",
                 "fields": [{ "name": "delta", "ty": "int" }]
             }))
             .expect("valid");
@@ -5757,7 +5753,7 @@ mod tests {
         let decision: crate::actor::ForeignDecision = {
             let f = fact.clone();
             Arc::new(move |_state, cmd, _ctx| {
-                vec![crate::envelope::Event::new(
+                vec![crate::envelope::Event::from_json_view(
                     f.clone(),
                     json!({ "delta": cmd["delta"].as_i64().unwrap_or(0) }),
                 )]
@@ -5769,7 +5765,7 @@ mod tests {
                 if ev.schema == f {
                     state["total"] = serde_json::json!(
                         state["total"].as_i64().unwrap_or(0)
-                            + ev.payload["delta"].as_i64().unwrap_or(0)
+                            + ev.payload_json()["delta"].as_i64().unwrap_or(0)
                     );
                 }
             })
@@ -5793,7 +5789,7 @@ mod tests {
         let built_decision: crate::actor::ForeignDecision = {
             let f = fact.clone();
             Arc::new(move |_state, cmd, _ctx| {
-                vec![crate::envelope::Event::new(
+                vec![crate::envelope::Event::from_json_view(
                     f.clone(),
                     json!({ "delta": cmd["delta"].as_i64().unwrap_or(0) }),
                 )]
@@ -5805,7 +5801,7 @@ mod tests {
                 if ev.schema == f {
                     state["total"] = serde_json::json!(
                         state["total"].as_i64().unwrap_or(0)
-                            + ev.payload["delta"].as_i64().unwrap_or(0)
+                            + ev.payload_json()["delta"].as_i64().unwrap_or(0)
                     );
                 }
             })
@@ -5813,7 +5809,7 @@ mod tests {
         crate::builder::spawn_foreign(&system)
             .at(ActorPath::new("t-built"))
             .schema(json!({
-                "name": "tally2", "version": 1, "kind": "command",
+                "name": "tally2", "kind": "command",
                 "fields": [{ "name": "delta", "ty": "int" }]
             }))
             .args(json!({ "total": 0 }))
@@ -5831,7 +5827,7 @@ mod tests {
         .await;
         for path in [ActorPath::new("t-pos"), ActorPath::new("t-built")] {
             system
-                .send(system.envelope(SchemaId::new("tally2", 1), path, json!({ "delta": 9 })))
+                .send(system.envelope(SchemaId::new("tally2"), path, json!({ "delta": 9 })))
                 .await
                 .expect("delivered");
         }
@@ -5858,8 +5854,7 @@ mod tests {
         fn schema_def() -> SchemaDef {
             SchemaDef {
                 name: "Add".into(),
-                version: 1,
-                kind: SchemaKind::Command,
+                                kind: SchemaKind::Command,
                 fields: vec![FieldDef::required("n", FieldTy::Int)],
                 description: Some("hand-first".into()),
             }
@@ -5900,26 +5895,36 @@ mod tests {
 
     #[tokio::test]
     async fn builder_registration_keeps_the_first_registered_def() {
-        // Given a def under the Add name+version hand-registered FIRST,
-        // with a body that differs from `Add::schema_def()`.
+        // Given a def under the name "Add" hand-registered FIRST (the
+        // foreign JSON path), with a body that differs from what the
+        // builder would derive.
         let (system, _clock) = ActorSystem::test();
-        system.register_schema::<AddFirstWins>();
+        system
+            .register_schema_json(json!({
+                "name": "Add",
+                "kind": "command",
+                "fields": [{ "name": "n", "ty": "int" }],
+                "description": "hand-first"
+            }))
+            .expect("registers");
 
-        // When a builder spawn declares the same schema id afterwards.
+        // When a builder spawn handles `Add` (whose descriptor was
+        // already registered FIRST via the foreign path — the table
+        // keeps the first def; the typed claim adds only the TypeId).
         crate::builder::spawn_es_builder::<BareCounter>(&system)
             .at(ActorPath::new("first-wins"))
             .handles::<Add>()
             .start();
 
-        // Then the export holds exactly ONE def for the id, and it is
+        // Then the export holds exactly ONE def for the name, and it is
         // the FIRST one (schemas are agreed facts, not config).
         let export = system.export().await;
         let defs: Vec<&SchemaDef> = export
             .schemas
             .iter()
-            .filter(|s| s.id() == Add::schema_id())
+            .filter(|s| s.name == "Add")
             .collect();
-        assert_eq!(defs.len(), 1, "no duplicate def for one id");
+        assert_eq!(defs.len(), 1, "no duplicate def for one name");
         assert_eq!(
             defs[0].description.as_deref(),
             Some("hand-first"),
@@ -5939,7 +5944,7 @@ mod tests {
         crate::builder::spawn_foreign(&system)
             .at(ActorPath::new("f-reg"))
             .schema(json!({
-                "name": "fbuildcmd", "version": 1, "kind": "command",
+                "name": "fbuildcmd", "kind": "command",
                 "fields": [{ "name": "delta", "ty": "int" }]
             }))
             .args(json!({ "total": 0 }))
@@ -5954,7 +5959,7 @@ mod tests {
             export
                 .schemas
                 .iter()
-                .any(|s| s.id() == SchemaId::new("fbuildcmd", 1)),
+                .any(|s| s.id() == SchemaId::new("fbuildcmd")),
             "foreign builder schema exported"
         );
     }
@@ -5970,14 +5975,12 @@ mod tests {
             Self::default()
         }
         fn apply(&mut self, event: &crate::envelope::Event) {
-            self.total += event.payload["n"].as_i64().unwrap_or(0);
+            self.total += event.payload_json()["n"].as_i64().unwrap_or(0);
         }
     }
     impl CommandHandler<Add> for DefaultManifestCounter {
         fn handle(&self, cmd: Add, _ctx: &mut CmdCtx<'_>) -> crate::envelope::Events {
-            crate::envelope::Events::from_vec(vec![crate::envelope::Event::new(
-                Added::schema_id(),
-                json!({ "n": cmd.n }),
+            crate::envelope::Events::from_vec(vec![crate::envelope::Event::from_json_view(Added::schema_id(), json!({ "n": cmd.n }),
             )])
         }
     }
@@ -6034,14 +6037,12 @@ mod tests {
             Self::default()
         }
         fn apply(&mut self, event: &crate::envelope::Event) {
-            self.total += event.payload["n"].as_i64().unwrap_or(0);
+            self.total += event.payload_json()["n"].as_i64().unwrap_or(0);
         }
     }
     impl CommandHandler<Add> for RichCounter {
         fn handle(&self, cmd: Add, _ctx: &mut CmdCtx<'_>) -> crate::envelope::Events {
-            crate::envelope::Events::from_vec(vec![crate::envelope::Event::new(
-                Added::schema_id(),
-                json!({ "n": cmd.n }),
+            crate::envelope::Events::from_vec(vec![crate::envelope::Event::from_json_view(Added::schema_id(), json!({ "n": cmd.n }),
             )])
         }
     }
@@ -6287,8 +6288,8 @@ mod tests {
         let envelope = result.expect_err("unresolved destination");
         assert_eq!(envelope.schema, Add::schema_id());
         assert_eq!(
-            envelope.as_json(),
-            Some(&json!({ "n": 1 })),
+            envelope.payload_json(),
+            &json!({ "n": 1 }),
             "the original payload is returned to the caller"
         );
     }
@@ -6313,7 +6314,7 @@ mod tests {
         let foreign_path = ActorPath::new("dep-foreign");
         let schema = system
             .register_schema_json(json!({
-                "name": "depcmd", "version": 1, "kind": "command",
+                "name": "depcmd", "kind": "command",
                 "fields": [{ "name": "delta", "ty": "int" }]
             }))
             .expect("valid");
@@ -6321,7 +6322,7 @@ mod tests {
         // loop back to the handler under the automatic fact broadcast.
         let fact = system
             .register_schema_json(json!({
-                "name": "depdone", "version": 1, "kind": "event",
+                "name": "depdone", "kind": "event",
                 "fields": [{ "name": "delta", "ty": "int" }]
             }))
             .expect("valid");
@@ -6333,7 +6334,7 @@ mod tests {
                 schema,
                 json!({ "total": 0 }),
                 Arc::new(move |_st, cmd, _ctx| {
-                    vec![crate::envelope::Event::new(
+                    vec![crate::envelope::Event::from_json_view(
                         f_decision.clone(),
                         json!({ "delta": cmd["delta"].as_i64().unwrap_or(0) }),
                     )]
@@ -6342,7 +6343,7 @@ mod tests {
                     if ev.schema == f_fold {
                         state["total"] = serde_json::json!(
                             state["total"].as_i64().unwrap_or(0)
-                                + ev.payload["delta"].as_i64().unwrap_or(0)
+                                + ev.payload_json()["delta"].as_i64().unwrap_or(0)
                         );
                     }
                 }),
@@ -6367,7 +6368,7 @@ mod tests {
             .expect("es delivered");
         system
             .send(system.envelope(
-                SchemaId::new("depcmd", 1),
+                SchemaId::new("depcmd"),
                 foreign_path.clone(),
                 json!({ "delta": 4 }),
             ))
@@ -6403,14 +6404,12 @@ mod tests {
             }
         }
         fn apply(&mut self, event: &crate::envelope::Event) {
-            self.total += event.payload["n"].as_i64().unwrap_or(0);
+            self.total += event.payload_json()["n"].as_i64().unwrap_or(0);
         }
     }
     impl CommandHandler<KeyedAdd> for KeyCounter {
         fn handle(&self, cmd: KeyedAdd, _ctx: &mut CmdCtx<'_>) -> crate::envelope::Events {
-            crate::envelope::Events::from_vec(vec![crate::envelope::Event::new(
-                Added::schema_id(),
-                json!({ "n": cmd.n }),
+            crate::envelope::Events::from_vec(vec![crate::envelope::Event::from_json_view(Added::schema_id(), json!({ "n": cmd.n }),
             )])
         }
     }
@@ -6468,9 +6467,9 @@ mod tests {
     }
     impl crate::actor::Projector for ChatLog {
         fn apply(&mut self, event: &crate::envelope::Event) {
-            if event.schema.as_str() == "Chatted@1" {
+            if event.schema.as_str() == "Chatted" {
                 self.messages += 1;
-                if let Some(text) = event.payload["text"].as_str() {
+                if let Some(text) = event.payload_json()["text"].as_str() {
                     self.keys_seen.push(text.to_owned());
                 }
             }
@@ -7207,11 +7206,11 @@ mod tests {
             &system,
             &source,
             vec![
-                crate::envelope::Event::new(
+                crate::envelope::Event::from_json_view(
                     Chatted::schema_id(),
                     crate::json!({ "chat_id": "1", "text": "x" }),
                 ),
-                crate::envelope::Event::new(
+                crate::envelope::Event::from_json_view(
                     Chatted::schema_id(),
                     crate::json!({ "chat_id": "1", "text": "y" }),
                 ),
@@ -8063,7 +8062,7 @@ mod tests {
             }
         }
         fn apply(&mut self, event: &crate::envelope::Event) {
-            self.total += event.payload["n"].as_i64().unwrap_or(0);
+            self.total += event.payload_json()["n"].as_i64().unwrap_or(0);
         }
         fn on_stop(&self) {
             self.log
@@ -8077,9 +8076,7 @@ mod tests {
             if cmd.n == 666 {
                 panic!("poison add");
             }
-            crate::envelope::Events::from_vec(vec![crate::envelope::Event::new(
-                Added::schema_id(),
-                json!({ "n": cmd.n }),
+            crate::envelope::Events::from_vec(vec![crate::envelope::Event::from_json_view(Added::schema_id(), json!({ "n": cmd.n }),
             )])
         }
     }
@@ -9913,7 +9910,7 @@ mod tests {
         let event_only = spawn_edged(&system, "subscriber", "sub", false, true).await;
 
         // When a Pack COMMAND flows schema-addressed.
-        let env = crate::envelope::Envelope::json(
+        let env = crate::envelope::Envelope::from_bytes_wrapped(
             Pack::schema_id(),
             Address::Schema(Pack::schema_id()),
             json!({ "order": "o-4" }),
@@ -9942,7 +9939,7 @@ mod tests {
 
         // When a schema-addressed envelope of the EVENT schema is sent
         // (a command-style dispatch).
-        let env = crate::envelope::Envelope::json(
+        let env = crate::envelope::Envelope::from_bytes_wrapped(
             Shipped::schema_id(),
             Address::Schema(Shipped::schema_id()),
             json!({ "order": "o-evt-cmd" }),
@@ -10400,8 +10397,8 @@ mod tests {
             Self::default()
         }
         fn apply(&mut self, event: &crate::envelope::Event) {
-            if event.schema.as_str() == "Added@1" {
-                self.total += event.payload["n"].as_i64().unwrap_or(0);
+            if event.schema.as_str() == "Added" {
+                self.total += event.payload_json()["n"].as_i64().unwrap_or(0);
             }
         }
         fn capture(&self) -> Result<Json, error_stack::Report<crate::journal::JournalError>> {
@@ -10413,9 +10410,7 @@ mod tests {
     }
     impl CommandHandler<Add> for SpiedCounter {
         fn handle(&self, cmd: Add, _ctx: &mut CmdCtx<'_>) -> crate::envelope::Events {
-            crate::envelope::Events::from_vec(vec![crate::envelope::Event::new(
-                Added::schema_id(),
-                json!({ "n": cmd.n }),
+            crate::envelope::Events::from_vec(vec![crate::envelope::Event::from_json_view(Added::schema_id(), json!({ "n": cmd.n }),
             )])
         }
     }
@@ -10592,7 +10587,7 @@ mod tests {
         // Given a system with a live foreign (schema-defined) actor and no
         // actor at some path.
         let (system, _clock) = ActorSystem::test();
-        let fact = SchemaId::new("tick", 1);
+        let fact = SchemaId::new("tick");
         let decision: crate::actor::ForeignDecision =
             Arc::new(|_state: &Json, _cmd: &Json, _ctx: &mut CmdCtx<'_>| Vec::new());
         let fold: crate::actor::ForeignFold =
@@ -10600,7 +10595,7 @@ mod tests {
         crate::builder::spawn_foreign(&system)
             .at(ActorPath::new("foreign"))
             .schema(json!({
-                "name": "tick", "version": 1, "kind": "command",
+                "name": "tick", "kind": "command",
                 "fields": [{ "name": "delta", "ty": "int" }]
             }))
             .args(json!({ "total": 0 }))

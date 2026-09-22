@@ -12,7 +12,7 @@ use trouper::actor::{CommandHandler, EventSourcedActor};
 use trouper::prelude::*;
 use trouper::tap::FactKind;
 
-#[derive(Command, Deserialize)]
+#[derive(Command, Serialize, Deserialize)]
 struct Ping {
     n: i64,
 }
@@ -50,8 +50,8 @@ impl EventSourcedActor for Counter {
     }
 
     fn apply(&mut self, event: &Event) {
-        if event.schema.as_str() == "Ponged@1" {
-            self.seen += event.payload["n"].as_i64().unwrap_or(0);
+        if event.schema.as_str() == "Ponged" {
+            self.seen += event.payload_json()["n"].as_i64().unwrap_or(0);
         }
     }
 }

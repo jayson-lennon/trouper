@@ -53,8 +53,8 @@ impl EventSourcedActor for Counter {
         Self::default()
     }
     fn apply(&mut self, event: &Event) {
-        if event.schema.as_str() == "Added@1" {
-            self.total += event.payload["n"].as_i64().unwrap_or(0);
+        if event.schema.as_str() == "Added" {
+            self.total += event.payload_json()["n"].as_i64().unwrap_or(0);
         }
     }
 }
@@ -89,8 +89,8 @@ struct Totals {
 }
 impl Projector for Totals {
     fn apply(&mut self, event: &Event) {
-        if event.schema.as_str() == "Added@1" {
-            self.total += event.payload["n"].as_i64().unwrap_or(0);
+        if event.schema.as_str() == "Added" {
+            self.total += event.payload_json()["n"].as_i64().unwrap_or(0);
             self.bell = self.total >= 30;
         }
     }

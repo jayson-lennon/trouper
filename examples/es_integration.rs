@@ -97,7 +97,7 @@ impl EventSourcedActor for Account {
     }
 
     fn apply(&mut self, event: &Event) {
-        if let Some(delta) = event.payload["delta"].as_i64() {
+        if let Some(delta) = event.payload_json()["delta"].as_i64() {
             self.balance += delta;
         }
     }

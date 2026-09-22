@@ -59,7 +59,7 @@ impl EventSourcedActor for Account {
 
     fn apply(&mut self, event: &Event) {
         if event.schema == AccountAdjusted::schema_id() {
-            self.balance += event.payload["delta"].as_i64().unwrap_or(0);
+            self.balance += event.payload_json()["delta"].as_i64().unwrap_or(0);
         }
     }
 }

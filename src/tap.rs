@@ -345,7 +345,7 @@ mod tests {
             ts(42),
             FactKind::Acked {
                 to: ActorPath::new("counter"),
-                schema: SchemaId::new("Add", 1),
+                schema: SchemaId::new("Add"),
                 trace: TraceCtx::root(),
             },
         );
@@ -358,7 +358,7 @@ mod tests {
         assert_eq!(value["kind"], "acked");
         assert_eq!(value["ts"], 42);
         assert_eq!(value["to"], "counter");
-        assert_eq!(value["schema"], "Add@1");
+        assert_eq!(value["schema"], "Add");
         assert!(value["trace_id"].is_string());
         assert!(value["causality_id"].is_string());
     }

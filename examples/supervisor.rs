@@ -35,7 +35,7 @@ fn log(line: impl Into<String>) {
 }
 
 /// The work unit: one copy goes to ONE worker per send_to_any.
-#[derive(Command, Debug, Serialize, Deserialize)]
+#[derive(Command, Debug, Serialize, Deserialize, Clone)]
 #[schema(description = "A unit of work for the worker pool.")]
 struct WorkJob {
     id: u32,
@@ -51,7 +51,7 @@ struct JobDone {
 /// The escalation control message the engine SENDS to the declared
 /// parent when a child's budget exhausts. It is an ordinary message —
 /// the parent's handler owns the response.
-#[derive(Command, Debug, Deserialize)]
+#[derive(Command, Debug, Serialize, Deserialize)]
 #[schema(description = "A supervised child exhausted its budget.")]
 struct Escalated {
     escalated: String,

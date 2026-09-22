@@ -40,7 +40,7 @@ struct Ship {
 }
 
 /// An event: the order WAS shipped (announcement).
-#[derive(Event, Debug, Serialize, Deserialize)]
+#[derive(Event, Debug, Serialize, Deserialize, Clone)]
 #[schema(description = "An order was shipped (announcement).")]
 struct Shipped {
     order: String,
@@ -144,10 +144,12 @@ async fn main() {
         .expect("delivered");
 
     // 2. A schema-addressed Ship (the route table picks the handler).
-    let env = Envelope::json(
+    let env = Envelope::from_bytes(
         Ship::schema_id(),
         Address::Schema(Ship::schema_id()),
-        serde_json::json!({ "order": "ord-2" }),
+        PayloadBytes::from(trouper::Json::of(
+            &serde_json::json!({ "order": "ord-2" }),
+        )),
         TraceCtx::root(),
     );
     system.send(env).await.expect("schema delivery");

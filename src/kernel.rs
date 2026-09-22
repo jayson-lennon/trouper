@@ -250,12 +250,23 @@ pub(crate) static REGISTRY_LOCKS: std::sync::atomic::AtomicU64 =
 /// `ActorManifest` clones (test builds only). Bumped by the derive's
 /// hand-written `Clone` impl in schema.rs.
 #[cfg(test)]
+
+#[cfg(test)]
 pub(crate) fn bump_manifest_clones() {
     MANIFEST_CLONES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 }
 
 #[cfg(test)]
 pub(crate) static MANIFEST_CLONES: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+#[cfg(test)]
+pub(crate) fn bump_serde_calls() {
+    SERDE_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+#[cfg(test)]
+pub(crate) static SERDE_CALLS: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
 
@@ -717,28 +728,15 @@ fn apply_rules(
                 // New causality for the copy, same trace id: a fresh cause
                 // INSIDE the original's trace, never a chain of two hops.
                 trace.causality_id = crate::envelope::CausalityId::new();
-                // The copy SHARES the payload tree (Arc bump), never a
-                // deep copy. A typed payload is not teeable at the waist.
-                let copy = match envelope.payload {
-                    crate::envelope::Payload::Json(_) => Some(
-                        Envelope::json_shared(
-                            envelope.schema.clone(),
-                            Address::Path(observer.clone()),
-                            envelope,
-                            trace,
-                        )
-                        .from(
-                            envelope
-                                .from
-                                .clone()
-                                .unwrap_or_else(|| ActorPath::new("anonymous")),
-                        ),
-                    ),
-                    crate::envelope::Payload::Typed(_) => None,
-                };
-                let Some(copy) = copy else {
-                    return (tee, inline); // typed payload: not teeable at the waist
-                };
+                // The copy SHARES the payload (Arc bump), never a copy
+                // of the value — every payload is shareable now.
+                let copy = Envelope::shared_from(
+                    envelope.schema.clone(),
+                    Address::Path(observer.clone()),
+                    &envelope,
+                    trace,
+                )
+                .from(envelope.from.clone().unwrap_or_else(|| ActorPath::new("anonymous")));
                 tee = Some((copy, observer.clone(), origin_trace));
             }
             crate::pool::RuleAction::Inline(interposer) => {
@@ -1126,11 +1124,11 @@ async fn step_es(ctx: &EsLoop) -> Step {
         // The dropped EVENT is what died: it is dead-lettered as an
         // envelope addressed back to the emitting actor (same trace,
         // so the drop stays causally linked to the command). The
-        // envelope SHARES the event's payload tree (Arc bump).
-        let dropped = Envelope::json_arc(
+        // envelope SHARES the event's payload (Arc bump).
+        let dropped = Envelope::raw(
             event.schema.clone(),
             crate::envelope::Address::Path(ctx.path.clone()),
-            std::sync::Arc::new(event.payload.clone()),
+            crate::envelope::Payload::shared(&event.payload),
             envelope.trace,
         )
         .from(ctx.path.clone());
@@ -1444,8 +1442,13 @@ impl crate::context::AskPort for KernelAskPort {
                 (lease, receiver)
             };
             let trace = crate::envelope::TraceCtx::root();
-            let envelope =
-                Envelope::json(schema, dest.clone(), payload, trace).reply_to(Address::Slot(lease));
+            let envelope = Envelope::raw(
+                schema,
+                dest.clone(),
+                crate::envelope::Payload::json_view(payload),
+                trace,
+            )
+            .reply_to(Address::Slot(lease));
             match deliver_with_retry(&endpoint, envelope).await {
                 Ok(()) => Ok((lease, receiver)),
                 Err(_) => {
@@ -1634,7 +1637,12 @@ async fn resolve_reply(
         Address::Schema(_) => {
             // A schema-addressed reply is an ordinary routed send (the
             // route table picks a handler).
-            let envelope = Envelope::json(schema, to, payload, trace);
+            let envelope = Envelope::raw(
+                schema,
+                to,
+                crate::envelope::Payload::json_view(payload),
+                trace,
+            );
             if let Err(undeliverable) = route(registry, kernel, shutting_down, envelope).await {
                 dead_letter(
                     kernel,
@@ -1647,7 +1655,12 @@ async fn resolve_reply(
         Address::Path(path) => {
             // Durable name: an ordinary envelope (any actor may have moved
             // on; unresolvable replies dead-letter like any send).
-            let envelope = Envelope::json(schema, Address::Path(path.clone()), payload, trace);
+            let envelope = Envelope::raw(
+                schema,
+                Address::Path(path.clone()),
+                crate::envelope::Payload::json_view(payload),
+                trace,
+            );
             if let Err(undeliverable) = route(registry, kernel, shutting_down, envelope).await {
                 dead_letter(
                     kernel,
@@ -1673,15 +1686,15 @@ async fn fan_out_emits(
     seqs: &[crate::journal::SeqNo],
 ) {
     let cause = crate::envelope::TraceCtx::root();
-    for (mut event, seq) in events.into_iter().zip(seqs.iter()) {
-        // The broadcast copy WRAPS the event's payload tree (one Arc
-        // allocation, ZERO deep copies): N subscribers read one tree. The
-        // event is consumed — its owned payload moves into the Arc.
+    for (event, seq) in events.into_iter().zip(seqs.iter()) {
+        // The broadcast copy SHARES the event's payload (one Arc bump,
+        // ZERO copies): N subscribers read one value. The event is
+        // consumed — its payload moves into the envelope.
         let schema = event.schema.clone();
-        let envelope = Envelope::json_arc(
+        let envelope = Envelope::raw(
             event.schema.clone(),
             crate::envelope::Address::Schema(event.schema.clone()),
-            std::sync::Arc::new(std::mem::take(&mut event.payload)),
+            event.payload,
             cause,
         )
         .from(ctx.path.clone())
@@ -1777,7 +1790,12 @@ fn dead_letter_schema(ctx: &EsLoop, intent: &crate::context::Intent, schema: &Sc
         }
         crate::context::Intent::Reply {
             to, payload, trace, ..
-        } => Envelope::json(schema.clone(), to.clone(), payload.clone(), *trace),
+        } => Envelope::raw(
+            schema.clone(),
+            to.clone(),
+            crate::envelope::Payload::json_view(payload.clone()),
+            *trace,
+        ),
         crate::context::Intent::StopSelf => return,
     };
     dead_letter(
@@ -2454,7 +2472,7 @@ async fn escalate(
     if let Some(parent) = &spec.parent {
         system
             .send(system.envelope(
-                crate::schema::SchemaId::new("Escalated", 1),
+                crate::schema::SchemaId::new("Escalated"),
                 parent.clone(),
                 message,
             ))

@@ -257,14 +257,16 @@ mod tests {
     use crate::actor::ActorPath;
     use crate::envelope::Envelope;
     use crate::envelope::TraceCtx;
+    use crate::envelope::PayloadBytes;
+    use crate::json::Json;
     use crate::schema::SchemaId;
     use serde_json::json;
 
     fn envelope(n: u32) -> Envelope {
-        Envelope::json(
-            SchemaId::new("Ping", 1),
+        Envelope::from_bytes(
+            SchemaId::new("Ping"),
             crate::envelope::Address::Path(ActorPath::new("a")),
-            json!({ "n": n }),
+            PayloadBytes::from(Json::from(json!({ "n": n }))),
             TraceCtx::root(),
         )
     }
@@ -277,11 +279,11 @@ mod tests {
         inbox.push(envelope(2)).expect("push");
 
         // When peeking, dropping the borrow, then peeking again.
-        let first_n = inbox.peek().map(|e| e.as_json().map(|j| j["n"].as_u64()));
-        let again_n = inbox.peek().map(|e| e.as_json().map(|j| j["n"].as_u64()));
+        let first_n = inbox.peek().map(|e| e.payload_json()["n"].as_u64());
+        let again_n = inbox.peek().map(|e| e.payload_json()["n"].as_u64());
 
         // Then the same first envelope is returned both times.
-        assert_eq!(first_n, Some(Some(Some(1))));
+        assert_eq!(first_n, Some(Some(1)));
         assert_eq!(again_n, first_n);
     }
 
@@ -298,7 +300,7 @@ mod tests {
         // Then the cursor moved and the second envelope is at the front.
         assert_eq!(inbox.cursor(), InboxOffset::new(1));
         let front = inbox.peek().expect("front");
-        assert_eq!(front.as_json().map(|j| j["n"].as_u64()), Some(Some(2)));
+        assert_eq!(front.payload_json()["n"].as_u64(), Some(2));
     }
 
     #[test]
@@ -336,7 +338,7 @@ mod tests {
 
         // Then it is refused (envelope returned) and the queue is untouched.
         let refused = result.expect_err("must refuse").into_envelope();
-        assert_eq!(refused.as_json().map(|j| j["n"].as_u64()), Some(Some(3)));
+        assert_eq!(refused.payload_json()["n"].as_u64(), Some(3));
         assert_eq!(inbox.len(), 2);
     }
 
@@ -352,20 +354,16 @@ mod tests {
             .push(envelope(3))
             .expect_err("eviction is reported")
             .into_envelope();
-        assert_eq!(evicted.as_json().map(|j| j["n"].as_u64()), Some(Some(1)));
+        assert_eq!(evicted.payload_json()["n"].as_u64(), Some(1));
 
         // Then the evicted envelope is gone: the cursor already sits on
         // envelope 2, which is what a peek returns.
-        let front_n = inbox
-            .peek()
-            .and_then(|e| e.as_json().map(|j| j["n"].as_u64()));
+        let front_n = inbox.peek().map(|e| e.payload_json()["n"].as_u64());
         assert_eq!(front_n, Some(Some(2)));
 
         // And after acking, envelope 3 follows in order.
         inbox.ack();
-        let next_n = inbox
-            .peek()
-            .and_then(|e| e.as_json().map(|j| j["n"].as_u64()));
+        let next_n = inbox.peek().map(|e| e.payload_json()["n"].as_u64());
         assert_eq!(next_n, Some(Some(3)));
     }
 

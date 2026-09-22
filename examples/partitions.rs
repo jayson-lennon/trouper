@@ -14,7 +14,7 @@ use trouper::kernel::DeadLetterReason;
 use trouper::prelude::*;
 use trouper::tap::FactKind;
 
-#[derive(Command, Deserialize)]
+#[derive(Command, Serialize, Deserialize)]
 struct KeyedAdd {
     // The `account` field is the shard key — the kernel reads it
     // per envelope to derive the entity path.
@@ -41,7 +41,7 @@ impl EventSourcedActor for Account {
     }
 
     fn apply(&mut self, event: &Event) {
-        self.balance += event.payload["n"].as_i64().unwrap_or(0);
+        self.balance += event.payload_json()["n"].as_i64().unwrap_or(0);
     }
 }
 

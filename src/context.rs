@@ -359,8 +359,13 @@ impl<'a> MsgCtx<'a> {
         payload: Json,
         reply_to: Option<Address>,
     ) {
-        let mut envelope = Envelope::json(schema, dest, payload, self.core.child_trace())
-            .from(self.core.self_path.clone());
+        let mut envelope = Envelope::raw(
+            schema,
+            dest,
+            crate::envelope::Payload::json_view(payload),
+            self.core.child_trace(),
+        )
+        .from(self.core.self_path.clone());
         if let Some(reply_to) = reply_to {
             envelope = envelope.reply_to(reply_to);
         }
@@ -371,10 +376,10 @@ impl<'a> MsgCtx<'a> {
     /// hand-built payload. The envelope's destination is the schema
     /// address itself — the trace's `dest` reads as the fan-out target.
     pub(crate) fn publish_json(&mut self, schema: SchemaId, payload: Json) {
-        let envelope = Envelope::json(
+        let envelope = Envelope::raw(
             schema.clone(),
             Address::Schema(schema),
-            payload,
+            crate::envelope::Payload::json_view(payload),
             self.core.child_trace(),
         )
         .from(self.core.self_path.clone());
@@ -570,7 +575,7 @@ mod tests {
                     (ActorPath::new("auditor"), ActorKind::Service),
                 ],
                 handlers: vec![(
-                    SchemaId::new("ReserveStock", 1),
+                    SchemaId::new("ReserveStock"),
                     ActorPath::new("inventory.west"),
                 )],
                 now: Timestamp::from_millis(millis),
@@ -631,7 +636,7 @@ mod tests {
                 );
                 assert_eq!(envelope.trace.trace_id, parent.trace_id);
                 assert_ne!(envelope.trace.causality_id, parent.causality_id);
-                assert_eq!(envelope.schema.as_str(), "ReserveStock@1");
+                assert_eq!(envelope.schema.as_str(), "ReserveStock");
             }
             Intent::Reply { .. } => panic!("expected a send"),
             Intent::Broadcast(_) | Intent::StopSelf => panic!("expected a send"),
@@ -706,7 +711,7 @@ mod tests {
         // When querying lookups, handlers_of, and the receive timestamp.
         let info = ctx.lookup(&ActorPath::new("auditor"));
         let missing = ctx.lookup(&ActorPath::new("ghost"));
-        let handlers = ctx.handlers_of(&SchemaId::new("ReserveStock", 1));
+        let handlers = ctx.handlers_of(&SchemaId::new("ReserveStock"));
         let ts = ctx.recv_ts();
 
         // Then the view's answers come through, including the clock's.
@@ -873,8 +878,8 @@ mod tests {
                 assert_eq!(ea.schema, StockReserved::schema_id());
                 assert_eq!(ea.dest, eb.dest);
                 assert_eq!(
-                    ea.clone().into_json().expect("json"),
-                    eb.clone().into_json().expect("json")
+                    ea.payload_json().clone(),
+                    eb.payload_json().clone()
                 );
             }
             _ => panic!("expected broadcast intents"),
@@ -918,8 +923,8 @@ mod tests {
                 assert_eq!(ea.schema, ReserveStock::schema_id());
                 assert_eq!(ea.schema, eb.schema);
                 assert_eq!(
-                    ea.clone().into_json().expect("json"),
-                    eb.clone().into_json().expect("json")
+                    ea.payload_json().clone(),
+                    eb.payload_json().clone()
                 );
                 assert_eq!(ea.from, eb.from);
             }
@@ -934,7 +939,7 @@ mod tests {
         // send capability - an entity owns no intents at all.
         fn uses_surface(ctx: &mut CmdCtx<'_>) {
             let _ = ctx.lookup(&ActorPath::new("x"));
-            let _ = ctx.handlers_of(&SchemaId::new("S", 1));
+            let _ = ctx.handlers_of(&SchemaId::new("S"));
             let _ = ctx.recv_ts();
             let _ = ctx.self_path();
             // ctx.stop_self();       <- no longer exists (compile-fail by design)

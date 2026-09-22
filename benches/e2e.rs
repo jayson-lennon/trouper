@@ -62,16 +62,14 @@ impl EventSourcedActor for Accum {
         Self::default()
     }
     fn apply(&mut self, event: &trouper::envelope::Event) {
-        if event.schema.as_str() == "Ticked@1" {
+        if event.schema.as_str() == "Ticked" {
             self.count += 1;
         }
     }
 }
 impl trouper::actor::CommandHandler<Tick> for Accum {
     fn handle(&self, _cmd: Tick, _ctx: &mut CmdCtx<'_>) -> trouper::envelope::Events {
-        trouper::envelope::Events::from_vec(vec![trouper::envelope::Event::new(
-            Ticked::schema_id(),
-            Json::of(&Ticked { n: 1 }),
+        trouper::envelope::Events::from_vec(vec![trouper::envelope::Event::from_json_view(Ticked::schema_id(), Json::of(&Ticked { n: 1 }),
         )])
     }
 }
@@ -119,16 +117,14 @@ impl EventSourcedActor for Bytes {
         Self::default()
     }
     fn apply(&mut self, event: &trouper::envelope::Event) {
-        if event.schema.as_str() == "Chunked@1" {
-            self.total += event.payload["bytes"].as_u64().unwrap_or(0);
+        if event.schema.as_str() == "Chunked" {
+            self.total += event.payload_json()["bytes"].as_u64().unwrap_or(0);
         }
     }
 }
 impl trouper::actor::CommandHandler<Chunk> for Bytes {
     fn handle(&self, cmd: Chunk, _ctx: &mut CmdCtx<'_>) -> trouper::envelope::Events {
-        trouper::envelope::Events::from_vec(vec![trouper::envelope::Event::new(
-            Chunked::schema_id(),
-            Json::of(&Chunked {
+        trouper::envelope::Events::from_vec(vec![trouper::envelope::Event::from_json_view(Chunked::schema_id(), Json::of(&Chunked {
                 bytes: cmd.body.len(),
             }),
         )])
@@ -476,7 +472,7 @@ impl EventSourcedActor for Wide {
         Self::default()
     }
     fn apply(&mut self, event: &trouper::envelope::Event) {
-        if event.schema.as_str() == "Chunked@1" {
+        if event.schema.as_str() == "Chunked" {
             self.count += 1;
         }
     }

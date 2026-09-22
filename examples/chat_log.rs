@@ -61,7 +61,7 @@ impl EventSourcedActor for ChatRoom {
         Self::default()
     }
     fn apply(&mut self, event: &Event) {
-        if event.schema.as_str() == "Chatted@1" {
+        if event.schema.as_str() == "Chatted" {
             self.messages += 1;
         }
     }
@@ -82,9 +82,9 @@ struct ChatLog {
 }
 impl Projector for ChatLog {
     fn apply(&mut self, event: &Event) {
-        if event.schema.as_str() == "Chatted@1" {
+        if event.schema.as_str() == "Chatted" {
             self.messages += 1;
-            if let Some(text) = event.payload["text"].as_str() {
+            if let Some(text) = event.payload_json()["text"].as_str() {
                 self.transcript.push(text.to_owned());
             }
         }

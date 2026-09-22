@@ -29,12 +29,12 @@ use trouper::tap::FactKind;
 
 // -- Commands -------------------------------------------------------------
 
-#[derive(Command, Deserialize)]
+#[derive(Command, Serialize, Deserialize)]
 struct Deposit {
     n: i64,
 }
 
-#[derive(Command, Deserialize)]
+#[derive(Command, Serialize, Deserialize)]
 struct Withdraw {
     n: i64,
 }
@@ -42,26 +42,26 @@ struct Withdraw {
 /// The technical-failure trigger: panics in the handler ONCE — a
 /// transient fault. (A poison that panics every time is a permanent
 /// fault: supervision would burn the budget and stop the actor.)
-#[derive(Command, Deserialize)]
+#[derive(Command, Serialize, Deserialize)]
 struct Poison {
     n: i64,
 }
 
 // -- Events ---------------------------------------------------------------
 
-#[derive(Event, Serialize, Deserialize)]
+#[derive(Event, Serialize, Deserialize, Clone)]
 struct Deposited {
     n: i64,
 }
 
-#[derive(Event, Serialize, Deserialize)]
+#[derive(Event, Serialize, Deserialize, Clone)]
 struct Withdrawn {
     n: i64,
 }
 
 /// The domain rejection, journaled like any event: a fact about the
 /// world ("a decline happened"), not an error report.
-#[derive(Event, Serialize, Deserialize)]
+#[derive(Event, Serialize, Deserialize, Clone)]
 struct WithdrawFailed {
     requested: i64,
     balance: i64,
@@ -79,9 +79,9 @@ impl EventSourcedActor for Account {
     // override (spawn args are ignored by default).
 
     fn apply(&mut self, event: &Event) {
-        if let Some(e) = event.decode::<Deposited>() {
+        if let Some(e) = event.as_fact::<Deposited>() {
             self.balance += e.n;
-        } else if let Some(e) = event.decode::<Withdrawn>() {
+        } else if let Some(e) = event.as_fact::<Withdrawn>() {
             self.balance -= e.n;
         }
         // WithdrawFailed: a decline changes nothing; no decode needed.

@@ -499,7 +499,7 @@ impl CommandEntry for ConsumeEntry {
         _ctx: &mut CmdCtx<'_>,
     ) -> Result<crate::envelope::Events, error_stack::Report<DispatchError>> {
         let mut events = crate::envelope::Events::new();
-        events.push(crate::envelope::Event::new(
+        events.push(crate::envelope::Event::from_json_view(
             self.schema.clone(),
             payload.clone(),
         ));
@@ -763,9 +763,9 @@ mod tests {
     use crate::json;
     use crate::schema::Command;
     use crate::schema::{FieldDef, FieldTy, SchemaDef, SchemaKind};
-    use serde::Deserialize;
+    use serde::{Deserialize, Serialize};
 
-    #[derive(Command, Deserialize)]
+    #[derive(Command, Serialize, Deserialize)]
     struct ReserveStock {
         qty: u32,
     }
@@ -776,8 +776,7 @@ mod tests {
         fn schema_def() -> SchemaDef {
             SchemaDef {
                 name: "StockReserved".into(),
-                version: 1,
-                kind: SchemaKind::Event,
+                                kind: SchemaKind::Event,
                 fields: vec![FieldDef::required("qty", FieldTy::Int)],
                 description: None,
             }
@@ -803,15 +802,15 @@ mod tests {
         }
 
         fn apply(&mut self, event: &crate::envelope::Event) {
-            if event.schema.as_str() == "StockReserved@1" {
-                self.count += event.payload["qty"].as_i64().unwrap_or(0);
+            if event.schema.as_str() == "StockReserved" {
+                self.count += event.payload_json()["qty"].as_i64().unwrap_or(0);
             }
         }
     }
 
     impl CommandHandler<ReserveStock> for Counter {
         fn handle(&self, cmd: ReserveStock, _ctx: &mut CmdCtx<'_>) -> crate::envelope::Events {
-            crate::envelope::Events::from_vec(vec![crate::envelope::Event::new(
+            crate::envelope::Events::from_vec(vec![crate::envelope::Event::from_json_view(
                 StockReserved::schema_id(),
                 json!({ "qty": cmd.qty }),
             )])
@@ -829,13 +828,9 @@ mod tests {
         let mut live = TypedEsState::new(Counter::restore(&json!({})));
 
         // When applying two events through the erased shell.
-        live.apply_erased(&crate::envelope::Event::new(
-            StockReserved::schema_id(),
-            json!({ "qty": 2 }),
+        live.apply_erased(&crate::envelope::Event::from_json_view(StockReserved::schema_id(), json!({ "qty": 2 }),
         ));
-        live.apply_erased(&crate::envelope::Event::new(
-            StockReserved::schema_id(),
-            json!({ "qty": 5 }),
+        live.apply_erased(&crate::envelope::Event::from_json_view(StockReserved::schema_id(), json!({ "qty": 5 }),
         ));
 
         // Then the fold matches a hand-computed total.
@@ -848,8 +843,8 @@ mod tests {
         // Given a live state (poisoned, say) and a replay tail of two events.
         let live = TypedEsState::new(Counter { count: 999 });
         let tail = vec![
-            crate::envelope::Event::new(StockReserved::schema_id(), json!({ "qty": 2 })),
-            crate::envelope::Event::new(StockReserved::schema_id(), json!({ "qty": 3 })),
+            crate::envelope::Event::from_json_view(StockReserved::schema_id(), json!({ "qty": 2 })),
+            crate::envelope::Event::from_json_view(StockReserved::schema_id(), json!({ "qty": 3 })),
         ];
 
         // When rebuilding with no snapshot.
@@ -865,8 +860,8 @@ mod tests {
         // Given a snapshot claiming count 10 and a tail of two events.
         let live = TypedEsState::new(Counter { count: 0 });
         let tail = vec![
-            crate::envelope::Event::new(StockReserved::schema_id(), json!({ "qty": 1 })),
-            crate::envelope::Event::new(StockReserved::schema_id(), json!({ "qty": 1 })),
+            crate::envelope::Event::from_json_view(StockReserved::schema_id(), json!({ "qty": 1 })),
+            crate::envelope::Event::from_json_view(StockReserved::schema_id(), json!({ "qty": 1 })),
         ];
 
         // When rebuilding from the snapshot.
@@ -925,7 +920,7 @@ mod tests {
         // Then one event came back — DECIDED but not yet applied (the loop
         // applies post-ack, per the atomic ordering).
         assert_eq!(events.len(), 1);
-        assert_eq!(events[0].payload["qty"], 4);
+        assert_eq!(events[0].payload_json()["qty"], 4);
         let captured = state.capture_erased().expect("capture");
         assert_eq!(captured["count"], 0, "dispatch must not mutate state");
 
@@ -977,13 +972,11 @@ mod tests {
         // Given a foreign state and entry (decision: echo qty; fold: add it).
         let schema = ReserveStock::schema_id();
         let decision: ForeignDecision = Arc::new(|_state, cmd, _ctx| {
-            vec![crate::envelope::Event::new(
-                StockReserved::schema_id(),
-                json!({ "qty": cmd["qty"] }),
+            vec![crate::envelope::Event::from_json_view(StockReserved::schema_id(), json!({ "qty": cmd["qty"] }),
             )]
         });
         let fold: ForeignFold = Arc::new(|state, event| {
-            let qty = event.payload["qty"].as_i64().unwrap_or(0);
+            let qty = event.payload_json()["qty"].as_i64().unwrap_or(0);
             state["count"] = serde_json::json!(state["count"].as_i64().unwrap_or(0) + qty);
         });
         let entry = ForeignCommandEntry::new(schema, decision);
@@ -1013,7 +1006,7 @@ mod tests {
             .expect("dispatch");
 
         // Then the event came back decided, not applied.
-        assert_eq!(events[0].payload["qty"], 6);
+        assert_eq!(events[0].payload_json()["qty"], 6);
         assert_eq!(state.state()["count"], 0, "dispatch must not fold");
 
         // When the kernel applies (post-ack).

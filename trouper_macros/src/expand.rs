@@ -1,5 +1,7 @@
 //! Derive expansion: parse the derive input and generate the
-//! `trouper::schema::Schema` impl.
+//! `trouper::schema::Schema` impl plus the `trouper::envelope::PayloadValue`
+//! impl (downcast dispatch, field-by-name reads, memoized JSON-text
+//! encoding) for the derived struct.
 
 use proc_macro2::TokenStream;
 use quote::{ToTokens, quote};
@@ -25,9 +27,16 @@ impl Kind {
 }
 
 /// Generates the `Schema` impl for the derived struct: name from the
-/// struct ident, version and description from `#[schema(...)]` container
-/// attributes (defaults: version 1, no description), kind from the
+/// struct ident, description from the `#[schema(...)]` container
+/// attribute (default: no description), kind from the
 /// derive, fields mapped from the Rust types.
+///
+/// Also generates the `PayloadValue` impl: `as_any` (the downcast
+/// dispatch core), `field` (string reads of declared fields by their
+/// DESCRIPTOR name — the rename-aware one serde respects), and
+/// `to_json_bytes` (compact JSON text, memoized in a `OnceLock` so the
+/// value serializes at most once no matter how many readers ask — the
+/// journal door's single-serialization contract).
 ///
 /// `#[schema(...)]` FIELD attributes are rejected; the error says so
 /// explicitly so early adopters aren't surprised.
@@ -35,8 +44,9 @@ pub fn generate(input: TokenStream, kind: Kind) -> syn::Result<TokenStream> {
     let input: DeriveInput = syn::parse2(input)?;
     let ident = &input.ident;
 
-    // Container #[schema(...)] attributes: `version = N`, `description = "..."`.
-    let mut version: Option<syn::LitInt> = None;
+    // Container #[schema(...)] attributes: `description = "..."`. A
+    // `version = N` attribute is REJECTED with a named error: schemas carry
+    // no version — evolution is additive (new fields get serde defaults).
     let mut description: Option<String> = None;
     for attr in &input.attrs {
         if !attr.path().is_ident("schema") {
@@ -44,12 +54,11 @@ pub fn generate(input: TokenStream, kind: Kind) -> syn::Result<TokenStream> {
         }
         attr.parse_nested_meta(|meta| {
             if meta.path.is_ident("version") {
-                if version.is_some() {
-                    return Err(meta.error("duplicate `version` in #[schema(...)]"));
-                }
-                let lit: syn::LitInt = meta.value()?.parse()?;
-                version = Some(lit);
-                Ok(())
+                Err(meta.error(
+                    "schemas carry no version; drop `version = N` — evolution is \
+                     additive (new fields get serde defaults), breaking shapes get a \
+                     new schema name",
+                ))
             } else if meta.path.is_ident("description") {
                 if description.is_some() {
                     return Err(meta.error("duplicate `description` in #[schema(...)]"));
@@ -59,7 +68,7 @@ pub fn generate(input: TokenStream, kind: Kind) -> syn::Result<TokenStream> {
                 Ok(())
             } else {
                 Err(meta.error(
-                    "unknown #[schema(...)] container attribute; supported: version, description",
+                    "unknown #[schema(...)] container attribute; supported: description",
                 ))
             }
         })?;
@@ -98,15 +107,27 @@ pub fn generate(input: TokenStream, kind: Kind) -> syn::Result<TokenStream> {
     // Map each Rust field type to its descriptor `FieldDef` expression,
     // honoring the field-level `#[schema(...)]` attributes:
     // `shard_key`, `rename = "..."`, `ty = "json"`, `description = "..."`.
-    let field_defs: Vec<TokenStream> = fields
-        .iter()
-        .map(|f| {
-            let name = f.ident.as_ref().expect("named fields");
-            let field_name = name.to_string();
-            let field = field_def_expr(f, &field_name)?;
-            Ok(field)
-        })
-        .collect::<syn::Result<_>>()?;
+    let mut field_defs: Vec<TokenStream> = Vec::new();
+    let mut field_reads: Vec<TokenStream> = Vec::new();
+    for f in fields {
+        let name = f.ident.as_ref().expect("named fields");
+        let field_name = name.to_string();
+        field_defs.push(field_def_expr(f, &field_name)?);
+        // The RUNTIME field name — the descriptor name the rename produces
+        // (serde serializes under the serde rename; this derive's rename
+        // attribute mirrors it). Struct field access goes through the
+        // Rust ident.
+        let rust_ident = quote::format_ident!(
+            "{}",
+            field_name.strip_prefix("r#").unwrap_or(&field_name)
+        );
+        let read_expr = field_string_read(&f.ty);
+        let desc_name = descriptor_name(f, &field_name)?;
+        let desc_lit = syn::LitStr::new(&desc_name, f.span());
+        field_reads.push(quote! {
+            #desc_lit => (#read_expr)(&self.#rust_ident),
+        });
+    }
 
     // At most ONE field may be the shard key.
     let has_shard_key = |f: &syn::Field| {
@@ -142,27 +163,149 @@ pub fn generate(input: TokenStream, kind: Kind) -> syn::Result<TokenStream> {
 
     let kind_variant = quote::format_ident!("{}", kind.variant());
     let name = ident.to_string();
-    let version = version
-        .map(|lit| quote! { #lit })
-        .unwrap_or_else(|| quote! { 1u32 });
     let description = match description {
         Some(text) => quote! { ::std::option::Option::Some(::std::string::String::from(#text)) },
         None => quote! { ::std::option::Option::None },
     };
+
+    // The `field()` match arms: descriptor name → string form.
+    let field_match_arms = &field_reads;
 
     Ok(quote! {
         impl ::trouper::schema::Schema for #ident {
             fn schema_def() -> ::trouper::schema::SchemaDef {
                 ::trouper::schema::SchemaDef {
                     name: ::std::string::String::from(#name),
-                    version: #version,
                     kind: ::trouper::schema::SchemaKind::#kind_variant,
                     fields: ::std::vec![#(#field_defs),*],
                     description: #description,
                 }
             }
         }
+
+        impl ::trouper::envelope::PayloadValue for #ident {
+            fn as_any(&self) -> &dyn ::std::any::Any {
+                self
+            }
+
+            fn field(&self, name: &str) -> ::std::option::Option<::std::string::String> {
+                match name {
+                    #(#field_match_arms)*
+                    _ => ::std::option::Option::None,
+                }
+            }
+
+            fn to_json_bytes(&self) -> ::std::sync::Arc<[::std::primitive::u8]> {
+                ::trouper::envelope::payload_value_json_bytes(self)
+            }
+        }
     })
+}
+
+/// The string-read EXPRESSION GENERATOR for one field type: returns code
+/// that turns `&T` into `Option<String>`, mirroring the descriptor type
+/// table. Unsupported (non-stringable) descriptor types read as `None`.
+fn field_string_read(ty: &Type) -> TokenStream {
+    if path_ends_with(ty, "PathBuf") {
+        quote! { |v: &#ty| ::std::option::Option::Some(v.to_string_lossy().into_owned()) }
+    } else if path_ends_with(ty, "Uuid") {
+        quote! { |v: &#ty| ::std::option::Option::Some(v.to_string()) }
+    } else if path_ends_with(ty, "String") {
+        quote! { |v: &#ty| ::std::option::Option::Some(v.clone()) }
+    } else if ty_is_stringish(ty) {
+        // `&str` (and any other Deref-to-str stringish type): copy out.
+        quote! { |v: &#ty| ::std::option::Option::Some(v.to_string()) }
+    } else if ty_is_numeric(ty) {
+        quote! { |v: &#ty| ::std::option::Option::Some(v.to_string()) }
+    } else if path_is(ty, "bool") {
+        quote! { |v: &#ty| ::std::option::Option::Some(v.to_string()) }
+    } else {
+        // Json-typed fields (objects, byte blobs) have no canonical
+        // string form — the shard-key read reports them as absent.
+        quote! { |_: &#ty| ::std::option::Option::None }
+    }
+}
+
+/// Whether the field type is string-valued (`String`, `&str`, `Uuid`,
+/// `PathBuf`) — read as-is per the descriptor table.
+fn ty_is_stringish(ty: &Type) -> bool {
+    fn check(ty: &Type) -> Option<bool> {
+        match ty {
+            Type::Path(TypePath { qself: None, path }) => {
+                let pivot = path.segments.last()?.ident.to_string();
+                Some(matches!(pivot.as_str(), "String" | "Uuid" | "PathBuf"))
+            }
+            Type::Reference(ty_ref) => match &*ty_ref.elem {
+                Type::Path(TypePath { qself: None, path }) if path.is_ident("str") => Some(true),
+                other => check(other),
+            },
+            Type::Group(group) => check(&group.elem),
+            Type::Paren(inner) => check(&inner.elem),
+            _ => None,
+        }
+    }
+    check(ty).unwrap_or(false)
+}
+
+/// Whether the field type is numeric per the descriptor table.
+fn ty_is_numeric(ty: &Type) -> bool {
+    fn check(ty: &Type) -> Option<bool> {
+        match ty {
+            Type::Path(TypePath { qself: None, path }) => {
+                let pivot = path.segments.last()?.ident.to_string();
+                Some(matches!(
+                    pivot.as_str(),
+                    "i8" | "i16" | "i32" | "i64" | "u8" | "u16" | "u32" | "u64" | "usize"
+                        | "isize" | "f32" | "f64"
+                ))
+            }
+            Type::Reference(ty_ref) => check(&ty_ref.elem),
+            Type::Group(group) => check(&group.elem),
+            Type::Paren(inner) => check(&inner.elem),
+            _ => None,
+        }
+    }
+    check(ty).unwrap_or(false)
+}
+
+/// The field's DESCRIPTOR name (the rename, or the Rust name with raw
+///-ident prefixes stripped) — the same name `field()` matches against.
+/// Re-parses the attributes fully (same grammar as `field_def_expr`) so
+/// no key is left unconsumed.
+fn descriptor_name(f: &syn::Field, rust_name: &str) -> syn::Result<String> {
+    let mut rename: Option<String> = None;
+    for attr in &f.attrs {
+        if !attr.path().is_ident("schema") {
+            continue;
+        }
+        attr.parse_nested_meta(|meta| {
+            if meta.path.is_ident("rename") {
+                if rename.is_some() {
+                    return Err(meta.error("duplicate `rename` in #[schema(...)]"));
+                }
+                let lit: syn::LitStr = meta.value()?.parse()?;
+                rename = Some(lit.value());
+                Ok(())
+            } else if meta.path.is_ident("shard_key") {
+                // A flag (no value), consumed by `field_def_expr`.
+                Ok(())
+            } else if meta.path.is_ident("ty") || meta.path.is_ident("description") {
+                // Consumed by `field_def_expr`; skip its value.
+                let _ = meta.value()?.parse::<syn::Expr>();
+                Ok(())
+            } else {
+                Err(meta.error(
+                    "unknown #[schema(...)] field attribute; supported: shard_key, rename, ty, description",
+                ))
+            }
+        })?;
+    }
+    Ok(rename.unwrap_or_else(|| {
+        rust_name
+            .strip_prefix("r#")
+            .unwrap_or(rust_name)
+            .to_string()
+    }))
 }
 
 /// Builds the `FieldDef` constructor expression for one struct field,
@@ -343,6 +486,21 @@ fn map_path_ty(path: &Path, ty: &Type, field_name: &str) -> syn::Result<TokenStr
 /// True when the type is exactly the named primitive path (e.g. `u8`).
 fn path_is(ty: &Type, name: &str) -> bool {
     matches!(ty, Type::Path(TypePath { qself: None, path }) if path.is_ident(name))
+}
+
+/// True when the type's LAST path segment is `name` (matches both `Uuid`
+/// and `uuid::Uuid`, `PathBuf` and `std::path::PathBuf`).
+fn path_ends_with(ty: &Type, name: &str) -> bool {
+    match ty {
+        Type::Path(TypePath { qself: None, path }) => path
+            .segments
+            .last()
+            .map(|s| s.ident == name)
+            .unwrap_or(false),
+        Type::Group(group) => path_ends_with(&group.elem, name),
+        Type::Paren(inner) => path_ends_with(&inner.elem, name),
+        _ => false,
+    }
 }
 
 /// The spanned "unsupported type" error: names the field, shows the type,

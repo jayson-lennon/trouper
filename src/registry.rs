@@ -6,15 +6,81 @@
 //! routes. Actor identity is its registered path; handles survive restarts
 //! because slots are swapped, never invalidated.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::HashMap;
 
 use tokio::sync::mpsc;
 
 use crate::actor::{ActorKind, ActorPath};
-use crate::envelope::Envelope;
+use crate::envelope::{Envelope, PayloadBytes};
 use crate::json::Json;
 use crate::schema::SchemaId;
 use crate::schema::{ActorManifest, Schema, SchemaDef, SchemaError};
+
+/// One Rust type per schema name, enforced process-wide.
+///
+/// `claim_schema_type` is called at every typed registration site (the
+/// manifest builder's `.handles::<S>()`/`.emits::<S>()`, typed schema
+/// registration). The first Rust type to claim a name owns it; a second,
+/// different Rust type under the same name is a startup error — folds and
+/// handlers match payloads by name and downcast to THE registered type, so
+/// two candidate types under one name would be silent corruption.
+///
+/// Same-type re-claims (the idempotent re-registration case: spawning two
+/// actors that both `.handles::<Add>()`) succeed.
+pub(crate) fn claim_schema_type<S: Schema + 'static>() -> Result<(), error_stack::Report<SchemaError>> {
+    use std::collections::hash_map::Entry;
+    static OWNERS: std::sync::OnceLock<parking_lot::Mutex<HashMap<String, std::any::TypeId>>> =
+        std::sync::OnceLock::new();
+    let owners = OWNERS.get_or_init(|| parking_lot::Mutex::new(HashMap::new()));
+    let name = S::schema_def().name;
+    let mut owners = owners.lock();
+    match owners.entry(name) {
+        Entry::Vacant(v) => {
+            v.insert(std::any::TypeId::of::<S>());
+            Ok(())
+        }
+        Entry::Occupied(o) if *o.get() == std::any::TypeId::of::<S>() => Ok(()),
+        Entry::Occupied(o) => {
+            use error_stack::IntoReport;
+            Err(SchemaError::DuplicateType(o.key().clone())
+                .into_report()
+                .attach(format!(
+                    "schema name already owned by another Rust type (registering {})",
+                    std::any::type_name::<S>()
+                )))
+        }
+    }
+}
+
+/// Decodes wire bytes into the LATEST registered type under `name` —
+/// the erased-ingress door.
+///
+/// The bytes are JSON text (valid UTF-8 by contract); `from_slice` reads
+/// them in place. The bound IS the invariant: `T` must be the exact type
+/// that claimed the name (a wrong `T` here misses the owner's TypeId and
+/// the decode runs against a foreign type — the caller's bug surfaces at
+/// the handler's downcast, as a `Decode` dead letter, never as UB).
+///
+/// # Errors
+///
+/// Returns an error when the name has no registered descriptor
+/// ([`SchemaError::InvalidDescriptor`]) or the bytes do not decode into
+/// `T`.
+pub fn decode_latest<T: Schema + serde::de::DeserializeOwned>(
+    name: &SchemaId,
+    bytes: &PayloadBytes,
+) -> Result<T, error_stack::Report<SchemaError>> {
+    use error_stack::{IntoReport, ResultExt};
+    if name.as_str() != T::schema_id().as_str() {
+        return Err(SchemaError::InvalidDescriptor
+            .into_report()
+            .attach(format!(
+                "decode_latest: requested {name} through type {}",
+                std::any::type_name::<T>()
+            )));
+    }
+    serde_json::from_slice::<T>(bytes.as_bytes()).change_context(SchemaError::InvalidDescriptor)
+}
 
 /// The deliverable front door of one running actor endpoint.
 ///
@@ -145,28 +211,22 @@ impl RoutePolicy {
 }
 
 /// The runtime's schema table: every message shape the system knows,
-/// however it was defined.
-///
-/// Keyed by name with versions sorted ascending, so "latest" is the last
-/// entry — versioning is embedded in [`SchemaId`] from day one.
+/// however it was defined. Keyed by schema name — identity is the name
+/// alone.
 #[derive(Debug, Default)]
 pub struct SchemaTable {
-    by_name: HashMap<String, BTreeMap<u32, SchemaDef>>,
+    by_name: HashMap<String, SchemaDef>,
 }
 
 impl SchemaTable {
-    /// Registers a descriptor; idempotent per name+version.
+    /// Registers a descriptor; idempotent per name.
     ///
-    /// Re-registering an identical (or even differing) descriptor under the
-    /// same name+version keeps the first registration: schemas are agreed
+    /// Re-registering an identical (or even differing) descriptor under
+    /// the same name keeps the first registration: schemas are agreed
     /// facts, not mutable config. Returns the schema's id either way.
     pub fn register(&mut self, def: SchemaDef) -> SchemaId {
         let id = def.id();
-        self.by_name
-            .entry(def.name.clone())
-            .or_default()
-            .entry(def.version)
-            .or_insert(def);
+        self.by_name.entry(def.name.clone()).or_insert(def);
         id
     }
 
@@ -183,36 +243,55 @@ impl SchemaTable {
         Ok(self.register(def))
     }
 
-    /// Registers a Rust type's schema — the typed path.
-    pub fn register_of<S: Schema>(&mut self) -> SchemaId {
-        self.register(S::schema_def())
+    /// Registers a Rust type's schema — the typed path — claiming
+    /// TypeId ownership of the name for `S`.
+    ///
+    /// # Errors
+    ///
+    /// [`SchemaError::DuplicateType`] when another Rust type already
+    /// owns this schema name.
+    pub fn register_typed<S: Schema + 'static>(
+        &mut self,
+    ) -> Result<SchemaId, error_stack::Report<SchemaError>> {
+        use error_stack::ResultExt;
+        let def = S::schema_def();
+        let name = def.name.clone();
+        let id = def.id();
+        // TypeId ownership FIRST: a wrong second type never touches the
+        // table, whether or not a descriptor already sat there.
+        claim_schema_type::<S>().change_context(SchemaError::DuplicateType(format!(
+            "{name} (registering {})",
+            std::any::type_name::<S>()
+        )))?;
+        self.by_name.entry(name).or_insert(def);
+        Ok(id)
     }
 
-    /// Looks a schema up by exact `name@version` id.
+    /// The descriptor registered under this name.
     pub fn by_id(&self, id: &SchemaId) -> Option<&SchemaDef> {
-        let name = id.name();
-        let version = id.version()?;
-        self.by_name.get(name)?.get(&version)
+        self.by_name.get(id.name())
+    }
+
+    /// The descriptor registered under a schema name.
+    pub fn by_name(&self, name: &str) -> Option<&SchemaDef> {
+        self.by_name.get(name)
     }
 
     /// The highest registered version of a schema name.
     pub fn latest(&self, name: &str) -> Option<&SchemaDef> {
-        self.by_name.get(name)?.values().next_back()
+        self.by_name.get(name)
     }
 
-    /// Every registered descriptor, name-then-version ordered (for export).
+    /// Every registered descriptor, name-ordered (for export).
     pub fn all(&self) -> Vec<&SchemaDef> {
         let mut names: Vec<&String> = self.by_name.keys().collect();
         names.sort();
-        names
-            .into_iter()
-            .flat_map(|name| self.by_name[name].values())
-            .collect()
+        names.into_iter().map(|name| &self.by_name[name]).collect()
     }
 
     /// The number of distinct schemas registered.
     pub fn len(&self) -> usize {
-        self.by_name.values().map(BTreeMap::len).sum()
+        self.by_name.len()
     }
 
     /// Whether no schema is registered.
@@ -272,14 +351,39 @@ impl Registry {
         self.schemas.register_json(json)
     }
 
-    /// Registers a Rust type's schema; the typed flavor.
-    pub fn register_schema_of<S: Schema>(&mut self) -> SchemaId {
-        self.schemas.register_of::<S>()
+    /// Registers a Rust type's schema; the typed flavor. Claims TypeId
+    /// ownership of the schema name for `S`.
+    ///
+    /// # Errors
+    ///
+    /// [`SchemaError::DuplicateType`] when another Rust type already owns
+    /// `S`'s schema name (one type per name, enforced at registration).
+    pub fn register_schema_of<S: Schema + 'static>(
+        &mut self,
+    ) -> Result<SchemaId, error_stack::Report<SchemaError>> {
+        self.schemas.register_typed::<S>()
     }
 
     /// The descriptor for an exact schema id.
     pub fn schema(&self, id: &SchemaId) -> Option<&SchemaDef> {
         self.schemas.by_id(id)
+    }
+
+    /// Decodes wire bytes under `name` into `T` — the erased-ingress
+    /// door, exposed for the kernel's typed fallbacks. `T` must be the
+    /// schema name's registered type (the bound enforces the caller's
+    /// static claim; see [`decode_latest`]).
+    ///
+    /// # Errors
+    ///
+    /// Propagates [`decode_latest`]'s failures (unknown name, bytes that
+    /// do not decode into `T`).
+    pub fn decode_latest_typed<T: Schema + serde::de::DeserializeOwned>(
+        &self,
+        name: &SchemaId,
+        bytes: &PayloadBytes,
+    ) -> Result<T, error_stack::Report<SchemaError>> {
+        decode_latest::<T>(name, bytes)
     }
 
     /// A snapshot of every live slot for export: (path, manifest).
@@ -702,22 +806,22 @@ mod tests {
     }
 
     fn envelope(n: u32) -> Envelope {
-        Envelope::json(
-            SchemaId::new("Ping", 1),
+        Envelope::from_bytes(
+            SchemaId::new("Ping"),
             crate::envelope::Address::Path(ActorPath::new("a")),
-            json!({ "n": n }),
+            PayloadBytes::from(Json::from(json!({ "n": n }))),
             TraceCtx::root(),
         )
     }
 
     #[test]
-    fn register_is_idempotent_per_name_and_version() {
-        // Given a schema table with ReserveStock@1 already registered.
+    fn register_is_idempotent_per_name() {
+        // Given a schema table with TestSchema already registered.
         let mut table = SchemaTable::default();
-        let first = table.register_of::<TestSchema>();
+        let first = table.register(versioned_schema(1));
 
-        // When registering ReserveStock@1 again.
-        let second = table.register_of::<TestSchema>();
+        // When registering TestSchema again.
+        let second = table.register(versioned_schema(1));
 
         // Then the id is stable and only one entry exists.
         assert_eq!(first, second);
@@ -725,33 +829,84 @@ mod tests {
     }
 
     #[test]
-    fn register_keeps_versions_sorted_and_latest_reports_highest() {
-        // Given the schema registered at versions 1 and 3.
+    fn duplicate_type_registration_fails_at_startup() {
+        // Given TestSchema registered under its name.
         let mut table = SchemaTable::default();
-        table.register(versioned_schema(1));
-        table.register(versioned_schema(3));
+        table
+            .register_typed::<TestSchema>()
+            .expect("first claim wins");
 
-        // When asking for the latest.
-        let latest = table.latest("TestSchema").expect("present");
+        // When a DIFFERENT Rust type registers the same schema name
+        // (TestSchemaImpostor declares the same name in its def).
+        let result = table.register_typed::<TestSchemaImpostor>();
 
-        // Then it is version 3.
-        assert_eq!(latest.id(), SchemaId::new("TestSchema", 3));
+        // Then registration fails with DuplicateType — one Rust type per
+        // schema name, enforced before any message can exist.
+        let report = result.expect_err("second type must be refused");
+        assert!(
+            matches!(report.current_context(), SchemaError::DuplicateType(_)),
+            "expected DuplicateType, got {report:?}"
+        );
+        // And the impostor never touched the table.
+        assert_eq!(table.len(), 1);
     }
 
     #[test]
-    fn by_id_requires_exact_version_match() {
-        // Given TestSchema at versions 1 and 2.
+    fn same_type_reregistration_is_idempotent() {
+        // Given TestSchema registered.
+        let mut table = SchemaTable::default();
+        let first = table.register_typed::<TestSchema>().expect("claim");
+
+        // When the SAME type registers again (two actors, one schema).
+        let second = table.register_typed::<TestSchema>().expect("re-claim");
+
+        // Then both registrations agree and one entry exists.
+        assert_eq!(first, second);
+        assert_eq!(table.len(), 1);
+    }
+
+    #[test]
+    fn latest_reports_the_named_schema() {
+        // Given TestSchema registered under its name.
         let mut table = SchemaTable::default();
         table.register(versioned_schema(1));
-        table.register(versioned_schema(2));
 
-        // When looking up by id — exact and missing.
-        let exact = table.by_id(&SchemaId::new("TestSchema", 1));
-        let missing = table.by_id(&SchemaId::new("TestSchema", 9));
+        // When asking for the latest (the erased-ingress lookup).
+        let latest = table.latest("TestSchema").expect("present");
 
-        // Then only the exact version is found.
+        // Then it is the registered descriptor under its name-only id.
+        assert_eq!(latest.id(), SchemaId::new("TestSchema"));
+    }
+
+    #[test]
+    fn by_id_matches_by_name() {
+        // Given TestSchema registered.
+        let mut table = SchemaTable::default();
+        table.register(versioned_schema(1));
+
+        // When looking up by its name-only id — and by an unknown name.
+        let exact = table.by_id(&SchemaId::new("TestSchema"));
+        let missing = table.by_id(&SchemaId::new("TestSchemaUnknown"));
+
+        // Then the name matches and the unknown name does not.
         assert!(exact.is_some());
         assert!(missing.is_none());
+    }
+
+    #[test]
+    fn legacy_versioned_id_strings_lookup_by_name() {
+        // Given TestSchema registered and a legacy `name@N` id string
+        // (written before name-only identity).
+        let mut table = SchemaTable::default();
+        table.register(versioned_schema(1));
+
+        // When parsing the legacy string and looking it up.
+        let legacy = SchemaId::parse("TestSchema").expect("parses");
+        let found = table.by_id(&legacy);
+
+        // Then the version component is dropped and the name matches.
+        assert!(found.is_some());
+        assert_eq!(legacy.as_str(), "TestSchema");
     }
 
     #[test]
@@ -759,7 +914,6 @@ mod tests {
         // Given a typed schema and its hand-written JSON twin.
         let json_twin = json!({
             "name": "TestSchema",
-            "version": 1,
             "kind": "command",
             "fields": []
         });
@@ -792,15 +946,14 @@ mod tests {
     fn all_lists_every_schema_in_name_then_version_order() {
         // Given schemas registered out of order across two names.
         let mut table = SchemaTable::default();
-        table.register(versioned_schema(2));
-        table.register(other_schema());
         table.register(versioned_schema(1));
+        table.register(other_schema());
 
         // When listing all schemas.
         let ids: Vec<String> = table.all().iter().map(|d| d.id().to_string()).collect();
 
-        // Then they are sorted by name, then version.
-        assert_eq!(ids, ["OtherSchema@1", "TestSchema@1", "TestSchema@2"]);
+        // Then they are sorted by name.
+        assert_eq!(ids, ["OtherSchema", "TestSchema"]);
     }
 
     #[test]
@@ -942,7 +1095,7 @@ mod tests {
     fn route_returns_the_single_handler_path() {
         // Given a single route from a schema to an actor.
         let mut registry = Registry::default();
-        let schema = SchemaId::new("Ping", 1);
+        let schema = SchemaId::new("Ping");
         let path = ActorPath::new("ponger");
         registry.add_route(schema.clone(), path.clone());
 
@@ -959,7 +1112,7 @@ mod tests {
     fn round_robin_rotates_across_registered_handlers() {
         // Given a schema routed to three handlers.
         let mut registry = Registry::default();
-        let schema = SchemaId::new("Ping", 1);
+        let schema = SchemaId::new("Ping");
         for name in ["a", "b", "c"] {
             registry.add_route(schema.clone(), ActorPath::new(name));
         }
@@ -985,7 +1138,7 @@ mod tests {
     fn handlers_of_lists_every_handler_of_a_schema() {
         // Given a schema routed to two handlers.
         let mut registry = Registry::default();
-        let schema = SchemaId::new("Ping", 1);
+        let schema = SchemaId::new("Ping");
         registry.add_route(schema.clone(), ActorPath::new("a"));
         registry.add_route(schema.clone(), ActorPath::new("b"));
 
@@ -1002,23 +1155,23 @@ mod tests {
         let mut registry = Registry::default();
         let gone = ActorPath::new("gone");
         let kept = ActorPath::new("kept");
-        registry.add_route(SchemaId::new("Ping", 1), gone.clone());
-        registry.add_route(SchemaId::new("Ping", 1), kept.clone());
-        registry.add_route(SchemaId::new("Pong", 1), gone.clone());
+        registry.add_route(SchemaId::new("Ping"), gone.clone());
+        registry.add_route(SchemaId::new("Ping"), kept.clone());
+        registry.add_route(SchemaId::new("Pong"), gone.clone());
 
         // When dropping routes of `gone`.
         registry.drop_routes_of(&gone);
 
         // Then `kept` still handles Ping and Pong is unrouted.
-        assert_eq!(registry.handlers_of(&SchemaId::new("Ping", 1)), [kept]);
-        assert!(registry.handlers_of(&SchemaId::new("Pong", 1)).is_empty());
+        assert_eq!(registry.handlers_of(&SchemaId::new("Ping")), [kept]);
+        assert!(registry.handlers_of(&SchemaId::new("Pong")).is_empty());
     }
 
     #[test]
     fn duplicate_route_declaration_keeps_registration_order() {
         // Given a schema routed to three handlers in non-alphabetical order.
         let mut registry = Registry::default();
-        let schema = SchemaId::new("Ping", 1);
+        let schema = SchemaId::new("Ping");
         registry.add_route(schema.clone(), ActorPath::new("c"));
         registry.add_route(schema.clone(), ActorPath::new("a"));
         registry.add_route(schema.clone(), ActorPath::new("b"));
@@ -1043,16 +1196,16 @@ mod tests {
         let mut registry = Registry::default();
         let gone = ActorPath::new("gone");
         let kept = ActorPath::new("kept");
-        registry.add_route(SchemaId::new("Ping", 1), gone.clone());
-        registry.add_route(SchemaId::new("Ping", 1), kept.clone());
-        registry.add_route(SchemaId::new("Pong", 1), gone.clone());
+        registry.add_route(SchemaId::new("Ping"), gone.clone());
+        registry.add_route(SchemaId::new("Ping"), kept.clone());
+        registry.add_route(SchemaId::new("Pong"), gone.clone());
 
         // When dropping routes of `gone`.
         registry.drop_routes_of(&gone);
 
         // Then `kept` still handles Ping and Pong is unrouted.
-        assert_eq!(registry.handlers_of(&SchemaId::new("Ping", 1)), [kept]);
-        assert!(registry.handlers_of(&SchemaId::new("Pong", 1)).is_empty());
+        assert_eq!(registry.handlers_of(&SchemaId::new("Ping")), [kept]);
+        assert!(registry.handlers_of(&SchemaId::new("Pong")).is_empty());
     }
 
     #[test]
@@ -1068,10 +1221,9 @@ mod tests {
         assert!(resolved.is_none());
     }
 
-    fn versioned_schema(version: u32) -> SchemaDef {
+    fn versioned_schema(_version: u32) -> SchemaDef {
         SchemaDef {
             name: "TestSchema".into(),
-            version,
             kind: crate::schema::SchemaKind::Command,
             fields: vec![],
             description: None,
@@ -1081,7 +1233,6 @@ mod tests {
     fn other_schema() -> SchemaDef {
         SchemaDef {
             name: "OtherSchema".into(),
-            version: 1,
             kind: crate::schema::SchemaKind::Event,
             fields: vec![],
             description: None,
@@ -1090,6 +1241,15 @@ mod tests {
 
     struct TestSchema;
     impl Schema for TestSchema {
+        fn schema_def() -> SchemaDef {
+            versioned_schema(1)
+        }
+    }
+
+    /// A different Rust type declaring the SAME schema name — the
+    /// duplicate-registration hazard the TypeId claim exists to catch.
+    struct TestSchemaImpostor;
+    impl Schema for TestSchemaImpostor {
         fn schema_def() -> SchemaDef {
             versioned_schema(1)
         }

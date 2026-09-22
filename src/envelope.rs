@@ -6,6 +6,7 @@
 //! zero-copy fast paths, erased exactly once at spawn.
 
 use std::ops::Deref;
+use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 use smallvec::SmallVec;
@@ -57,25 +58,307 @@ impl TraceCtx {
     }
 }
 
-/// What an envelope carries.
+/// What an envelope carries: one erased, shared payload.
 ///
-/// Clonable so the runtime can peek a message without consuming it: the
-/// envelope stays at the inbox cursor until acknowledged, which is what
-/// makes redelivery possible. The JSON payload is shared (`Arc<Json>`):
-/// a clone of an envelope is a refcount bump, not a deep tree copy — the
-/// many simultaneous owners (the channel copy and the inbox cursor; the
-/// fan-out copies; the journal entry and the outbox intent) all read one
-/// tree. The typed arm is an `Arc` clone (cheap) for the same reason.
+/// Clonable by refcount — a clone of an envelope bumps the payload's
+/// `Arc`, never a copy of the value. The many simultaneous owners (the
+/// channel copy and the inbox cursor; the fan-out copies; the journal
+/// entry and the outbox intent) all read ONE value.
+///
+/// The fabric holds live typed values (downcast via [`AnyPayload`]) OR
+/// wire bytes that arrived erased (decoded on demand); serde exists only
+/// at the doors — the journal and erased ingress. There is no `Bytes`
+/// fabric arm: a message that is not in memory is not a message.
 #[derive(Clone)]
-pub enum Payload {
-    /// A reserved in-process fast path, not yet crossed by production code:
-    /// every runtime boundary is JSON today, so no adapter constructs this
-    /// arm yet. Kept as the seam for a future zero-copy path; downstream
-    /// code must still handle it ([`Envelope::as_json`](crate::envelope::Envelope::as_json) treats it as an
-    /// error).
-    Typed(std::sync::Arc<dyn std::any::Any + Send + Sync>),
-    /// Plain JSON, shared by reference count.
-    Json(std::sync::Arc<Json>),
+pub struct Payload(Arc<PayloadCell>);
+
+/// The payload and its memoized JSON view. The view is interior-mutable
+/// through the shared `Arc`: the FIRST reader of a `Bytes` payload pays
+/// the decode (a debug-render path, never the typed hot path), every
+/// later reader — including readers on other threads — shares it.
+struct PayloadCell {
+    inner: AnyPayload,
+    json_view: std::sync::OnceLock<Json>,
+    /// The memoized wire encoding (the journal door's input). Live
+    /// values serialize at most once no matter how many readers ask;
+    /// `Bytes` payloads pass their bytes through and never populate it.
+    wire: std::sync::OnceLock<Arc<[u8]>>,
+}
+
+impl std::fmt::Debug for Payload {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match &self.0.inner {
+            AnyPayload::Value(value) => f
+                .debug_tuple("Payload::Value")
+                .field(&value.as_any().type_id())
+                .finish(),
+            AnyPayload::Bytes(bytes) => {
+                f.debug_tuple("Payload::Bytes").field(&bytes.as_str()).finish()
+            }
+            AnyPayload::Json(view) => f.debug_tuple("Payload::Json").field(view).finish(),
+        }
+    }
+}
+
+impl Payload {
+    /// Wraps a live value (the typed send edge's constructor).
+    pub(crate) fn value<T: PayloadValue>(value: T) -> Self {
+        Self(Arc::new(PayloadCell {
+            inner: AnyPayload::Value(Arc::new(value)),
+            json_view: std::sync::OnceLock::new(),
+            wire: std::sync::OnceLock::new(),
+        }))
+    }
+
+    /// Wraps wire bytes (the erased-ingress constructor).
+    pub(crate) fn bytes(bytes: PayloadBytes) -> Self {
+        Self(Arc::new(PayloadCell {
+            inner: AnyPayload::Bytes(bytes),
+            json_view: std::sync::OnceLock::new(),
+            wire: std::sync::OnceLock::new(),
+        }))
+    }
+
+    /// Wraps a JSON tree as a payload (the internal Json-flavored seams:
+    /// reply forwarding to schema/path addresses). Live values remain the
+    /// normal shape; this is the escape hatch for payloads that already
+    /// exist as trees.
+    pub(crate) fn json_view(view: Json) -> Self {
+        Self(Arc::new(PayloadCell {
+            inner: AnyPayload::Json(view),
+            json_view: std::sync::OnceLock::new(),
+            wire: std::sync::OnceLock::new(),
+        }))
+    }
+
+    /// Wraps a shared payload — a refcount bump (the fan-out's
+    /// constructor: one value across N handlers).
+    pub(crate) fn shared(source: &Payload) -> Self {
+        Self(Arc::clone(&source.0))
+    }
+
+    /// The payload union erased for downcast dispatch.
+    pub(crate) fn inner(&self) -> &AnyPayload {
+        &self.0.inner
+    }
+
+    /// The JSON view, materializing (and memoizing) through the bytes
+    /// when needed. DLQ rendering and foreign-fold surfaces read here;
+    /// the typed hot path never does.
+    pub(crate) fn json(&self) -> &Json {
+        self.0.json_view.get_or_init(|| match &self.0.inner {
+            AnyPayload::Json(view) => view.clone(),
+            other => Json(serde_json::from_slice(&other.json_text()).unwrap_or_default()),
+        })
+    }
+
+    /// The wire encoding — serde at most once per payload VALUE (the
+    /// memoization lives in the shared cell: one serialize, every later
+    /// reader shares the bytes). The journal door's input.
+    pub(crate) fn json_text(&self) -> Arc<[u8]> {
+        if let AnyPayload::Bytes(bytes) = &self.0.inner {
+            return Arc::clone(&bytes.0); // bytes ARE the wire encoding
+        }
+        self.0
+            .wire
+            .get_or_init(|| self.0.inner.json_text())
+            .clone()
+    }
+
+    /// The wire encoding as [`PayloadBytes`] (the journal entry's shape).
+    pub(crate) fn wire_bytes(&self) -> PayloadBytes {
+        PayloadBytes(self.json_text())
+    }
+
+    /// A field's value as a string (the shard-key read).
+    pub(crate) fn field(&self, name: &str) -> Option<String> {
+        self.0.inner.field(name)
+    }
+}
+
+/// The payload union INSIDE the shared cell — the three ways a message
+/// body can exist. Everything below `Payload` is crate-private; handlers
+/// see typed reads (`Payload`-level accessors) and never the union.
+pub(crate) enum AnyPayload {
+    /// A live value of the schema's registered Rust type. The common
+    /// case: every typed `tell`/`publish`/event build lands here.
+    Value(Arc<dyn PayloadValue>),
+    /// Wire bytes that arrived without a live value (erased ingress) —
+    /// the payload is the LATEST registered type's bytes; the decode to
+    /// `Json` (and the type) happens on demand at the readers.
+    Bytes(PayloadBytes),
+    /// A JSON view (the memoized materialization of `Bytes`).
+    Json(Json),
+}
+
+impl AnyPayload {
+    /// Downcasts to the schema's registered type. A `Bytes` payload
+    /// decodes into `T` on demand — replayed/erased deliveries join the
+    /// live path HERE, the only shape-changing transition in the system.
+    pub(crate) fn downcast_ref<T: Schema + serde::de::DeserializeOwned + Clone + 'static>(
+        &self,
+    ) -> Option<T> {
+        match self {
+            AnyPayload::Value(value) => value.as_any().downcast_ref::<T>().cloned(),
+            AnyPayload::Bytes(bytes) => {
+                bump_serde_calls();
+                serde_json::from_slice::<T>(bytes.as_bytes()).ok()
+            }
+            AnyPayload::Json(_) => None,
+        }
+    }
+
+    /// A field's value as a string (the shard-key read). Live values
+    /// answer from the derive-generated match; bytes decode the one
+    /// field through the tree (a router-path read, off the hot fold).
+    pub(crate) fn field(&self, name: &str) -> Option<String> {
+        match self {
+            AnyPayload::Value(value) => value.field(name),
+            AnyPayload::Bytes(bytes) => {
+                bump_serde_calls();
+                let view: Json = serde_json::from_slice(bytes.as_bytes()).ok()?;
+                view.get(name).and_then(json_string_of)
+            }
+            AnyPayload::Json(view) => view.get(name).and_then(json_string_of),
+        }
+    }
+
+    /// The wire encoding (serde once). The journal door's input.
+    pub(crate) fn json_text(&self) -> Arc<[u8]> {
+        match self {
+            AnyPayload::Value(value) => value.to_json_bytes(),
+            AnyPayload::Bytes(bytes) => Arc::clone(&bytes.0),
+            AnyPayload::Json(view) => {
+                bump_serde_calls();
+                Arc::from(serde_json::to_vec(view).expect("Json tree always serializes"))
+            }
+        }
+    }
+}
+
+/// A field's string form for shard-key extraction (the `Json` fallback
+/// path mirrors the typed `field` contract: strings as-is, numbers and
+/// bools stringified, everything else unreadable).
+fn json_string_of(value: &serde_json::Value) -> Option<String> {
+    use serde_json::Value;
+    match value {
+        Value::String(s) => Some(s.clone()),
+        Value::Number(n) => Some(n.to_string()),
+        Value::Bool(b) => Some(b.to_string()),
+        _ => None,
+    }
+}
+
+/// The runtime's questions to a live payload value, generated by the
+/// derive for every declared message type. `std::any::Any` alone cannot
+/// answer them: shard-key reads and journal encoding need the schema's
+/// field names, which only the type knows.
+pub trait PayloadValue: Send + Sync + 'static {
+    /// The value as `Any` — the downcast dispatch core.
+    fn as_any(&self) -> &dyn std::any::Any;
+    /// A declared field's value as a string; `None` when the field is
+    /// absent or its type has no string form (objects, lists of them).
+    fn field(&self, name: &str) -> Option<String>;
+    /// The value's compact JSON-text encoding. The derive memoizes this
+    /// (one serialization per value, shared by every later reader).
+    fn to_json_bytes(&self) -> Arc<[u8]>;
+}
+
+impl<T: PayloadValue> PayloadValue for Arc<T> {
+    fn as_any(&self) -> &dyn std::any::Any {
+        (**self).as_any()
+    }
+    fn field(&self, name: &str) -> Option<String> {
+        (**self).field(name)
+    }
+    fn to_json_bytes(&self) -> Arc<[u8]> {
+        (**self).to_json_bytes()
+    }
+}
+
+/// The ONLY byte type in the system: compact JSON text (valid UTF-8 by
+/// construction — every producer is a serde JSON serializer). Bytes exist
+/// at exactly two doors — erased ingress and the journal — and never ride
+/// the fabric as a fabric arm.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PayloadBytes(pub(crate) Arc<[u8]>);
+
+impl Serialize for PayloadBytes {
+    /// Serde: the bytes serialize AS their JSON text (a JSON string) —
+    /// the journal row stays queryable, not base64 soup.
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(self.as_str())
+    }
+}
+
+impl<'de> Deserialize<'de> for PayloadBytes {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let text = String::deserialize(deserializer)?;
+        Ok(PayloadBytes(Arc::from(text.into_bytes())))
+    }
+}
+
+impl PayloadBytes {
+    /// Wraps already-encoded bytes (journal replay, bench fixtures).
+    ///
+    /// The caller guarantees the bytes are valid JSON text —
+    /// [`PayloadBytes::assert_json_text`] is the debug-gate for the
+    /// boundary constructors; replay trusts its own writer.
+    pub fn from_bytes(bytes: impl Into<Arc<[u8]>>) -> Self {
+        Self(bytes.into())
+    }
+
+    /// The bytes as a byte slice (serde_json's `from_slice` input).
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.0
+    }
+
+    /// The bytes as UTF-8 text (they are valid JSON by contract).
+    pub fn as_str(&self) -> &str {
+        std::str::from_utf8(&self.0).unwrap_or("<invalid utf8>")
+    }
+
+    /// Debug gate for the erased boundary: garbage bytes die loudly at
+    /// the door instead of silently inside a handler fold. Runs the
+    /// parse; test builds keep it always (the door cost is once per
+    /// erased envelope, not per hop).
+    pub(crate) fn assert_json_text(&self) {
+        if serde_json::from_slice::<serde_json::Value>(&self.0).is_err() {
+            panic!(
+                "PayloadBytes: erased ingress delivered non-JSON bytes: {:?}",
+                self.as_str().get(..120).unwrap_or("<..>")
+            );
+        }
+    }
+}
+
+impl From<&Json> for PayloadBytes {
+    fn from(value: &Json) -> Self {
+        bump_serde_calls();
+        Self(Arc::from(serde_json::to_vec(&value).expect("Json tree always serializes")))
+    }
+}
+
+impl From<Json> for PayloadBytes {
+    fn from(value: Json) -> Self {
+        Self::from(&value)
+    }
+}
+
+/// Counts one serde boundary crossing (test probe — see
+/// `kernel::bump_manifest_clones` for the pattern).
+#[allow(dead_code)] // called from cfg(test) probe paths; kept compiled
+pub(crate) fn bump_serde_calls() {
+    #[cfg(test)]
+    crate::kernel::bump_serde_calls();
+}
+
+/// The derive's `to_json_bytes` body: compact JSON text, counted once per
+/// real serialization (the derive memoizes at the call site via a
+/// `OnceLock` wrapper — this helper runs at most once per value).
+pub fn payload_value_json_bytes<T: Serialize>(value: &T) -> Arc<[u8]> {
+    bump_serde_calls();
+    Arc::from(serde_json::to_vec(value).expect("schema payload serialization cannot fail"))
 }
 
 impl std::fmt::Display for Address {
@@ -88,62 +371,85 @@ impl std::fmt::Display for Address {
     }
 }
 
-impl std::fmt::Debug for Payload {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Typed(_) => f.write_str("Payload::Typed(<erased>)"),
-            Self::Json(value) => f.debug_tuple("Payload::Json").field(value.as_ref()).finish(),
-        }
-    }
-}
-
-/// A domain event: schema-tagged JSON, appended to journals and folded into
-/// state. Events are facts that already happened.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+/// A domain event: schema-tagged payload, appended to journals and folded
+/// into state. Events are facts that already happened. The payload rides
+/// the fabric as a live value (serde once — at the journal door).
+#[derive(Debug, Clone)]
 pub struct Event {
     /// The event's schema.
     pub schema: SchemaId,
-    /// The event's JSON payload.
-    pub payload: Json,
+    /// The event's payload (live value, bytes from replay, or a memoized
+    /// JSON view).
+    pub payload: Payload,
+}
+
+impl PartialEq for Event {
+    /// Event equality compares the JSON views — the semantic content.
+    /// (Two `Value` payloads of the same type compare through their
+    /// encodings; PartialEq on the erased `Arc` cannot.)
+    fn eq(&self, other: &Self) -> bool {
+        self.schema == other.schema && self.payload_json() == other.payload_json()
+    }
 }
 
 impl Event {
-    /// Creates an event from a schema id and JSON payload.
-    pub fn new(schema: SchemaId, payload: impl Into<Json>) -> Self {
+    /// Creates an event from a typed fact (the fold-friendly
+    /// constructor). The fact is wrapped, never serialized.
+    pub fn new<T: Into<Payload>>(schema: SchemaId, fact: T) -> Self {
         Self {
             schema,
-            payload: payload.into(),
+            payload: fact.into(),
         }
     }
 
-    /// Decodes the payload into the typed fact `T`, matching by schema id
-    /// (`name@version`, exact — version-pinned).
+    /// Creates an event from wire bytes (journal replay's constructor).
+    pub fn from_bytes(schema: SchemaId, bytes: PayloadBytes) -> Self {
+        Self {
+            schema,
+            payload: Payload::bytes(bytes),
+        }
+    }
+
+    /// Creates an event from a JSON tree (the internal Json-flavored
+    /// seams: projector re-records, foreign folds).
+    pub fn from_json_view(schema: SchemaId, view: Json) -> Self {
+        Self {
+            schema,
+            payload: Payload::json_view(view),
+        }
+    }
+
+    /// Extracts the typed fact `T`, matching by schema NAME.
     ///
     /// The typed fold for [`crate::actor::EventSourcedActor::apply`] and
     /// [`crate::actor::Projector::apply`]: an event whose schema is not
-    /// `T`'s (another fact type, or another VERSION of this one) yields
-    /// `None` without touching the payload; a matching event decodes —
-    /// borrowing the tree, so no payload copy is paid (the same cost
-    /// command dispatch pays since `Json::decode` borrows).
+    /// `T`'s (another fact type) yields `None` without touching the
+    /// payload; a matching event downcasts (a live value: a TypeId
+    /// recognition and an `Arc` read, no decode) — or decodes from bytes
+    /// (a replayed event), the system's only shape-changing transition.
     ///
     /// Unmatched schemas are simply ignored — one fold can consume several
-    /// fact types by stacking `decode` calls.
-    pub fn decode<T: Schema + serde::de::DeserializeOwned>(&self) -> Option<T> {
+    /// fact types by stacking `as_fact` calls.
+    pub fn as_fact<T: Schema + serde::de::DeserializeOwned + Clone + 'static>(&self) -> Option<T> {
         if self.schema != T::schema_id() {
             return None;
         }
-        // Borrows: the fold reads the fact's tree in place — it never
-        // copies it (`&Value` IS a serde deserializer).
-        T::deserialize(&self.payload.0).ok()
+        self.payload.inner().downcast_ref::<T>()
     }
 
-    /// Whether this event's schema is exactly `T`'s (`name@version`).
+    /// Whether this event's schema is exactly `T`'s (the name).
     ///
-    /// A pure schema-id comparison: no clone, no decode. Use it to skip
+    /// A pure name comparison: no clone, no decode. Use it to skip
     /// work, or when the payload shape is read dynamically instead of
     /// decoded into a type.
     pub fn is<T: Schema>(&self) -> bool {
         self.schema == T::schema_id()
+    }
+
+    /// The event's JSON view — materialized on demand (see
+    /// [`Envelope::payload_json`]).
+    pub fn payload_json(&self) -> &Json {
+        self.payload.json()
     }
 }
 
@@ -185,87 +491,84 @@ pub struct RecordedOrigin {
 }
 
 impl Envelope {
-    /// Assembles a JSON-payload envelope.
-    pub fn json(
+    /// Assembles a typed envelope: `value` becomes the message body with
+    /// NO serialization — the fabric carries the live value, and serde
+    /// happens only at the doors (journal append, journal replay).
+    pub fn json<T: Into<Payload>>(
         schema: SchemaId,
         dest: Address,
-        payload: impl Into<Json>,
+        value: T,
         trace: TraceCtx,
     ) -> Self {
-        Self {
-            schema,
-            dest,
-            from: None,
-            reply_to: None,
-            trace,
-            payload: Payload::Json(std::sync::Arc::new(payload.into())),
-            recorded_origin: None,
-        }
+        Self::raw(schema, dest, value.into(), trace)
     }
 
-    /// Assembles a JSON-payload envelope that SHARES this envelope's
-    /// payload tree (an `Arc` bump, never a deep copy) — the kernel's
-    /// constructor for tee/fan-out copies of an existing message.
-    pub(crate) fn json_shared(
+    /// Assembles a payload-SHARING envelope (a `Payload` Arc bump, never a
+    /// copy of the value) — the kernel's constructor for tee/fan-out copies
+    /// of an existing message.
+    pub(crate) fn shared_from(
         schema: SchemaId,
         dest: Address,
         source: &Envelope,
         trace: TraceCtx,
     ) -> Self {
-        let payload = match &source.payload {
-            Payload::Json(arc) => std::sync::Arc::clone(arc),
-            Payload::Typed(_) => return Self::typed(schema, dest, (), trace),
-        };
-        Self::json_arc(schema, dest, payload, trace)
+        let mut copy = Self::raw(schema, dest, Payload::shared(&source.payload), trace);
+        copy.recorded_origin = source.recorded_origin.clone();
+        copy
     }
 
-    /// The `Arc`-payload variant of [`Envelope::json`] (kernel-internal:
-    /// the event fan-out wraps an event's payload once for broadcast).
-    pub(crate) fn json_arc(
-        schema: SchemaId,
-        dest: Address,
-        payload: std::sync::Arc<Json>,
-        trace: TraceCtx,
-    ) -> Self {
+    /// The bare constructor: schema, destination, payload, trace. The
+    /// metadata fields default; setters chain the rest.
+    pub(crate) fn raw(schema: SchemaId, dest: Address, payload: Payload, trace: TraceCtx) -> Self {
         Self {
             schema,
             dest,
             from: None,
             reply_to: None,
             trace,
-            payload: Payload::Json(payload),
+            payload,
             recorded_origin: None,
         }
     }
 
-    /// The JSON view of the payload (or `null` for a typed payload).
+    /// Assembles a JSON-text-payload envelope — the erased boundary:
+    /// ingress callers (foreign bridges, command emulations) hold wire
+    /// bytes, never live Rust values.
+    ///
+    /// # Panics
+    ///
+    /// Panics when `bytes` is not valid JSON text — the erased boundary's
+    /// contract is that bytes were produced by a serializer; garbage bytes
+    /// are a caller bug, not a runtime value (garbage IN the fabric dies
+    /// loudly HERE, never inside a handler fold).
+    pub fn from_bytes(
+        schema: SchemaId,
+        dest: Address,
+        bytes: PayloadBytes,
+        trace: TraceCtx,
+    ) -> Self {
+        bytes.assert_json_text();
+        Self::raw(schema, dest, Payload::bytes(bytes), trace)
+    }
+
+    /// Assembles a bytes-payload envelope from an owned JSON tree — the
+    /// convenience form of [`Envelope::from_bytes`]: the tree serializes
+    /// to compact text once, at the door.
+    pub fn from_bytes_wrapped(
+        schema: SchemaId,
+        dest: Address,
+        payload: impl Into<Json>,
+        trace: TraceCtx,
+    ) -> Self {
+        Self::from_bytes(schema, dest, PayloadBytes::from(payload.into()), trace)
+    }
+
+    /// The payload's JSON view — materialized ON DEMAND for the readers
+    /// that genuinely need a tree (DLQ rendering, foreign fold surfaces).
+    /// A `json` view is memoized into the payload's `OnceLock`, so the
+    /// first reader pays the decode and every later reader shares it.
     pub fn payload_json(&self) -> &Json {
-        static NULL: std::sync::OnceLock<Json> = std::sync::OnceLock::new();
-        match &self.payload {
-            Payload::Json(value) => value,
-            Payload::Typed(_) => NULL.get_or_init(Json::default),
-        }
-    }
-
-    /// Assembles a typed envelope for the reserved in-process fast path.
-    /// Production code passes payloads as JSON; this constructor exists for
-    /// that future path and for the erased-payload unit test.
-    #[doc(hidden)]
-    pub fn typed<T: Send + Sync + 'static>(
-        schema: SchemaId,
-        dest: Address,
-        payload: T,
-        trace: TraceCtx,
-    ) -> Self {
-        Self {
-            schema,
-            dest,
-            from: None,
-            reply_to: None,
-            trace,
-            payload: Payload::Typed(std::sync::Arc::new(payload)),
-            recorded_origin: None,
-        }
+        self.payload.json()
     }
 
     /// Stamps this copy as a recorded fact from `(journal, seq)` (the
@@ -293,21 +596,21 @@ impl Envelope {
         self
     }
 
-    /// The payload as JSON, if it is one.
+    /// The payload as JSON, if a JSON view is already materialized (no
+    /// on-demand decode — readers that need a tree use
+    /// [`Envelope::payload_json`]).
     pub fn as_json(&self) -> Option<&Json> {
-        match &self.payload {
-            Payload::Json(value) => Some(value),
-            Payload::Typed(_) => None,
+        match self.payload.inner() {
+            AnyPayload::Json(view) => Some(view),
+            _ => None,
         }
     }
 
-    /// Takes the payload as JSON. The error arm is the typed payload
-    /// itself — typed payloads have no JSON encoding on this path.
-    pub fn into_json(self) -> Result<Json, Payload> {
-        match self.payload {
-            Payload::Json(value) => Ok((*value).clone()),
-            typed @ Payload::Typed(_) => Err(typed),
-        }
+    /// The payload's wire encoding (bytes), for the journal door and the
+    /// erased bridge. Value payloads serialize here ONCE — callers that
+    /// only peek (never crossing a door) never pay this.
+    pub fn to_payload_bytes(&self) -> PayloadBytes {
+        PayloadBytes(self.payload.json_text())
     }
 }
 
@@ -363,21 +666,22 @@ mod tests {
 
     #[test]
     fn json_envelope_roundtrips_payload_and_metadata() {
-        // Given a JSON envelope with sender and reply-to set.
-        let envelope = Envelope::json(
-            SchemaId::new("ReserveStock", 1),
+        // Given a bytes-payload envelope (the erased boundary) with
+        // sender and reply-to set.
+        let envelope = Envelope::from_bytes(
+            SchemaId::new("ReserveStock"),
             Address::Path(ActorPath::new("inventory.west")),
-            json!({ "sku": "widget", "qty": 2 }),
+            PayloadBytes::from(Json::of(&json!({ "sku": "widget", "qty": 2 }))),
             TraceCtx::root(),
         )
         .from(ActorPath::new("storefront"))
         .reply_to(Address::Path(ActorPath::new("storefront")));
 
-        // When reading the payload back out.
-        let payload = envelope.as_json().expect("json payload");
+        // When reading the payload view back out.
+        let payload = envelope.payload_json();
 
         // Then the metadata and payload survive intact.
-        assert_eq!(envelope.schema.as_str(), "ReserveStock@1");
+        assert_eq!(envelope.schema.as_str(), "ReserveStock");
         assert_eq!(
             envelope.from.as_ref().map(|p| p.as_str()),
             Some("storefront")
@@ -390,21 +694,22 @@ mod tests {
     }
 
     #[test]
-    fn typed_envelope_holds_erased_payload() {
-        // Given a typed envelope.
-        let envelope = Envelope::typed(
-            SchemaId::new("Tick", 1),
+    fn bytes_payload_view_is_memoized() {
+        // Given a bytes-payload envelope.
+        let envelope = Envelope::from_bytes(
+            SchemaId::new("Tick"),
             Address::Path(ActorPath::new("a")),
-            42u32,
+            PayloadBytes::from(Json::of(&json!({ "n": 42 }))),
             TraceCtx::root(),
         );
 
-        // When inspecting the payload.
-        let rendered = format!("{envelope:?}");
+        // When reading the JSON view twice.
+        let first = envelope.payload_json();
+        let second = envelope.payload_json();
 
-        // Then it is opaque — never leakable across the waist.
-        assert!(rendered.contains("<erased>"));
-        assert!(envelope.as_json().is_none());
+        // Then both reads agree — and the Debug shape renders the bytes.
+        assert_eq!(first, second);
+        assert_eq!(first["n"], 42);
     }
 }
 
@@ -592,46 +897,28 @@ impl Extend<Event> for Events {
 /// A typed fact that knows how to become a journal-ready [`Event`].
 ///
 /// Implemented automatically for every type that is a [`Schema`] and
-/// [`Serialize`] — i.e. for every declared message type. Call sites never
-/// name this trait; they pass typed facts straight to [`Events::one`] or
-/// [`Events::push_event`].
-///
-/// # Panics
-///
-/// [`IntoEvent::into_event`] panics if serializing the payload fails. For
-/// the runtime's value domain (strings, numbers, bools, nulls, and
-/// compositions of them) serialization cannot fail, so a failure here means
-/// a programming bug — a failing invariant is a crash, not a value. Use
-/// [`IntoEvent::try_into_event`] at the boundary of hand-rolled `Serialize`
-/// impls that can fail.
-pub trait IntoEvent: Schema + Serialize + Sized {
+/// [`PayloadValue`] — i.e. for every declared message type (the derive
+/// generates both). Call sites never name this trait; they pass typed
+/// facts straight to [`Events::one`] or [`Events::push_event`]. Building
+/// an event WRAPS the value — no serialization on this path; serde
+/// happens once, when the journal door asks for the wire encoding.
+pub trait IntoEvent: Schema + Into<Payload> + Sized {
     /// Builds the event, deriving the schema id from the type.
-    ///
-    /// # Panics
-    ///
-    /// Panics with a named message if serializing the payload fails.
     fn into_event(self) -> Event {
-        self.try_into_event().unwrap_or_else(|e| {
-            panic!(
-                "IntoEvent: failed to serialize payload for {}: {e}",
-                Self::schema_id()
-            )
-        })
-    }
-
-    /// Builds the event, reporting serialization failure instead of
-    /// panicking.
-    ///
-    /// # Errors
-    ///
-    /// Returns the underlying `serde_json` error if the payload cannot be
-    /// serialized.
-    fn try_into_event(self) -> Result<Event, serde_json::Error> {
-        Ok(Event::new(Self::schema_id(), serde_json::to_value(&self)?))
+        Event {
+            schema: Self::schema_id(),
+            payload: self.into(),
+        }
     }
 }
 
-impl<T: Schema + Serialize> IntoEvent for T {}
+impl<T: Schema + PayloadValue> IntoEvent for T {}
+
+impl<T: PayloadValue> From<T> for Payload {
+    fn from(value: T) -> Self {
+        Payload::value(value)
+    }
+}
 
 #[cfg(test)]
 mod events_tests {
@@ -643,7 +930,7 @@ mod events_tests {
     use crate::json;
     use serde::Deserialize;
 
-    #[derive(crate::schema::Event, Serialize, Deserialize)]
+    #[derive(crate::schema::Event, Serialize, Deserialize, Clone)]
     struct Deposited {
         n: i64,
     }
@@ -667,8 +954,8 @@ mod events_tests {
         // event in order.
         assert!(events.0.spilled(), "past two events must spill");
         assert_eq!(events.len(), 3);
-        assert_eq!(events[0].payload["n"], 1);
-        assert_eq!(events[2].payload["n"], 3);
+        assert_eq!(events[0].payload_json()["n"], 1);
+        assert_eq!(events[2].payload_json()["n"], 3);
     }
 
     #[test]
@@ -682,39 +969,54 @@ mod events_tests {
         // Then the schema id is derived from the type (name@version) and the
         // payload is the serialized fact.
         assert_eq!(event.schema, Deposited::schema_id());
-        assert_eq!(event.schema.as_str(), "Deposited@1");
-        assert_eq!(event.payload["n"], 5);
+        assert_eq!(event.schema.as_str(), "Deposited");
+        assert_eq!(event.payload_json()["n"], 5);
     }
 
     #[test]
-    fn decode_yields_the_typed_fact_on_exact_schema_id() {
-        // Given an event recorded as `Deposited@1`.
+    fn as_fact_yields_the_typed_fact_on_exact_schema_name() {
+        // Given an event built from a live fact.
         let event = Deposited { n: 7 }.into_event();
 
-        // When decoding it into the typed fact.
-        let decoded: Option<Deposited> = event.decode();
+        // When extracting the typed fact.
+        let fact: Option<Deposited> = event.as_fact();
 
-        // Then the fact comes back with its data.
-        assert_eq!(decoded.expect("decode").n, 7);
+        // Then the fact comes back with its data — a downcast, no decode.
+        assert_eq!(fact.expect("as_fact").n, 7);
     }
 
     #[test]
-    fn decode_returns_none_on_version_mismatch() {
-        // Given an event recorded as `Deposited@2` (a v2 payload shape).
-        let event = Event::new(SchemaId::new("Deposited", 2), json!({ "n": 9, "cents": 0 }));
+    fn as_fact_downcasts_replayed_bytes_by_name() {
+        // Given an event RECORDED as bytes (replay shape) under the same
+        // schema name.
+        let bytes = PayloadBytes::from(Json::of(&Deposited { n: 9 }));
+        let event = Event::from_bytes(Deposited::schema_id(), bytes);
 
-        // When decoding it through the v1 type.
-        let decoded: Option<Deposited> = event.decode();
+        // When extracting the typed fact.
+        let fact: Option<Deposited> = event.as_fact();
 
-        // Then nothing decodes: version-pinned, no silent corruption.
-        assert!(decoded.is_none(), "v2 payload must not decode as v1");
+        // Then the bytes decode into the declared struct — replayed
+        // deliveries join the live fold path.
+        assert_eq!(fact.expect("decode").n, 9);
+    }
+
+    #[test]
+    fn as_fact_returns_none_for_other_facts() {
+        // Given an event under a DIFFERENT schema name.
+        let event = Event::from_json_view(SchemaId::new("Withdrawn"), json!({ "n": 9 }));
+
+        // When asking it for a Deposited.
+        let fact: Option<Deposited> = event.as_fact();
+
+        // Then nothing comes back: folds stack safely by name.
+        assert!(fact.is_none());
     }
 
     #[test]
     fn is_matches_without_cloning_or_decoding() {
-        // Given two events: one `Deposited@1`, one `Withdrawn@1`.
+        // Given two events: one Deposited, one Withdrawn.
         let deposited = Deposited { n: 1 }.into_event();
-        let withdrawn = Event::new(SchemaId::new("Withdrawn", 1), json!({ "n": 1 }));
+        let withdrawn = Event::from_json_view(SchemaId::new("Withdrawn"), json!({ "n": 1 }));
 
         // When asking each whether it IS a Deposited.
         let deposited_is = deposited.is::<Deposited>();
@@ -725,41 +1027,43 @@ mod events_tests {
         assert!(!withdrawn_is);
     }
 
-    /// A fact whose serialization fails (injected via a hand-rolled impl).
-    #[derive(crate::schema::Event, Clone, Copy)]
-    #[allow(dead_code)] // the payload value never serializes; that's the test
-    struct Unserializable {
-        bad: f64,
-    }
-    impl Serialize for Unserializable {
-        fn serialize<S: serde::Serializer>(&self, _serializer: S) -> Result<S::Ok, S::Error> {
-            use serde::ser::Error as _;
-            Err(S::Error::custom("injected serialize failure"))
-        }
+    #[test]
+    fn into_event_wraps_without_serializing() {
+        // Given a typed fact.
+        let fact = Deposited { n: 3 };
+
+        // When converting it into an event.
+        let event = fact.into_event();
+
+        // Then the payload IS the value (downcast back, no bytes needed).
+        let fact: Option<Deposited> = event.as_fact();
+        assert_eq!(fact.expect("live value").n, 3);
     }
 
     #[test]
-    fn try_into_event_reports_serialize_failure() {
-        // Given a fact whose serialization fails.
-        let fact = Unserializable { bad: f64::NAN };
+    fn dlq_payload_json_still_renders_for_inspection() {
+        // Given an event built from a live fact.
+        let event = Deposited { n: 11 }.into_event();
 
-        // When converting with the fallible escape hatch.
-        let result = fact.try_into_event();
+        // When rendering its JSON view (the DLQ materializer path).
+        let view = event.payload_json();
 
-        // Then the failure is reported, not panicked.
-        assert!(result.is_err(), "injected failure must surface as Err");
+        // Then the tree is inspectable.
+        assert_eq!(view["n"], 11);
+    }
 
-        // When converting with the named-panic path.
-        // Then the panic names the schema.
-        let panicked = std::panic::catch_unwind(move || fact.into_event());
-        let msg = panicked
-            .err()
-            .and_then(|p| p.downcast_ref::<String>().cloned())
-            .unwrap_or_default();
-        assert!(
-            msg.contains("Unserializable@1"),
-            "panic must name the schema, got: {msg}"
-        );
+    #[test]
+    fn payload_bytes_from_json_roundtrips_text() {
+        // Given a Json tree.
+        let tree = json!({ "k": "v" });
+
+        // When converting to wire bytes and back.
+        let bytes = PayloadBytes::from(tree.clone());
+        let round: Json = serde_json::from_slice(bytes.as_bytes()).expect("parse");
+
+        // Then the bytes ARE the compact JSON text of the tree.
+        assert_eq!(bytes.as_str(), r#"{"k":"v"}"#);
+        assert_eq!(round, tree);
     }
 
     #[test]
@@ -796,7 +1100,7 @@ mod events_tests {
         assert_eq!(events.len(), 1);
         let appended: &[Event] = &events;
         assert_eq!(appended[0].schema, StockReserved::schema_id());
-        assert_eq!(appended[0].payload["qty"], 4);
+        assert_eq!(appended[0].payload_json()["qty"], 4);
     }
 
     /// Minimal counter state for the dispatch test above (same shape as the
@@ -814,7 +1118,7 @@ mod events_tests {
         }
         fn apply(&mut self, event: &Event) {
             if event.schema == StockReserved::schema_id() {
-                self.count += event.payload["qty"].as_i64().unwrap_or(0);
+                self.count += event.payload_json()["qty"].as_i64().unwrap_or(0);
             }
         }
     }

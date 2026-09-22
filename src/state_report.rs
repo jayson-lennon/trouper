@@ -18,7 +18,7 @@ use crate::context::CmdCtx;
 use crate::envelope::{Event, Events};
 use crate::json::Json;
 use crate::schema::{ActorManifest, Command, Event, Schema};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 /// Ask the reporter to record the attached export document.
 ///
@@ -26,7 +26,7 @@ use serde::Deserialize;
 /// export is async and locks the system, so it cannot happen inside an
 /// event-sourced handler — the async caller captures, then hands the
 /// document over.
-#[derive(Command, Deserialize)]
+#[derive(Command, Serialize, Deserialize)]
 #[schema(description = "record the attached system export as a fact")]
 pub struct ReportState {
     /// The captured `SystemExport` document.
@@ -39,7 +39,7 @@ pub struct ReportState {
 ///
 /// (The schema is zero-field: the payload is the export document itself,
 /// not a field of it.)
-#[derive(Event, Deserialize)]
+#[derive(Event, Serialize, Deserialize)]
 #[schema(description = "the payload is the SystemExport document itself, not a field of it")]
 pub struct StateReported;
 
@@ -70,7 +70,7 @@ impl EventSourcedActor for StateReporter {
     fn apply(&mut self, event: &Event) {
         if event.schema == StateReported::schema_id() {
             self.seq += 1;
-            self.export = Some(event.payload.clone());
+            self.export = Some(event.payload_json().clone());
         }
     }
 }
@@ -80,7 +80,7 @@ impl CommandHandler<ReportState> for StateReporter {
         // Raw push, deliberately: the payload IS the export document, not a
         // field of a typed fact — there is nothing for IntoEvent to build.
         let mut events = Events::new();
-        events.push(Event::new(StateReported::schema_id(), cmd.export));
+        events.push(Event::from_json_view(StateReported::schema_id(), cmd.export));
         events
     }
 }
@@ -132,7 +132,7 @@ mod tests {
         // IS the export document (verbatim, not wrapped).
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].schema, StateReported::schema_id());
-        assert_eq!(events[0].payload, test_export(3));
+        assert_eq!(events[0].payload_json(), &test_export(3));
     }
 
     #[test]
@@ -144,7 +144,7 @@ mod tests {
         let first = test_export(1);
         let second = test_export(2);
         for payload in [&first, &second] {
-            reporter.apply(&Event::new(StateReported::schema_id(), payload.clone()));
+            reporter.apply(&Event::from_json_view(StateReported::schema_id(), payload.clone()));
         }
 
         // Then seq counts every applied report and export is the LAST one.
@@ -156,11 +156,11 @@ mod tests {
     fn apply_ignores_foreign_event_schemas() {
         // Given a reporter with one recorded report.
         let mut reporter = StateReporter::default();
-        reporter.apply(&Event::new(StateReported::schema_id(), test_export(1)));
+        reporter.apply(&Event::from_json_view(StateReported::schema_id(), test_export(1)));
 
         // When a foreign-schema event is applied.
-        let other = SchemaId::new("Foreign", 1);
-        reporter.apply(&Event::new(other, json!({ "x": 1 })));
+        let other = SchemaId::new("Foreign");
+        reporter.apply(&Event::from_json_view(other, json!({ "x": 1 })));
 
         // Then seq and export are untouched.
         assert_eq!(reporter.seq, 1);

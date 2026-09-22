@@ -19,7 +19,7 @@ use trouper::system::SnapshotCadence;
 
 // -- A typed event-sourced actor -------------------------------------------
 
-#[derive(Command, Deserialize)]
+#[derive(Command, Serialize, Deserialize)]
 #[schema(description = "Add stock")]
 struct Restock {
     sku: String,
@@ -49,8 +49,8 @@ impl EventSourcedActor for Inventory {
     }
 
     fn apply(&mut self, event: &Event) {
-        if event.schema.as_str() == "Restocked@1" {
-            self.total += event.payload["qty"].as_i64().unwrap_or(0);
+        if event.schema.as_str() == "Restocked" {
+            self.total += event.payload_json()["qty"].as_i64().unwrap_or(0);
         }
     }
 }
@@ -121,24 +121,24 @@ async fn main() {
         }))
         .args(trouper::json!({ "total": 0 }))
         .handle(Arc::new(|_state, cmd, _ctx| {
-            vec![Event::new(
-                SchemaId::new("TallyAdded", 1),
-                json!({ "delta": cmd["delta"].as_i64().unwrap_or(0) }),
+            vec![Event::from_json_view(
+                SchemaId::new("TallyAdded"),
+                trouper::Json::from(json!({ "delta": cmd["delta"].as_i64().unwrap_or(0) })),
             )]
         }))
         .apply(Arc::new(|state: &mut Json, ev: &Event| {
             state["total"] = json!(
-                state["total"].as_i64().unwrap_or(0) + ev.payload["delta"].as_i64().unwrap_or(0)
+                state["total"].as_i64().unwrap_or(0) + ev.payload_json()["delta"].as_i64().unwrap_or(0)
             );
         }))
-        .emits_id(SchemaId::new("TallyAdded", 1))
+        .emits_id(SchemaId::new("TallyAdded"))
         .start()
         .expect("foreign spawn");
     println!("   spawned {tally}");
 
     system
         .send(system.envelope(
-            SchemaId::new("TallyAdd", 1),
+            SchemaId::new("TallyAdd"),
             ActorPath::new("tally"),
             json!({ "delta": 9 }),
         ))

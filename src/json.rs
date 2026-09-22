@@ -302,7 +302,7 @@ mod tests {
         use crate::actor::EventSourcedActor;
         use crate::prelude::*;
 
-        #[derive(Event, serde::Serialize, serde::Deserialize)]
+        #[derive(Event, serde::Serialize, serde::Deserialize, Clone)]
         struct Pong {
             n: i64,
         }
@@ -321,7 +321,7 @@ mod tests {
                 }
             }
             fn apply(&mut self, event: &Event) {
-                if let Some(p) = event.decode::<Pong>() {
+                if let Some(p) = event.as_fact::<Pong>() {
                     self.seen = p.n;
                 }
             }
@@ -341,7 +341,7 @@ mod tests {
             // Then everything round-trips on the public API alone.
             assert_eq!(actor.seen, 12);
             assert_eq!(decision.len(), 1);
-            assert_eq!(decision[0].payload["n"], 4);
+            assert_eq!(decision[0].payload_json()["n"], 4);
         }
     }
 }

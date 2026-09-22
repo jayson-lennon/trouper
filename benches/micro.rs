@@ -14,8 +14,8 @@ use trouper::journal::{InMemoryJournalStore, JournalStore, SeqNo};
 use trouper::schema::SchemaId;
 
 fn event(n: u64) -> Event {
-    Event::new(
-        SchemaId::new("BenchEvent", 1),
+    Event::from_json_view(
+        SchemaId::new("BenchEvent"),
         Json::of(&serde_json::json!({ "n": n })),
     )
 }

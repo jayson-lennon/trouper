@@ -6,8 +6,8 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
-
-use crate::envelope::Event;
+use crate::envelope::{Event, PayloadBytes};
+use crate::schema::SchemaId;
 pub use crate::json::Json;
 
 /// Why an actor's journal holds a fact.
@@ -36,14 +36,44 @@ pub enum EventOrigin {
 ///
 /// A single container keeps events and snapshots interleaved, which makes
 /// compaction (dropping pre-snapshot events) trivial later.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum JournalEntry {
     /// A domain event — a fact that already happened.
     Event {
         /// Position of this event in the actor's journal.
         seq: SeqNo,
-        /// The event itself.
+        /// The event itself (payload carried live; the wire encoding is
+        /// taken at append — one serialization per committed event).
         event: Event,
+        /// Why this journal holds the fact (defaults to [`EventOrigin::Recorded`]
+        /// for journals written before projectors existed).
+        origin: EventOrigin,
+        /// The store-assigned global arrival order across all paths.
+        /// Defaults to 0 for legacy entries (they sort early; ordering
+        /// among them falls back to per-journal seq).
+        ingest_seq: u64,
+    },
+    /// A memoized fold of every event up to and including `seq`.
+    Snapshot {
+        /// Sequence of the last event folded into `state`.
+        seq: SeqNo,
+        /// The snapshot state.
+        state: Json,
+    },
+}
+
+/// The WIRE form of one journal entry (what a persistence backend stores
+/// and replays). The event payload is compact JSON text — the journal
+/// door's contract: written once at append via the payload's memoized
+/// encoding, decoded straight into the declared struct at replay.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum WireJournalEntry {
+    /// A domain event — a fact that already happened.
+    Event {
+        /// Position of this event in the actor's journal.
+        seq: SeqNo,
+        /// The event: schema name + JSON-text payload.
+        event: WireEvent,
         /// Why this journal holds the fact (defaults to [`EventOrigin::Recorded`]
         /// for journals written before projectors existed).
         #[serde(default)]
@@ -63,6 +93,90 @@ pub enum JournalEntry {
     },
 }
 
+/// The wire form of an event: schema + payload bytes.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct WireEvent {
+    /// The event's schema.
+    pub schema: SchemaId,
+    /// The event's compact JSON-text payload.
+    pub payload: PayloadBytes,
+}
+
+impl From<&Event> for WireEvent {
+    fn from(event: &Event) -> Self {
+        Self {
+            schema: event.schema.clone(),
+            payload: event.payload.wire_bytes(),
+        }
+    }
+}
+
+impl TryFrom<WireEvent> for Event {
+    type Error = error_stack::Report<JournalError>;
+
+    fn try_from(wire: WireEvent) -> Result<Self, Self::Error> {
+        let bytes = wire.payload;
+        bytes.assert_json_text();
+        Ok(Event::from_bytes(wire.schema, bytes))
+    }
+}
+
+impl From<&JournalEntry> for WireJournalEntry {
+    fn from(entry: &JournalEntry) -> Self {
+        match entry {
+            JournalEntry::Event {
+                seq,
+                event,
+                origin,
+                ingest_seq,
+            } => Self::Event {
+                seq: *seq,
+                event: WireEvent::from(event),
+                origin: origin.clone(),
+                ingest_seq: *ingest_seq,
+            },
+            JournalEntry::Snapshot { seq, state } => Self::Snapshot {
+                seq: *seq,
+                state: state.clone(),
+            },
+        }
+    }
+}
+
+impl TryFrom<WireJournalEntry> for JournalEntry {
+    type Error = error_stack::Report<JournalError>;
+
+    fn try_from(wire: WireJournalEntry) -> Result<Self, Self::Error> {
+        match wire {
+            WireJournalEntry::Event {
+                seq,
+                event,
+                origin,
+                ingest_seq,
+            } => Ok(JournalEntry::Event {
+                seq,
+                event: Event::try_from(event)?,
+                origin,
+                ingest_seq,
+            }),
+            WireJournalEntry::Snapshot { seq, state } => {
+                Ok(JournalEntry::Snapshot { seq, state })
+            }
+        }
+    }
+}
+
+impl Event {
+    /// The event as a JSON view (test mirror of the wire shape).
+    #[cfg(test)]
+    pub(crate) fn to_json_view(&self) -> Json {
+        crate::json!({
+            "schema": self.schema.as_str(),
+            "payload": self.payload_json(),
+        })
+    }
+}
+
 impl JournalEntry {
     /// The entry's sequence number.
     pub fn seq(&self) -> SeqNo {
@@ -77,6 +191,64 @@ impl JournalEntry {
             Self::Event { event, .. } => Some(event),
             Self::Snapshot { .. } => None,
         }
+    }
+
+    /// Renders the entry as its JSON view (the on-disk shape): event
+    /// payloads appear as their wire bytes parsed back into a tree.
+    #[cfg(test)]
+    pub(crate) fn to_json_view(&self) -> Json {
+        match self {
+            JournalEntry::Event { seq, event, origin, ingest_seq } => {
+                crate::json!({
+                    "Event": {
+                        "seq": seq.0,
+                        "event": event.to_json_view(),
+                        "origin": "recorded",
+                        "ingest_seq": ingest_seq,
+                    }
+                })
+            }
+            JournalEntry::Snapshot { seq, state } => {
+                crate::json!({ "Snapshot": { "seq": seq.0, "state": state } })
+            }
+        }
+    }
+
+    /// Parses a JSON view produced by [`JournalEntry::to_json_view`]
+    /// (test-only mirror of the serde shape).
+    #[cfg(test)]
+    pub(crate) fn from_json_view(
+        view: Json,
+    ) -> Result<Self, error_stack::Report<crate::registry::RegistryError>> {
+        use error_stack::ResultExt;
+        let obj = view
+            .as_object()
+            .ok_or_else(|| error_stack::Report::new(crate::registry::RegistryError::InvalidSpec))
+            .change_context(crate::registry::RegistryError::InvalidSpec)?;
+        if let Some(e) = obj.get("Event") {
+            let seq = e["seq"].as_u64().unwrap_or(0);
+            let ev = &e["event"];
+            let bytes = crate::envelope::PayloadBytes::from(crate::json::Json::of(&ev["payload"]));
+            return Ok(JournalEntry::Event {
+                seq: SeqNo(seq),
+                event: Event::from_bytes(
+                    SchemaId::parse(ev["schema"].as_str().unwrap_or_default())
+                        .unwrap_or_else(|| SchemaId::new("?")),
+                    bytes,
+                ),
+                origin: EventOrigin::Recorded,
+                ingest_seq: e["ingest_seq"].as_u64().unwrap_or(0),
+            });
+        }
+        if let Some(snap) = obj.get("Snapshot") {
+            return Ok(JournalEntry::Snapshot {
+                seq: SeqNo(snap["seq"].as_u64().unwrap_or(0)),
+                state: Json(snap["state"].clone()),
+            });
+        }
+        Err(error_stack::Report::new(
+            crate::registry::RegistryError::InvalidSpec,
+        ))
     }
 }
 
@@ -120,7 +292,7 @@ impl JournaledEvent {
     /// per-key projector seed test, mirroring broadcast's derivation.
     pub fn recorded_payload_key(&self, key_field: &str, key: &str) -> bool {
         self.origin == EventOrigin::Recorded
-            && self.event.payload.get(key_field).and_then(|v| v.as_str()) == Some(key)
+            && self.event.payload.field(key_field).as_deref() == Some(key)
     }
 }
 
@@ -720,7 +892,7 @@ mod tests {
     use crate::schema::SchemaId;
 
     fn event(qty: i64) -> Event {
-        Event::new(SchemaId::new("StockReserved", 1), json!({ "qty": qty }))
+        Event::from_json_view(SchemaId::new("StockReserved"), json!({ "qty": qty }))
     }
 
     #[test]
@@ -740,9 +912,11 @@ mod tests {
         ];
 
         for entry in entries {
-            // When round-tripping through JSON.
-            let round: JournalEntry =
-                serde_json::from_str(&serde_json::to_string(&entry).expect("ser")).expect("de");
+            // When round-tripping through the entry's JSON view (the
+            // on-disk rendering; payloads are wire bytes, held in a view
+            // tree for the assertion).
+            let view = entry.to_json_view();
+            let round = JournalEntry::from_json_view(view).expect("parses");
 
             // Then kind, sequence, payload, origin, and arrival order are
             // preserved.
@@ -754,11 +928,12 @@ mod tests {
     fn legacy_event_entries_deserialize_with_defaulted_origin_and_ingest() {
         // Given a pre-0.6.0 serialized event entry (no origin/ingest_seq).
         let legacy = r#"{
-            "Event": { "seq": 3, "event": { "schema": "StockReserved@1", "payload": { "qty": 2 } } }
+            "Event": { "seq": 3, "event": { "schema": "StockReserved", "payload": { "qty": 2 } } }
         }"#;
 
-        // When deserializing it.
-        let entry: JournalEntry = serde_json::from_str(legacy).expect("legacy entry loads");
+        // When parsing it through the entry view (the on-disk shape).
+        let entry = JournalEntry::from_json_view(serde_json::from_str(legacy).expect("view"))
+            .expect("legacy entry loads");
 
         // Then the entry loads with the Recorded origin and ingest 0 —
         // old journals remain readable across the upgrade.
@@ -934,7 +1109,7 @@ mod tests {
         let a = crate::actor::ActorPath::new("a");
         let b = crate::actor::ActorPath::new("b");
         let proj = crate::actor::ActorPath::new("proj");
-        let tick = || Event::new(SchemaId::new("Ticked", 1), json!({ "qty": 1 }));
+        let tick = || Event::from_json_view(SchemaId::new("Ticked"), json!({ "qty": 1 }));
         store.append(&a, &[event(1), tick()]).await.expect("a");
         store.append(&b, &[tick()]).await.expect("b");
         let scanned = store.scan(&[tick().schema]).await.expect("scan");
