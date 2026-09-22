@@ -207,7 +207,7 @@ mod tests {
         Json::from(serde_json::Value::Object(map))
     }
 
-    #[derive(serde::Serialize, serde::Deserialize, PartialEq, Eq, Debug)]
+    #[derive(serde::Serialize, serde::Deserialize, PartialEq, Eq, Debug, Clone)]
     struct Wide {
         k0: u64,
     }
@@ -290,7 +290,7 @@ mod tests {
         assert_eq!(round, value);
     }
 
-    #[derive(serde::Serialize, serde::Deserialize, PartialEq, Eq, Debug)]
+    #[derive(serde::Serialize, serde::Deserialize, PartialEq, Eq, Debug, Clone)]
     struct Genesis {
         key: String,
         on_hand: i64,
@@ -307,7 +307,7 @@ mod tests {
             n: i64,
         }
 
-        #[derive(serde::Serialize, serde::Deserialize, Default)]
+        #[derive(serde::Serialize, serde::Deserialize, Default, Clone)]
         struct Pinger {
             seen: i64,
         }

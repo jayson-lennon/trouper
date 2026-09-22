@@ -229,7 +229,7 @@ pub trait Schema {
 
 // The derive macros live in the workspace's `trouper_macros` crate; they
 // are re-exported here (and reach the prelude through the glob above) so
-// users write `#[derive(Event)]` next to `#[derive(Serialize)]`.
+// users write `#[derive(Event)]` next to `#[derive(Serialize, Clone)]`.
 pub use trouper_macros::{Command, Event};
 
 /// A type that round-trips the wire: a schema contract with serde on both
@@ -443,7 +443,7 @@ mod tests {
     #[test]
     fn derive_event_matches_hand_written_def() {
         // Given a type with the derive and an identical hand-written def.
-        #[derive(Event, serde::Serialize, serde::Deserialize)]
+        #[derive(Event, serde::Serialize, serde::Deserialize, Clone)]
         struct StockReserved {
             sku: String,
             qty: u64,
@@ -467,7 +467,7 @@ mod tests {
     #[test]
     fn derive_command_sets_kind() {
         // Given a command type with the derive.
-        #[derive(Command, serde::Serialize, serde::Deserialize)]
+        #[derive(Command, serde::Serialize, serde::Deserialize, Clone)]
         struct ReserveStock2 {
             sku: String,
         }
@@ -484,7 +484,7 @@ mod tests {
     #[test]
     fn field_types_map_to_descriptor_tys() {
         // Given one type exercising every supported field type.
-        #[derive(Event, serde::Serialize, serde::Deserialize)]
+        #[derive(Event, serde::Serialize, serde::Deserialize, Clone)]
         #[allow(dead_code)] // descriptor data; exercised via schema_def only
         struct Kitchen {
             small: i8,
@@ -530,7 +530,7 @@ mod tests {
     #[test]
     fn description_attribute_applies() {
         // Given a type with a container-level description.
-        #[derive(Event, serde::Serialize, serde::Deserialize)]
+        #[derive(Event, serde::Serialize, serde::Deserialize, Clone)]
         #[schema(description = "Second edition of the fact.")]
         struct ReservedV2 {
             sku: String,
@@ -551,7 +551,7 @@ mod tests {
     #[test]
     fn field_description_attribute_applies() {
         // Given a type with a field-level description.
-        #[derive(Command, serde::Serialize, serde::Deserialize)]
+        #[derive(Command, serde::Serialize, serde::Deserialize, Clone)]
         struct Report {
             #[schema(description = "the captured export document")]
             export: Json,
@@ -570,7 +570,7 @@ mod tests {
     #[test]
     fn shard_key_attribute_sets_role() {
         // Given a type whose second field is the shard key.
-        #[derive(Command, serde::Serialize, serde::Deserialize)]
+        #[derive(Command, serde::Serialize, serde::Deserialize, Clone)]
         struct Credit {
             account: String,
             #[schema(shard_key)]
@@ -590,7 +590,7 @@ mod tests {
     #[test]
     fn rename_attribute_renames_descriptor_field_only() {
         // Given a type whose Rust field name differs from the wire name.
-        #[derive(Event, serde::Serialize, serde::Deserialize)]
+        #[derive(Event, serde::Serialize, serde::Deserialize, Clone)]
         #[serde(rename_all = "camelCase")]
         struct OrderShipped {
             #[schema(rename = "orderId")]
@@ -613,7 +613,7 @@ mod tests {
     #[test]
     fn ty_json_attribute_forces_the_descriptor_ty() {
         // Given a type whose field type is not otherwise mappable.
-        #[derive(Event, serde::Serialize, serde::Deserialize)]
+        #[derive(Event, serde::Serialize, serde::Deserialize, Clone)]
         struct Attachment {
             #[schema(ty = "json")]
             bytes: Vec<u8>,

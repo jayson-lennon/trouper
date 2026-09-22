@@ -26,7 +26,7 @@ use serde::{Deserialize, Serialize};
 /// export is async and locks the system, so it cannot happen inside an
 /// event-sourced handler — the async caller captures, then hands the
 /// document over.
-#[derive(Command, Serialize, Deserialize)]
+#[derive(Command, Serialize, Deserialize, Clone)]
 #[schema(description = "record the attached system export as a fact")]
 pub struct ReportState {
     /// The captured `SystemExport` document.
@@ -39,7 +39,7 @@ pub struct ReportState {
 ///
 /// (The schema is zero-field: the payload is the export document itself,
 /// not a field of it.)
-#[derive(Event, Serialize, Deserialize)]
+#[derive(Event, Serialize, Deserialize, Clone)]
 #[schema(description = "the payload is the SystemExport document itself, not a field of it")]
 pub struct StateReported;
 
@@ -49,7 +49,7 @@ pub struct StateReported;
 /// recorded export. `seq` is the freshness signal — a caller reads it before
 /// injecting a [`ReportState`], then waits for it to advance, so a query
 /// never returns a stale export.
-#[derive(serde::Serialize, serde::Deserialize, Default)]
+#[derive(serde::Serialize, serde::Deserialize, Default, Clone)]
 pub struct StateReporter {
     seq: u64,
     export: Option<Json>,

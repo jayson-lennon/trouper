@@ -1042,7 +1042,6 @@ async fn step_es(ctx: &EsLoop) -> Step {
     let dispatch_result = {
         let state = ctx.state().await;
         let mut state = state.lock().await;
-        let payload = envelope.payload_json();
         let mut cmd_ctx = CmdCtx::new(
             &ctx.path,
             &envelope.trace,
@@ -1052,7 +1051,7 @@ async fn step_es(ctx: &EsLoop) -> Step {
         );
 
         std::panic::catch_unwind(AssertUnwindSafe(|| {
-            entry.dispatch(state.as_mut(), payload, &mut cmd_ctx)
+            entry.dispatch(state.as_mut(), &envelope.payload, &mut cmd_ctx)
         }))
     };
 
@@ -2087,9 +2086,9 @@ async fn step_service(ctx: &ServiceLoop) -> Step {
     };
 
     // 3. DECODE (sync — decode failures dead-letter cleanly). The payload
-    // is borrowed: decode reads the shared tree, it never copies it.
-    let payload = envelope.payload_json();
-    let decoded = match entry.decode(payload) {
+    // is borrowed: decode downcasts the live value (zero serde) or reads
+    // the shared bytes — it never copies the message body.
+    let decoded = match entry.decode(&envelope.payload) {
         Ok(msg) => msg,
         Err(report) => {
             let reason = format!("{report}");

@@ -121,7 +121,7 @@ impl<A: crate::actor::EventSourcedActor> SpawnBuilder<A> {
     pub fn handles<C>(mut self) -> Self
     where
         A: crate::actor::CommandHandler<C>,
-        C: Schema + serde::de::DeserializeOwned + Send + 'static,
+        C: Schema + serde::de::DeserializeOwned + Clone + Send + Sync + 'static,
     {
         self.system.register_schema::<C>();
         let id = C::schema_id();
@@ -281,7 +281,7 @@ impl<A: ServiceActor> ServiceBuilder<A> {
     pub fn handles<M>(mut self) -> Self
     where
         A: crate::actor::MsgHandler<M>,
-        M: Schema + serde::de::DeserializeOwned + Send + 'static,
+        M: Schema + serde::de::DeserializeOwned + Clone + Send + Sync + 'static,
     {
         self.system.register_schema::<M>();
         let id = M::schema_id();

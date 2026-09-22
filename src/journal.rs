@@ -198,7 +198,7 @@ impl JournalEntry {
     #[cfg(test)]
     pub(crate) fn to_json_view(&self) -> Json {
         match self {
-            JournalEntry::Event { seq, event, origin, ingest_seq } => {
+            JournalEntry::Event { seq, event, ingest_seq, .. } => {
                 crate::json!({
                     "Event": {
                         "seq": seq.0,

@@ -204,7 +204,13 @@ impl AnyPayload {
                 bump_serde_calls();
                 serde_json::from_slice::<T>(bytes.as_bytes()).ok()
             }
-            AnyPayload::Json(_) => None,
+            // The erased Json-flavored seams (send_json/ask_json/reply):
+            // the handler's type decodes from the tree — borrowed, the
+            // same cost the old dispatch paid.
+            AnyPayload::Json(view) => {
+                bump_serde_calls();
+                T::deserialize(&view.0).ok()
+            }
         }
     }
 
@@ -332,6 +338,12 @@ impl PayloadBytes {
     }
 }
 
+impl From<Json> for Payload {
+    fn from(view: Json) -> Self {
+        Self::json_view(view)
+    }
+}
+
 impl From<&Json> for PayloadBytes {
     fn from(value: &Json) -> Self {
         bump_serde_calls();
@@ -417,6 +429,14 @@ impl Event {
             schema,
             payload: Payload::json_view(view),
         }
+    }
+
+    /// Creates an event that ADOPTS an existing payload (an `Arc` bump,
+    /// never a copy) — the consume-entry seam: a projector's consumed
+    /// command re-enters its journal as a fact without a single payload
+    /// copy.
+    pub fn with_shared_payload(schema: SchemaId, payload: Payload) -> Self {
+        Self { schema, payload }
     }
 
     /// Extracts the typed fact `T`, matching by schema NAME.
@@ -1092,7 +1112,7 @@ mod events_tests {
 
         // When dispatching the command.
         let events = adapter
-            .dispatch(&mut state, &json!({ "qty": 4 }), &mut ctx)
+            .dispatch(&mut state, &Payload::value(ReserveStock { qty: 4 }), &mut ctx)
             .expect("dispatch");
 
         // Then the buffer holds exactly the decided events, in order, ready
@@ -1105,7 +1125,7 @@ mod events_tests {
 
     /// Minimal counter state for the dispatch test above (same shape as the
     /// actor.rs doc fixture).
-    #[derive(Serialize, Deserialize, Default)]
+    #[derive(Serialize, Deserialize, Default, Clone)]
     struct Counter {
         count: i64,
     }
@@ -1128,12 +1148,12 @@ mod events_tests {
         }
     }
 
-    #[derive(crate::schema::Command, Serialize, Deserialize)]
+    #[derive(crate::schema::Command, Serialize, Deserialize, Clone)]
     struct ReserveStock {
         qty: i64,
     }
 
-    #[derive(crate::schema::Event, Serialize, Deserialize)]
+    #[derive(crate::schema::Event, Serialize, Deserialize, Clone)]
     struct StockReserved {
         qty: i64,
     }

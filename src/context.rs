@@ -372,6 +372,34 @@ impl<'a> MsgCtx<'a> {
         self.core.outbox.push_send(envelope);
     }
 
+    /// The payload-generic broadcast: the typed publish's engine.
+    pub(crate) fn publish_payload(&mut self, schema: SchemaId, payload: crate::envelope::Payload) {
+        let envelope = Envelope::raw(
+            schema.clone(),
+            Address::Schema(schema),
+            payload,
+            self.core.child_trace(),
+        )
+        .from(self.core.self_path.clone());
+        self.core.outbox.push_broadcast(envelope);
+    }
+
+    /// The payload-generic reply engine (typed reply's core). The reply
+    /// slot world is still JSON-shaped (typed slots are a later phase);
+    /// the payload materializes its view here — memoized, so the encode
+    /// happens at most once.
+    pub(crate) fn reply_payload(
+        &mut self,
+        schema: SchemaId,
+        payload: crate::envelope::Payload,
+    ) {
+        if let Some(reply_to) = self.core.reply_to().cloned() {
+            self.core
+                .outbox
+                .push_reply(reply_to, schema, payload.json().clone(), self.core.child_trace());
+        }
+    }
+
     /// Escape hatch: records a broadcast with an explicit schema id and
     /// hand-built payload. The envelope's destination is the schema
     /// address itself — the trace's `dest` reads as the fan-out target.
@@ -484,9 +512,12 @@ impl<'a> MsgCtx<'a> {
     /// schema; delivered after the current message is acknowledged. Typed:
     /// the schema id comes from the message type. Zero subscribers is a
     /// silent no-op: events are news, not work orders.
-    pub fn publish<M: Message>(&mut self, msg: &M) {
-        let payload = Json::of(&msg);
-        self.publish_json(M::schema_id(), payload);
+    pub fn publish<M: Message + crate::envelope::PayloadValue + Clone>(&mut self, msg: &M) {
+        // The live value rides the fabric (zero serde); only the journal
+        // door serializes it later. `M: Clone` comes from `Message`'s
+        // supertrait bounds via the adapter contract.
+        let payload = crate::envelope::Payload::value(msg.clone());
+        self.publish_payload(M::schema_id(), payload);
     }
 
     /// Records a reply to the message's `reply_to`, if the sender asked.
@@ -494,9 +525,9 @@ impl<'a> MsgCtx<'a> {
     /// A reply without a `reply_to` is dropped silently: the asker is gone,
     /// so the fact is unobservable by definition. Not a broadcast — use
     /// [`MsgCtx::publish`] for events.
-    pub fn reply<M: Message>(&mut self, msg: M) {
-        let payload = Json::of(&msg);
-        self.reply_json(M::schema_id(), payload);
+    pub fn reply<M: Message + crate::envelope::PayloadValue>(&mut self, msg: M) {
+        let payload = crate::envelope::Payload::value(msg);
+        self.reply_payload(M::schema_id(), payload);
     }
 
     /// Snapshot info about a path.
@@ -539,25 +570,25 @@ mod tests {
 
     /// Typed messages for the effect tests: the schema id comes from the
     /// type, so the assertions prove the derivation.
-    #[derive(Command, Serialize, Deserialize)]
+    #[derive(Command, Serialize, Deserialize, Clone)]
     struct ReserveStock {
         qty: i64,
     }
 
-    #[derive(Event, Serialize, Deserialize)]
+    #[derive(Event, Serialize, Deserialize, Clone)]
     struct Reserved {
         ok: bool,
     }
 
-    #[derive(Event, Serialize, Deserialize)]
+    #[derive(Event, Serialize, Deserialize, Clone)]
     struct StockReserved {
         qty: i64,
     }
 
-    #[derive(Command, Serialize, Deserialize)]
+    #[derive(Command, Serialize, Deserialize, Clone)]
     struct Ping;
 
-    #[derive(Event, Serialize, Deserialize)]
+    #[derive(Event, Serialize, Deserialize, Clone)]
     struct Pong;
 
     /// A view over static data; tests never touch a real registry.

@@ -347,7 +347,7 @@ pub trait CommandEntry: Send + Sync {
     fn dispatch(
         &self,
         state: &mut dyn DynEsActor,
-        payload: &Json,
+        payload: &crate::envelope::Payload,
         ctx: &mut CmdCtx<'_>,
     ) -> Result<crate::envelope::Events, error_stack::Report<DispatchError>>;
 }
@@ -373,7 +373,7 @@ impl<A: EventSourcedActor, C> TypedEsAdapter<A, C> {
 impl<A, C> CommandEntry for TypedEsAdapter<A, C>
 where
     A: EventSourcedActor + CommandHandler<C>,
-    C: DeserializeOwned + Send + 'static,
+    C: Schema + DeserializeOwned + Clone + Send + Sync + 'static,
 {
     fn schema(&self) -> SchemaId {
         self.schema.clone()
@@ -382,16 +382,18 @@ where
     fn dispatch(
         &self,
         state: &mut dyn DynEsActor,
-        payload: &Json,
+        payload: &crate::envelope::Payload,
         ctx: &mut CmdCtx<'_>,
     ) -> Result<crate::envelope::Events, error_stack::Report<DispatchError>> {
-        use error_stack::ResultExt;
-        let cmd: C = payload
-            .decode::<C>()
-            .change_context(DispatchError::Decode(format!(
+        // Downcast FIRST (the typed fabric: no serde on the live path).
+        // Only bytes that arrived without a live value (erased ingress,
+        // replay) decode here — the fabric's one shape-changing door.
+        let cmd: C = payload.inner().downcast_ref::<C>().ok_or_else(|| {
+            error_stack::Report::new(DispatchError::Decode(format!(
                 "command {} did not match its schema",
                 self.schema
-            )))?;
+            )))
+        })?;
 
         // Safe: the spawn that registered this adapter built the state as
         // the same `A` — a mismatch is a kernel bug, hence a panic.
@@ -495,13 +497,13 @@ impl CommandEntry for ConsumeEntry {
     fn dispatch(
         &self,
         _state: &mut dyn DynEsActor,
-        payload: &Json,
+        payload: &crate::envelope::Payload,
         _ctx: &mut CmdCtx<'_>,
     ) -> Result<crate::envelope::Events, error_stack::Report<DispatchError>> {
         let mut events = crate::envelope::Events::new();
-        events.push(crate::envelope::Event::from_json_view(
+        events.push(crate::envelope::Event::with_shared_payload(
             self.schema.clone(),
-            payload.clone(),
+            crate::envelope::Payload::shared(payload),
         ));
         Ok(events)
     }
@@ -605,20 +607,22 @@ impl CommandEntry for ForeignCommandEntry {
     fn dispatch(
         &self,
         state: &mut dyn DynEsActor,
-        payload: &Json,
+        payload: &crate::envelope::Payload,
         ctx: &mut CmdCtx<'_>,
     ) -> Result<crate::envelope::Events, error_stack::Report<DispatchError>> {
         // DECIDE ONLY (like the typed adapter): the foreign state folds the
         // returned events itself, post-ack, via its own fold closure. The
         // decision closure is the one `Vec`-returning seam left in the
-        // kernel — wrapped once, here, into the compact buffer.
+        // kernel — wrapped once, here, into the compact buffer. The
+        // payload materializes to a tree (memoized) because the foreign
+        // world is JSON-shaped by contract.
         let foreign = state
             .as_any_mut()
             .downcast_mut::<ForeignEsState>()
             .expect("foreign entry on non-foreign state — kernel bug");
         Ok(crate::envelope::Events::from_vec((self.decision)(
             foreign.state(),
-            payload,
+            payload.json(),
             ctx,
         )))
     }
@@ -672,7 +676,7 @@ pub trait MsgEntry: Send + Sync {
     /// [`DispatchError::Decode`] when the payload does not match.
     fn decode(
         &self,
-        payload: &Json,
+        payload: &crate::envelope::Payload,
     ) -> Result<Box<dyn std::any::Any + Send>, error_stack::Report<DispatchError>>;
 
     /// Runs the typed handler against the boxed message (consumes it).
@@ -705,7 +709,7 @@ impl<A: ServiceActor, M> TypedServiceAdapter<A, M> {
 impl<A, M> MsgEntry for TypedServiceAdapter<A, M>
 where
     A: ServiceActor + MsgHandler<M>,
-    M: DeserializeOwned + Send + 'static,
+    M: Schema + DeserializeOwned + Clone + Send + Sync + 'static,
 {
     fn schema(&self) -> SchemaId {
         self.schema.clone()
@@ -713,15 +717,19 @@ where
 
     fn decode(
         &self,
-        payload: &Json,
+        payload: &crate::envelope::Payload,
     ) -> Result<Box<dyn std::any::Any + Send>, error_stack::Report<DispatchError>> {
-        use error_stack::ResultExt;
+        // Downcast first (zero serde on the live path); only wire bytes
+        // that arrived without a value decode here.
         let msg: M = payload
-            .decode::<M>()
-            .change_context(DispatchError::Decode(format!(
-                "message {} did not match its schema",
-                self.schema
-            )))?;
+            .inner()
+            .downcast_ref::<M>()
+            .ok_or_else(|| {
+                error_stack::Report::new(DispatchError::Decode(format!(
+                    "message {} did not match its schema",
+                    self.schema
+                )))
+            })?;
         Ok(Box::new(msg))
     }
 
@@ -759,13 +767,14 @@ impl ServiceAny for dyn DynServiceActor {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::envelope::Payload;
     use crate::actor::{ActorKind, ActorPath};
     use crate::json;
     use crate::schema::Command;
     use crate::schema::{FieldDef, FieldTy, SchemaDef, SchemaKind};
     use serde::{Deserialize, Serialize};
 
-    #[derive(Command, Serialize, Deserialize)]
+    #[derive(Command, Serialize, Deserialize, Clone)]
     struct ReserveStock {
         qty: u32,
     }
@@ -784,7 +793,7 @@ mod tests {
     }
 
     /// A counter as the canonical ES actor under test.
-    #[derive(Serialize, Deserialize, Default)]
+    #[derive(Serialize, Deserialize, Default, Clone)]
     struct Counter {
         count: i64,
     }
@@ -914,7 +923,7 @@ mod tests {
 
         // When dispatching a well-formed command.
         let events = adapter
-            .dispatch(&mut state, &json!({ "qty": 4 }), &mut ctx)
+            .dispatch(&mut state, &Payload::value(ReserveStock { qty: 4 }), &mut ctx)
             .expect("dispatch");
 
         // Then one event came back — DECIDED but not yet applied (the loop
@@ -959,7 +968,7 @@ mod tests {
         let mut ctx = CmdCtx::new(&path, &trace, None, &NullView, &mut outbox);
 
         // When dispatching a malformed payload.
-        let result = adapter.dispatch(&mut state, &json!({ "nope": true }), &mut ctx);
+        let result = adapter.dispatch(&mut state, &Payload::from(json!({ "nope": true })), &mut ctx);
 
         // Then it is a Decode error and the state is untouched.
         let report = result.expect_err("must not decode");
@@ -1002,7 +1011,7 @@ mod tests {
 
         // When dispatching a JSON command (no Rust type involved).
         let events = entry
-            .dispatch(&mut state, &json!({ "qty": 6 }), &mut ctx)
+            .dispatch(&mut state, &Payload::value(ReserveStock { qty: 6 }), &mut ctx)
             .expect("dispatch");
 
         // Then the event came back decided, not applied.
@@ -1068,7 +1077,7 @@ mod tests {
     #[test]
     fn es_any_reads_typed_projector_state() {
         // Given a typed projector shell wrapping a read model at 7.
-        #[derive(Serialize, Deserialize, Default)]
+        #[derive(Serialize, Deserialize, Default, Clone)]
         struct View {
             total: i64,
         }
@@ -1092,7 +1101,7 @@ mod tests {
         let erased: &dyn DynEsActor = &live;
 
         // When reading it as a different actor type.
-        #[derive(Serialize, Deserialize, Default)]
+        #[derive(Serialize, Deserialize, Default, Clone)]
         struct Other {
             x: i64,
         }

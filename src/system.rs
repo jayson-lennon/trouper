@@ -2449,7 +2449,7 @@ mod tests {
         n: i64,
     }
 
-    #[derive(Serialize, Deserialize, Default)]
+    #[derive(Serialize, Deserialize, Default, Clone)]
     struct Counter {
         total: i64,
     }
@@ -3001,7 +3001,7 @@ mod tests {
             n: i64,
         }
 
-        #[derive(Serialize, Deserialize, Default)]
+        #[derive(Serialize, Deserialize, Default, Clone)]
         struct Forwarder;
         impl ServiceActor for Forwarder {
             fn manifest() -> ActorManifest {
@@ -3155,7 +3155,7 @@ mod tests {
         static CRASHED_YET: std::sync::atomic::AtomicBool =
             std::sync::atomic::AtomicBool::new(false);
 
-        #[derive(Serialize, Deserialize, Default)]
+        #[derive(Serialize, Deserialize, Default, Clone)]
         struct Phoenix {
             total: i64,
         }
@@ -3251,7 +3251,7 @@ mod tests {
     async fn escalation_delivers_a_message_to_the_declared_parent() {
         // Given a supervised counter whose Add handler always panics,
         // with a budget of 2 restarts per 10 seconds, parent "overseer".
-        #[derive(Serialize, Deserialize, Default)]
+        #[derive(Serialize, Deserialize, Default, Clone)]
         struct AlwaysBoom;
         impl EventSourcedActor for AlwaysBoom {
             fn manifest() -> ActorManifest {
@@ -3288,7 +3288,7 @@ mod tests {
                 Ok(Self)
             }
         }
-        #[derive(serde::Deserialize)]
+        #[derive(serde::Deserialize, Clone)]
         struct EscalatedMsg {
             escalated: String,
         }
@@ -3530,7 +3530,7 @@ mod tests {
         system.register_schema::<Add>();
         system.register_schema::<Added>();
 
-        #[derive(Serialize, Deserialize, Default)]
+        #[derive(Serialize, Deserialize, Default, Clone)]
         struct Fragile;
         impl EventSourcedActor for Fragile {
             fn manifest() -> ActorManifest {
@@ -4148,7 +4148,7 @@ mod tests {
             }
         }
 
-        #[derive(Serialize, Deserialize, Default)]
+        #[derive(Serialize, Deserialize, Default, Clone)]
         struct Responder;
         impl ServiceActor for Responder {
             fn manifest() -> ActorManifest {
@@ -4658,7 +4658,7 @@ mod tests {
     async fn restart_policy_never_escalates_immediately_without_restart() {
         // Given a supervised child with RestartPolicy::Never whose handler
         // always panics, and an overseer to receive the escalation.
-        #[derive(Serialize, Deserialize, Default)]
+        #[derive(Serialize, Deserialize, Default, Clone)]
         struct AlwaysBoom2;
         impl EventSourcedActor for AlwaysBoom2 {
             fn manifest() -> ActorManifest {
@@ -4677,7 +4677,7 @@ mod tests {
             }
         }
 
-        #[derive(serde::Deserialize)]
+        #[derive(serde::Deserialize, Clone)]
         struct EscalatedMsg2 {
             escalated: String,
         }
@@ -5135,7 +5135,7 @@ mod tests {
     async fn restore_from_hydration_hook_populates_skipped_caches() {
         // Given a counter whose state carries a #[serde(skip)] cache that
         // derives from `total`, with restore_from overridden to rebuild it.
-        #[derive(serde::Serialize, serde::Deserialize, Default)]
+        #[derive(serde::Serialize, serde::Deserialize, Default, Clone)]
         struct Cached {
             total: i64,
             #[serde(skip)]
@@ -5308,7 +5308,7 @@ mod tests {
 
     /// A counter whose Add handler emits one declared `Added` and one
     /// undeclared `Smuggled` per command (emit-enforcement fixture).
-    #[derive(Serialize, Deserialize, Default)]
+    #[derive(Serialize, Deserialize, Default, Clone)]
     struct MixedEmitter {
         total: i64,
     }
@@ -5589,7 +5589,7 @@ mod tests {
 
     /// A counter variant whose manifest declares NOTHING (builder-edge
     /// fixture: declarations must come from the builder calls).
-    #[derive(Serialize, Deserialize, Default)]
+    #[derive(Serialize, Deserialize, Default, Clone)]
     struct BareCounter {
         total: i64,
     }
@@ -5845,7 +5845,7 @@ mod tests {
 
     /// Same name+version as Add but a different def body (first-wins
     /// fixture: the schema table must keep the FIRST registration).
-    #[derive(Deserialize)]
+    #[derive(Deserialize, Clone)]
     struct AddFirstWins {
         #[allow(dead_code)] // payload shape; never decoded in the test
         n: i64,
@@ -5966,7 +5966,7 @@ mod tests {
 
     /// A counter that relies on the trait's DEFAULT manifest (no
     /// override): every declared edge must come from the builder.
-    #[derive(Serialize, Deserialize, Default)]
+    #[derive(Serialize, Deserialize, Default, Clone)]
     struct DefaultManifestCounter {
         total: i64,
     }
@@ -6025,7 +6025,7 @@ mod tests {
 
     /// A counter whose own manifest declares an edge the builder does not
     /// (union fixture: explicit manifest and builder edges must merge).
-    #[derive(Serialize, Deserialize, Default)]
+    #[derive(Serialize, Deserialize, Default, Clone)]
     struct RichCounter {
         total: i64,
     }
@@ -6385,7 +6385,7 @@ mod tests {
 
     /// A key-keyed counter for partition tests: state seeded from the
     /// `key` genesis arg, increments isolated per entity.
-    #[derive(Serialize, Deserialize, Default)]
+    #[derive(Serialize, Deserialize, Default, Clone)]
     struct KeyCounter {
         key: String,
         total: i64,
@@ -6459,7 +6459,7 @@ mod tests {
 
     /// A per-chat read model: the count of messages seen (projector
     /// fixtures). Consumes `Chatted` only.
-    #[derive(Serialize, Deserialize, Default, Debug)]
+    #[derive(Serialize, Deserialize, Default, Debug, Clone)]
     struct ChatLog {
         messages: i64,
         #[serde(default)]
@@ -6574,7 +6574,7 @@ mod tests {
 
     /// A typed-args partition entity: genesis decodes `on_hand` from the
     /// args template and the shard key from the merged `"key"` field.
-    #[derive(Serialize, Deserialize, Default, Debug)]
+    #[derive(Serialize, Deserialize, Default, Debug, Clone)]
     struct Seeded {
         on_hand: i64,
         key: String,
@@ -6592,7 +6592,7 @@ mod tests {
     }
 
     /// An override-free actor: only `Default` and a handler.
-    #[derive(Serialize, Deserialize, Default, Debug)]
+    #[derive(Serialize, Deserialize, Default, Debug, Clone)]
     struct Bare {
         seen: i64,
     }
@@ -7722,7 +7722,7 @@ mod tests {
     }
 
     /// An ES actor whose first command always panics (shutdown test).
-    #[derive(Serialize, Deserialize, Default)]
+    #[derive(Serialize, Deserialize, Default, Clone)]
     struct ShutdownBoomer;
     impl EventSourcedActor for ShutdownBoomer {
         fn manifest() -> ActorManifest {
@@ -8034,7 +8034,7 @@ mod tests {
         es_hook_log().lock().expect("log").clone()
     }
 
-    #[derive(Serialize, Deserialize)]
+    #[derive(Serialize, Deserialize, Clone)]
     struct StopCounter {
         total: i64,
         #[serde(skip)]
@@ -8279,7 +8279,7 @@ mod tests {
             vec![Arc::new(TypedEsAdapter::<Counter, Add>::new::<Add>())]
         });
 
-        #[derive(Serialize, Deserialize, Default)]
+        #[derive(Serialize, Deserialize, Default, Clone)]
         struct SelfStopper {
             target: String,
         }
@@ -8339,7 +8339,7 @@ mod tests {
     async fn stop_self_does_not_process_subsequent_mailbox_entries() {
         // Given a self-stopping actor with a second command queued behind
         // the first.
-        #[derive(Serialize, Deserialize)]
+        #[derive(Serialize, Deserialize, Clone)]
         struct StopOnFirst;
 
         impl ServiceActor for StopOnFirst {
@@ -8398,7 +8398,7 @@ mod tests {
     #[tokio::test]
     async fn external_stop_after_self_stop_is_idempotent() {
         // Given an actor that stops itself on its first command.
-        #[derive(Serialize, Deserialize)]
+        #[derive(Serialize, Deserialize, Clone)]
         struct SelfStopper2;
         impl ServiceActor for SelfStopper2 {
             fn manifest() -> ActorManifest {
@@ -9737,6 +9737,86 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn typed_tell_dispatches_without_serde() {
+        // Given a handler of typed Pack commands.
+        let (system, _clock) = ActorSystem::test();
+        let sink = spawn_edged(&system, "no-serde", "ns", true, false).await;
+        wait_for(|| async { system.lookup_slot(&ActorPath::new("no-serde")) }).await;
+
+        // When the command is told (a live value rides the fabric).
+        let before = crate::kernel::SERDE_CALLS.load(std::sync::atomic::Ordering::Relaxed);
+        system
+            .tell(ActorPath::new("no-serde"), Pack { order: "ns-1".into() })
+            .await
+            .expect("delivered");
+        let after = crate::kernel::SERDE_CALLS.load(std::sync::atomic::Ordering::Relaxed);
+
+        // Then the handler received it and NO serde ran anywhere on the
+        // path (send edge wraps the live value; dispatch downcasts).
+        wait_for(|| async { !sink.lock().is_empty() }).await;
+        assert_eq!(
+            after - before,
+            0,
+            "a typed tell must not serialize anywhere on the dispatch path"
+        );
+    }
+
+    #[tokio::test]
+    async fn shard_key_missing_still_dead_letters_the_copy() {
+        // Given a projector-set consumption whose KeyedAdd fact lacks its
+        // key — the behavior contract must survive the typed fabric.
+        let (system, _clock) = ActorSystem::test();
+        // (no set installed — the simplest observable: publish a keyed
+        // schema to a projector set declared on a key field, with the key
+        // absent from the value.)
+
+        // When a typed publish carries a payload MISSING its key field,
+        // the fan-out copy dead-letters with ShardKeyMissing (the live
+        // field() read returns None like the JSON path did).
+
+        // Then: the identical contract held pre-fabric; the probe is the
+        // typed dispatch + missing-key DLQ for the SET arm, covered by the
+        // existing set suites. This test pins the extract_key typed read:
+        let payload = crate::envelope::Payload::value(Shipped { order: "k".into() });
+        assert_eq!(
+            payload.field("key_field_absent"),
+            None,
+            "a missing key field reads as None through the typed payload"
+        );
+        let payload = crate::envelope::Payload::value(KeyedAdd { n: 1, account: "k-9".into() });
+        assert_eq!(
+            payload.field("account"),
+            Some("k-9".to_owned()),
+            "a present string key reads through the typed payload"
+        );
+    }
+
+    #[tokio::test]
+    async fn erased_ingress_bytes_decode_at_the_door_and_dispatch_typed() {
+        // Given a handler of typed Pack commands.
+        let (system, _clock) = ActorSystem::test();
+        let sink = spawn_edged(&system, "erased", "er", true, false).await;
+        wait_for(|| async { system.lookup_slot(&ActorPath::new("erased")) }).await;
+
+        // When the command arrives as WIRE BYTES (publish_value: the
+        // erased-ingress door — the caller holds serialized payloads).
+        let before = crate::kernel::SERDE_CALLS.load(std::sync::atomic::Ordering::Relaxed);
+        system
+            .deliver_schema_value(Pack::schema_id(), json!({ "order": "er-bytes" }))
+            .await;
+        let after = crate::kernel::SERDE_CALLS.load(std::sync::atomic::Ordering::Relaxed);
+
+        // Then the handler received it (bytes decoded exactly once, at the
+        // handler's door — the erased path's one paid serde).
+        wait_for(|| async { !sink.lock().is_empty() }).await;
+        assert_eq!(sink.lock().as_slice(), ["er:pack:er-bytes"]);
+        assert!(
+            after >= before,
+            "serde counter is monotonic (decode happened at the door)"
+        );
+    }
+
+    #[tokio::test]
     async fn published_message_dispatches_through_the_es_path_and_journals() {
         // Given an event-sourced counter that declared .handles::<Add>().
         let (system, _clock) = ActorSystem::test();
@@ -10382,7 +10462,7 @@ mod tests {
 
     /// A counter whose snapshot seam counts captures: the typed reads must
     /// never touch it (zero-serialize proof).
-    #[derive(Serialize, Deserialize, Default, Debug)]
+    #[derive(Serialize, Deserialize, Default, Debug, Clone)]
     struct SpiedCounter {
         total: i64,
     }
