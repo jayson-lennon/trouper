@@ -1048,7 +1048,10 @@ fn projection_read(c: &mut Criterion) {
                     let projector = ActorPath::new(format!("bench/proj-read-{index}"));
                     assert!(
                         system
-                            .try_with_projector_state::<Ledger, _>(&projector, |l| (l.count, l.tail.len()))
+                            .try_with_projector_state::<Ledger, _>(&projector, |l| (
+                                l.count,
+                                l.tail.len()
+                            ))
                             .is_some(),
                         "projector {projector} must serve a typed frame"
                     );
@@ -1089,8 +1092,7 @@ fn projection_read(c: &mut Criterion) {
                     .unwrap_or(0);
                 // 7 hot frames (most frames draw without new data).
                 for _ in 0..7 {
-                    let _ =
-                        system.try_with_projector_state::<Ledger, _>(&projector, |l| l.count);
+                    let _ = system.try_with_projector_state::<Ledger, _>(&projector, |l| l.count);
                 }
                 // The edit: one command, wait for the fold to move.
                 system

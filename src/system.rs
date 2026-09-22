@@ -2225,10 +2225,16 @@ impl ActorSystem {
         // LIVE CHECK before the factory: a concurrent wake (another read,
         // or the fact flow activating via the set arm) may have landed
         // between our cold check in `with_projector_state` and here —
-        // spawning over the live path panics (`PathTaken`). If live now,
-        // skip straight to the CaughtUp wait: the fold is converging.
+        // spawning over the live path panics (`PathTaken`). A live
+        // projector's own catch-up is either done or in flight; quiesce
+        // (its inbox drains AFTER history folds — step 3 of
+        // `catch_up_projector` starts the loop post-seed) and the fold is
+        // complete. No counter wait here: the winning activation's bump
+        // may already be behind our `watermark` snapshot, so waiting for
+        // a NEW bump would time out on a fold that is actually whole.
         if self.read_projector_live(path).await {
-            return self.wait_caught_up_past(path, watermark).await;
+            self.await_quiescent(path).await;
+            return true;
         }
         (spec.factory)(self, path, &spec.entity_args(&key));
         self.wait_caught_up_past(path, watermark).await
