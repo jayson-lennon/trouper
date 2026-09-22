@@ -15,37 +15,37 @@ costs (`cargo bench --bench micro`), run with criterion on the
 development machine (Intel i5-10400, Linux, release profile). Numbers
 are the mean of the current baseline; treat them as shape and scale,
 not absolute promises — rerun `cargo bench` locally for your hardware.
-(The Rate column names the unit per bench — msg, ask roundtrip, or
-frame read — rather than criterion's generic "elem"; Rate and Mean are
-both per message / roundtrip / read. Durations use the largest unit
-that stays a whole number.)
+(The "Criterion time" column is the raw mean per iteration, exactly as
+`cargo bench` prints it; "Per message" divides by the case's element
+count; "Rate" names the unit per bench — msg, ask roundtrip, or frame
+read — instead of criterion's generic "elem".)
 
 ### e2e — full send → done cycles
 
-| Bench | Case | Per message | Rate |
-|---|---|---:|---:|
-| tell_baseline | 1 message | **34 µs** | 29,100 msg/s |
-| producer_scaling | 1 producer | 35 µs | 28,600 msg/s |
-| | 2 | 36 µs | 27,600 msg/s |
-| | 4 | 36 µs | 27,500 msg/s |
-| | 8 | 33 µs | 30,400 msg/s |
-| payload_size | 500 B | 1.23 ms | — |
-| | 2 KB | 1.26 ms | — |
-| | 64 KB | 1.32 ms | — |
-| | 1 MB | 1.49 ms | — |
-| wide_tree | 100k_nodes | 1.23 ms | — |
-| | 1M_nodes | 1.31 ms | — |
-| fanout | handlers_1 | 12.7 µs | 78,800 roundtrips/s |
-| | handlers_8 | 102.6 µs | 9,700 roundtrips/s |
-| | handlers_64 | 824.4 µs | 1,200 roundtrips/s |
-| overload_block | 16 producers, full inbox | 36.6 µs | 27,300 msg/s |
-| idle_fleet | 1k idle actors | 33.7 µs | 29,700 msg/s |
-| | 10k idle actors | 33.7 µs | 29,700 msg/s |
-| swarm | p32_r128 | 1.43 µs | 700,000 msg/s |
-| | p128_r512 | 1.27 µs | 785,000 msg/s |
-| | p512_r2048 | 1.62 µs | 618,000 msg/s |
-| projection_read | hot_typed_64_frames | 117 ns | 8,550,000 reads/s |
-| | hot_json_64_frames | 6.16 ms | 162 reads/s |
+| Bench | Case | Criterion time | Per message | Rate |
+|---|---|---:|---:|---:|
+| tell_baseline | 64_messages | 2.197 ms | **34.3 µs** | 29,126 msg/s |
+| producer_scaling | 1_producer | 4.483 ms | 35.0 µs | 28,552 msg/s |
+| | 2_producers | 4.630 ms | 36.2 µs | 27,646 msg/s |
+| | 4_producers | 4.647 ms | 36.3 µs | 27,543 msg/s |
+| | 8_producers | 4.212 ms | 32.9 µs | 30,386 msg/s |
+| payload_size | 500_B | 1.227 ms | 1.227 ms | — |
+| | 2_KB | 1.256 ms | 1.256 ms | — |
+| | 64_KB | 1.324 ms | 1.324 ms | — |
+| | 1_MB | 1.493 ms | 1.493 ms | — |
+| wide_tree | 100k_nodes | 1.233 ms | 1.233 ms | — |
+| | 1M_nodes | 1.306 ms | 1.306 ms | — |
+| fanout | handlers_1 | 406.0 µs | 12.69 µs | 78,812 roundtrips/s |
+| | handlers_8 | 3.283 ms | 102.6 µs | 9,747 roundtrips/s |
+| | handlers_64 | 26.38 ms | 824.4 µs | 1,213 roundtrips/s |
+| overload_block | 16_producers_512_messages | 18.75 ms | 36.62 µs | 27,304 msg/s |
+| idle_fleet | 1000_idle_producers_1 | 2.157 ms | 33.71 µs | 29,669 msg/s |
+| | 10k_idle | 2.158 ms | 33.72 µs | 29,656 msg/s |
+| swarm | p32_r128 | 5.847 ms | 1.428 µs | 700,511 msg/s |
+| | p128_r512 | 20.87 ms | 1.274 µs | 785,045 msg/s |
+| | p512_r2048 | 106.1 ms | 1.619 µs | 617,817 msg/s |
+| projection_read | hot_typed_64_frames | 7.485 µs | 117 ns | 8,550,000 reads/s |
+| | hot_json_64_frames | 394.5 ms | 6.165 ms | 162.2 reads/s |
 
 What the shapes mean:
 
