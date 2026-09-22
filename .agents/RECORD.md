@@ -113,3 +113,6 @@ Entries are added or amended **only with human approval**.
 - (bench) Every e2e bench that commits messages measures batches of 1, 64, and 512 messages; swarm keeps its own declared per-case counts, and payload_size/wide_tree measure single committed messages.
 - (bench) Bench completion waits are push-driven: benches await Acked tap facts and ask replies, never poll actor state on a timer — the exception is swarm, whose measured body settles on hand-registered sink counters polled on a timer, out of scope for the push-wait conversion.
 - (bench) Criterion throughput Elements equal the number of messages each iteration commits.
+- (schemas) The Event/Command derive maps every non-shard-key field to FieldTy::Json without inspecting its Rust type; no field type is a compile error.
+- (schemas) The Event/Command derive maps a #[schema(shard_key)] field to its real flat descriptor type, since shard keys are string or number values read at partition routing.
+- (schemas) The derive's schema name is the struct ident and descriptor field names are the Rust field idents; renames are serde's concern only, and the shard-key field must not be serde-renamed.
