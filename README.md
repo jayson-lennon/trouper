@@ -48,28 +48,22 @@ criterion's `Elements` count when comparing against a local run.)
 
 What the shapes mean:
 
-- **tell_baseline** — one producer, one fresh entity, full
-  send→fold→ack. The per-message floor: ~34 µs end to end.
-- **producer_scaling** — P concurrent producers on one entity. Throughput
-  holds as producers grow: per-actor bookkeeping is cell-local, so
-  concurrency doesn't funnel through one lock.
-- **payload_size** — the typed payload fabric's per-message cost across
-  body sizes (payloads are `Arc`-shared; a copy is a refcount bump).
-- **wide_tree** — the same commit cycle with a pathologically WIDE
-  payload (one JSON tree of 100k / 1M filler nodes): the fabric's cost
-  when a payload is a deep tree instead of a few fields. Time is per
-  committed message; the byte column is the payload's wire size.
-- **fanout** — 32 ask roundtrips per iteration (request + reply through
-  one of N echo services); the rate falls as the fixture grows.
-- **overload_block** — 16 producers against a `Block` inbox at capacity:
-  lossless backpressure, senders paced.
-- **idle_fleet** — one busy entity while 1k / 10k idle actors sit
-  alongside. Flat vs tell_baseline: idle actors don't tax the busy path
-  (an idle actor with no duties armed never wakes).
-- **swarm** — P entities × R rounds, many-to-many at fleet scale.
-- **projection_read** — frontend frame reads over a projector's live
-  fold: the typed closure read (zero copies) vs the JSON twin
-  (serialize + decode per read).
+- **tell_baseline** — the floor: one message through send→fold→ack,
+  ~34 µs.
+- **producer_scaling** — 1/2/4/8 producers on one entity. The rate
+  holds as producers grow (no single-lock funnel).
+- **payload_size** — one message per commit at 500 B → 1 MB payloads.
+- **wide_tree** — one commit with a huge JSON-tree payload (100k / 1M
+  nodes): 1.23 → 1.31 ms shows tree width barely matters.
+- **fanout** — 32 ask roundtrips (request + reply); slower with more
+  live echo services.
+- **overload_block** — 16 producers into a full `Block` inbox:
+  backpressure, no loss.
+- **idle_fleet** — one busy entity among 1k / 10k idle actors. Same
+  time as tell_baseline: idle actors cost nothing.
+- **swarm** — many-to-many at fleet scale (32 tells × every receiver).
+- **projection_read** — how fast a UI can read a projector's state:
+  typed closure (8.5 M reads/s) vs JSON (162 reads/s).
 
 ### micro — journal component costs
 
