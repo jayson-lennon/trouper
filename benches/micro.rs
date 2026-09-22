@@ -1,6 +1,8 @@
 //! Component-shaped benchmarks: the journal store's isolated costs, which
 //! e2e benches cannot separate from routing and dispatch. These track the
-//! planned journal-store restructure.
+//! planned journal-store restructure. The store is the in-memory
+//! implementation (the only one); a durable backend would carry its own
+//! cost on top of every number here.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -26,10 +28,12 @@ fn seed(store: &InMemoryJournalStore, path: &ActorPath, events: u64) {
     store.append_sync(path, &batch).expect("seed append");
 }
 
-/// journal_append: the store's append cost at batch sizes 1 / 8 / 64 —
-/// what every committed ES message pays inside the atomic step.
-fn journal_append(c: &mut Criterion) {
-    let mut group = c.benchmark_group("micro/journal_append");
+/// in_memory_journal_append: the store's append cost at batch sizes 1 /
+/// 8 / 64 — what every committed ES message pays inside the atomic
+/// step. The name states the scope: this is the IN-MEMORY store; a
+/// durable backend's cost rides on top.
+fn in_memory_journal_append(c: &mut Criterion) {
+    let mut group = c.benchmark_group("micro/in_memory_journal_append");
     for batch in [1u64, 8, 64] {
         // ONE ELEMENT = one EVENT appended in the batch (not one
         // message): elem/s = events/s through the store, isolated from
@@ -49,15 +53,15 @@ fn journal_append(c: &mut Criterion) {
     group.finish();
 }
 
-/// journal_replay_restart: `load()` over a journaled path — the dominant
-/// cost of a crash restart or cold re-activation (snapshot + tail + full
-/// history clone).
-fn journal_replay_restart(c: &mut Criterion) {
+/// in_memory_journal_replay_restart: `load()` over a journaled path —
+/// the dominant cost of a crash restart or cold re-activation (snapshot
+/// + tail + full history clone), against the in-memory store.
+fn in_memory_journal_replay_restart(c: &mut Criterion) {
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .expect("rt");
-    let mut group = c.benchmark_group("micro/journal_replay_restart");
+    let mut group = c.benchmark_group("micro/in_memory_journal_replay_restart");
     for history in [1_000u64, 10_000] {
         // ONE ELEMENT = one EVENT replayed by load() (snapshot + tail +
         // history): elem/s = replayed events/s — the restart-cost view.
@@ -84,7 +88,7 @@ fn journal_replay_restart(c: &mut Criterion) {
 
 /// Keeps the bench binary honest about the seeded-journal cadence test
 /// (a projector-style repeated load, close/chain-in-bench-style).
-fn journal_repeated_load(c: &mut Criterion) {
+fn in_memory_journal_repeated_load(c: &mut Criterion) {
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -92,8 +96,9 @@ fn journal_repeated_load(c: &mut Criterion) {
     let store = Arc::new(InMemoryJournalStore::new());
     let path = ActorPath::new("bench/repeated");
     seed(&store, &path, 10_000);
-    let mut group = c.benchmark_group("micro/journal_replay_restart");
+    let mut group = c.benchmark_group("micro/in_memory_journal_replay_restart");
     // Same element rule as journal_N: one replayed EVENT (10k history).
+    group.throughput(criterion::Throughput::Elements(10_000));
     group.bench_function("repeat_load_10k", |b| {
         b.iter(|| {
             let store = store.clone();
@@ -111,8 +116,8 @@ const _: Option<Duration> = None;
 
 criterion_group!(
     benches,
-    journal_append,
-    journal_replay_restart,
-    journal_repeated_load
+    in_memory_journal_append,
+    in_memory_journal_replay_restart,
+    in_memory_journal_repeated_load
 );
 criterion_main!(benches);

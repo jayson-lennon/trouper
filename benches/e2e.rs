@@ -13,7 +13,9 @@
 //! Message benches share one matrix: batches of 1, 64, and 512 (the
 //! swarm keeps its declared 32×receivers shape; payload_size and
 //! wide_tree are single-message by design — they price payload width,
-//! not batching).
+//! not batching). The send price and the commit price are separate
+//! benches: `fire_and_forget` stops at channel accept (the EDA
+//! producer's wait), `tell_acked` waits for the durable ack.
 //!
 //! Structure: setup runs inside `rt.block_on`; the measured `b.iter`
 //! bodies hop into the runtime via `rt.block_on` (criterion's thread is
@@ -336,15 +338,17 @@ fn seed_cursor(system: &ActorSystem) -> std::cell::Cell<u64> {
 }
 
 // ---------------------------------------------------------------------------
-// tell_baseline: one producer, one fresh entity, full send→fold→ack cycle.
+// tell_acked: one producer, one fresh entity, full send→fold→ack cycle.
+// The commit floor. For the send-only price (channel accept + route +
+// Sent fact, no commit wait) see fire_and_forget.
 // ---------------------------------------------------------------------------
 
-fn tell_baseline(c: &mut Criterion) {
+fn tell_acked(c: &mut Criterion) {
     let (system, rt) = spawn_system();
     let iterations = Iterations(std::sync::atomic::AtomicU64::new(0));
     let cursor = seed_cursor(&system);
 
-    let mut group = c.benchmark_group("e2e/tell_baseline");
+    let mut group = c.benchmark_group("e2e/tell_acked");
     // ONE ELEMENT = one message, send→fold→ack COMPLETE (the file-wide
     // rule: never a bare tell). So criterion's elem/s reads as msg/s.
     // 1 = the true single-message floor (the push-wait detects its ack
@@ -355,9 +359,48 @@ fn tell_baseline(c: &mut Criterion) {
         group.bench_function(format!("{size}_messages"), |b| {
             b.iter(|| {
                 rt.block_on(async {
-                    let path = iterations.next_path("bench/tell-baseline");
+                    let path = iterations.next_path("bench/tell-acked");
                     spawn_accum(&system, &path).await;
                     drive_and_settle(&system, &cursor, &path, size).await;
+                });
+            });
+        });
+    }
+    group.finish();
+}
+
+// ---------------------------------------------------------------------------
+// fire_and_forget: the same entity, same fresh-per-iteration cadence,
+// but the tell RESOLVES AT CHANNEL ACCEPT — the measured body never
+// waits for routing, folding, or the ack. This is the EDA send price:
+// how long a producer waits before it can process its own next
+// message. One element = one tell handed to the front door; elem/s is
+// sends/s, NOT commits/s (that's tell_acked).
+// ---------------------------------------------------------------------------
+
+fn fire_and_forget(c: &mut Criterion) {
+    let (system, rt) = spawn_system();
+    let iterations = Iterations(std::sync::atomic::AtomicU64::new(0));
+
+    let mut group = c.benchmark_group("e2e/fire_and_forget");
+    // Same 1/64/512 cadence as the commit benches. The fresh entity per
+    // iteration keeps spawn (registry slot + routes) amortized into the
+    // number exactly like tell_acked — the delta between the two benches
+    // at the same size IS the commit+fold+ack cost.
+    group.sample_size(30);
+    for size in [1u64, 64, 512] {
+        group.throughput(criterion::Throughput::Elements(size));
+        group.bench_function(format!("{size}_messages"), |b| {
+            b.iter(|| {
+                rt.block_on(async {
+                    let path = iterations.next_path("bench/fire-forget");
+                    spawn_accum(&system, &path).await;
+                    for n in 0..size as i64 {
+                        system
+                            .tell(path.clone(), Tick { n })
+                            .await
+                            .expect("tell accepted");
+                    }
                 });
             });
         });
@@ -452,7 +495,7 @@ fn producer_scaling(c: &mut Criterion) {
 // payload_size: realistic application messages (a few typed fields, a
 // small tag vec, one bulk body string), one tell per measured message.
 // The reported time IS one tell→fold→ack cycle at that body size —
-// comparable 1:1 against tell_baseline's per-message number.
+// comparable 1:1 against tell_acked's per-message number.
 // ---------------------------------------------------------------------------
 
 fn payload_size(c: &mut Criterion) {
@@ -763,7 +806,7 @@ fn overload_block(c: &mut Criterion) {
 // idle_fleet: throughput on ONE busy actor while 1k / 10k idle actors sit
 // alongside — the polling-floor tax (tracks the polling-removal
 // improvement). Both fleets drive the same 1/64/512-message cases; the
-// idle fleet's cost is the wall-clock delta vs tell_baseline, never the
+// idle fleet's cost is the wall-clock delta vs tell_acked, never the
 // element count.
 // ---------------------------------------------------------------------------
 
@@ -1133,7 +1176,7 @@ fn projection_read(c: &mut Criterion) {
     // advance" case here. A GUI never polls for catch-up — its render
     // loop just re-reads hot each frame (the hot cases above). End-to-end
     // "when does the edit appear on screen" composes from existing
-    // benches: tell_baseline (commit) + broadcast/fanout (delivery) +
+    // benches: tell_acked (commit) + broadcast/fanout (delivery) +
     // hot_typed (the draw).
 
     group.finish();
@@ -1141,7 +1184,8 @@ fn projection_read(c: &mut Criterion) {
 
 criterion_group!(
     benches,
-    tell_baseline,
+    tell_acked,
+    fire_and_forget,
     producer_scaling,
     payload_size,
     wide_tree,

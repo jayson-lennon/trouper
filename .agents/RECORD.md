@@ -105,6 +105,7 @@ Entries are added or amended **only with human approval**.
 - (journal) A due-time snapshot check reads kernel-side anchors and loads the journal only when a snapshot is due.
 - (runtime) Ask reply leases are bounded: failed request deliveries cancel the lease and expired slots are pruned.
 - (bench) Criterion benches live in benches/e2e.rs (usage-shaped) and benches/micro.rs (component-shaped), run via cargo bench.
+- (bench) The e2e tell_acked bench measures the full send→fold→ack commit at batches of 1/64/512 messages; the fire_and_forget bench measures the sustained send-only price (channel accept + route) at the same cadence — its producer-side wait saturates to commit pace when the Block inbox fills, so it is not a durability or burst number.
 - (runtime) Message delivery wakes the actor's loop through a Notify signal fired by the front door; no fixed-interval polling exists on the message path.
 - (runtime) Per-actor mutable bookkeeping lives on the actor cell as lock-free state; the kernel tables lock guards cross-actor state only (an ES message's happy path acquires it zero times; a send acquires it once for its Sent fact).
 - (runtime) An idle actor's loop sleeps until its next due duty (snapshot cadence or passivation) or the next message, whichever comes first; an actor with no duties armed does not wake at all.

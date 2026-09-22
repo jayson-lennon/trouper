@@ -32,9 +32,12 @@ single-message by design (they price payload width, not batching).
 
 | Bench            | Case                        | Criterion time | Per message |                Rate |
 | ---------------- | --------------------------- | -------------: | ----------: | ------------------: |
-| tell_baseline    | 1_messages                  |     333.483 µs |    333.5 µs |         2,999 msg/s |
-|                  | 64_messages                 |       1.428 ms |     22.3 µs |        44,811 msg/s |
-|                  | 512_messages                |      16.427 ms |     32.1 µs |        31,167 msg/s |
+| tell_acked       | 1_messages                  |     367.765 µs |    367.8 µs |         2,719 msg/s |
+|                  | 64_messages                 |       1.847 ms |     28.9 µs |        34,655 msg/s |
+|                  | 512_messages                |      16.299 ms |     31.8 µs |        31,413 msg/s |
+| fire_and_forget  | 1_messages                  |     741.292 µs |    741.3 µs |         1,349 msg/s |
+|                  | 64_messages                 |       1.430 ms |     22.3 µs |        44,756 msg/s |
+|                  | 512_messages                |      14.822 ms |     28.9 µs |        34,544 msg/s |
 | producer_scaling | 1_message_1_producer        |     547.846 µs |    547.8 µs |         1,825 msg/s |
 |                  | 64_messages_1_producers     |       1.501 ms |     23.4 µs |        42,645 msg/s |
 |                  | 64_messages_2_producers     |     668.089 µs |     10.4 µs |        95,796 msg/s |
@@ -76,9 +79,17 @@ single-message by design (they price payload width, not batching).
 
 What the shapes mean:
 
-- **tell_baseline**: the floor, one message through send→fold→ack;
-  batches of 64/512 price the per-message cost once the entity is
-  warm (spawn amortized, ~22-32 µs per message).
+- **tell_acked**: the COMMIT floor, one message through
+  send→fold→ack; batches of 64/512 price the per-message cost once
+  the entity is warm (~29-32 µs per message).
+- **fire_and_forget**: the SEND floor — the same tell loop with no
+  completion wait: channel accept + route, resolved at the front
+  door. This is what an event-driven producer waits before its own
+  next message; the delta vs tell_acked is the fold+ack+observation
+  cost. SUSTAINED LOOP ONLY: tells arrive faster than the entity can
+  commit, so the inbox fills and backpressure engages (the same
+  Block policy overload_block exercises); this measures the
+  producer-side wait, not durability.
 - **producer_scaling**: 1/2/4/8 producers on one entity at 64 and 512
   messages (the 1-message case runs one producer — distributing a
   single message across producers measures nothing). Per-message cost
@@ -94,7 +105,7 @@ What the shapes mean:
   messages (backpressure, no loss); the 1-message case is the same
   entity with its inbox unfilled — the no-backpressure datapoint.
 - **idle_fleet**: one busy entity among 1k / 10k idle actors at 1/64/512
-  messages. Within noise of tell_baseline; idle actors cost nothing.
+  messages. Within noise of tell_acked; idle actors cost nothing.
 - **swarm**: many-to-many at fleet scale (32 tells × every receiver),
   per-message cost at 4k/64k/1M messages in flight.
 - **projection_read**: how fast a UI can read a projector's state,
@@ -102,14 +113,14 @@ What the shapes mean:
 
 ### micro
 
-| Bench                  | Case            |    Mean |
-| ---------------------- | --------------- | ------: |
-| journal_append         | batch_1         | 81.5 ns |
-|                        | batch_8         | 333.9 ns |
-|                        | batch_64        | 2.379 µs |
-| journal_replay_restart | journal_1000    | 51.9 µs |
-|                        | journal_10000   | 557.2 µs |
-|                        | repeat_load_10k | 748.2 µs |
+| Bench                          | Case            |    Mean |
+| ------------------------------ | --------------- | ------: |
+| in_memory_journal_append       | batch_1         | 71.2 ns |
+|                                | batch_8         | 255.3 ns |
+|                                | batch_64        | 1.711 µs |
+| in_memory_journal_replay_rest… | journal_1000    | 52.7 µs |
+|                                | journal_10000   | 592.5 µs |
+|                                | repeat_load_10k | 784.2 µs |
 
 Also see `examples/idle_burn.rs`, a CPU-seconds probe for idle fleets
 (5,000 duty-armed idle actors burn ~0.003 CPU-seconds per second of
