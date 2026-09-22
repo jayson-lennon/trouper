@@ -13,7 +13,9 @@ categories = ["concurrency", "asynchronous"]
 members = ["trouper_macros"]
 
 [dependencies]
-trouper_macros = { path = "trouper_macros" }
+# path for the workspace build, version for the published manifest
+# (crates.io rejects a dependency without a version requirement).
+trouper_macros = { path = "trouper_macros", version = "0.8.0" }
 tokio = { version = "1.53", features = ["rt-multi-thread", "sync", "time", "macros", "net", "io-util", "signal"] }
 serde = { version = "1.0", features = ["derive", "rc"] }
 serde_json = "1.0"
