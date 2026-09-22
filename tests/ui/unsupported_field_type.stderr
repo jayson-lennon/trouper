@@ -1,5 +1,0 @@
-error: unsupported schema field type `std :: collections :: HashMap < String, i64 >` for field `total`; supported: integers, floats, bool, String, uuid::Uuid, Json (or override with #[schema(ty = "json")])
- --> tests/ui/unsupported_field_type.rs:7:12
-  |
-7 |     total: std::collections::HashMap<String, i64>,
-  |            ^^^
