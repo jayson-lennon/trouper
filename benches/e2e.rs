@@ -27,7 +27,7 @@ use serde::{Deserialize, Serialize};
 use tokio::runtime::Runtime;
 use tokio::sync::Barrier;
 
-use trouper::actor::{ActorKind, ActorPath, EventSourcedActor, ServiceActor};
+use trouper::actor::{ActorKind, ActorPath, EventSourcedActor, Projector, ServiceActor};
 use trouper::context::{CmdCtx, MsgCtx};
 use trouper::inbox::OverloadPolicy;
 use trouper::json::Json;
@@ -75,6 +75,29 @@ impl trouper::actor::CommandHandler<Tick> for Accum {
             Ticked::schema_id(),
             Json::of(&Ticked { n: 1 }),
         )])
+    }
+}
+
+/// The read model the projection_read bench draws over: folds `Ticked`
+/// facts into the same count the entity holds, plus a bounded tail
+/// (the shape a UI summary actually renders — an aggregate and a few
+/// recent rows).
+#[derive(Serialize, Deserialize, Default)]
+struct Ledger {
+    count: u64,
+    tail: Vec<u64>,
+}
+
+impl Projector for Ledger {
+    fn apply(&mut self, event: &trouper::envelope::Event) {
+        if event.schema.as_str() == "Ticked" {
+            let n = event.payload_json()["n"].as_u64().unwrap_or(0);
+            self.count += 1;
+            self.tail.push(n);
+            if self.tail.len() > 8 {
+                self.tail.remove(0);
+            }
+        }
     }
 }
 
@@ -931,6 +954,179 @@ fn swarm(c: &mut Criterion) {
     group.finish();
 }
 
+// ---------------------------------------------------------------------------
+// projection_read: frontend frame reads over a projector's live fold — the
+// poll → (optionally) commit → draw cycle a UI runs per frame.
+// "Drawing" IS the closure: `try_with_projector_state::<Ledger, _>(path,
+// |ledger| …)` runs over the live fold with zero copies (examples/
+// try_with.rs demos the pattern). Three shapes:
+//   hot_typed  — N live projectors, closure read only (the steady frame);
+//   hot_json   — the JSON twin (`projector_state`), serialize + decode;
+//   poll+draw  — the frame loop: most frames read hot; every 8th the
+//                frontend sends one command and waits for the fold to
+//                advance, then draws (read-your-write).
+// Completion is the projector's own fold count (polled to an exact
+// watermark), so the bench measures COMPLETE cycles, not channel accepts.
+// ---------------------------------------------------------------------------
+
+fn projection_read(c: &mut Criterion) {
+    let (system, rt) = spawn_system();
+    // FIXTURE (setup block_on ends before the group; each measured body
+    // hops into the runtime fresh — the file's structure rule).
+    rt.block_on(async {
+        // N projectors, each consuming the entity's broadcast `Ticked`
+        // copies. Entities are pre-warmed by one tick each, so every
+        // read below is HOT (no wake path in the steady-state shape).
+        const N: usize = 64;
+        let (projectors, entities): (Vec<ActorPath>, Vec<ActorPath>) = (0..N)
+            .map(|index| {
+                (
+                    ActorPath::new(format!("bench/proj-read-{index}")),
+                    ActorPath::new(format!("bench/proj-src-{index}")),
+                )
+            })
+            .unzip();
+        for (projector, entity) in projectors.iter().zip(entities.iter()) {
+            trouper::builder::spawn_projector_builder::<Ledger>(&system)
+                .at(projector.clone())
+                .args(Json::default())
+                .consumes::<Ticked>()
+                .start();
+            system.spawn_es::<Accum, _>(
+                entity.clone(),
+                &Json::default(),
+                SpawnOpts::default(),
+                || {
+                    vec![Arc::new(
+                        trouper::actor::TypedEsAdapter::<Accum, Tick>::new::<Tick>(),
+                    )]
+                },
+            );
+        }
+        // Warm: one tick per source; EVERY projector consumes EVERY
+        // source's `Ticked` copy (standalone-projector consumption is by
+        // schema, not source — examples/try_with.rs), so each fold ends
+        // at exactly N. Waiting for N also proves all copies arrived.
+        for entity in entities.iter() {
+            system
+                .tell(entity.clone(), Tick { n: 1 })
+                .await
+                .expect("delivered");
+        }
+        for projector in projectors.iter() {
+            let mut settled = false;
+            for _ in 0..30_000 {
+                if system
+                    .with_projector_state::<Ledger, _>(projector, |l| l.count)
+                    .await
+                    == Some(N as u64)
+                {
+                    settled = true;
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+            assert!(
+                settled,
+                "projector {projector} never folded all {N} sources"
+            );
+        }
+    });
+
+    let mut group = c.benchmark_group("e2e/projection_read");
+    group.throughput(criterion::Throughput::Elements(64));
+    group.sample_size(20);
+
+    // HOT TYPED: one frame across the whole fleet (64 closure reads,
+    // zero copies). Misses return None and count as a read of the
+    // previous frame — the never-blocking contract; assert the fleet
+    // stays readable so a broken projector can't fake a fast bench.
+    group.bench_function("hot_typed_64_frames", |b| {
+        b.iter(|| {
+            rt.block_on(async {
+                for index in 0..64usize {
+                    let projector = ActorPath::new(format!("bench/proj-read-{index}"));
+                    assert!(
+                        system
+                            .try_with_projector_state::<Ledger, _>(&projector, |l| (l.count, l.tail.len()))
+                            .is_some(),
+                        "projector {projector} must serve a typed frame"
+                    );
+                }
+            });
+        });
+    });
+
+    // HOT JSON: the same frame through the JSON twin (serialize +
+    // decode per read) — the typed seam's alternative, priced.
+    group.bench_function("hot_json_64_frames", |b| {
+        b.iter(|| {
+            rt.block_on(async {
+                for index in 0..64usize {
+                    let projector = ActorPath::new(format!("bench/proj-read-{index}"));
+                    assert!(
+                        system.projector_state(&projector).await.is_some(),
+                        "projector {projector} must serve a JSON frame"
+                    );
+                }
+            });
+        });
+    });
+
+    // POLL+DRAW: the frame loop. 8 frames per iteration; on the 8th
+    // the frontend tells the source entity and waits for the fold to
+    // advance (read-your-write), then draws. One cycle = 7 hot
+    // frames + 1 commit-and-draw (the interactive shape: a user edits,
+    // the panel redraws).
+    group.bench_function("poll_then_draw_cycle", |b| {
+        b.iter(|| {
+            rt.block_on(async {
+                let entity = ActorPath::new("bench/proj-src-0");
+                let projector = ActorPath::new("bench/proj-read-0");
+                let before = system
+                    .with_projector_state::<Ledger, _>(&projector, |l| l.count)
+                    .await
+                    .unwrap_or(0);
+                // 7 hot frames (most frames draw without new data).
+                for _ in 0..7 {
+                    let _ =
+                        system.try_with_projector_state::<Ledger, _>(&projector, |l| l.count);
+                }
+                // The edit: one command, wait for the fold to move.
+                system
+                    .tell(entity.clone(), Tick { n: 1 })
+                    .await
+                    .expect("delivered");
+                let mut settled = false;
+                for _ in 0..30_000 {
+                    if system
+                        .with_projector_state::<Ledger, _>(&projector, |l| l.count)
+                        .await
+                        >= Some(before + 1)
+                    {
+                        settled = true;
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                }
+                assert!(settled, "fold never advanced past {before}");
+                // The draw over the freshly advanced fold.
+                let frame = system
+                    .with_projector_state::<Ledger, _>(&projector, |l| {
+                        (l.count, l.tail.last().copied())
+                    })
+                    .await;
+                assert!(
+                    frame.is_some_and(|(count, _)| count > before),
+                    "draw must observe the new fact"
+                );
+            });
+        });
+    });
+
+    group.finish();
+}
+
 criterion_group!(
     benches,
     tell_baseline,
@@ -940,6 +1136,7 @@ criterion_group!(
     fanout,
     overload_block,
     idle_fleet,
+    projection_read,
     swarm
 );
 criterion_main!(benches);

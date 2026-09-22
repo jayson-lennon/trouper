@@ -2222,13 +2222,32 @@ impl ActorSystem {
             .strip_prefix(&format!("{}/", spec.public.as_str()))
             .unwrap_or_default()
             .to_owned();
+        // LIVE CHECK before the factory: a concurrent wake (another read,
+        // or the fact flow activating via the set arm) may have landed
+        // between our cold check in `with_projector_state` and here —
+        // spawning over the live path panics (`PathTaken`). If live now,
+        // skip straight to the CaughtUp wait: the fold is converging.
+        if self.read_projector_live(path).await {
+            return self.wait_caught_up_past(path, watermark).await;
+        }
         (spec.factory)(self, path, &spec.entity_args(&key));
-        // Poll for the caught-up counter moving PAST the watermark. The
-        // counter lives in the kernel (never evicted): under tap pressure
-        // the CaughtUp FACT may drop out of the ring, but the wake signal
-        // survives. The factory's arm is synchronous (slot + routes exist
-        // immediately); the catch-up future runs concurrently — the
-        // counter is the marker.
+        self.wait_caught_up_past(path, watermark).await
+    }
+
+    /// Whether a typed projector read would find LIVE state at `path`
+    /// right now (existence only — no lock held past the check).
+    async fn read_projector_live(&self, path: &ActorPath) -> bool {
+        let state = {
+            let kernel = self.kernel.lock();
+            kernel.es_state.get(path).cloned()
+        };
+        state.is_some()
+    }
+
+    /// Waits bounded for the projector's caught-up counter to move past
+    /// `watermark` (the wake's completeness marker — the counter lives in
+    /// the kernel, never evicted, so the signal survives tap pressure).
+    async fn wait_caught_up_past(&self, path: &ActorPath, watermark: u64) -> bool {
         const CAUGHT_UP_BUDGET: std::time::Duration = std::time::Duration::from_secs(5);
         let deadline = tokio::time::Instant::now() + CAUGHT_UP_BUDGET;
         loop {
