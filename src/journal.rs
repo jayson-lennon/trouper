@@ -271,6 +271,15 @@ pub enum JournalError {
     Hint,
     /// A catch-up scan failed (the backing store could not be read).
     Scan,
+    /// A journaled event payload did not decode into its schema's
+    /// registered type (the boundary-decode contract: a failing payload
+    /// is named by schema and seq, never silently skipped).
+    Decode {
+        /// The schema whose payload failed to decode.
+        schema: SchemaId,
+        /// The seq of the failing entry.
+        seq: SeqNo,
+    },
 }
 
 /// One event entry as the store presents it (the replay seam).
@@ -291,6 +300,10 @@ impl JournaledEvent {
     /// re-record) whose payload names `key` under `key_field` — the
     /// per-key projector seed test, mirroring broadcast's derivation.
     pub fn recorded_payload_key(&self, key_field: &str, key: &str) -> bool {
+        // Short-circuit on origin FIRST: the payload field read (a tree
+        // decode on wire bytes) only ever runs for recorded facts. This
+        // is a cold scan path (seed-time, not per-message), so the read
+        // is paid per scanned recorded entry, not per delivered message.
         self.origin == EventOrigin::Recorded
             && self.event.payload.field(key_field).as_deref() == Some(key)
     }
@@ -889,10 +902,89 @@ impl std::fmt::Display for SeqNo {
 mod tests {
     use super::*;
     use crate::json;
+    use crate::schema::Schema as _;
     use crate::schema::SchemaId;
 
     fn event(qty: i64) -> Event {
         Event::from_json_view(SchemaId::new("StockReserved"), json!({ "qty": qty }))
+    }
+
+    #[test]
+    fn journal_payload_is_valid_json_text_and_queryable() {
+        // Given a typed fact appended through the wire door.
+        use crate::envelope::Payload;
+        let fact = StockReservedWire { qty: 7, sku: "w-1".into() };
+        let wire = WireEvent::from(&Event::new(
+            StockReservedWire::schema_id(),
+            Payload::value(fact),
+        ));
+
+        // When the stored bytes are read back (what a SQL TEXT/JSONB
+        // column would hold).
+        let text = std::str::from_utf8(wire.payload.as_bytes()).expect("valid utf8");
+        let parsed: Json = serde_json::from_str(text).expect("valid JSON text");
+
+        // Then the payload is compact queryable JSON (a json_extract-style
+        // read works directly on the stored form).
+        assert_eq!(parsed["qty"], 7);
+        assert_eq!(parsed["sku"], "w-1");
+        assert!(!text.contains(' '), "compact encoding, not pretty-printed");
+    }
+
+    #[test]
+    fn additive_fields_fold_as_none_from_old_payloads() {
+        // Given an OLD-shaped payload (no `sku` field) on the wire — what
+        // a pre-evolution journal entry holds.
+        let old_shape = json!({ "qty": 3 });
+        let wire = WireEvent {
+            schema: StockReservedWire::schema_id(),
+            payload: crate::envelope::PayloadBytes::from(Json::of(&old_shape)),
+        };
+        let event = Event::try_from(wire).expect("wire -> event");
+
+        // When the LATEST type decodes it (the replay/fold door).
+        let fact: StockReservedWire = serde_json::from_slice(event.payload.json_text().as_ref())
+            .expect("additive evolution decodes");
+
+        // Then the new field defaults (the additive-fields contract) and
+        // the old data survives.
+        assert_eq!(fact.qty, 3);
+        assert_eq!(fact.sku, "", "missing new field defaults, never fails");
+    }
+
+    #[test]
+    fn boundary_decode_failure_is_named_by_schema_and_seq() {
+        // Given a wire payload whose shape does not fit its schema's
+        // registered type (qty is a string where an int is declared).
+        let bad = json!({ "qty": "not-a-number", "sku": "w-2" });
+        let wire = WireEvent {
+            schema: StockReservedWire::schema_id(),
+            payload: crate::envelope::PayloadBytes::from(Json::of(&bad)),
+        };
+        let seq = SeqNo(41);
+
+        // When the boundary decode runs and fails.
+        let event = Event::try_from(wire).expect("wire -> event (bytes are valid JSON)");
+        let decoded = serde_json::from_slice::<StockReservedWire>(event.payload.json_text().as_ref());
+
+        // Then the failure is surfaceable as the named Decode error
+        // carrying schema + seq (the loud-rebuild contract).
+        assert!(decoded.is_err(), "type-shape mismatch must not decode");
+        let err = JournalError::Decode {
+            schema: StockReservedWire::schema_id(),
+            seq,
+        };
+        let rendered = format!("{err}");
+        assert!(rendered.contains("StockReserved"), "names the schema: {rendered}");
+        assert!(rendered.contains("41"), "names the seq: {rendered}");
+    }
+
+    /// A derived fact type for the wire-door probes.
+    #[derive(crate::schema::Event, serde::Serialize, serde::Deserialize, Clone, PartialEq)]
+    struct StockReservedWire {
+        qty: i64,
+        #[serde(default)]
+        sku: String,
     }
 
     #[test]

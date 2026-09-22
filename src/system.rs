@@ -9847,6 +9847,47 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn typed_es_command_serializes_exactly_once_at_the_journal_door() {
+        // Given an event-sourced counter (typed Add in, Added out).
+        let (system, _clock) = ActorSystem::test();
+        let path = ActorPath::new("serde-door");
+        system.register_schema::<Add>();
+        system.register_schema::<Added>();
+        system.spawn_es::<Counter, _>(path.clone(), &json!({}), SpawnOpts::default(), || {
+            vec![Arc::new(TypedEsAdapter::<Counter, Add>::new::<Add>())]
+        });
+        wait_for(|| async { system.lookup_slot(&path) }).await;
+
+        // When a typed tell rides the full path: send edge (live value)
+        // → dispatch downcast → decision → journal append (the door).
+        let before = crate::kernel::SERDE_CALLS.load(std::sync::atomic::Ordering::Relaxed);
+        system.tell(path.clone(), Add { n: 5 }).await.expect("told");
+        wait_for(|| async { system.journal_len(&path) == 1 }).await;
+        let after = crate::kernel::SERDE_CALLS.load(std::sync::atomic::Ordering::Relaxed);
+
+        // Then at most ONE serialization ran for the whole path: the
+        // send edge wrapped a live value, dispatch downcast, and the
+        // journal door's encode is MEMOIZED in the payload cell — an
+        // in-memory store may never need it (0); a disk store reads the
+        // memoized bytes once (1). Either way: never more than one.
+        let serde_calls = after - before;
+        assert!(
+            serde_calls <= 1,
+            "send→handle→ack serializes at most once (the memoized journal door), got {serde_calls}"
+        );
+        // And the memoized encoding IS the correct durable form.
+        let entries = system.journal_entries(&path);
+        let event = entries.iter().find_map(|e| match e {
+            crate::journal::JournalEntry::Event { event, .. } => Some(event),
+            _ => None,
+        })
+        .expect("appended");
+        assert_eq!(event.payload_json()["n"], 5, "the stored payload round-trips");
+        let state = system.es_state(&path).await.expect("live");
+        assert_eq!(state["total"], json!(5));
+    }
+
+    #[tokio::test]
     async fn ctx_ask_round_trips_a_typed_request() {
         // Given a caller service actor that asks a replying actor with
         // the TYPED ctx.ask (schema id and payload from the type).
