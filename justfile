@@ -72,8 +72,11 @@ bump LEVEL:
         exit 1
     fi
 
-    # --- Commit + tag (annotated, so `git push --follow-tags` carries it) ---
-    git add Cargo.toml Cargo.lock trouper_macros/Cargo.toml
+    # --- Commit + tag (annotated, so `git push --follow-tags` carries it).
+    # Cargo.lock is deliberately NOT committed: this repo ignores it
+    # (library convention); `cargo update --workspace` above refreshes it
+    # locally only. ---
+    git add Cargo.toml trouper_macros/Cargo.toml
     git commit -m "Bump version to ${CANDIDATE}"
     git tag -a "v${CANDIDATE}" -m "trouper v${CANDIDATE}"
 
