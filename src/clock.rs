@@ -75,6 +75,14 @@ impl ClockService {
     pub fn name(&self) -> &'static str {
         self.backend.name()
     }
+
+    /// The backend as a fake-clock watch receiver, when one was installed
+    /// (tests): idle loops race their deadline sleep against clock jumps,
+    /// so a test's `advance()` instantly recomputes duties (the 20ms poll
+    /// arm this replaces was also the tests' observation wake).
+    pub(crate) fn fake_watch(&self) -> Option<watch::Receiver<u64>> {
+        self.fake.as_ref().map(|f| f.state.clone())
+    }
 }
 
 /// The production clock: wall time.

@@ -22,7 +22,7 @@ use crate::inbox::InboxOffset;
 use crate::inbox::{Inbox, OverloadPolicy};
 use crate::json::Json;
 pub use crate::kernel::DeadLetter;
-use crate::kernel::{ActorCell, EsLoop, KernelState, route};
+use crate::kernel::{ActorCell, CountingKernelLock, EsLoop, KernelState, route};
 use crate::registry::{Endpoint, EndpointInfo, Registry};
 use crate::schema::Schema;
 use crate::schema::SchemaId;
@@ -191,7 +191,7 @@ pub struct ActorSystemCore {
     /// Routing table: slots, schemas, routes.
     pub(crate) registry: Arc<CountingRegistryLock>,
     /// Actor tables: cells, journals, ES state, entries, crashes.
-    pub(crate) kernel: Arc<Mutex<KernelState>>,
+    pub(crate) kernel: Arc<CountingKernelLock>,
     pub(crate) clock: ClockService,
     /// The read-only view handed to handler contexts (the system itself).
     pub(crate) view: Arc<dyn RuntimeView>,
@@ -392,11 +392,17 @@ impl ActorSystem {
         let engine_spec = spec.clone();
         let path = spec.path.clone();
         (spec.spawn)(&engine, &path, &spec.args);
+        // The child's cell, when the spawn closure registered one (an
+        // edge-only spec may spawn nothing — the engine then just parks
+        // on shutdown). The engine reads the crash flag LOCK-FREE and
+        // parks on the cell's crash signal — no polling, no kernel lock.
+        let child_cell = self.kernel.lock().cells.get(&spec.path).cloned();
         let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
         self.child_shutdowns.lock().push(_shutdown_tx);
         tokio::spawn(crate::kernel::supervise_child(
             engine,
             engine_spec,
+            child_cell,
             shutdown_rx,
         ));
     }
@@ -716,12 +722,15 @@ impl ActorSystemCore {
         // the sweep stores through the core handle, the send path reads
         // through clones — never a lock in between.
         let shutting_down = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let mut kernel = KernelState::with_tap_capacity(config.tap_capacity);
-        kernel.journal_store = journal_store.clone();
-        kernel.shutting_down = shutting_down.clone();
+        let kernel = {
+            let mut kernel = KernelState::with_tap_capacity(config.tap_capacity);
+            kernel.journal_store = journal_store.clone();
+            kernel.shutting_down = shutting_down.clone();
+            CountingKernelLock::with_state(kernel)
+        };
         Self {
             registry,
-            kernel: Arc::new(Mutex::new(kernel)),
+            kernel: Arc::new(kernel),
             clock: config.clock,
             view,
             child_shutdowns: parking_lot::Mutex::new(Vec::new()),
@@ -923,42 +932,55 @@ impl ActorSystemCore {
         // undeclared schemas pre-append) — the builder/foreign paths feed
         // extra declarations through `declare_emits` before the first step.
         drop(registry);
-        let mut kernel = self.kernel.lock();
         let cell = Arc::new(ActorCell::new(
             path.clone(),
             Inbox::new(opts.mailbox_capacity.max(1), opts.mailbox_policy),
             opts.mailbox_capacity.max(1),
             opts.mailbox_policy,
         ));
+        // CELL-LOCAL SPAWN CONFIG: the per-actor bookkeeping the loop and
+        // the front door will read — dispatch entries, snapshot cadence +
+        // anchor, passivation, birth work stamp, watermark — is stamped
+        // here, NOT in the kernel tables (the kernel lock guards
+        // cross-actor tables only).
+        {
+            let mut entries_slot = cell.entries.write().expect("entries lock");
+            *entries_slot = entries;
+        }
+        *cell.snapshot_policy.write().expect("snapshot policy lock") = opts.snapshot;
+        // The time-cadence anchor: the spawn anchors it (the first
+        // snapshot becomes due one full interval after the journal began).
+        // Unanchored (`CELL_SENTINEL`) only when the cadence is Off — the
+        // anchor is meaningless without a time policy.
+        if matches!(opts.snapshot, crate::actor::SnapshotCadence::Time(_)) {
+            cell.snapshot_anchor_ms.store(
+                self.clock.now().as_millis(),
+                std::sync::atomic::Ordering::Release,
+            );
+        }
+        *cell.passivation.write().expect("passivation lock") = opts.passivation;
+        // The spawn itself starts the idle clock: an actor spawned and
+        // never messaged passivates from its birth stamp, not from the
+        // first message.
+        cell.last_work_ms.store(
+            self.clock.now().as_millis(),
+            std::sync::atomic::Ordering::Release,
+        );
+        if let Some(wm) = opts.high_watermark {
+            cell.watermark_high
+                .store(wm, std::sync::atomic::Ordering::Release);
+            cell.has_watermark.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+        let mut kernel = self.kernel.lock();
         kernel.cells.insert(path.clone(), cell.clone());
-        // The time-cadence anchor is kernel-side policy bookkeeping (the
-        // spawn anchors it; the first snapshot becomes due one full
-        // interval after the journal began).
-        kernel
-            .snapshot_cadence_ms
-            .insert(path.clone(), Some(self.clock.now().as_millis()));
         kernel
             .es_state
             .insert(path.clone(), Arc::new(tokio::sync::Mutex::new(state)));
-        kernel.entries.insert(path.clone(), entries);
         // Genesis args anchor every rebuild-from-journal (supervised
         // restarts AND boot recovery): without them a replay restarts
         // from `restore({})` instead of the spawn's genesis.
         kernel.genesis_args.insert(path.clone(), args.clone());
-        kernel.snapshot_policy.insert(path.clone(), opts.snapshot);
-        if let Some(passivation) = opts.passivation {
-            kernel.passivation.insert(path.clone(), passivation);
-        }
-        // The spawn itself starts the idle clock: an actor spawned and
-        // never messaged passivates from its birth stamp, not from the
-        // first message.
-        kernel
-            .last_work_ms
-            .insert(path.clone(), self.clock.now().as_millis());
-        if let Some(wm) = opts.high_watermark {
-            kernel.watermarks.insert(path.clone(), (wm, false));
-            cell.has_watermark.store(true, std::sync::atomic::Ordering::SeqCst);
-        }
+        let is_projector = kernel.projectors.contains(&path);
         kernel.record_fact(
             self.clock.now(),
             crate::tap::FactKind::Spawned {
@@ -978,6 +1000,7 @@ impl ActorSystemCore {
             shutting_down: self.shutting_down.clone(),
             view: self.view.clone(),
             clock: self.clock.clone(),
+            is_projector,
         };
         ArmedEsActor { path, loop_ctx, rx }
     }
@@ -1076,26 +1099,31 @@ impl ActorSystemCore {
                 registry.add_route(schema, path.clone());
             }
         }
-        let mut kernel = self.kernel.lock();
         let cell = Arc::new(ActorCell::new(
             path.clone(),
             Inbox::new(opts.mailbox_capacity.max(1), opts.mailbox_policy),
             opts.mailbox_capacity.max(1),
             opts.mailbox_policy,
         ));
-        kernel.cells.insert(path.clone(), cell.clone());
-        kernel.genesis_args.insert(path.clone(), args.clone());
-        kernel.msg_entries.insert(path.clone(), entries);
-        if let Some(passivation) = opts.passivation {
-            kernel.passivation.insert(path.clone(), passivation);
+        // CELL-LOCAL SPAWN CONFIG (service tier): message entries,
+        // passivation, birth work stamp, watermark.
+        {
+            let mut msg_slot = cell.msg_entries.write().expect("msg entries lock");
+            *msg_slot = entries;
         }
-        kernel
-            .last_work_ms
-            .insert(path.clone(), self.clock.now().as_millis());
+        *cell.passivation.write().expect("passivation lock") = opts.passivation;
+        cell.last_work_ms.store(
+            self.clock.now().as_millis(),
+            std::sync::atomic::Ordering::Release,
+        );
         if let Some(wm) = opts.high_watermark {
-            kernel.watermarks.insert(path.clone(), (wm, false));
+            cell.watermark_high
+                .store(wm, std::sync::atomic::Ordering::Release);
             cell.has_watermark.store(true, std::sync::atomic::Ordering::SeqCst);
         }
+        let mut kernel = self.kernel.lock();
+        kernel.cells.insert(path.clone(), cell.clone());
+        kernel.genesis_args.insert(path.clone(), args.clone());
         kernel.record_fact(
             self.clock.now(),
             crate::tap::FactKind::Spawned {
@@ -1114,6 +1142,7 @@ impl ActorSystemCore {
             shutting_down: self.shutting_down.clone(),
             view: self.view.clone(),
             clock: self.clock.clone(),
+            is_projector: false,
         };
         let started_path = path.clone();
         let view = self.view.clone();
@@ -1135,8 +1164,10 @@ impl ActorSystemCore {
                     );
                 }
                 Err(report) => {
-                    let mut kernel = kernel_table.lock();
-                    kernel.crashed.insert(started_path.clone());
+                    // Start failure: the cell is crashed (supervision
+                    // restarts via `start`). The front_cell handle IS the
+                    // registered cell.
+                    front_cell.mark_crashed();
                     let _ = report;
                 }
             }
@@ -1445,6 +1476,7 @@ impl ActorSystemCore {
             shutting_down: self.shutting_down.clone(),
             view: self.view.clone(),
             clock: self.clock.clone(),
+            is_projector: self.kernel.lock().projectors.contains(&path),
         };
         crate::kernel::restart_es(&ctx, genesis_args).await
     }
@@ -1569,7 +1601,11 @@ impl ActorSystemCore {
         for _ in 0..500 {
             let settled = {
                 let kernel = self.kernel.lock();
-                kernel.services.contains_key(path) || kernel.crashed.contains(path)
+                kernel.services.contains_key(path)
+                    || kernel
+                        .cells
+                        .get(path)
+                        .is_some_and(|cell| cell.is_crashed())
             };
             if settled {
                 break;
@@ -1620,6 +1656,7 @@ impl ActorSystemCore {
                 if let Some(cell) = on_stop_cell
                     && cell.claim_on_stop()
                 {
+                    let is_projector = self.kernel.lock().projectors.contains(&path);
                     let ctx = crate::kernel::EsLoop {
                         path: path.clone(),
                         cell,
@@ -1628,6 +1665,7 @@ impl ActorSystemCore {
                         shutting_down: self.shutting_down.clone(),
                         view: self.view.clone(),
                         clock: self.clock.clone(),
+                        is_projector,
                     };
                     crate::kernel::run_on_stop(&ctx).await;
                 }
@@ -1708,10 +1746,9 @@ impl ActorSystemCore {
             // The projector marker dies with the actor too (a re-spawn
             // re-registers it via the factory's builder).
             kernel.projectors.remove(path);
-            // Passivation bookkeeping dies with the actor (a partition set
-            // re-spawn re-registers it via the factory's builder).
-            kernel.passivation.remove(path);
-            kernel.last_work_ms.remove(path);
+            // Passivation bookkeeping and work stamps are CELL-LOCAL now:
+            // they die with the cell (a partition set re-spawn re-registers
+            // them via the factory's builder, as before).
             let notified_parent = kernel.specs.get(path).and_then(|s| s.parent.clone());
             kernel.specs.remove(path);
             if was_live {
@@ -2693,7 +2730,14 @@ mod tests {
         assert_eq!(state["total"], 5);
         let entries = system.journal_entries(&path);
         assert_eq!(entries.len(), 1);
-        assert!(system.kernel.lock().crashed.is_empty());
+        assert!(
+            !system
+                .kernel
+                .lock()
+                .cells
+                .values()
+                .any(|cell| cell.is_crashed())
+        );
     }
 
     #[tokio::test]
@@ -2906,7 +2950,10 @@ mod tests {
         {
             assert!(system.journal_entries(&path).is_empty());
             let kernel = system.kernel.lock();
-            assert!(kernel.crashed.contains(&path));
+            assert!(
+                kernel.cells.get(&path).is_some_and(|cell| cell.is_crashed()),
+                "the panic was recorded on the cell"
+            );
             assert!(kernel.dead_letters.is_empty());
         }
         assert_eq!(system.inbox_cursor(&path).map(|c| c.as_u64()), Some(0));
@@ -3687,11 +3734,14 @@ mod tests {
 
     async fn wait_for_crash(system: &ActorSystem, path: &ActorPath) {
         for _ in 0..2_000 {
+            if system
+                .kernel
+                .lock()
+                .cells
+                .get(path)
+                .is_some_and(|cell| cell.is_crashed())
             {
-                let kernel = system.kernel.lock();
-                if kernel.crashed.contains(path) {
-                    return;
-                }
+                return;
             }
             tokio::time::sleep(std::time::Duration::from_millis(2)).await;
         }
@@ -5431,10 +5481,10 @@ mod tests {
         );
     }
 
-    /// Kernel crash-record peek (tests).
+    /// Kernel crash-record peek (tests): the crash flag lives on the cell.
     fn kernel_has_crash(system: &ActorSystem, path: &ActorPath) -> bool {
         let kernel = system.kernel.lock();
-        kernel.crashed.contains(path)
+        kernel.cells.get(path).is_some_and(|cell| cell.is_crashed())
     }
 
     #[tokio::test]
@@ -9631,6 +9681,184 @@ mod tests {
         );
     }
 
+    /// RED (cell-local bookkeeping): the kernel-lock probe mirror of the
+    /// registry test above. GREEN target: one tell+step acquires the
+    /// kernel ONCE (the commit point); RED today: several (Delivered
+    /// fact, entry table, journal-store clone, post-append bookkeeping
+    /// are separate critical sections).
+    #[tokio::test]
+    async fn delivering_one_es_message_acquires_the_kernel_once() {
+        // Given a live ES counter that has settled from its spawn.
+        let (system, _clock) = ActorSystem::test();
+        let path = ActorPath::new("kernel-lock-count");
+        system.spawn_es::<Counter, _>(path.clone(), &json!({}), SpawnOpts::default(), || {
+            vec![Arc::new(TypedEsAdapter::<Counter, Add>::new::<Add>())]
+        });
+        wait_for(|| async {
+            system.tap_facts().iter().any(
+                |f| matches!(&f.kind, crate::tap::FactKind::Spawned { path: p, .. } if *p == path),
+            )
+        })
+        .await;
+
+        // When ONE command flows through tell + atomic step (kernel
+        // acquisitions counted around the send's await — the actor's own
+        // bookkeeping included, since that is exactly what the cell-local
+        // migration removes from the message path). `wait_for_cursor`
+        // polls the kernel's cursor peek, so the count is taken BEFORE
+        // it: the window is send→(first observe), then the read.
+        let before = crate::kernel::KERNEL_LOCKS.load(std::sync::atomic::Ordering::Relaxed);
+        system
+            .send(system.envelope(Add::schema_id(), path.clone(), json!({ "n": 7 })))
+            .await
+            .expect("delivered");
+        let after = crate::kernel::KERNEL_LOCKS.load(std::sync::atomic::Ordering::Relaxed);
+        let acquisitions = after - before;
+        wait_for_cursor(&system, &path, 1).await;
+
+        // Then the behavior is intact (one Add committed)...
+        let total = system.with_es_state::<Counter, _>(&path, |c| c.total).await;
+        assert_eq!(total, Some(7), "the command committed");
+        // ...and the whole message path acquired the kernel EXACTLY ONCE
+        // (the commit point: Delivered fact + append-store + Acked fact in
+        // one critical section).
+        assert!(
+            acquisitions <= 1,
+            "one tell+step must acquire the kernel ≤1 time (acquired {acquisitions})"
+        );
+    }
+
+    /// RED (deadline idle): an idle ES actor with NO duties armed (no
+    /// passivation, no time-cadence snapshot) must perform ZERO
+    /// non-message wakeups over an observation window. GREEN: the poll
+    /// arm is gone, so the counter does not move. RED today: the 20ms
+    /// poll backstop wakes the loop ~50×/s.
+    #[tokio::test]
+    async fn idle_actor_with_no_duties_never_wakes() {
+        // Given a live ES counter with no duties (SpawnOpts::default():
+        // SnapshotCadence::Off, no passivation), settled from its spawn.
+        let (system, _clock) = ActorSystem::test();
+        let path = ActorPath::new("idle-quiet");
+        system.spawn_es::<Counter, _>(path.clone(), &json!({}), SpawnOpts::default(), || {
+            vec![Arc::new(TypedEsAdapter::<Counter, Add>::new::<Add>())]
+        });
+        wait_for(|| async {
+            system.tap_facts().iter().any(
+                |f| matches!(&f.kind, crate::tap::FactKind::Spawned { path: p, .. } if *p == path),
+            )
+        })
+        .await;
+
+        // When the actor idles for an observation window (100ms — five
+        // poll periods today; the counter is read inline, no helper).
+        let before = crate::kernel::CELL_WAKEUPS.load(std::sync::atomic::Ordering::Relaxed);
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        let after = crate::kernel::CELL_WAKEUPS.load(std::sync::atomic::Ordering::Relaxed);
+        let wakeups = after - before;
+
+        // Then the loop never woke: no duties means nothing to wait for.
+        assert_eq!(
+            wakeups, 0,
+            "an idle actor with no duties must not wake (woke {wakeups}×)"
+        );
+    }
+
+    /// RED (deadline idle): a message delivered to a duty-armed idle
+    /// actor is still handled promptly — the wake signal (Notify), not a
+    /// timer, is the message path. This holds TODAY (the Notify already
+    /// exists) and must KEEP holding after the poll arms are removed;
+    /// the deadline sleep must never delay or lose a delivery.
+    #[tokio::test]
+    async fn delivered_message_wakes_idle_actor_without_timer() {
+        // Given an idle ES counter with a passivation window far beyond
+        // the observation horizon (duties armed, never due here).
+        let (system, _clock) = ActorSystem::test();
+        let path = ActorPath::new("idle-wake");
+        system.spawn_es::<Counter, _>(
+            path.clone(),
+            &json!({}),
+            SpawnOpts {
+                snapshot: SnapshotCadence::Off,
+                mailbox_capacity: 64,
+                mailbox_policy: OverloadPolicy::Block,
+                high_watermark: None,
+                passivation: Some(Passivation {
+                    idle_for: std::time::Duration::from_secs(60),
+                }),
+            },
+            || vec![Arc::new(TypedEsAdapter::<Counter, Add>::new::<Add>())],
+        );
+        wait_for(|| async {
+            system.tap_facts().iter().any(
+                |f| matches!(&f.kind, crate::tap::FactKind::Spawned { path: p, .. } if *p == path),
+            )
+        })
+        .await;
+
+        // When ONE command arrives after the actor has idled.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        system
+            .send(system.envelope(Add::schema_id(), path.clone(), json!({ "n": 9 })))
+            .await
+            .expect("delivered");
+
+        // Then the actor handled it promptly (bounded wall wait — well
+        // beyond any scheduler slop, far below the passivation horizon).
+        wait_for(|| async {
+            system.with_es_state::<Counter, _>(&path, |c| c.total).await == Some(9)
+        })
+        .await;
+    }
+
+    /// RED (supervisor wake): a supervised child that sits idle must NOT
+    /// touch the kernel lock from its supervision engine — the engine
+    /// waits on a signal, not a poll. The crash→restart BEHAVIOR is
+    /// guarded by `supervision_engine_restarts_a_crashed_es_child_...`;
+    /// this probe counts the mechanism (GREEN: zero kernel acquisitions
+    /// over an idle window; RED today: the 5ms poll hammers the lock
+    /// ~200×/s through the SAME mutex every other path needs).
+    #[tokio::test]
+    async fn idle_supervision_engine_never_touches_the_kernel_lock() {
+        // Given a supervised (harmless) child, settled from its spawn.
+        let (system, _clock) = ActorSystem::test();
+        let child = ActorPath::new("quiet-child");
+        let spec = crate::supervision::ActorSpec {
+            path: child.clone(),
+            parent: None,
+            restart: crate::supervision::RestartPolicy::Permanent,
+            budget: crate::supervision::RestartBudget::default(),
+            backoff: crate::supervision::Backoff::default(),
+            args: json!({}),
+            spawn: Arc::new(|sys: &ActorSystem, path: &ActorPath, args: &Json| {
+                sys.spawn_es::<Counter, _>(path.clone(), args, SpawnOpts::default(), || {
+                    vec![Arc::new(TypedEsAdapter::<Counter, Add>::new::<Add>())]
+                });
+            }),
+        };
+        system.spawn(spec);
+        // Settle BEYOND registration: the spawn closure runs eagerly, but
+        // the child's ES loop task (and its one-time spawn-time kernel
+        // work — recover_at_boot, table inserts) only reaches the lock on
+        // the first scheduler awaits, which land after `system.spawn`
+        // returns. The window must open after that spawn-time burst, so
+        // anything counted inside IS steady-state supervision polling.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        // When the system idles for an observation window (100ms) with
+        // the supervision engine alive underneath.
+        let before = crate::kernel::KERNEL_LOCKS.load(std::sync::atomic::Ordering::Relaxed);
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        let after = crate::kernel::KERNEL_LOCKS.load(std::sync::atomic::Ordering::Relaxed);
+        let acquisitions = after - before;
+
+        // Then the engine never polled: zero kernel acquisitions from
+        // the idle supervision path (any acquisition here IS the poll).
+        assert_eq!(
+            acquisitions, 0,
+            "an idle supervision engine must not acquire the kernel (acquired {acquisitions}×)"
+        );
+    }
+
     #[tokio::test]
     async fn emit_gate_does_not_clone_the_manifest() {
         // Given a mixed emitter (declares Added; smuggles Smuggled) — the
@@ -10925,5 +11153,177 @@ mod tests {
         let log: ChatLog = json_state.decode().expect("decodes");
         assert_eq!(log.messages, 1);
         assert_eq!(typed, 1);
+    }
+
+    #[tokio::test]
+    async fn respawned_entity_passivates_per_factory_config() {
+        // Given a partition set of passivating KeyCounters (50ms idle, on
+        // the ENTITY spawn opts the factory's builder declares — the
+        // set's spec opts stay default, so the builder is the config's
+        // only source).
+        let (system, clock) = ActorSystem::test();
+        system.register_schema::<KeyedAdd>();
+        let spec = crate::pool::PartitionSpec {
+            public: ActorPath::new("cad1"),
+            system: system.clone(),
+            factory: Arc::new(|system, path, args| {
+                crate::builder::spawn_es_builder::<KeyCounter>(system)
+                    .at(path.clone())
+                    .args(args.clone())
+                    .passivate_after(std::time::Duration::from_millis(50))
+                    .handles::<KeyedAdd>()
+                    .emits::<Added>()
+                    .start();
+            }),
+            key_field: "account".to_owned(),
+            args_template: None,
+            opts: SpawnOpts::default(),
+        };
+        system.install_partition_set(spec).expect("install");
+        let entity = ActorPath::new("cad1/k");
+
+        // When one keyed command activates the entity and commits.
+        let e = system.envelope(
+            KeyedAdd::schema_id(),
+            ActorPath::new("cad1"),
+            json!({ "n": 4, "account": "k" }),
+        );
+        system.send(e).await.expect("delivered");
+        wait_for(|| async { system.journal_len(&entity) == 1 }).await;
+
+        // And the idle window elapses: the FIRST passivation (fresh
+        // spawn arms the idle timer from its opts).
+        clock.advance(std::time::Duration::from_millis(200));
+        wait_for(|| async { stopped_with(&system, &entity, crate::actor::StopReason::Passivated) })
+            .await;
+
+        // And the SAME key is addressed again — the factory re-spawns
+        // the entity from its own SpawnOpts — and the re-activated
+        // entity commits the second command.
+        let e2 = system.envelope(
+            KeyedAdd::schema_id(),
+            ActorPath::new("cad1"),
+            json!({ "n": 10, "account": "k" }),
+        );
+        system.send(e2).await.expect("delivered after passivation");
+        wait_for(|| async { system.journal_len(&entity) == 2 }).await;
+
+        // Then the RE-SPAWNED entity passivates too. The guard is strict:
+        // the tap must show a SECOND Spawned fact for the path (the
+        // factory's re-spawn) and a Passivated fact recorded AFTER it —
+        // proving the re-spawn re-armed the idle timer from the factory's
+        // config (a stale/lost policy would leave the re-spawn alive
+        // forever).
+        clock.advance(std::time::Duration::from_millis(200));
+        wait_for(|| async {
+            let facts = system.tap_facts();
+            let spawns = facts
+                .iter()
+                .filter(
+                    |f| matches!(&f.kind, crate::tap::FactKind::Spawned { path: p, .. } if *p == entity),
+                )
+                .count();
+            let last_spawn = facts
+                .iter()
+                .rposition(
+                    |f| matches!(&f.kind, crate::tap::FactKind::Spawned { path: p, .. } if *p == entity),
+                );
+            let passivated_after_respawn = match last_spawn {
+                Some(idx) => facts[idx + 1..].iter().any(
+                    |f| matches!(&f.kind, crate::tap::FactKind::Stopped { path: p, reason: crate::actor::StopReason::Passivated } if *p == entity),
+                ),
+                None => false,
+            };
+            spawns >= 2 && passivated_after_respawn
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn respawned_entity_keeps_spawn_capacity() {
+        // Given a partition set whose factory spawns entities with a
+        // mailbox of TWO under DropNew (the set's spec opts stay default
+        // — the builder's spawn opts are the config's only source).
+        let (system, clock) = ActorSystem::test();
+        system.register_schema::<KeyedAdd>();
+        let spec = crate::pool::PartitionSpec {
+            public: ActorPath::new("cad2"),
+            system: system.clone(),
+            factory: Arc::new(|system, path, args| {
+                crate::builder::spawn_es_builder::<KeyCounter>(system)
+                    .at(path.clone())
+                    .args(args.clone())
+                    .mailbox(2, crate::inbox::OverloadPolicy::DropNew)
+                    .passivate_after(std::time::Duration::from_millis(50))
+                    .handles::<KeyedAdd>()
+                    .emits::<Added>()
+                    .start();
+            }),
+            key_field: "account".to_owned(),
+            args_template: None,
+            opts: SpawnOpts::default(),
+        };
+        system.install_partition_set(spec).expect("install");
+        let entity = ActorPath::new("cad2/cap-2");
+
+        // When the entity activates, commits one command, passivates,
+        // and re-activates from the factory on the same key.
+        let e = system.envelope(
+            KeyedAdd::schema_id(),
+            ActorPath::new("cad2"),
+            json!({ "n": 1, "account": "cap-2" }),
+        );
+        system.send(e).await.expect("delivered");
+        wait_for(|| async { system.journal_len(&entity) == 1 }).await;
+        clock.advance(std::time::Duration::from_millis(200));
+        wait_for(|| async { stopped_with(&system, &entity, crate::actor::StopReason::Passivated) })
+            .await;
+        let e2 = system.envelope(
+            KeyedAdd::schema_id(),
+            ActorPath::new("cad2"),
+            json!({ "n": 2, "account": "cap-2" }),
+        );
+        system.send(e2).await.expect("delivered after passivation");
+        wait_for(|| async { system.journal_len(&entity) == 2 }).await;
+
+        // And a burst of TWENTY commands crosses the re-spawned entity's
+        // tiny mailbox: each send only awaits the kernel route (DropNew's
+        // front door is non-blocking), so the burst lands FASTER than the
+        // entity's loop commits — the front-door queue (2× capacity = 4)
+        // fills and the rest are refused to the DLQ.
+        for n in 3..=22_i64 {
+            let burst = system.envelope(
+                KeyedAdd::schema_id(),
+                ActorPath::new("cad2"),
+                json!({ "n": n, "account": "cap-2" }),
+            );
+            system.send(burst).await.expect("delivered");
+        }
+
+        // Then at least one envelope was dead-lettered through the front
+        // door for the re-spawned entity (InboxRefused — the spawned
+        // capacity/policy survived the passivation re-spawn; a default
+        // 64/Block re-spawn would refuse nothing).
+        wait_for(|| async {
+            system
+                .dead_letter_reasons()
+                .await
+                .iter()
+                .any(|r| r.starts_with("InboxRefused"))
+        })
+        .await;
+        let refused_for_entity = system
+            .drain_dead_letters()
+            .into_iter()
+            .filter(|l| {
+                l.reason == crate::kernel::DeadLetterReason::InboxRefused
+                    && l.envelope.schema == KeyedAdd::schema_id()
+                    && l.envelope.payload_json()["account"] == "cap-2"
+            })
+            .count();
+        assert!(
+            refused_for_entity >= 1,
+            "the re-spawned entity still refuses over capacity ({refused_for_entity} refused)"
+        );
     }
 }

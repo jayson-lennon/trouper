@@ -93,56 +93,35 @@ pub(crate) struct KernelState {
     /// Where every actor's journal lives (the in-memory store by
     /// default; a test/backend store rides the same trait).
     pub(crate) journal_store: Arc<dyn crate::journal::JournalStore>,
-    /// Per-path snapshot-cadence bookkeeping (the time anchor is policy
-    /// state, not storage — it stays kernel-side, off the store).
-    pub(crate) snapshot_cadence_ms: HashMap<ActorPath, Option<u64>>,
     pub(crate) es_state: HashMap<ActorPath, Arc<tokio::sync::Mutex<Box<dyn DynEsActor>>>>,
-    pub(crate) entries: HashMap<ActorPath, Vec<Arc<dyn CommandEntry>>>,
     /// Live projectors: their step-9 fan-out is suppressed (a projector's
     /// re-records are checkpoint writes, never new facts).
     pub(crate) projectors: HashSet<ActorPath>,
-    pub(crate) snapshot_policy: HashMap<ActorPath, crate::actor::SnapshotCadence>,
     /// Live service instances (service actors are not journaled).
     pub(crate) services: HashMap<ActorPath, Arc<tokio::sync::Mutex<Box<dyn DynServiceActor>>>>,
     /// Reply-slot leases (the mechanism half of reply addresses).
     pub(crate) replies: crate::reply::ReplyTable,
     /// Ask lifecycle facts (the tap consumes these).
     pub(crate) ask_facts: Vec<AskFact>,
-    /// Per-actor async message dispatch entries.
-    pub(crate) msg_entries: HashMap<ActorPath, Vec<Arc<dyn MsgEntry>>>,
     /// Spawn args (genesis rebuild needs them at restart time).
     pub(crate) genesis_args: HashMap<ActorPath, Json>,
-    /// Paths whose loop died to a handler panic (awaiting supervision).
-    pub(crate) crashed: HashSet<ActorPath>,
     /// Envelopes that could not be delivered or decoded.
     pub(crate) dead_letters: Vec<DeadLetter>,
-    /// The global observation ring (drop-oldest).
+    /// The global observation ring (drop-oldest, self-locking — facts
+    /// are recorded wherever they happen, including without this lock).
     pub(crate) tap: crate::tap::TapRing,
     /// Supervised children: path → spec.
     pub(crate) specs: HashMap<ActorPath, crate::supervision::ActorSpec>,
     /// Sliding-window failure records: path → window.
     pub(crate) failures: HashMap<ActorPath, crate::supervision::FailureWindow>,
-    /// Per-actor backpressure watermarks: path → (high watermark, fired).
-    /// `fired` latches the up-crossing (down-crossings re-arm it), so a
-    /// sustained overload produces one fact, not one per message.
-    pub(crate) watermarks: HashMap<ActorPath, (u64, bool)>,
-    /// Per-actor passivation config: path → idle window. The companion
-    /// `last_work_ms` map carries the injected-clock stamp of the last
-    /// completed step (kernel-side bookkeeping, off the journal store).
-    pub(crate) passivation: HashMap<ActorPath, crate::system::Passivation>,
-    /// Injected-clock millis of each actor's last completed message step.
-    pub(crate) last_work_ms: HashMap<ActorPath, u64>,
     /// Per-projector caught-up counter: incremented every time a
     /// projector's catch-up completes. The wake path polls this counter
     /// instead of scanning the evictable tap ring (the tap's CaughtUp
-    /// fact remains the host-observable marker).
+    /// fact remains the host-observable marker). KERNEL-SIDE BY CONTRACT:
+    /// the wake signal must survive cell teardown (wake_projector
+    /// snapshots the count, re-spawns, and waits for it to move PAST —
+    /// a cell-local counter would reset to 0 and false-succeed).
     pub(crate) caught_up: HashMap<ActorPath, u64>,
-    /// Each ES actor's last COMMITTED event seq, updated at the ack point
-    /// of the atomic step. Lets the idle time-cadence snapshot check run
-    /// O(1) — the anchor seq comes from kernel bookkeeping, not a full
-    /// journal load (only this path's own appends advance it, so it is
-    /// never stale-high).
-    pub(crate) last_event_seq: HashMap<ActorPath, crate::journal::SeqNo>,
     /// The graceful-shutdown barrier: set by the sweep, read on every
     /// route (deliveries dead-letter with `ShuttingDown`), by partition
     /// activation (refused), by the supervision engines (suspended), and
@@ -165,26 +144,17 @@ impl KernelState {
         Self {
             cells: HashMap::new(),
             journal_store: Arc::new(crate::journal::InMemoryJournalStore::new()),
-            snapshot_cadence_ms: HashMap::new(),
             es_state: HashMap::new(),
-            entries: HashMap::new(),
-            snapshot_policy: HashMap::new(),
             services: HashMap::new(),
             replies: crate::reply::ReplyTable::default(),
             ask_facts: Vec::new(),
-            msg_entries: HashMap::new(),
             projectors: HashSet::new(),
             genesis_args: HashMap::new(),
-            crashed: HashSet::new(),
             dead_letters: Vec::new(),
             tap: crate::tap::TapRing::new(tap_capacity),
             specs: HashMap::new(),
             failures: HashMap::new(),
-            watermarks: HashMap::new(),
-            passivation: HashMap::new(),
-            last_work_ms: HashMap::new(),
             caught_up: HashMap::new(),
-            last_event_seq: HashMap::new(),
             shutting_down: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
     }
@@ -196,6 +166,75 @@ impl KernelState {
     /// any loss visible.
     pub fn record_fact(&mut self, ts: crate::clock::Timestamp, kind: crate::tap::FactKind) {
         self.tap.push(ts, kind);
+    }
+}
+
+/// The runtime's shared kernel lock, wrapped with a test-build acquisition
+/// counter — the twin of [`crate::system::CountingRegistryLock`].
+///
+/// Production: a newtype over `Mutex<KernelState>` that derefs exactly like
+/// the mutex — zero behavior change, one struct field. Test builds: every
+/// `lock()` bumps [`KERNEL_LOCKS`] before handing out the guard, so tests
+/// can count critical sections per message window (the cell-local
+/// bookkeeping work's mechanism deliverable).
+pub(crate) struct CountingKernelLock {
+    tables: Mutex<KernelState>,
+    /// A SHARED clone of the state's tap ring (Arc interior): the message
+    /// path records facts without acquiring the tables.
+    tap: crate::tap::TapRing,
+    /// A clone of the state's journal-store `Arc`: the append path clones
+    /// the store without acquiring the tables (system-wide, set once in
+    /// the core's assembly block before the lock is ever shared).
+    store: Arc<dyn crate::journal::JournalStore>,
+}
+
+impl CountingKernelLock {
+    /// Acquires the kernel tables, counting the critical section in test
+    /// builds.
+    #[inline]
+    pub(crate) fn lock(&self) -> parking_lot::MutexGuard<'_, KernelState> {
+        #[cfg(test)]
+        bump_kernel_locks();
+        self.tables.lock()
+    }
+
+    /// Records one fact to the tap WITHOUT acquiring the tables (the ring
+    /// is self-locking and shared with the state) — the message path's
+    /// fact recorder.
+    pub(crate) fn tap_push(&self, ts: crate::clock::Timestamp, kind: crate::tap::FactKind) {
+        self.tap.push(ts, kind);
+    }
+
+    /// The journal store handle, cloned WITHOUT acquiring the tables.
+    pub(crate) fn journal_store(&self) -> Arc<dyn crate::journal::JournalStore> {
+        self.store.clone()
+    }
+
+    /// Wraps an already-built kernel state (the core's assembly block:
+    /// journal store + shutdown barrier swapped in before wrapping). The
+    /// tap ring and the journal-store `Arc` are CLONED out so the hot
+    /// path reads them without the tables.
+    pub(crate) fn with_state(tables: KernelState) -> Self {
+        let tap = tables.tap.clone();
+        let store = tables.journal_store.clone();
+        Self {
+            tables: Mutex::new(tables),
+            tap,
+            store,
+        }
+    }
+}
+
+impl std::ops::Deref for CountingKernelLock {
+    type Target = Mutex<KernelState>;
+    fn deref(&self) -> &Self::Target {
+        &self.tables
+    }
+}
+
+impl std::ops::DerefMut for CountingKernelLock {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.tables
     }
 }
 
@@ -246,6 +285,32 @@ pub(crate) fn bump_registry_locks() {
 pub(crate) static REGISTRY_LOCKS: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
+/// Live `KernelState` critical sections (test builds only). Counted where
+/// the kernel guard is handed out, mirroring [`REGISTRY_LOCKS`] — the
+/// cell-local bookkeeping work's mechanism deliverable (fewer kernel
+/// acquisitions per message) is a lock count no behavioral test observes.
+#[cfg(test)]
+pub(crate) fn bump_kernel_locks() {
+    KERNEL_LOCKS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+#[cfg(test)]
+pub(crate) static KERNEL_LOCKS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// ES/service loop wakeups that are NOT message deliveries (test builds
+/// only): every iteration that completes the idle select's timer arm.
+/// The deliverable "an idle actor with no duties never wakes" is
+/// probe-observable through this counter.
+#[cfg(test)]
+pub(crate) fn bump_cell_wakeups() {
+    CELL_WAKEUPS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+#[cfg(test)]
+pub(crate) static CELL_WAKEUPS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
 
 /// `ActorManifest` clones (test builds only). Bumped by the derive's
 /// hand-written `Clone` impl in schema.rs.
@@ -277,6 +342,13 @@ pub(crate) struct ActorHandle {
 }
 
 /// Everything the runtime owns for one actor across restarts.
+///
+/// OWNERSHIP RULE (cell-local bookkeeping): every field below is state
+/// exactly one loop task reads and writes, or spawn-static config — so it
+/// lives HERE, not in the kernel tables. The kernel lock guards cross-actor
+/// tables only (cells, specs, failures, state shells, dead letters, the
+/// reply table, the caught-up wake counters); a message path never takes it
+/// for per-actor bookkeeping.
 pub(crate) struct ActorCell {
     /// The actor's path (its identity).
     pub(crate) path: ActorPath,
@@ -296,18 +368,71 @@ pub(crate) struct ActorCell {
     pub(crate) has_watermark: std::sync::atomic::AtomicBool,
     /// The running loop's handle, when a task is live.
     pub(crate) handle: tokio::sync::Mutex<Option<ActorHandle>>,
-    /// Wakes the actor loop when work arrives (latency optimization; the
-    /// loop's poll backstop is the correctness guarantee).
+    /// Wakes the actor loop when work arrives (the message path is
+    /// push-driven: the front door fires this on every accepted push; the
+    /// loop never polls for mail).
     pub(crate) work: Arc<Notify>,
     /// Whether the actor's `on_stop` hook has run. Claimed by whichever
     /// caller reaches the graceful exit FIRST (the loop's self-stop/
     /// passivation exit, or the external stop after joining the task) —
     /// the hook runs exactly once per actor lifetime, never twice.
     pub(crate) on_stop_done: std::sync::atomic::AtomicBool,
+    // --- CELL-LOCAL BOOKKEEPING (single-writer: the actor's own loop) ---
+    /// Whether this actor's loop died to a panic (or its service `start`
+    /// failed) and it is awaiting supervision. Written by the loop's
+    /// crash paths, read lock-free by the supervision engine.
+    pub(crate) crashed: std::sync::atomic::AtomicBool,
+    /// Wakes the supervision engine when `crashed` flips true (the
+    /// signal-driven replacement for the 5ms poll).
+    pub(crate) crash_signal: Arc<Notify>,
+    /// Backpressure watermark: the inbox depth that fires the
+    /// `Backpressured` fact (spawn-static once set; 0 = none — checked
+    /// only when `has_watermark` reads true).
+    pub(crate) watermark_high: std::sync::atomic::AtomicU64,
+    /// The watermark latch: `true` from the up-crossing until the depth
+    /// falls back to/below the mark, so a sustained overload produces one
+    /// fact, not one per message. Written only by the front door.
+    pub(crate) watermark_fired: std::sync::atomic::AtomicBool,
+    /// Injected-clock millis of the last COMPLETED message step (only a
+    /// committed step resets the passivation timer). Written by the loop
+    /// on `Step::Work`; the SPAWN stamps it as the idle window's start
+    /// (an actor spawned and never messaged passivates from birth).
+    pub(crate) last_work_ms: std::sync::atomic::AtomicU64,
+    /// This ES actor's last COMMITTED event seq, updated at the ack point.
+    /// `u64::MAX` = never committed (NOT 0 — seq 0 is a legitimate
+    /// committed value, and the idle snapshot rule refuses to snapshot an
+    /// actor whose first post-snapshot seq would skip event 0).
+    pub(crate) last_event_seq: std::sync::atomic::AtomicU64,
+    /// The time-cadence snapshot anchor (injected-clock millis of the last
+    /// completed time snapshot). `u64::MAX` = unanchored — an unanchored
+    /// cadence is never due (safe default, preserved verbatim).
+    pub(crate) snapshot_anchor_ms: std::sync::atomic::AtomicU64,
+    /// The spawn-declared snapshot cadence (ES actors; Off by default).
+    /// Written at spawn (and by a projector-set activation's override),
+    /// read by the step-10 and idle checks.
+    pub(crate) snapshot_policy: std::sync::RwLock<crate::actor::SnapshotCadence>,
+    /// The spawn-declared passivation window, if any. Written at spawn
+    /// (a partition re-spawn re-derives it from the factory's builder;
+    /// a projector-set activation overrides it from its spec).
+    pub(crate) passivation: std::sync::RwLock<Option<crate::system::Passivation>>,
+    /// The spawn-declared command entries (ES tier): what this actor can
+    /// decode. Written at spawn and re-attached at restart; read per
+    /// message (the read side is the hot side).
+    pub(crate) entries: std::sync::RwLock<Vec<Arc<dyn CommandEntry>>>,
+    /// The spawn-declared message entries (service tier).
+    pub(crate) msg_entries: std::sync::RwLock<Vec<Arc<dyn MsgEntry>>>,
 }
+
+/// Sentinel for "never"/"unanchored" in the cell's millis/seq atomics —
+/// never a legitimate value (real timestamps are epoch millis; real seqs
+/// start at 0, and 0 is a legitimate committed seq).
+pub(crate) const CELL_SENTINEL: u64 = u64::MAX;
 
 impl ActorCell {
     /// Creates a cell with a fresh inbox; the endpoint arrives on start.
+    /// Cell-local bookkeeping starts at its defaults (never worked, never
+    /// committed, unanchored, not crashed, no watermark); the spawn site
+    /// stamps the idle window, cadence, and passivation config.
     pub fn new(
         path: ActorPath,
         inbox: Inbox,
@@ -323,6 +448,17 @@ impl ActorCell {
             handle: tokio::sync::Mutex::new(None),
             work: Arc::new(Notify::new()),
             on_stop_done: std::sync::atomic::AtomicBool::new(false),
+            crashed: std::sync::atomic::AtomicBool::new(false),
+            crash_signal: Arc::new(Notify::new()),
+            watermark_high: std::sync::atomic::AtomicU64::new(0),
+            watermark_fired: std::sync::atomic::AtomicBool::new(false),
+            last_work_ms: std::sync::atomic::AtomicU64::new(0),
+            last_event_seq: std::sync::atomic::AtomicU64::new(CELL_SENTINEL),
+            snapshot_anchor_ms: std::sync::atomic::AtomicU64::new(CELL_SENTINEL),
+            snapshot_policy: std::sync::RwLock::new(crate::actor::SnapshotCadence::Off),
+            passivation: std::sync::RwLock::new(None),
+            entries: std::sync::RwLock::new(Vec::new()),
+            msg_entries: std::sync::RwLock::new(Vec::new()),
         }
     }
 
@@ -332,6 +468,28 @@ impl ActorCell {
         !self
             .on_stop_done
             .swap(true, std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Marks the actor crashed and wakes its supervision engine (the
+    /// crash signal; engines read the flag lock-free). Idempotent.
+    pub(crate) fn mark_crashed(&self) {
+        self.crashed
+            .store(true, std::sync::atomic::Ordering::Release);
+        self.crash_signal.notify_waiters();
+    }
+
+    /// Clears the crash flag: a restarted actor is not crashed (the
+    /// supervision engine calls this after a successful restart, so the
+    /// next wait observes a NEW crash, not the handled one).
+    pub(crate) fn clear_crashed(&self) {
+        self.crashed
+            .store(false, std::sync::atomic::Ordering::Release);
+    }
+
+    /// Whether the actor is crashed (lock-free read; Acquire pairs with
+    /// `mark_crashed`'s Release).
+    pub(crate) fn is_crashed(&self) -> bool {
+        self.crashed.load(std::sync::atomic::Ordering::Acquire)
     }
 }
 
@@ -345,13 +503,17 @@ pub(crate) struct EsLoop {
     /// The shared routing table.
     pub(crate) registry: Arc<crate::system::CountingRegistryLock>,
     /// The shared actor tables.
-    pub(crate) kernel: Arc<Mutex<KernelState>>,
+    pub(crate) kernel: Arc<CountingKernelLock>,
     /// Lock-free clone of the shutdown barrier (the send-path check).
     pub(crate) shutting_down: std::sync::Arc<std::sync::atomic::AtomicBool>,
     /// The read-only view handed to handler contexts.
     pub(crate) view: Arc<dyn RuntimeView>,
     /// The injected clock (lease expiries, deterministic tests).
     pub(crate) clock: crate::clock::ClockService,
+    /// Whether this actor is in the kernel's projector set (read once at
+    /// spawn — the set only changes at spawn/teardown, never mid-step).
+    /// Lets step 9 skip the kernel lock.
+    pub(crate) is_projector: bool,
 }
 
 impl EsLoop {
@@ -377,7 +539,7 @@ impl EsLoop {
 /// shutdown barrier, read LOCK-FREE (never through the kernel lock).
 pub(crate) async fn route(
     registry: &crate::system::CountingRegistryLock,
-    kernel: &Mutex<KernelState>,
+    kernel: &CountingKernelLock,
     shutting_down: &std::sync::atomic::AtomicBool,
     envelope: Envelope,
 ) -> Result<ActorPath, Envelope> {
@@ -386,7 +548,7 @@ pub(crate) async fn route(
 
 async fn route_inner(
     registry: &crate::system::CountingRegistryLock,
-    kernel: &Mutex<KernelState>,
+    kernel: &CountingKernelLock,
     shutting_down: &std::sync::atomic::AtomicBool,
     envelope: Envelope,
 ) -> Result<ActorPath, Envelope> {
@@ -582,7 +744,7 @@ async fn route_inner(
 /// same-key race delivers to the winner's entity.
 async fn resolve_partition(
     registry: &crate::system::CountingRegistryLock,
-    kernel: &Mutex<KernelState>,
+    kernel: &CountingKernelLock,
     shutting_down: &std::sync::atomic::AtomicBool,
     envelope: &Envelope,
     dest: ActorPath,
@@ -637,7 +799,7 @@ fn extract_key(registry: &crate::system::CountingRegistryLock, envelope: &Envelo
 /// delivery obligation — the activation rule is declaration-scoped).
 async fn resolve_projector_set(
     registry: &crate::system::CountingRegistryLock,
-    kernel: &Mutex<KernelState>,
+    kernel: &CountingKernelLock,
     shutting_down: &std::sync::atomic::AtomicBool,
     envelope: &Envelope,
     spec: Option<crate::pool::ProjectorSetSpec>,
@@ -662,22 +824,19 @@ async fn resolve_projector_set(
     }
     (spec.factory)(&spec.system, &projector_path, &spec.entity_args(&key));
     // The set owns lifecycle policy for its activated projectors:
-    // passivation and snapshot cadence ride the spec. (A projector's
-    // builder has no passivate_after — a standalone passivated projector
-    // has no wake path — so per-key passivation can only come from here.)
-    // Applied AFTER the factory returns: the arm is synchronous, so the
-    // config is in place before the loop's first idle poll.
+    // passivation and snapshot cadence ride the spec — written to the
+    // CELL (the policy's home now). (A projector's builder has no
+    // passivate_after — a standalone passivated projector has no wake
+    // path — so per-key passivation can only come from here.) Applied
+    // AFTER the factory returns: the arm is synchronous, so the config is
+    // in place before the loop's first idle check. The factory's arm
+    // seeded the cell; the set's spec OVERRIDES it.
     {
-        let mut kernel = kernel.lock();
-        if let Some(passivation) = spec.opts.passivation {
-            kernel
-                .passivation
-                .insert(projector_path.clone(), passivation);
-        }
-        if spec.opts.snapshot != crate::actor::SnapshotCadence::Off {
-            kernel
-                .snapshot_policy
-                .insert(projector_path.clone(), spec.opts.snapshot);
+        let cell = kernel.lock().cells.get(&projector_path).cloned();
+        if let Some(cell) = cell {
+            *cell.passivation.write().expect("passivation lock") = spec.opts.passivation;
+            *cell.snapshot_policy.write().expect("snapshot policy lock") =
+                spec.opts.snapshot;
         }
     }
     Ok(Some(projector_path))
@@ -751,21 +910,25 @@ fn apply_rules(
 /// `detail` is the human-readable elaboration (e.g. the decode error);
 /// `reason` is the typed category.
 pub(crate) fn dead_letter(
-    kernel: &Mutex<KernelState>,
+    kernel: &CountingKernelLock,
     envelope: &Envelope,
     reason: crate::kernel::DeadLetterReason,
     detail: &str,
 ) {
-    let mut kernel = kernel.lock();
-    kernel.dead_letters.push(DeadLetter {
-        schema: envelope.schema.clone(),
-        dest: envelope.dest.clone(),
-        reason: reason.clone(),
-        detail: detail.to_owned(),
-        trace: envelope.trace,
-        envelope: envelope.clone(),
-    });
-    kernel.record_fact(
+    kernel
+        .lock()
+        .dead_letters
+        .push(DeadLetter {
+            schema: envelope.schema.clone(),
+            dest: envelope.dest.clone(),
+            reason: reason.clone(),
+            detail: detail.to_owned(),
+            trace: envelope.trace,
+            envelope: envelope.clone(),
+        });
+    // The fact rides the self-locking tap — observation never needs the
+    // kernel tables.
+    kernel.tap_push(
         envelope.trace.causality_id.as_millis_ts(),
         crate::tap::FactKind::DeadLettered {
             dest: envelope.dest.clone(),
@@ -797,7 +960,7 @@ async fn deliver_with_retry(endpoint: &Endpoint, envelope: Envelope) -> Result<(
 /// silently.
 pub(crate) async fn front_door_loop(
     cell: Arc<ActorCell>,
-    kernel: Arc<Mutex<KernelState>>,
+    kernel: Arc<CountingKernelLock>,
     mut rx: mpsc::Receiver<Envelope>,
 ) {
     while let Some(envelope) = rx.recv().await {
@@ -805,26 +968,30 @@ pub(crate) async fn front_door_loop(
         // WATERMARK CHECK (rate-limited): fires on the UP-crossing only;
         // the latch re-arms when the depth falls back to/below the mark.
         // Actors with no declared watermark (the common case) skip the
-        // whole block — no depth read, no kernel lock on this path (the
-        // cell-local flag answers "declared?" without either).
+        // whole block — no depth read, no lock of any kind (the cell-local
+        // flag answers "declared?"). The latch and the mark are CELL-LOCAL
+        // now (single writer: this front door), so the enqueue path never
+        // takes the kernel lock — the Backpressured fact rides the
+        // self-locking tap.
         if cell.has_watermark.load(std::sync::atomic::Ordering::SeqCst) {
             let depth = cell.inbox.lock().await.len() as u64;
-            let mut kernel_state = kernel.lock();
-            if let Some((wm, fired)) = kernel_state.watermarks.get_mut(&cell.path) {
-                if depth > *wm && !*fired {
-                    *fired = true;
-                    kernel_state.record_fact(
-                        envelope.trace.causality_id.as_millis_ts(),
-                        crate::tap::FactKind::Backpressured {
-                            path: cell.path.clone(),
-                            depth,
-                        },
-                    );
-                } else if depth <= *wm && *fired {
-                    *fired = false;
-                }
+            let wm = cell.watermark_high.load(std::sync::atomic::Ordering::Acquire);
+            if depth > wm
+                && !cell
+                    .watermark_fired
+                    .swap(true, std::sync::atomic::Ordering::AcqRel)
+            {
+                kernel.tap_push(
+                    envelope.trace.causality_id.as_millis_ts(),
+                    crate::tap::FactKind::Backpressured {
+                        path: cell.path.clone(),
+                        depth,
+                    },
+                );
+            } else if depth <= wm {
+                cell.watermark_fired
+                    .store(false, std::sync::atomic::Ordering::Release);
             }
-            drop(kernel_state);
         }
         if accepted {
             cell.work.notify_one();
@@ -848,7 +1015,7 @@ const BLOCK_HOLD_RETRIES: usize = 1_000;
 /// refusals dead-letter immediately, exactly as before.
 async fn push_holding_block(
     cell: &ActorCell,
-    kernel: &Mutex<KernelState>,
+    kernel: &CountingKernelLock,
     envelope: Envelope,
 ) -> bool {
     let mut attempt = 0usize;
@@ -882,10 +1049,127 @@ async fn push_holding_block(
     }
 }
 
+/// The idler: everything one loop's idle tail needs. Cloned per loop.
+#[derive(Clone)]
+struct Idler {
+    clock: crate::clock::ClockService,
+}
+
+impl Idler {
+    /// The next DUE DUTY TIME (injected-clock millis), or `None` when no
+    /// duties are armed:
+    /// - time-cadence snapshot: anchor + interval, ONLY when the cadence
+    ///   is Time AND anchored AND the actor has committed at least once
+    ///   (the seq-0 rule — an unanchored or never-committed cadence is
+    ///   never due, exactly as `maybe_snapshot_on_idle` decides);
+    /// - passivation: birth/last-work stamp + idle window.
+    /// The minimum of the armed duties wins. Mirrors the idle checks'
+    /// cell reads verbatim — a deadline and the check that consumes it
+    /// can never disagree.
+    fn next_duty_due_ms(&self, cell: &ActorCell) -> Option<u64> {
+        let snapshot_due: Option<u64> = match *cell
+            .snapshot_policy
+            .read()
+            .expect("snapshot policy lock")
+        {
+            crate::actor::SnapshotCadence::Time(interval) => {
+                let anchor = cell
+                    .snapshot_anchor_ms
+                    .load(std::sync::atomic::Ordering::Acquire);
+                let committed = cell
+                    .last_event_seq
+                    .load(std::sync::atomic::Ordering::Acquire);
+                if anchor == CELL_SENTINEL || committed == CELL_SENTINEL {
+                    None
+                } else {
+                    Some(anchor.saturating_add(interval.as_millis() as u64))
+                }
+            }
+            _ => None,
+        };
+        let passivation_due: Option<u64> = (*cell
+            .passivation
+            .read()
+            .expect("passivation lock"))
+        .map(|p| {
+            cell.last_work_ms
+                .load(std::sync::atomic::Ordering::Acquire)
+                .saturating_add(p.idle_for.as_millis() as u64)
+        });
+        match (snapshot_due, passivation_due) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        }
+    }
+
+    /// The loop's idle tail: park until a MESSAGE (notify), SHUTDOWN
+    /// (watch), or the next DUE DUTY — never a fixed poll.
+    ///
+    /// Deadline sleeps the real remaining window (exact in production).
+    /// Under an injected fake clock the sleep is raced against the clock
+    /// watch: a test's `advance()` wakes the loop to recompute duties
+    /// immediately (the removed 20ms arm was also the tests' observation
+    /// wake; the clock jump is now). No duties armed: park forever in
+    /// production (`pending` — zero wakeups, the deliverable), or just
+    /// on clock jumps under a fake.
+    async fn idle_wait(
+        &self,
+        cell: &ActorCell,
+        shutdown: &mut watch::Receiver<bool>,
+    ) {
+        let notified = cell.work.notified();
+        let fake_watch = self.clock.fake_watch();
+        tokio::select! {
+            _ = notified => {}
+            _ = shutdown.changed() => {}
+            _ = async {
+                loop {
+                    let due = self.next_duty_due_ms(cell);
+                    let now = self.clock.now().as_millis();
+                    match fake_watch.clone() {
+                        // REAL CLOCK: deadline sleep, exact — the loop
+                        // wakes when the earliest duty is due (or never,
+                        // when nothing is armed: zero wakeups).
+                        None => match due {
+                            Some(due) => {
+                                let window = due.saturating_sub(now);
+                                tokio::time::sleep(
+                                    std::time::Duration::from_millis(window),
+                                )
+                                .await;
+                                #[cfg(test)]
+                                bump_cell_wakeups();
+                                return;
+                            }
+                            None => std::future::pending::<()>().await,
+                        },
+                        // FAKE CLOCK (tests): the fake may jump far ahead
+                        // of real time, so the due delta cannot map to a
+                        // real sleep — recompute on every jump and return
+                        // as soon as the duty is due. The removed 20ms
+                        // arm was also the tests' observation wake; the
+                        // clock jump is now.
+                        Some(mut rx) => {
+                            if due.is_some_and(|d| d <= now) {
+                                #[cfg(test)]
+                                bump_cell_wakeups();
+                                return;
+                            }
+                            let _ = rx.changed().await;
+                        }
+                    }
+                }
+            } => {}
+        }
+    }
+}
+
 /// The ES actor loop: the atomic step, forever, until shutdown or crash.
 ///
-/// Idles with a notify + short poll backstop; the poll is deliberate — it
-/// bounds wakeup latency without lost-wakeup races.
+/// PUSH-DRIVEN: a message wakes the loop through the front door's notify;
+/// the idle tail parks on the notify, the shutdown watch, or the next due
+/// duty (deadline idle — no fixed poll; a duty-armed actor wakes exactly
+/// when its earliest duty is due, an actor with no duties never wakes).
 pub(crate) async fn es_actor_loop(loop_ctx: EsLoop, mut shutdown: watch::Receiver<bool>) {
     // SPAWN-TIME RECOVERY: a re-activated entity (partition re-spawn,
     // or any spawn onto a journaled path) replays its journal before the
@@ -903,10 +1187,14 @@ pub(crate) async fn es_actor_loop(loop_ctx: EsLoop, mut shutdown: watch::Receive
             }
             Step::Idle => {
                 // Idle window: the time-based snapshot cadence is checked
-                // here (the 20ms poll arm below is the wake), never
-                // mid-step — snapshots stay BETWEEN messages.
+                // here (deadline idle is the wake), never mid-step —
+                // snapshots stay BETWEEN messages. Passivation is
+                // TERMINAL for this loop task: on true, break (the
+                // graceful exit already ran inside the check).
                 maybe_snapshot_on_idle(&loop_ctx).await;
-                maybe_passivate(&loop_ctx).await;
+                if maybe_passivate(&loop_ctx).await {
+                    break;
+                }
             }
             Step::Crashed => break, // supervisor takes over
             Step::Stop => {
@@ -916,11 +1204,17 @@ pub(crate) async fn es_actor_loop(loop_ctx: EsLoop, mut shutdown: watch::Receive
                 break;
             }
         }
-        let notified = loop_ctx.cell.work.notified();
-        tokio::select! {
-            _ = notified => {}
-            _ = tokio::time::sleep(std::time::Duration::from_millis(20)) => {}
-        }
+        // DEADLINE IDLE: park on message / shutdown / next due duty. The
+        // ES loop's shutdown wake IS this watch arm (the removed poll was
+        // its only other timer). notified() is created BEFORE the select
+        // — a wake that fired between the last await and now must not be
+        // lost to a permit granted after the arm registered.
+        let idler = Idler {
+            clock: loop_ctx.clock.clone(),
+        };
+        idler
+            .idle_wait(&loop_ctx.cell, &mut shutdown)
+            .await;
     }
     drain_inbox_on_stop(&loop_ctx).await;
 }
@@ -999,27 +1293,25 @@ async fn step_es(ctx: &EsLoop) -> Step {
     let Some(envelope) = envelope else {
         return Step::Idle;
     };
-    {
-        let mut kernel = ctx.kernel.lock();
-        kernel.record_fact(
-            envelope.trace.causality_id.as_millis_ts(),
-            crate::tap::FactKind::Delivered {
-                to: ctx.path.clone(),
-                schema: envelope.schema.clone(),
-                trace: envelope.trace,
-            },
-        );
-    }
+    // The Delivered fact rides the self-locking tap — observation on the
+    // message path never takes the kernel lock.
+    ctx.kernel.tap_push(
+        envelope.trace.causality_id.as_millis_ts(),
+        crate::tap::FactKind::Delivered {
+            to: ctx.path.clone(),
+            schema: envelope.schema.clone(),
+            trace: envelope.trace,
+        },
+    );
 
-    // 2. FIND the command entry for this schema.
+    // 2. FIND the command entry for this schema (cell-local: spawn-static
+    // config, written at spawn/restart, read per message).
     let entry = {
-        let kernel = ctx.kernel.lock();
-        kernel.entries.get(&ctx.path).and_then(|entries| {
-            entries
-                .iter()
-                .find(|e| e.schema() == envelope.schema)
-                .cloned()
-        })
+        let entries = ctx.cell.entries.read().expect("entries lock");
+        entries
+            .iter()
+            .find(|e| e.schema() == envelope.schema)
+            .cloned()
     };
     let Some(entry) = entry else {
         // Unknown schema: dead-letter and ADVANCE the cursor (the message
@@ -1072,17 +1364,14 @@ async fn step_es(ctx: &EsLoop) -> Step {
             // PANIC: nothing appended, nothing acked, outbox discarded.
             // The state may be poisoned — mark crashed and stop; the
             // supervisor rebuilds from the journal (never reuses `state`).
-            {
-                let mut kernel = ctx.kernel.lock();
-                kernel.crashed.insert(ctx.path.clone());
-                kernel.record_fact(
-                    envelope.trace.causality_id.as_millis_ts(),
-                    crate::tap::FactKind::Failed {
-                        path: ctx.path.clone(),
-                        error: "handler panic".to_owned(),
-                    },
-                );
-            }
+            ctx.cell.mark_crashed();
+            ctx.kernel.tap_push(
+                envelope.trace.causality_id.as_millis_ts(),
+                crate::tap::FactKind::Failed {
+                    path: ctx.path.clone(),
+                    error: "handler panic".to_owned(),
+                },
+            );
             let _ = poison;
             return Step::Crashed;
         }
@@ -1145,7 +1434,7 @@ async fn step_es(ctx: &EsLoop) -> Step {
     // NOTE: the declared/undeclared `envelope` binding above was consumed
     // by the filter; the events own their traces now.
     let seqs = {
-        let store = ctx.kernel.lock().journal_store.clone();
+        let store = ctx.kernel.journal_store();
         // A stamped envelope IS a recorded fact from elsewhere (a
         // projector consuming a broadcast copy): journal the identity
         // re-record as a CHECKPOINT — origin `CatchUp { source: the
@@ -1193,8 +1482,7 @@ async fn step_es(ctx: &EsLoop) -> Step {
             },
         };
         if appended.is_err() {
-            let mut kernel = ctx.kernel.lock();
-            kernel.crashed.insert(ctx.path.clone());
+            ctx.cell.mark_crashed();
             return Step::Crashed;
         }
         if !apply_new {
@@ -1206,22 +1494,24 @@ async fn step_es(ctx: &EsLoop) -> Step {
         appended.expect("append ok checked above")
     };
 
-    // 6. ACK (the commit point: this message will never redeliver).
+    // 6. ACK (the commit point: this message will never redeliver). The
+    // commit-point bookkeeping is cell-local + tap-direct: the last
+    // committed seq and the Acked fact land without the kernel lock (the
+    // seq is single-writer — this loop is the only appender for the path).
     ctx.cell.inbox.lock().await.ack();
-    {
-        let mut kernel = ctx.kernel.lock();
-        if let Some(last) = seqs.last() {
-            kernel.last_event_seq.insert(ctx.path.clone(), *last);
-        }
-        kernel.record_fact(
-            envelope.trace.causality_id.as_millis_ts(),
-            crate::tap::FactKind::Acked {
-                to: ctx.path.clone(),
-                schema: envelope.schema.clone(),
-                trace: envelope.trace,
-            },
-        );
+    if let Some(last) = seqs.last() {
+        ctx.cell
+            .last_event_seq
+            .store(last.as_u64(), std::sync::atomic::Ordering::Release);
     }
+    ctx.kernel.tap_push(
+        envelope.trace.causality_id.as_millis_ts(),
+        crate::tap::FactKind::Acked {
+            to: ctx.path.clone(),
+            schema: envelope.schema.clone(),
+            trace: envelope.trace,
+        },
+    );
 
     // 7. APPLY (the same fold replay uses; state may now lag the journal
     // only if the process dies before this line — rebuild covers that).
@@ -1250,7 +1540,7 @@ async fn step_es(ctx: &EsLoop) -> Step {
     // kernel's projector set), not the envelope: a projector consuming a
     // plain host publish has no stamp, but its re-record is still just a
     // checkpoint write.
-    if !ctx.kernel.lock().projectors.contains(&ctx.path) {
+    if !ctx.is_projector {
         fan_out_emits(ctx, events, &seqs).await;
     }
 
@@ -1353,7 +1643,7 @@ pub(crate) struct KernelAskPort {
     /// The shared routing table.
     pub(crate) registry: Arc<crate::system::CountingRegistryLock>,
     /// The shared actor tables (reply leases + ask facts live here).
-    pub(crate) kernel: Arc<Mutex<KernelState>>,
+    pub(crate) kernel: Arc<CountingKernelLock>,
     /// The clock for lease expiries.
     pub(crate) clock: crate::clock::ClockService,
 }
@@ -1510,7 +1800,7 @@ impl crate::context::AskPort for KernelAskPort {
 /// publishes never disturb one-of send rotation.
 pub(crate) async fn broadcast(
     registry: &crate::system::CountingRegistryLock,
-    kernel: &Mutex<KernelState>,
+    kernel: &CountingKernelLock,
     shutting_down: &std::sync::atomic::AtomicBool,
     schema: SchemaId,
     envelope: Envelope,
@@ -1616,7 +1906,7 @@ pub(crate) async fn broadcast(
 /// mechanism); a path routes an ordinary envelope through the registry
 /// (the durable name).
 async fn resolve_reply(
-    kernel: &Mutex<KernelState>,
+    kernel: &CountingKernelLock,
     registry: &crate::system::CountingRegistryLock,
     shutting_down: &std::sync::atomic::AtomicBool,
     to: Address,
@@ -1807,14 +2097,11 @@ fn dead_letter_schema(ctx: &EsLoop, intent: &crate::context::Intent, schema: &Sc
 /// message-count cadence snapshots when the last committed event landed on
 /// an n-boundary; a time cadence is checked on the idle path instead.
 async fn maybe_snapshot(ctx: &EsLoop, seqs: Vec<crate::journal::SeqNo>) {
-    let cadence = {
-        let kernel = ctx.kernel.lock();
-        kernel
-            .snapshot_policy
-            .get(&ctx.path)
-            .copied()
-            .unwrap_or_default()
-    };
+    let cadence = *ctx
+        .cell
+        .snapshot_policy
+        .read()
+        .expect("snapshot policy lock");
     let crate::actor::SnapshotCadence::Messages(n) = cadence else {
         return;
     };
@@ -1848,12 +2135,12 @@ async fn snapshot_now(ctx: &EsLoop, last: crate::journal::SeqNo) {
             .await
             .is_ok()
         {
-            // The time-cadence anchor is kernel-side policy bookkeeping.
-            let mut kernel = ctx.kernel.lock();
-            kernel
-                .snapshot_cadence_ms
-                .insert(ctx.path.clone(), Some(now.as_millis()));
-            kernel.record_fact(
+            // The time-cadence anchor is cell-local policy bookkeeping
+            // (written by this loop alone; `u64::MAX` = unanchored).
+            ctx.cell
+                .snapshot_anchor_ms
+                .store(now.as_millis(), std::sync::atomic::Ordering::Release);
+            ctx.kernel.tap_push(
                 now,
                 crate::tap::FactKind::SnapshotTaken {
                     path: ctx.path.clone(),
@@ -1865,42 +2152,50 @@ async fn snapshot_now(ctx: &EsLoop, last: crate::journal::SeqNo) {
 }
 
 /// The time-cadence half of snapshotting: checked on the ES loop's idle
-/// path (the 20ms poll arm is the wake), so an actor that never receives
-/// another message still snapshots when the interval elapses. BETWEEN
-/// messages by construction — the idle check runs after a full step drained
-/// the inbox.
+/// path, so an actor that never receives another message still snapshots
+/// when the interval elapses. BETWEEN messages by construction — the idle
+/// check runs after a full step drained the inbox.
 ///
-/// The due check is O(1): anchor and last committed seq come from
-/// kernel-side bookkeeping (`snapshot_cadence_ms`, `last_event_seq`), so
-/// an idle tick never loads the journal — `snapshot_now`'s capture reads
-/// the live state, and the store only learns of the snapshot via
+/// The due check is O(1) and LOCK-FREE: cadence, anchor, and last
+/// committed seq are cell-local bookkeeping (single-writer), so an idle
+/// check never loads the journal — `snapshot_now`'s capture reads the
+/// live state, and the store only learns of the snapshot via
 /// `append_snapshot`.
 async fn maybe_snapshot_on_idle(ctx: &EsLoop) {
-    let (cadence, anchor_ms, last_committed) = {
-        let kernel = ctx.kernel.lock();
-        (
-            kernel
-                .snapshot_policy
-                .get(&ctx.path)
-                .copied()
-                .unwrap_or_default(),
-            kernel.snapshot_cadence_ms.get(&ctx.path).copied().flatten(),
-            kernel.last_event_seq.get(&ctx.path).copied(),
-        )
-    };
+    let cadence = *ctx
+        .cell
+        .snapshot_policy
+        .read()
+        .expect("snapshot policy lock");
     let crate::actor::SnapshotCadence::Time(interval) = cadence else {
         return;
     };
+    let anchor = ctx
+        .cell
+        .snapshot_anchor_ms
+        .load(std::sync::atomic::Ordering::Acquire);
+    let last_committed = ctx
+        .cell
+        .last_event_seq
+        .load(std::sync::atomic::Ordering::Acquire);
     // An unanchored cadence is never due (safe default), and an actor
     // that never committed has nothing to anchor a snapshot to: the
     // first post-snapshot seq would wrongly skip event seq 0 on restore.
-    let (Some(anchor), Some(last)) = (anchor_ms, last_committed) else {
-        return;
-    };
-    if ctx.clock.now().as_millis().saturating_sub(anchor) < interval.as_millis() as u64 {
+    // (Both are `CELL_SENTINEL`, never 0 — 0 is a legitimate value for
+    // both a millis timestamp and a committed seq.)
+    if anchor == CELL_SENTINEL || last_committed == CELL_SENTINEL {
         return;
     }
-    snapshot_now(ctx, last).await;
+    if ctx
+        .clock
+        .now()
+        .as_millis()
+        .saturating_sub(anchor)
+        < interval.as_millis() as u64
+    {
+        return;
+    }
+    snapshot_now(ctx, crate::journal::SeqNo::new(last_committed)).await;
 }
 
 /// Closes the inbox on stop; teardown (or the sweep) flushes undelivered
@@ -1920,8 +2215,9 @@ async fn drain_inbox_on_stop(ctx: &EsLoop) {
 /// message merely enqueued does not.
 fn stamp_work(ctx: &EsLoop) {
     let now = ctx.clock.now().as_millis();
-    let mut kernel = ctx.kernel.lock();
-    kernel.last_work_ms.insert(ctx.path.clone(), now);
+    ctx.cell
+        .last_work_ms
+        .store(now, std::sync::atomic::Ordering::Release);
 }
 
 /// The idle arm's passivation check: when the actor's declared idle
@@ -1930,28 +2226,34 @@ fn stamp_work(ctx: &EsLoop) {
 /// already queued through the normal step path (bounded by inbox
 /// capacity), then exit gracefully with `StopReason::Passivated`.
 ///
+/// Returns `true` when the actor PASSIVATED (the caller's loop must
+/// break — passivation is terminal for this loop task; re-activation is
+/// the factory's job, not this task's).
+///
 /// Suspended during the shutdown sweep: the sweep owns termination.
-async fn maybe_passivate(ctx: &EsLoop) {
-    let (idle_for, last_work_ms) = {
-        let kernel = ctx.kernel.lock();
-        // The sweep owns termination: passivation stands down.
-        if kernel
-            .shutting_down
-            .load(std::sync::atomic::Ordering::SeqCst)
-        {
-            return;
-        }
-        match kernel.passivation.get(&ctx.path) {
-            Some(p) => (p.idle_for, kernel.last_work_ms.get(&ctx.path).copied()),
-            None => return,
-        }
+async fn maybe_passivate(ctx: &EsLoop) -> bool {
+    // The sweep owns termination: passivation stands down (lock-free —
+    // the loop holds its own Arc of the barrier).
+    if ctx
+        .shutting_down
+        .load(std::sync::atomic::Ordering::SeqCst)
+    {
+        return false;
+    }
+    let idle_for = *ctx.cell.passivation.read().expect("passivation lock");
+    let Some(idle_for) = idle_for.map(|p| p.idle_for) else {
+        return false;
     };
+    // The spawn ALWAYS stamps the idle window's start (the birth stamp —
+    // millis 0 is a legitimate injected-clock value, so no sentinel here:
+    // an actor spawned and never messaged passivates from birth).
+    let last = ctx
+        .cell
+        .last_work_ms
+        .load(std::sync::atomic::Ordering::Acquire);
     let now = ctx.clock.now().as_millis();
-    let Some(last) = last_work_ms else {
-        return;
-    };
     if now.saturating_sub(last) < idle_for.as_millis() as u64 {
-        return;
+        return false;
     }
     // CLOSE THE DOOR first: pushes now refuse to the DLQ, but entries
     // already inside stay processable (peek/ack still work on a closed
@@ -1979,7 +2281,7 @@ async fn maybe_passivate(ctx: &EsLoop) {
     // Lifecycle hint BEFORE the exit: the journal is durable (everything
     // drained), so the store may demote the path to cold storage. A
     // failing hint never blocks passivation — log and proceed.
-    let store = ctx.kernel.lock().journal_store.clone();
+    let store = ctx.kernel.journal_store();
     if let Err(e) = store.passivated(&ctx.path).await {
         tracing::error!(
             actor = %ctx.path,
@@ -1988,6 +2290,10 @@ async fn maybe_passivate(ctx: &EsLoop) {
     }
     ctx.graceful_exit(crate::actor::StopReason::Passivated)
         .await;
+    // Terminal for THIS loop task: the loop must break, never re-idle
+    // (re-idling with cell-local config intact would spin a zombie:
+    // still-due → passivate → idempotent teardown → forever).
+    true
 }
 /// The service actor loop: pop → decode → dispatch (async, impure) →
 /// drop the message. No journal, no cursor — service actors are at-most-once
@@ -2003,9 +2309,11 @@ pub(crate) async fn service_actor_loop(loop_ctx: ServiceLoop, mut shutdown: watc
                 continue;
             }
             Step::Idle => {
-                // Idle window: passivation is checked here (the 20ms
-                // poll arm below is the wake), never mid-step.
-                maybe_passivate(&loop_ctx.es).await;
+                // Idle window: passivation is checked here (deadline
+                // idle is the wake), never mid-step. TERMINAL on true.
+                if maybe_passivate(&loop_ctx.es).await {
+                    break;
+                }
             }
             Step::Crashed => break,
             Step::Stop => {
@@ -2018,12 +2326,14 @@ pub(crate) async fn service_actor_loop(loop_ctx: ServiceLoop, mut shutdown: watc
                 break;
             }
         }
-        let notified = loop_ctx.es.cell.work.notified();
-        tokio::select! {
-            _ = shutdown.changed() => {}
-            _ = notified => {}
-            _ = tokio::time::sleep(std::time::Duration::from_millis(20)) => {}
-        }
+        // DEADLINE IDLE (see the ES loop's arm): message / shutdown /
+        // next due duty. notified() is created before the select.
+        let idler = Idler {
+            clock: loop_ctx.es.clock.clone(),
+        };
+        idler
+            .idle_wait(&loop_ctx.es.cell, &mut shutdown)
+            .await;
     }
     drain_inbox_on_stop(&loop_ctx.es).await;
 }
@@ -2050,27 +2360,28 @@ async fn step_service(ctx: &ServiceLoop) -> Step {
         return Step::Idle;
     };
 
-    {
-        let mut kernel = ctx.es.kernel.lock();
-        kernel.record_fact(
-            envelope.trace.causality_id.as_millis_ts(),
-            crate::tap::FactKind::Delivered {
-                to: ctx.es.path.clone(),
-                schema: envelope.schema.clone(),
-                trace: envelope.trace,
-            },
-        );
-    }
+    // The Delivered fact rides the self-locking tap (no kernel lock).
+    ctx.es.kernel.tap_push(
+        envelope.trace.causality_id.as_millis_ts(),
+        crate::tap::FactKind::Delivered {
+            to: ctx.es.path.clone(),
+            schema: envelope.schema.clone(),
+            trace: envelope.trace,
+        },
+    );
 
-    // 2. FIND the message entry.
+    // 2. FIND the message entry (cell-local spawn-static config).
     let entry = {
-        let kernel = ctx.es.kernel.lock();
-        kernel.msg_entries.get(&ctx.es.path).and_then(|entries| {
-            entries
-                .iter()
-                .find(|e| e.schema() == envelope.schema)
-                .cloned()
-        })
+        let entries = ctx
+            .es
+            .cell
+            .msg_entries
+            .read()
+            .expect("msg entries lock");
+        entries
+            .iter()
+            .find(|e| e.schema() == envelope.schema)
+            .cloned()
     };
     let Some(entry) = entry else {
         dead_letter(
@@ -2145,8 +2456,7 @@ async fn step_service(ctx: &ServiceLoop) -> Step {
     });
     let outbox = if handle.await.is_err() {
         // Handler panicked: mark crashed (supervision restarts via `start`).
-        let mut kernel = ctx.es.kernel.lock();
-        kernel.crashed.insert(ctx.es.path.clone());
+        ctx.es.cell.mark_crashed();
         return Step::Crashed;
     } else {
         outbox_rx.await.unwrap_or_default()
@@ -2192,7 +2502,7 @@ pub(crate) async fn restart_es(
                 events: Vec::new(),
             })
     };
-    let (snapshot, tail) = (replay.snapshot, replay.tail);
+    let (snapshot, tail) = (replay.snapshot.clone(), replay.tail.clone());
 
     // Rebuild through the erased shell: the OLD instance is dropped, the
     // fresh one starts from snapshot-or-genesis plus the replay tail.
@@ -2215,13 +2525,36 @@ pub(crate) async fn restart_es(
         let old = old.lock().await;
         old.rebuild(genesis_args, snapshot_state, &tail)?
     };
-    // Fresh instance swapped in; the poisoned one is gone.
+    // Fresh instance swapped in; the poisoned one is gone. The CELL is
+    // reused (identity + inbox + config survive): its transient state is
+    // reset here — a restarted actor is not crashed, its idle window
+    // restarts from the restart stamp, and the last committed seq is
+    // re-derived from the replay (the journal's head; the seq is the
+    // journal's, not the loop's, at this moment).
     {
         let mut kernel = ctx.kernel.lock();
         kernel
             .es_state
             .insert(ctx.path.clone(), Arc::new(tokio::sync::Mutex::new(fresh)));
-        kernel.crashed.remove(&ctx.path);
+        ctx.cell.clear_crashed();
+        let now_ms = ctx.clock.now().as_millis();
+        ctx.cell
+            .last_work_ms
+            .store(now_ms, std::sync::atomic::Ordering::Release);
+        let journal_head = replay
+            .events
+            .iter()
+            .map(|j| j.seq.as_u64())
+            .max()
+            .unwrap_or(0);
+        ctx.cell.last_event_seq.store(
+            if replay.events.is_empty() {
+                CELL_SENTINEL
+            } else {
+                journal_head
+            },
+            std::sync::atomic::Ordering::Release,
+        );
         kernel.record_fact(
             ctx.clock.now(),
             crate::tap::FactKind::Spawned {
@@ -2280,36 +2613,52 @@ pub(crate) fn door_capacity(
 /// The supervision engine: one task per supervised child, awaiting the
 /// child's crash, then applying the spec — policy → budget → backoff →
 /// restart, or stop + escalate.
-pub async fn supervise_child(
+///
+/// SIGNAL-DRIVEN: the wait is the child's crash Notify (a push), not a
+/// poll — an idle engine acquires nothing. The crashed flag is read
+/// LOCK-FREE off the child's cell (Acquire pairs with the crash store's
+/// Release); the kernel lock appears only on the cold restart path
+/// (budget, genesis args, restart mechanics). `cell` is `None` for an
+/// edge-only spec whose spawn closure registered no actor — the engine
+/// parks on shutdown alone.
+pub(crate) async fn supervise_child(
     system: crate::system::ActorSystem,
     spec: crate::supervision::ActorSpec,
+    mut cell: Option<std::sync::Arc<ActorCell>>,
     mut shutdown: tokio::sync::watch::Receiver<bool>,
 ) {
     loop {
+        // SHUTDOWN FIRST: a stop that fired before/while a crash signal
+        // raced us wins — checked before every wait AND before every
+        // restart action (the old poll loop noticed shutdown within its
+        // 5ms sweep; the instant signal path must check it explicitly or
+        // a crash landing between cycles would restart after the sweep).
+        if *shutdown.borrow_and_update() {
+            return;
+        }
         // Wait for this child to crash (or the system to shut down).
         let mut crashed_seen = false;
         let watch = async {
             loop {
-                // Sweep suspension: a graceful shutdown that spawns
-                // restarts fights itself — stand down until the watcher
-                // exits.
-                if system
-                    .kernel
-                    .lock()
-                    .shutting_down
-                    .load(std::sync::atomic::Ordering::SeqCst)
-                {
-                    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-                    continue;
-                }
-                let crashed = {
-                    let kernel = system.kernel.lock();
-                    kernel.crashed.contains(&spec.path)
+                let Some(cell) = cell.as_ref() else {
+                    // Edge-only spec: no actor exists, so none can crash —
+                    // the watch arm parks forever and only shutdown can
+                    // wake the engine.
+                    loop {
+                        std::future::pending::<()>().await;
+                    }
                 };
-                if crashed {
+                // CHECK FIRST: a crash that fired before we park (e.g.
+                // the fresh loop re-crashing on its redelivered poison
+                // before the engine re-arms) left the flag set with no
+                // pending waiter — notify_waiters does not coalesce for
+                // absent waiters. Lock-free read (Acquire pairs with
+                // mark_crashed's Release).
+                if cell.is_crashed() {
                     break;
                 }
-                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                // Then PARK on the signal: zero wakeups while healthy.
+                cell.crash_signal.notified().await;
             }
         };
         tokio::select! {
@@ -2319,7 +2668,9 @@ pub async fn supervise_child(
             }
         }
         let _ = crashed_seen;
-
+        // The engine's `cell` handle may point at a DEAD cell after a
+        // service restart re-spawned a fresh one — the budget/backoff
+        // section below re-resolves it before acting on the crash.
         // The child crashed. Interpret the spec.
         let now = system.clock.now().as_millis();
         let policy = spec.restart;
@@ -2368,6 +2719,14 @@ pub async fn supervise_child(
         };
         let delay = spec.backoff.delay(consecutive);
         tokio::time::sleep(delay).await;
+        // The backoff sleep is the engine's only await between the
+        // cycle-top shutdown check and the restart — a stop that lands
+        // during the sleep must abort the restart (the old 5ms poll
+        // noticed shutdown within its sweep; the signal path checks
+        // here instead).
+        if *shutdown.borrow_and_update() {
+            return;
+        }
         let is_es_child = system_is_es_child(&system, &spec.path);
         if is_es_child {
             // Journal-anchored recovery: rebuild from snapshot-or-genesis,
@@ -2388,6 +2747,7 @@ pub async fn supervise_child(
                 shutting_down: system.shutting_down.clone(),
                 view: system.view.clone(),
                 clock: system.clock.clone(),
+                is_projector: false,
             };
             let genesis_args = {
                 let kernel = system.kernel.lock();
@@ -2411,11 +2771,20 @@ pub async fn supervise_child(
             }
             (spec.spawn)(&system, &spec.path, &spec.args);
             // The fresh instance is running (the spawn closure re-runs the
-            // loop); clear the stale crash flag so the next wait observes a
-            // NEW crash, not the one we just handled.
+            // loop). A service spawn builds a FRESH cell (already clean) —
+            // but the engine's `cell` handle still points at the dead one:
+            // re-resolve so the next wait listens on the LIVE cell's crash
+            // signal, then make sure the fresh cell starts clear.
             {
-                let mut kernel = system.kernel.lock();
-                kernel.crashed.remove(&spec.path);
+                let fresh_cell = system.kernel.lock().cells.get(&spec.path).cloned();
+                if let Some(fresh_cell) = fresh_cell {
+                    fresh_cell.clear_crashed();
+                    cell = Some(fresh_cell);
+                } else {
+                    // The spawn closure registered nothing this time —
+                    // fall back to the parked edge-only watch.
+                    cell = None;
+                }
             }
         }
     }
@@ -2439,9 +2808,11 @@ async fn escalate(
 ) {
     {
         let mut kernel = system.kernel.lock();
-        kernel.crashed.remove(&spec.path);
-        // The child is gone: record the stop WITH its typed reason, then
-        // the escalation.
+        // The child is gone: clear its crash flag (cell-local now) and
+        // record the stop WITH its typed reason, then the escalation.
+        if let Some(cell) = kernel.cells.get(&spec.path).cloned() {
+            cell.clear_crashed();
+        }
         kernel.record_fact(
             system.clock.now(),
             crate::tap::FactKind::Stopped {

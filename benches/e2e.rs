@@ -693,6 +693,40 @@ fn idle_fleet(c: &mut Criterion) {
             });
         });
     });
+
+    // 10k_idle: the same shape an order of magnitude wider — one busy
+    // entity keeping its steady 64-tell trickle while 10_000 idlers
+    // poll. Spawn is one-per-path, so the fixture is its own cost: the
+    // sample size drops to the criterion floor (10) to keep total wall
+    // time sane, exactly like the file's other heavy cases (swarm, wide_tree).
+    let fleet = 10_000usize;
+    rt.block_on(async {
+        for index in 0..fleet {
+            let path = ActorPath::new(format!("bench/idle-10k-{index}"));
+            system.spawn_es::<Accum, _>(path.clone(), &Json::default(), SpawnOpts::default(), || {
+                vec![Arc::new(trouper::actor::TypedEsAdapter::<Accum, Tick>::new::<Tick>())]
+            });
+        }
+        for index in 0..fleet {
+            let path = ActorPath::new(format!("bench/idle-10k-{index}"));
+            wait_entity_exists(&system, &path).await;
+        }
+        // A SECOND busy entity for this case (the 1k case's target keeps
+        // its own trickle below, isolated from the 10k run).
+        let busy = ActorPath::new("bench/busy-10k");
+        spawn_accum(&system, &busy).await;
+    });
+
+    group.throughput(criterion::Throughput::Elements(64));
+    group.sample_size(10);
+    group.bench_function("10k_idle", |b| {
+        b.iter(|| {
+            rt.block_on(async {
+                let path = ActorPath::new("bench/busy-10k");
+                drive_and_settle_watermark(&system, &path, 64).await;
+            });
+        });
+    });
     group.finish();
 }
 

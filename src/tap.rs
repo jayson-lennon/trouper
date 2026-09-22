@@ -218,8 +218,19 @@ impl Fact {
 }
 
 /// The bounded observation ring (drop-oldest under pressure).
-#[derive(Debug)]
+///
+/// Self-locking (interior mutability): facts are recorded wherever they
+/// happen — including WITHOUT the kernel lock (the message path records
+/// its Delivered/Acked facts at the commit point, which no longer holds
+/// the kernel tables across the journal append). The ring is tiny and the
+/// push is O(1): a sync `parking_lot` mutex, never held across an await.
+#[derive(Debug, Clone)]
 pub struct TapRing {
+    inner: std::sync::Arc<parking_lot::Mutex<TapRingInner>>,
+}
+
+#[derive(Debug)]
+struct TapRingInner {
     capacity: usize,
     entries: VecDeque<Fact>,
     /// The offset the next fact gets (monotonic across evictions).
@@ -232,26 +243,29 @@ impl TapRing {
     /// Creates a tap ring holding `capacity` facts.
     pub fn new(capacity: usize) -> Self {
         Self {
-            capacity: capacity.max(1),
-            entries: VecDeque::new(),
-            next_offset: 0,
-            floor: 0,
+            inner: std::sync::Arc::new(parking_lot::Mutex::new(TapRingInner {
+                capacity: capacity.max(1),
+                entries: VecDeque::new(),
+                next_offset: 0,
+                floor: 0,
+            })),
         }
     }
 
     /// The offset the next pushed fact will carry.
     pub fn next_offset(&self) -> u64 {
-        self.next_offset
+        self.inner.lock().next_offset
     }
 
     /// Appends a fact; the oldest drops when full. Returns the offset.
-    pub fn push(&mut self, ts: crate::clock::Timestamp, kind: FactKind) -> u64 {
-        let offset = self.next_offset;
-        self.next_offset += 1;
-        self.entries.push_back(Fact { offset, ts, kind });
-        while self.entries.len() > self.capacity {
-            self.entries.pop_front();
-            self.floor += 1;
+    pub fn push(&self, ts: crate::clock::Timestamp, kind: FactKind) -> u64 {
+        let mut inner = self.inner.lock();
+        let offset = inner.next_offset;
+        inner.next_offset += 1;
+        inner.entries.push_back(Fact { offset, ts, kind });
+        while inner.entries.len() > inner.capacity {
+            inner.entries.pop_front();
+            inner.floor += 1;
         }
         offset
     }
@@ -260,8 +274,9 @@ impl TapRing {
     ///
     /// Returns a snapshot of everything from there.
     pub fn subscribe(&self, from: u64) -> (u64, Vec<Fact>) {
-        let start = from.max(self.floor);
-        let facts: Vec<Fact> = self
+        let inner = self.inner.lock();
+        let start = from.max(inner.floor);
+        let facts: Vec<Fact> = inner
             .entries
             .iter()
             .filter(|f| f.offset >= start)
@@ -272,17 +287,18 @@ impl TapRing {
 
     /// The retained range: `[floor, next_offset)`.
     pub fn retained(&self) -> (u64, u64) {
-        (self.floor, self.next_offset)
+        let inner = self.inner.lock();
+        (inner.floor, inner.next_offset)
     }
 
     /// The number of retained facts.
     pub fn len(&self) -> usize {
-        self.entries.len()
+        self.inner.lock().entries.len()
     }
 
     /// Whether nothing is retained.
     pub fn is_empty(&self) -> bool {
-        self.entries.is_empty()
+        self.inner.lock().entries.is_empty()
     }
 }
 
@@ -307,7 +323,7 @@ mod tests {
     #[test]
     fn tap_ring_assigns_monotonic_offsets_and_drops_oldest() {
         // Given a tap ring of capacity two.
-        let mut ring = TapRing::new(2);
+        let ring = TapRing::new(2);
 
         // When three facts are pushed.
         let a = ring.push(ts(0), spawned_fact("a"));
@@ -323,7 +339,7 @@ mod tests {
     #[test]
     fn subscribe_clamps_to_the_floor_and_returns_retained_facts() {
         // Given a ring that evicted its first entry.
-        let mut ring = TapRing::new(2);
+        let ring = TapRing::new(2);
         ring.push(ts(0), spawned_fact("a"));
         ring.push(ts(1), spawned_fact("b"));
         ring.push(ts(2), spawned_fact("c"));
@@ -340,7 +356,7 @@ mod tests {
     #[test]
     fn facts_project_to_json_with_trace_context_only_at_the_boundary() {
         // Given an acked fact carrying a trace.
-        let mut ring = TapRing::new(8);
+        let ring = TapRing::new(8);
         ring.push(
             ts(42),
             FactKind::Acked {
@@ -366,7 +382,7 @@ mod tests {
     #[test]
     fn tap_drop_oldest_never_loses_future_facts() {
         // Given a tiny ring flooded past capacity.
-        let mut ring = TapRing::new(3);
+        let ring = TapRing::new(3);
         for i in 0..10 {
             ring.push(ts(i), spawned_fact("a"));
         }
