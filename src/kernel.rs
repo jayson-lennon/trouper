@@ -44,7 +44,13 @@
 //! (`u64::MAX` = never committed, preserving the seq-0 rule), snapshot
 //! anchor (`u64::MAX` = unanchored), snapshot cadence + passivation config
 //! (an `RwLock`, not `OnceLock`: the projector-set activation arm may
-//! override spawn config before the first idle), and dispatch entries.
+//! override spawn config before the first idle), dispatch entries, and the
+//! declared-emits mirror (spawn-seeded from the manifest, re-synced at the
+//! declaration-mutation point — `ActorSystemCore::declare_emits`). The
+//! [`EsLoop`] likewise carries its own clone of the live state Arc,
+//! captured at spawn and rebound at boot recovery / restart / projector
+//! catch-up — the only moments the table's Arc is ever replaced. Step-hot
+//! reads (state shell, emit declarations) touch NEITHER global lock.
 //! Single-flag reads (supervisor, front door) are lock-free Acquire/Release.
 //!
 //! The kernel tables keep ONLY cross-actor state whose observations span
@@ -57,7 +63,9 @@
 //!
 //! The message happy path acquires the kernel tables lock ZERO times (tap
 //! and store ride lock-free Arc handles); a send acquires it once (its Sent
-//! fact). Probe-counted under `cfg(test)` (`KERNEL_LOCKS`, `CELL_WAKEUPS`).
+//! fact). The emit gates read the cell-local declarations mirror — the
+//! registry lock is off the message path too. Probe-counted under
+//! `cfg(test)` (`KERNEL_LOCKS`, `CELL_WAKEUPS`).
 
 use parking_lot::Mutex;
 use std::collections::{HashMap, HashSet};
