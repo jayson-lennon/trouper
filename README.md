@@ -55,6 +55,10 @@ What the shapes mean:
   concurrency doesn't funnel through one lock.
 - **payload_size** — the typed payload fabric's per-message cost across
   body sizes (payloads are `Arc`-shared; a copy is a refcount bump).
+- **wide_tree** — the same commit cycle with a pathologically WIDE
+  payload (one JSON tree of 100k / 1M filler nodes): the fabric's cost
+  when a payload is a deep tree instead of a few fields. Time is per
+  committed message; the byte column is the payload's wire size.
 - **fanout** — 32 ask roundtrips per iteration (request + reply through
   one of N echo services); the rate falls as the fixture grows.
 - **overload_block** — 16 producers against a `Block` inbox at capacity:
