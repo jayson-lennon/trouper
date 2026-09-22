@@ -62,7 +62,7 @@ pub struct SpawnOpts {
     pub mailbox_capacity: usize,
     /// Inbox overload policy (default Block = backpressure).
     pub mailbox_policy: OverloadPolicy,
-    /// Inbox depth at which a [`crate::tap::FactKind::Backpressured`] fact
+    /// Inbox depth at which a [`crate::observe::ObservationKind::Backpressured`] fact
     /// fires (once per crossing); `None` = never. Pool/partition specs use
     /// it to make sustained overload observable.
     pub high_watermark: Option<u64>,
@@ -100,8 +100,12 @@ pub(crate) type ServiceStart = std::pin::Pin<
 pub struct SystemConfig {
     /// The injected clock (leases, fact timestamps; tests use a fake).
     pub clock: ClockService,
-    /// The tap ring's capacity (drop-oldest under pressure).
-    pub tap_capacity: usize,
+    /// The observation handler installed at startup (opt-in; `None` = off,
+    /// the default — with no handler installed no observation is ever
+    /// constructed). Install or remove later via
+    /// [`ActorSystem::set_observation`](ActorSystem::set_observation) /
+    /// [`ActorSystem::clear_observation`](ActorSystem::clear_observation).
+    pub observation: Option<crate::observe::ObservationHandler>,
     /// Default mailbox capacity and overload policy for spawned actors
     /// (per-spawn [`SpawnOpts`] override these).
     pub default_mailbox: MailboxDefaults,
@@ -130,7 +134,7 @@ impl SystemConfig {
     pub fn production() -> Self {
         Self {
             clock: ClockService::new(Arc::new(SystemClock::new())),
-            tap_capacity: 4096,
+            observation: None,
             default_mailbox: MailboxDefaults::default(),
         }
     }
@@ -139,7 +143,7 @@ impl SystemConfig {
     pub fn with_clock(clock: ClockService) -> Self {
         Self {
             clock,
-            tap_capacity: 4096,
+            observation: None,
             default_mailbox: MailboxDefaults::default(),
         }
     }
@@ -209,6 +213,10 @@ pub struct ActorSystemCore {
     /// default; swapped per system at construction).
     pub(crate) journal_store_slot:
         parking_lot::RwLock<std::sync::Arc<dyn crate::journal::JournalStore>>,
+    /// The test-build observation log the `test()` constructors install
+    /// (the assertions' window on the observation flow). `None` for
+    /// production systems — observation there is only the host's handler.
+    pub(crate) observation_log: Option<crate::observe::ObservationLog>,
 }
 
 /// A handle onto one shared actor fabric: the single surface for
@@ -274,16 +282,19 @@ impl ActorSystem {
     }
 
     /// A handle onto a fabric tuned for tests: a [`FakeClock`] starting
-    /// at 1_000 ms and a small tap ring (reachable via the returned clock).
+    /// at 1_000 ms. Test builds install a capturing observation log —
+    /// production keeps observation strictly opt-in.
     pub fn test() -> (Self, Arc<FakeClock>) {
         let core = ActorSystemCore::test();
         (Self(std::sync::Arc::new(core.0)), core.1)
     }
 
-    /// Like [`ActorSystem::test`](crate::system::ActorSystem::test), but with an explicit (tiny) tap ring
-    /// capacity — gap/pressure tests flood the ring on purpose.
-    pub fn test_with_tap(tap_capacity: usize) -> (Self, Arc<FakeClock>) {
-        let core = ActorSystemCore::test_with_tap(tap_capacity);
+    /// Like [`ActorSystem::test`](crate::system::ActorSystem::test), but with
+    /// an observation handler installed at startup.
+    pub fn test_with_observer(
+        handler: crate::observe::ObservationHandler,
+    ) -> (Self, Arc<FakeClock>) {
+        let core = ActorSystemCore::test_with_observer(handler);
         (Self(std::sync::Arc::new(core.0)), core.1)
     }
 
@@ -486,7 +497,13 @@ pub enum EdgeDirection {
     Emits,
 }
 
-/// One observed edge: aggregated send traffic from the tap.
+/// One observed edge: aggregated send traffic.
+///
+/// Under opt-in observation there is no send history: [`ActorSystem::export`]
+/// counts `Sent` observations that flow during the export's own await
+/// points (its temporary counting handler replaces whatever handler was
+/// installed and leaves observation off afterwards), so a quiet system
+/// exports no observed edges.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ObservedEdge {
     /// The sending path (absent for system-entry sends).
@@ -707,18 +724,22 @@ pub(crate) async fn catch_up_projector(
     armed.start_loop();
 
     // 4. The observable completion marker: the kernel's caught-up counter
-    //    (the wake path's wait signal) and the tap fact (the host-observable
-    //    record) both advance here.
-    let mut kernel = system.kernel.lock();
-    kernel
-        .caught_up
-        .entry(path.clone())
-        .and_modify(|count| *count += 1)
-        .or_insert(1);
-    kernel.record_fact(
-        system.clock.now(),
-        crate::tap::FactKind::CaughtUp { path, seeded },
-    );
+    //    (the wake path's wait signal) and the CaughtUp observation (the
+    //    host-observable record, when observation is on) both advance here.
+    {
+        let mut kernel = system.kernel.lock();
+        kernel
+            .caught_up
+            .entry(path.clone())
+            .and_modify(|count| *count += 1)
+            .or_insert(1);
+    }
+    if system.kernel.observing() {
+        system.kernel.observe(crate::observe::Observation::new(
+            system.clock.now(),
+            crate::observe::ObservationKind::CaughtUp { path, seeded },
+        ));
+    }
 }
 
 impl ActorSystemCore {
@@ -765,10 +786,10 @@ impl ActorSystemCore {
         // through clones — never a lock in between.
         let shutting_down = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let kernel = {
-            let mut kernel = KernelState::with_tap_capacity(config.tap_capacity);
+            let mut kernel = KernelState::new();
             kernel.journal_store = journal_store.clone();
             kernel.shutting_down = shutting_down.clone();
-            CountingKernelLock::with_state(kernel)
+            CountingKernelLock::with_state_and_observer(kernel, config.observation)
         };
         Self {
             registry,
@@ -779,6 +800,7 @@ impl ActorSystemCore {
             mailbox_defaults: config.default_mailbox,
             shutting_down,
             journal_store_slot: parking_lot::RwLock::new(journal_store),
+            observation_log: None,
         }
     }
 
@@ -801,31 +823,36 @@ impl ActorSystemCore {
             mailbox_defaults: MailboxDefaults::default(),
             shutting_down,
             journal_store_slot: parking_lot::RwLock::new(store),
+            observation_log: None,
         }
     }
 
     /// Creates a fabric tuned for tests: a [`FakeClock`] starting at
-    /// 1_000 ms and a small tap ring (reachable via the returned clock).
+    /// 1_000 ms. Test builds install a capturing
+    /// [`crate::observe::ObservationLog`] (the assertions' window on the
+    /// observation flow — `facts()`); production never does.
     pub(crate) fn test() -> (Self, Arc<FakeClock>) {
         let (clock, fake) = ClockService::fake(1_000);
-        (
-            Self::new(SystemConfig {
-                clock,
-                tap_capacity: 256,
-                default_mailbox: MailboxDefaults::default(),
-            }),
-            fake,
-        )
+        let log = crate::observe::ObservationLog::default();
+        let mut system = Self::new(SystemConfig {
+            clock,
+            observation: Some(log.handler()),
+            default_mailbox: MailboxDefaults::default(),
+        });
+        system.observation_log = Some(log);
+        (system, fake)
     }
 
-    /// Like [`ActorSystemCore::test`], but with an explicit (tiny) tap ring
-    /// capacity — gap/pressure tests flood the ring on purpose.
-    pub(crate) fn test_with_tap(tap_capacity: usize) -> (Self, Arc<FakeClock>) {
+    /// Like [`ActorSystemCore::test`], but with an explicit observation
+    /// handler instead of the default test log.
+    pub(crate) fn test_with_observer(
+        handler: crate::observe::ObservationHandler,
+    ) -> (Self, Arc<FakeClock>) {
         let (clock, fake) = ClockService::fake(1_000);
         (
             Self::new(SystemConfig {
                 clock,
-                tap_capacity,
+                observation: Some(handler),
                 default_mailbox: MailboxDefaults::default(),
             }),
             fake,
@@ -1031,15 +1058,17 @@ impl ActorSystemCore {
         // from `restore({})` instead of the spawn's genesis.
         kernel.genesis_args.insert(path.clone(), args.clone());
         let is_projector = kernel.projectors.contains(&path);
-        kernel.record_fact(
-            self.clock.now(),
-            crate::tap::FactKind::Spawned {
-                path: path.clone(),
-                kind: crate::actor::ActorKind::EventSourced,
-                restart: false,
-            },
-        );
         drop(kernel);
+        if self.kernel.observing() {
+            self.kernel.observe(crate::observe::Observation::new(
+                self.clock.now(),
+                crate::observe::ObservationKind::Spawned {
+                    path: path.clone(),
+                    kind: crate::actor::ActorKind::EventSourced,
+                    restart: false,
+                },
+            ));
+        }
 
         // Front door + ES loop parts; the loop starts in `start_loop`.
         let loop_ctx = EsLoop {
@@ -1182,15 +1211,17 @@ impl ActorSystemCore {
         let mut kernel = self.kernel.lock();
         kernel.cells.insert(path.clone(), cell.clone());
         kernel.genesis_args.insert(path.clone(), args.clone());
-        kernel.record_fact(
-            self.clock.now(),
-            crate::tap::FactKind::Spawned {
-                path: path.clone(),
-                kind: crate::actor::ActorKind::Service,
-                restart: false,
-            },
-        );
         drop(kernel);
+        if self.kernel.observing() {
+            self.kernel.observe(crate::observe::Observation::new(
+                self.clock.now(),
+                crate::observe::ObservationKind::Spawned {
+                    path: path.clone(),
+                    kind: crate::actor::ActorKind::Service,
+                    restart: false,
+                },
+            ));
+        }
 
         // The service tier wraps this loop ONLY for its shared plumbing
         // (front door, cell, routing): `step_service` runs against
@@ -1565,22 +1596,21 @@ impl ActorSystemCore {
         crate::kernel::restart_es(&mut ctx, genesis_args).await
     }
 
-    /// A snapshot of tap facts from an offset (inspection/tests).
-    pub fn tap_facts_from(&self, from: u64) -> Vec<crate::tap::Fact> {
-        let kernel = self.kernel.lock();
-        kernel.tap.subscribe(from).1
+    /// Installs or replaces the observation handler at runtime.
+    ///
+    /// Takes effect at the next emission site: in-flight handler calls
+    /// finish, then every observation flows to the new handler. Handlers
+    /// must not call back into the system (see
+    /// [`crate::observe`]` `module docs) and a panicking handler is
+    /// isolated from the message path.
+    pub fn set_observation(&self, handler: crate::observe::ObservationHandler) {
+        self.kernel.set_observer(Some(handler));
     }
 
-    /// The tap ring's next-offset watermark: the offset the next fact
-    /// will carry. An O(1) peek — an observer can wait for facts to
-    /// EXIST without draining the ring on every check.
-    pub fn tap_next_offset(&self) -> u64 {
-        self.kernel.lock().tap.next_offset()
-    }
-
-    /// All retained tap facts (inspection/tests).
-    pub fn tap_facts(&self) -> Vec<crate::tap::Fact> {
-        self.tap_facts_from(0)
+    /// Removes the observation handler (observation off). Uncaptured
+    /// observations are gone — there is no history.
+    pub fn clear_observation(&self) {
+        self.kernel.set_observer(None);
     }
 
     /// Gracefully stops the actor at `path`: children stop first
@@ -1840,22 +1870,24 @@ impl ActorSystemCore {
             // them via the factory's builder, as before).
             let notified_parent = kernel.specs.get(path).and_then(|s| s.parent.clone());
             kernel.specs.remove(path);
-            if was_live {
-                kernel.record_fact(
-                    self.clock.now(),
-                    crate::tap::FactKind::Stopped {
+            drop(kernel);
+            if was_live && self.kernel.observing() {
+                let now = self.clock.now();
+                self.kernel.observe(crate::observe::Observation::new(
+                    now,
+                    crate::observe::ObservationKind::Stopped {
                         path: path.clone(),
                         reason,
                     },
-                );
+                ));
                 if let Some(parent) = notified_parent {
-                    kernel.record_fact(
-                        self.clock.now(),
-                        crate::tap::FactKind::LinkNotified {
+                    self.kernel.observe(crate::observe::Observation::new(
+                        now,
+                        crate::observe::ObservationKind::LinkNotified {
                             parent,
                             child: path.clone(),
                         },
-                    );
+                    ));
                 }
             }
         }
@@ -1864,7 +1896,37 @@ impl ActorSystemCore {
 
     /// Exports the system: schemas, live actors (ES state included),
     /// declared vs observed edges. The artifact a future canvas consumes.
+    ///
+    /// Under opt-in observation there is no send history: `observed_edges`
+    /// counts `Sent` observations that flow during the export's own await
+    /// points (see [`ObservedEdge`]). The export installs a temporary
+    /// counting handler, replaces whatever handler the host installed,
+    /// and leaves observation OFF afterwards — a quiet system exports no
+    /// observed edges.
     pub async fn export(&self) -> SystemExport {
+        // The traffic-snapshot window: any send that lands while the
+        // export's state captures await is counted. (Installed before the
+        // actor pass; cleared before the result is built.)
+        type ObservedEdges = std::collections::HashMap<(Option<String>, String, SchemaId), u64>;
+        let observed: Arc<parking_lot::Mutex<ObservedEdges>> =
+            Arc::new(parking_lot::Mutex::new(ObservedEdges::new()));
+        self.set_observation({
+            let observed = observed.clone();
+            Arc::new(move |observation| {
+                if let crate::observe::ObservationKind::Sent {
+                    from, dest, schema, ..
+                } = &observation.kind
+                {
+                    let to_str = dest.to_string();
+                    let from_str = from.as_ref().map(|p| p.to_string());
+                    *observed
+                        .lock()
+                        .entry((from_str, to_str, schema.clone()))
+                        .or_insert(0) += 1;
+                }
+            })
+        });
+
         // Schemas (all versions).
         let schemas = {
             let registry = self.registry.lock();
@@ -1935,21 +1997,16 @@ impl ActorSystemCore {
             })
             .collect();
 
-        // Observed edges: aggregate Sent facts from the tap.
-        let mut counts: std::collections::HashMap<(Option<String>, String, SchemaId), u64> =
-            std::collections::HashMap::new();
-        for fact in self.tap_facts() {
-            if let crate::tap::FactKind::Sent {
-                from, dest, schema, ..
-            } = &fact.kind
-            {
-                let to_str = dest.to_string();
-                let from_str = from.as_ref().map(|p| p.to_string());
-                *counts
-                    .entry((from_str, to_str, schema.clone()))
-                    .or_insert(0) += 1;
-            }
-        }
+        // Observed edges: take the traffic snapshot and close the window
+        // (observation off after an export — never turned on as a side
+        // effect).
+        let counts: std::collections::HashMap<(Option<String>, String, SchemaId), u64> = {
+            self.clear_observation();
+
+            Arc::try_unwrap(observed)
+                .map(|m| m.into_inner())
+                .unwrap_or_default()
+        };
         let mut observed_edges: Vec<ObservedEdge> = counts
             .into_iter()
             .map(|((from, to, schema), count)| ObservedEdge {
@@ -2438,27 +2495,17 @@ impl ActorSystem {
             .unwrap_or_default()
             .to_owned();
         (spec.factory)(self, path, &spec.entity_args(&key));
-        // Await the re-fold (same bounded poll as projector_state).
-        let watermark = self.kernel.lock().tap.next_offset();
-        const BUDGET: std::time::Duration = std::time::Duration::from_secs(5);
-        let deadline = tokio::time::Instant::now() + BUDGET;
-        loop {
-            if self
-                .tap_facts_from(watermark)
-                .iter()
-                .any(|fact| {
-                    matches!(&fact.kind, crate::tap::FactKind::CaughtUp { path: p, .. } if p == path)
-                })
-            {
-                break;
-            }
-            if tokio::time::Instant::now() >= deadline {
-                return Err(
-                    error_stack::Report::new(crate::registry::RegistryError::InvalidSpec)
-                        .attach("rebuild_projector: catch-up did not complete within the budget"),
-                );
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        // Await the re-fold (the caught-up counter is the kernel's
+        // completeness signal — same bounded wait the wake path uses).
+        let watermark = {
+            let kernel = self.kernel.lock();
+            kernel.caught_up.get(path).copied().unwrap_or(0)
+        };
+        if !self.wait_caught_up_past(path, watermark).await {
+            return Err(
+                error_stack::Report::new(crate::registry::RegistryError::InvalidSpec)
+                    .attach("rebuild_projector: catch-up did not complete within the budget"),
+            );
         }
         self.await_quiescent(path).await;
         Ok(())
@@ -2589,15 +2636,21 @@ mod tests {
                 .collect()
         }
 
-        /// The tap as a compact census of fact kinds (tests).
+        /// The observation flow captured by the test log, in emission
+        /// order (tests; requires a `test()`-built system).
+        pub fn facts(&self) -> Vec<crate::observe::Observation> {
+            self.observation_log
+                .as_ref()
+                .map(|log| log.snapshot())
+                .unwrap_or_default()
+        }
+
+        /// A compact census of observation kinds (tests).
         pub fn fact_kind_counts(&self) -> HashMap<String, usize> {
-            let mut counts = HashMap::new();
-            for fact in self.tap_facts() {
-                let kind = format!("{:?}", fact.kind);
-                let name = kind.split(['(', '{']).next().unwrap_or(&kind).trim();
-                *counts.entry(name.to_owned()).or_default() += 1;
-            }
-            counts
+            self.observation_log
+                .as_ref()
+                .map(|log| log.kind_counts())
+                .unwrap_or_default()
         }
     }
 
@@ -2727,8 +2780,8 @@ mod tests {
             || vec![Arc::new(TypedEsAdapter::<Counter, Add>::new::<Add>())],
         );
         wait_for(|| async {
-            system.tap_facts().iter().any(
-                |f| matches!(&f.kind, crate::tap::FactKind::Spawned { path: p, .. } if *p == path),
+            system.facts().iter().any(
+                |f| matches!(&f.kind, crate::observe::ObservationKind::Spawned { path: p, .. } if *p == path),
             )
         })
         .await;
@@ -2793,8 +2846,8 @@ mod tests {
             },
         );
         wait_for(|| async {
-            system.tap_facts().iter().any(
-                |f| matches!(&f.kind, crate::tap::FactKind::Spawned { path: p, .. } if *p == path),
+            system.facts().iter().any(
+                |f| matches!(&f.kind, crate::observe::ObservationKind::Spawned { path: p, .. } if *p == path),
             )
         })
         .await;
@@ -2812,9 +2865,9 @@ mod tests {
         system.restart_es(&path, &json!({})).await.expect("restart");
         wait_for(|| async {
             system
-                .tap_facts()
+                .facts()
                 .iter()
-                .any(|f| matches!(&f.kind, crate::tap::FactKind::Spawned { path: p, restart, .. } if *p == path && *restart))
+                .any(|f| matches!(&f.kind, crate::observe::ObservationKind::Spawned { path: p, restart, .. } if *p == path && *restart))
         })
         .await;
 
@@ -2927,8 +2980,8 @@ mod tests {
             vec![Arc::new(TypedServiceAdapter::<Parked, Add>::new::<Add>())]
         });
         wait_for(|| async {
-            system.tap_facts().iter().any(
-                |f| matches!(&f.kind, crate::tap::FactKind::Spawned { path: p, .. } if *p == path),
+            system.facts().iter().any(
+                |f| matches!(&f.kind, crate::observe::ObservationKind::Spawned { path: p, .. } if *p == path),
             )
         })
         .await;
@@ -3016,9 +3069,9 @@ mod tests {
         );
         wait_for(|| async {
             system
-                .tap_facts()
+                .facts()
                 .iter()
-                .any(|f| matches!(&f.kind, crate::tap::FactKind::Spawned { path, .. } if *path == path.clone()))
+                .any(|f| matches!(&f.kind, crate::observe::ObservationKind::Spawned { path, .. } if *path == path.clone()))
         })
         .await;
 
@@ -3151,8 +3204,8 @@ mod tests {
         path: &ActorPath,
         reason: crate::actor::StopReason,
     ) -> bool {
-        system.tap_facts().iter().any(|f| {
-            matches!(&f.kind, crate::tap::FactKind::Stopped { path: p, reason: r } if p == path && *r == reason)
+        system.facts().iter().any(|f| {
+            matches!(&f.kind, crate::observe::ObservationKind::Stopped { path: p, reason: r } if p == path && *r == reason)
         })
     }
 
@@ -3267,22 +3320,22 @@ mod tests {
             .expect("send");
         wait_for(|| async {
             system
-                .tap_facts()
+                .facts()
                 .iter()
-                .any(|f| matches!(&f.kind, crate::tap::FactKind::Delivered { to, .. } if *to == ActorPath::new("echo")))
+                .any(|f| matches!(&f.kind, crate::observe::ObservationKind::Delivered { to, .. } if *to == ActorPath::new("echo")))
         })
         .await;
 
         // Then the facts carry a shared trace id across the hops.
-        let facts = system.tap_facts();
+        let facts = system.facts();
         let a_hop = facts
             .iter()
-            .find(|f| matches!(&f.kind, crate::tap::FactKind::Delivered { to, .. } if *to == ActorPath::new("a")))
+            .find(|f| matches!(&f.kind, crate::observe::ObservationKind::Delivered { to, .. } if *to == ActorPath::new("a")))
             .expect("hop a delivered");
-        let trace_of = |f: &crate::tap::Fact| match &f.kind {
-            crate::tap::FactKind::Delivered { trace, .. }
-            | crate::tap::FactKind::Acked { trace, .. }
-            | crate::tap::FactKind::Sent { trace, .. } => *trace,
+        let trace_of = |f: &crate::observe::Observation| match &f.kind {
+            crate::observe::ObservationKind::Delivered { trace, .. }
+            | crate::observe::ObservationKind::Acked { trace, .. }
+            | crate::observe::ObservationKind::Sent { trace, .. } => *trace,
             _ => panic!("unexpected fact kind"),
         };
         let a_trace = trace_of(a_hop);
@@ -3291,7 +3344,7 @@ mod tests {
             .filter(|f| {
                 matches!(
                     &f.kind,
-                    crate::tap::FactKind::Delivered { to, .. } if *to == ActorPath::new("echo")
+                    crate::observe::ObservationKind::Delivered { to, .. } if *to == ActorPath::new("echo")
                 )
             })
             .collect();
@@ -3306,21 +3359,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn tap_drop_oldest_under_pressure_keeps_delivery_working() {
-        // Given a system whose tap ring is tiny (test-visible capacity).
-        let (clock, fake) = ClockService::fake(1_000);
-        let system = ActorSystem::new(SystemConfig {
-            clock,
-            tap_capacity: 4,
-            default_mailbox: MailboxDefaults::default(),
-        });
-        let _clock = fake;
+    async fn overflow_traffic_keeps_delivery_working_and_projects_to_json() {
+        // Given a system under a flood of far more messages than any
+        // observation consumer would want to keep.
+        let (system, _clock) = ActorSystem::test();
         let path = ActorPath::new("counter");
         system.spawn_es::<Counter, _>(path.clone(), &json!({}), SpawnOpts::default(), || {
             vec![Arc::new(TypedEsAdapter::<Counter, Add>::new::<Add>())]
         });
 
-        // When far more messages flow than the ring can hold.
+        // When 50 messages flow through the observation flow.
         for n in 0..50 {
             system
                 .send(system.envelope(Add::schema_id(), path.clone(), json!({ "n": n })))
@@ -3333,17 +3381,13 @@ mod tests {
         let journal_len = system.journal_entries(&path).len();
         assert_eq!(journal_len, 50);
 
-        // And the ring retained only its newest facts with monotonic
-        // offsets and a JSON projection that still works.
-        let facts = system.tap_facts();
-        assert!(facts.len() <= 4, "ring dropped oldest: {}", facts.len());
-        let offsets: Vec<u64> = facts.iter().map(|f| f.offset).collect();
-        let sorted = offsets.clone();
-        let mut sorted = sorted;
-        sorted.sort_unstable();
-        assert_eq!(offsets, sorted, "offsets monotonic");
+        // And the log retained everything in emission order, and the JSON
+        // projection still works at the boundary.
+        let facts = system.facts();
+        assert!(facts.len() >= 50, "every message observed: {}", facts.len());
         let last = facts.last().expect("facts").to_json();
-        assert!(last["offset"].is_u64());
+        assert!(last["kind"].is_string());
+        assert!(last["ts"].is_u64());
     }
 
     #[tokio::test]
@@ -3414,8 +3458,8 @@ mod tests {
         // poison command (with a good one queued BEHIND it).
         system.spawn(spec);
         wait_for(|| async {
-            system.tap_facts().iter().any(
-                |f| matches!(&f.kind, crate::tap::FactKind::Spawned { path, .. } if *path == child),
+            system.facts().iter().any(
+                |f| matches!(&f.kind, crate::observe::ObservationKind::Spawned { path, .. } if *path == child),
             )
         })
         .await;
@@ -3438,11 +3482,11 @@ mod tests {
         .await;
 
         // And the engine marked the restart with Spawned { restart: true }.
-        let facts = system.tap_facts();
+        let facts = system.facts();
         let restarted = facts.iter().any(|f| {
             matches!(
                 &f.kind,
-                crate::tap::FactKind::Spawned { path, restart, .. }
+                crate::observe::ObservationKind::Spawned { path, restart, .. }
                     if *path == child && *restart
             )
         });
@@ -3593,13 +3637,13 @@ mod tests {
 
         // And the tap recorded the child's stop WITH the typed
         // budget-exhausted reason, before the escalation fact.
-        let facts = system.tap_facts();
+        let facts = system.facts();
         let stopped_escalated = facts.iter().position(|f| {
-            matches!(&f.kind, crate::tap::FactKind::Stopped { path, reason }
+            matches!(&f.kind, crate::observe::ObservationKind::Stopped { path, reason }
                 if *path == worker && *reason == crate::actor::StopReason::Escalated)
         });
         let escalated = facts.iter().position(
-            |f| matches!(&f.kind, crate::tap::FactKind::Escalated { path, .. } if *path == worker),
+            |f| matches!(&f.kind, crate::observe::ObservationKind::Escalated { path, .. } if *path == worker),
         );
         assert!(stopped_escalated.is_some(), "Stopped(Escalated) recorded");
         assert!(escalated.is_some(), "Escalated recorded");
@@ -3694,11 +3738,11 @@ mod tests {
 
         // Then BOTH Stopped facts exist, and the CHILD's was recorded
         // BEFORE the parent's (children drain first).
-        let facts = system.tap_facts();
+        let facts = system.facts();
         let stops: Vec<String> = facts
             .iter()
             .filter_map(|f| match &f.kind {
-                crate::tap::FactKind::Stopped { path, .. } => Some(path.to_string()),
+                crate::observe::ObservationKind::Stopped { path, .. } => Some(path.to_string()),
                 _ => None,
             })
             .collect();
@@ -3723,7 +3767,7 @@ mod tests {
         let notified = facts.iter().any(|f| {
             matches!(
                 &f.kind,
-                crate::tap::FactKind::LinkNotified { parent, child }
+                crate::observe::ObservationKind::LinkNotified { parent, child }
                     if parent.as_str() == "parent" && child.as_str() == "child"
             )
         });
@@ -3794,17 +3838,17 @@ mod tests {
 
         // And exactly one stop was recorded, with the Crashed reason.
         wait_for(|| async {
-            system.tap_facts().iter().any(|f| {
-                matches!(&f.kind, crate::tap::FactKind::Stopped { path, reason }
+            system.facts().iter().any(|f| {
+                matches!(&f.kind, crate::observe::ObservationKind::Stopped { path, reason }
                     if *path == child && *reason == crate::actor::StopReason::Crashed)
             })
         })
         .await;
         let spawn_count = system
-            .tap_facts()
+            .facts()
             .iter()
             .filter(
-                |f| matches!(&f.kind, crate::tap::FactKind::Spawned { path, .. } if *path == child),
+                |f| matches!(&f.kind, crate::observe::ObservationKind::Spawned { path, .. } if *path == child),
             )
             .count();
         assert_eq!(spawn_count, 1, "no restart after the crash");
@@ -3837,21 +3881,16 @@ mod tests {
         system.stop(&path).await;
 
         // Then no failure was recorded (the engine arms only on crashes)
-        // and the stop fact says graceful.
-        let stops: Vec<_> = {
-            let kernel = system.kernel.lock();
-            assert!(!kernel.specs.contains_key(&path), "spec removed on stop");
-            kernel
-                .tap
-                .subscribe(0)
-                .1
-                .into_iter()
-                .filter(|f| matches!(&f.kind, crate::tap::FactKind::Stopped { .. }))
-                .collect()
-        };
-        assert_eq!(stops.len(), 1, "exactly one stop fact: {stops:?}");
+        // and the stop observation says graceful.
+        let stops: Vec<_> = system
+            .facts()
+            .into_iter()
+            .filter(|f| matches!(&f.kind, crate::observe::ObservationKind::Stopped { .. }))
+            .collect();
+        assert_eq!(stops.len(), 1, "exactly one stop observation: {stops:?}");
         let no_failures = {
             let kernel = system.kernel.lock();
+            assert!(!kernel.specs.contains_key(&path), "spec removed on stop");
             kernel.failures.get(&path).map(|w| w.is_empty()) != Some(false)
         };
         assert!(no_failures, "no failure recorded for a normal exit");
@@ -3959,9 +3998,9 @@ mod tests {
         // When an Add message is sent to it.
         wait_for(|| async {
             system
-                .tap_facts()
+                .facts()
                 .iter()
-                .any(|f| matches!(&f.kind, crate::tap::FactKind::Spawned { path, .. } if *path == ActorPath::new("auditor")))
+                .any(|f| matches!(&f.kind, crate::observe::ObservationKind::Spawned { path, .. } if *path == ActorPath::new("auditor")))
         })
         .await;
         system
@@ -4054,9 +4093,9 @@ mod tests {
         );
         wait_for(|| async {
             system
-                .tap_facts()
+                .facts()
                 .iter()
-                .any(|f| matches!(&f.kind, crate::tap::FactKind::Spawned { path, .. } if *path == ActorPath::new("asker")))
+                .any(|f| matches!(&f.kind, crate::observe::ObservationKind::Spawned { path, .. } if *path == ActorPath::new("asker")))
         })
         .await;
 
@@ -4155,9 +4194,9 @@ mod tests {
         );
         wait_for(|| async {
             system
-                .tap_facts()
+                .facts()
                 .iter()
-                .any(|f| matches!(&f.kind, crate::tap::FactKind::Spawned { path, .. } if *path == ActorPath::new("asker")))
+                .any(|f| matches!(&f.kind, crate::observe::ObservationKind::Spawned { path, .. } if *path == ActorPath::new("asker")))
         })
         .await;
 
@@ -4270,9 +4309,9 @@ mod tests {
         );
         wait_for(|| async {
             system
-                .tap_facts()
+                .facts()
                 .iter()
-                .any(|f| matches!(&f.kind, crate::tap::FactKind::Spawned { path, .. } if *path == ActorPath::new("asker")))
+                .any(|f| matches!(&f.kind, crate::observe::ObservationKind::Spawned { path, .. } if *path == ActorPath::new("asker")))
         })
         .await;
         system
@@ -4406,9 +4445,9 @@ mod tests {
         );
         wait_for(|| async {
             system
-                .tap_facts()
+                .facts()
                 .iter()
-                .any(|f| matches!(&f.kind, crate::tap::FactKind::Spawned { path, .. } if *path == ActorPath::new("counter")))
+                .any(|f| matches!(&f.kind, crate::observe::ObservationKind::Spawned { path, .. } if *path == ActorPath::new("counter")))
         })
         .await;
 
@@ -4556,8 +4595,8 @@ mod tests {
             },
         );
         wait_for(|| async {
-            system.tap_facts().iter().any(
-                |f| matches!(&f.kind, crate::tap::FactKind::Spawned { path: p, .. } if *p == path),
+            system.facts().iter().any(
+                |f| matches!(&f.kind, crate::observe::ObservationKind::Spawned { path: p, .. } if *p == path),
             )
         })
         .await;
@@ -4781,7 +4820,7 @@ mod tests {
         let export = system.export().await;
 
         // Then schemas, actors (with kind), and both declared-edge
-        // directions appear; observed edges count the publish.
+        // directions appear; observed_edges stays empty (no history).
         assert!(export.schemas.iter().any(|s| s.id() == schema));
         assert_eq!(export.actors.len(), 2, "both actors live: {export:?}");
         let source = export
@@ -4813,15 +4852,11 @@ mod tests {
                     && e.direction == crate::system::EdgeDirection::Handles),
             "handle edge exported: {export:?}"
         );
-        let observed = export
-            .observed_edges
-            .iter()
-            .find(|e| e.to == format!("schema({})", Shipped::schema_id()))
-            .expect("observed schema edge");
-        assert!(
-            observed.count >= 1,
-            "at least the one publish: {observed:?}"
-        );
+        // Under opt-in observation there is NO send history: the publish
+        // above happened before the export, so its traffic is gone —
+        // observed_edges is empty (the ObservationHandler is the live
+        // record; the DLQ is the only after-the-fact artifact).
+        assert!(export.observed_edges.is_empty(), "no history: {export:?}");
     }
 
     #[tokio::test]
@@ -4989,15 +5024,15 @@ mod tests {
         // initial spawn), no restart flag anywhere.
         wait_for(|| async {
             system
-                .tap_facts()
+                .facts()
                 .iter()
-                .any(|f| matches!(f.kind, crate::tap::FactKind::Escalated { .. }))
+                .any(|f| matches!(f.kind, crate::observe::ObservationKind::Escalated { .. }))
         })
         .await;
-        let facts = system.tap_facts();
-        let worker_spawns: Vec<&crate::tap::Fact> = facts
+        let facts = system.facts();
+        let worker_spawns: Vec<&crate::observe::Observation> = facts
             .iter()
-            .filter(|f| matches!(&f.kind, crate::tap::FactKind::Spawned { path, .. } if *path == worker))
+            .filter(|f| matches!(&f.kind, crate::observe::ObservationKind::Spawned { path, .. } if *path == worker))
             .collect();
         assert_eq!(
             worker_spawns.len(),
@@ -5007,7 +5042,7 @@ mod tests {
         assert!(
             !matches!(
                 worker_spawns[0].kind,
-                crate::tap::FactKind::Spawned { restart: true, .. }
+                crate::observe::ObservationKind::Spawned { restart: true, .. }
             ),
             "Never must not restart"
         );
@@ -5015,17 +5050,17 @@ mod tests {
         // And the child stopped with the typed Crashed reason (the crash
         // is what stopped it; Never means no restart, hence no escalation
         // restart-cycle — the crash IS the terminal stop).
-        let facts = system.tap_facts();
+        let facts = system.facts();
         assert!(
             facts.iter().any(|f| matches!(
                 &f.kind,
-                crate::tap::FactKind::Stopped { path, reason }
+                crate::observe::ObservationKind::Stopped { path, reason }
                     if *path == worker && *reason == crate::actor::StopReason::Crashed
             )),
             "Stopped {{ Crashed }} expected: {:?}",
             facts
                 .iter()
-                .filter(|f| matches!(f.kind, crate::tap::FactKind::Stopped { .. }))
+                .filter(|f| matches!(f.kind, crate::observe::ObservationKind::Stopped { .. }))
                 .collect::<Vec<_>>()
         );
 
@@ -5251,10 +5286,10 @@ mod tests {
             );
         }
         assert!(
-            system
-                .tap_facts()
-                .iter()
-                .any(|f| matches!(f.kind, crate::tap::FactKind::SnapshotTaken { .. })),
+            system.facts().iter().any(|f| matches!(
+                f.kind,
+                crate::observe::ObservationKind::SnapshotTaken { .. }
+            )),
             "SnapshotTaken fact emitted"
         );
         // The latest snapshot's fold already contains Adds 1-4 (total 10):
@@ -5307,10 +5342,10 @@ mod tests {
             );
         }
         assert!(
-            !system
-                .tap_facts()
-                .iter()
-                .any(|f| matches!(f.kind, crate::tap::FactKind::SnapshotTaken { .. })),
+            !system.facts().iter().any(|f| matches!(
+                f.kind,
+                crate::observe::ObservationKind::SnapshotTaken { .. }
+            )),
             "no snapshot facts under Off"
         );
     }
@@ -5614,9 +5649,9 @@ mod tests {
             assert_eq!(kernel.dead_letters[0].schema, Smuggled::schema_id());
         }
         assert!(
-            system.tap_facts().iter().any(|f| matches!(
+            system.facts().iter().any(|f| matches!(
                 &f.kind,
-                crate::tap::FactKind::DeadLettered { reason, .. }
+                crate::observe::ObservationKind::DeadLettered { reason, .. }
                     if *reason == crate::kernel::DeadLetterReason::UndeclaredEvent
             )),
             "DeadLettered(UndeclaredEvent) fact on the tap"
@@ -5734,10 +5769,12 @@ mod tests {
         // Then the idle actor snapshots BETWEEN messages, anchored at the
         // last event's seq (0).
         wait_for(|| async {
-            system
-                .tap_facts()
-                .iter()
-                .any(|f| matches!(f.kind, crate::tap::FactKind::SnapshotTaken { .. }))
+            system.facts().iter().any(|f| {
+                matches!(
+                    f.kind,
+                    crate::observe::ObservationKind::SnapshotTaken { .. }
+                )
+            })
         })
         .await;
         let snap_seq = {
@@ -5781,10 +5818,10 @@ mod tests {
 
         // Then no snapshot fired: the cadence was not yet due.
         assert!(
-            !system
-                .tap_facts()
-                .iter()
-                .any(|f| matches!(f.kind, crate::tap::FactKind::SnapshotTaken { .. })),
+            !system.facts().iter().any(|f| matches!(
+                f.kind,
+                crate::observe::ObservationKind::SnapshotTaken { .. }
+            )),
             "time cadence must not fire before its interval elapses"
         );
     }
@@ -5810,10 +5847,10 @@ mod tests {
         // Then the journal holds only events and no snapshot ever fired.
         assert_eq!(system.journal_len(&path), 5);
         assert!(
-            !system
-                .tap_facts()
-                .iter()
-                .any(|f| matches!(f.kind, crate::tap::FactKind::SnapshotTaken { .. })),
+            !system.facts().iter().any(|f| matches!(
+                f.kind,
+                crate::observe::ObservationKind::SnapshotTaken { .. }
+            )),
             "Off never snapshots"
         );
     }
@@ -5937,9 +5974,9 @@ mod tests {
         // Then the undeclared event was dropped before append (the builder
         // edge is the enforced edge) and a fact records the drop.
         assert_eq!(system.journal_len(&path), 0, "no declared edge, no append");
-        assert!(system.tap_facts().iter().any(|f| matches!(
+        assert!(system.facts().iter().any(|f| matches!(
             &f.kind,
-            crate::tap::FactKind::DeadLettered { reason, .. }
+            crate::observe::ObservationKind::DeadLettered { reason, .. }
                 if *reason == crate::kernel::DeadLetterReason::UndeclaredEvent
         )));
 
@@ -6936,11 +6973,11 @@ mod tests {
             Some(6)
         );
         let spawns = system
-            .tap_facts()
+            .facts()
             .iter()
             .filter(|f| matches!(
                 &f.kind,
-                crate::tap::FactKind::Spawned { path, .. } if *path == ActorPath::new("accounts/a")
+                crate::observe::ObservationKind::Spawned { path, .. } if *path == ActorPath::new("accounts/a")
             ))
             .count();
         assert_eq!(spawns, 1, "same key activated the entity exactly once");
@@ -7150,73 +7187,6 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn projector_wake_survives_tap_flood() {
-        // Given a 1-slot tap ring — ANY later fact evicts everything the
-        // wake could have observed — a ChatLog projector set, and one
-        // stored fact for key "5" folded by an activation that then
-        // stopped (genuinely cold). A background publisher continuously
-        // floods the ring with unrelated facts.
-        let (system, clock) = ActorSystem::test_with_tap(1);
-        let opts = SpawnOpts {
-            passivation: Some(Passivation {
-                idle_for: std::time::Duration::from_millis(50),
-            }),
-            ..Default::default()
-        };
-        let spec = crate::pool::ProjectorSetSpec {
-            opts,
-            ..install_chat_projector_set_spec(&system, "proj/chats")
-        };
-        system.install_projector_set(spec).expect("install");
-        publish_chatted(&system, "5", "a").await;
-        let path5 = ActorPath::new("proj/chats/5");
-        wait_for(|| async { system_is_live(&system, &path5) }).await;
-        for _ in 0..500 {
-            if system.es_state(&path5).await.is_some() {
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-        }
-        clock.advance(std::time::Duration::from_millis(100));
-        system.stop(&path5).await;
-        assert!(
-            system.es_state(&path5).await.is_none(),
-            "projector evicted before the flooded wake"
-        );
-
-        // Unrelated publishes for another key, fast enough that the
-        // 1-slot ring turns over many times per poll window.
-        let flood_system = system.clone();
-        let flood = tokio::spawn(async move {
-            for i in 0..10_000u64 {
-                publish_chatted(&flood_system, "flood", &format!("n{i}")).await;
-                tokio::time::sleep(std::time::Duration::from_millis(2)).await;
-            }
-        });
-
-        // When reading the cold projector through the full wake path —
-        // bounded far below the 5s wake budget so a stall fails fast.
-        let read = tokio::time::timeout(
-            std::time::Duration::from_secs(2),
-            system.projector_state(&ActorPath::new("proj/chats/5")),
-        )
-        .await;
-
-        // Then the wake still completes despite the evicted CaughtUp
-        // fact, and the fold is complete.
-        flood.abort();
-        let _ = flood.await;
-        let state = read
-            .expect("wake completed under the 2s bound")
-            .expect("flooded wake returns the fold");
-        let log: ChatLog = state.decode().expect("state decodes");
-        assert_eq!(log.messages, 1, "exactly the stored fact folded");
-        assert_eq!(log.keys_seen, vec!["a".to_owned()]);
-    }
-
-    /// A counting wrapper over the in-memory store: records how many
-    /// `load()` calls the runtime makes (the D3 idle-snapshot probe).
     struct CountingLoadsStore {
         inner: crate::journal::InMemoryJournalStore,
         loads: std::sync::atomic::AtomicUsize,
@@ -7626,11 +7596,11 @@ mod tests {
             .and_then(|s| s["total"].as_i64());
         assert_eq!(total, Some(10), "all five commands hit ONE entity");
         let spawns = system
-            .tap_facts()
+            .facts()
             .iter()
             .filter(|f| matches!(
                 &f.kind,
-                crate::tap::FactKind::Spawned { path, .. } if *path == ActorPath::new("accounts/race")
+                crate::observe::ObservationKind::Spawned { path, .. } if *path == ActorPath::new("accounts/race")
             ))
             .count();
         assert_eq!(spawns, 1, "the race yielded a single activation");
@@ -7693,17 +7663,17 @@ mod tests {
         // copy's true trace is the Delivered fact AT the observer (the tee
         // Sent fact deliberately carries the ORIGINAL trace — that is the
         // link between the two deliveries).
-        let facts = system.tap_facts();
+        let facts = system.facts();
         let tee_delivered = facts
             .iter()
             .find(|f| {
                 matches!(
                     &f.kind,
-                    crate::tap::FactKind::Delivered { to, .. } if *to == ActorPath::new("watcher")
+                    crate::observe::ObservationKind::Delivered { to, .. } if *to == ActorPath::new("watcher")
                 )
             })
             .expect("tee copy delivered");
-        if let crate::tap::FactKind::Delivered { trace, .. } = &tee_delivered.kind {
+        if let crate::observe::ObservationKind::Delivered { trace, .. } = &tee_delivered.kind {
             assert_ne!(
                 trace.causality_id, original_causality,
                 "copy has a NEW causality"
@@ -7915,9 +7885,9 @@ mod tests {
         }
         wait_for(|| async {
             system
-                .tap_facts()
+                .facts()
                 .iter()
-                .any(|f| matches!(&f.kind, crate::tap::FactKind::Backpressured { path, .. } if *path == plain))
+                .any(|f| matches!(&f.kind, crate::observe::ObservationKind::Backpressured { path, .. } if *path == plain))
         })
         .await;
         // Release the gate so the worker drains (clean shutdown): the
@@ -7933,9 +7903,9 @@ mod tests {
         // Then exactly ONE Backpressured fact fired for the up-crossing
         // (rate-limited: not one per message).
         let fires = system
-            .tap_facts()
+            .facts()
             .iter()
-            .filter(|f| matches!(&f.kind, crate::tap::FactKind::Backpressured { path, .. } if *path == plain))
+            .filter(|f| matches!(&f.kind, crate::observe::ObservationKind::Backpressured { path, .. } if *path == plain))
             .count();
         assert_eq!(fires, 1, "one fact per up-crossing, not per message");
     }
@@ -8030,8 +8000,8 @@ mod tests {
         // The engine is demonstrably RESTARTING (a Spawned{restart: true}
         // fact exists) before we cut the power.
         wait_for(|| async {
-            system.tap_facts().iter().any(|f| {
-                matches!(&f.kind, crate::tap::FactKind::Spawned { path, restart, .. }
+            system.facts().iter().any(|f| {
+                matches!(&f.kind, crate::observe::ObservationKind::Spawned { path, restart, .. }
                     if *path == child && *restart)
             })
         })
@@ -8042,10 +8012,10 @@ mod tests {
         // restart count moves again.
         let frozen_failures = failure_count(&system, &child);
         let restarts = |sys: &ActorSystem| {
-            sys.tap_facts()
+            sys.facts()
                 .iter()
                 .filter(|f| {
-                    matches!(&f.kind, crate::tap::FactKind::Spawned { path, restart, .. }
+                    matches!(&f.kind, crate::observe::ObservationKind::Spawned { path, restart, .. }
                         if *path == child && *restart)
                 })
                 .count()
@@ -8490,9 +8460,9 @@ mod tests {
             .expect("delivered");
         wait_for(|| async {
             system
-                .tap_facts()
+                .facts()
                 .iter()
-                .any(|f| matches!(f.kind, crate::tap::FactKind::Escalated { .. }))
+                .any(|f| matches!(f.kind, crate::observe::ObservationKind::Escalated { .. }))
         })
         .await;
 
@@ -8501,9 +8471,9 @@ mod tests {
         tokio::time::sleep(std::time::Duration::from_millis(30)).await;
         assert!(
             system
-                .tap_facts()
+                .facts()
                 .iter()
-                .any(|f| matches!(f.kind, crate::tap::FactKind::Stopped { .. })),
+                .any(|f| matches!(f.kind, crate::observe::ObservationKind::Stopped { .. })),
             "escalation records the stop fact"
         );
     }
@@ -8683,10 +8653,10 @@ mod tests {
 
         // Then exactly ONE Stopped fact exists (no double-record, no panic).
         let stops = system
-            .tap_facts()
+            .facts()
             .iter()
             .filter(
-                |f| matches!(&f.kind, crate::tap::FactKind::Stopped { path: p, .. } if *p == path),
+                |f| matches!(&f.kind, crate::observe::ObservationKind::Stopped { path: p, .. } if *p == path),
             )
             .count();
         assert_eq!(stops, 1, "stop is idempotent: one Stopped fact");
@@ -8872,8 +8842,8 @@ mod tests {
         };
         system.spawn(spec);
         wait_for(|| async {
-            system.tap_facts().iter().any(
-                |f| matches!(&f.kind, crate::tap::FactKind::Spawned { path: p, .. } if *p == child),
+            system.facts().iter().any(
+                |f| matches!(&f.kind, crate::observe::ObservationKind::Spawned { path: p, .. } if *p == child),
             )
         })
         .await;
@@ -8894,10 +8864,10 @@ mod tests {
         // Then supervision restarted it through restart_es, and the fresh
         // instance replayed the pre-crash event.
         wait_for(|| async {
-            system.tap_facts().iter().any(|f| {
+            system.facts().iter().any(|f| {
                 matches!(
                     &f.kind,
-                    crate::tap::FactKind::Spawned { path: p, restart: true, .. } if *p == child
+                    crate::observe::ObservationKind::Spawned { path: p, restart: true, .. } if *p == child
                 )
             })
         })
@@ -9203,16 +9173,16 @@ mod tests {
         // actor). No passivation while mail keeps crashing the drain.
         wait_for(|| async {
             system
-                .tap_facts()
+                .facts()
                 .iter()
-                .any(|f| matches!(&f.kind, crate::tap::FactKind::Spawned { path: p, restart: true, .. } if *p == child))
+                .any(|f| matches!(&f.kind, crate::observe::ObservationKind::Spawned { path: p, restart: true, .. } if *p == child))
         })
         .await;
         wait_for(|| async {
             system
-                .tap_facts()
+                .facts()
                 .iter()
-                .any(|f| matches!(&f.kind, crate::tap::FactKind::Escalated { path: p, .. } if *p == child))
+                .any(|f| matches!(&f.kind, crate::observe::ObservationKind::Escalated { path: p, .. } if *p == child))
         })
         .await;
     }
@@ -9463,8 +9433,8 @@ mod tests {
         };
         system.spawn(spec);
         wait_for(|| async {
-            system.tap_facts().iter().any(
-                |f| matches!(&f.kind, crate::tap::FactKind::Spawned { path: p, .. } if *p == child),
+            system.facts().iter().any(
+                |f| matches!(&f.kind, crate::observe::ObservationKind::Spawned { path: p, .. } if *p == child),
             )
         })
         .await;
@@ -9476,10 +9446,10 @@ mod tests {
         // second Spawned fact ever arrives.
         tokio::time::sleep(std::time::Duration::from_millis(60)).await;
         let spawns = system
-            .tap_facts()
+            .facts()
             .iter()
             .filter(
-                |f| matches!(&f.kind, crate::tap::FactKind::Spawned { path: p, .. } if *p == child),
+                |f| matches!(&f.kind, crate::observe::ObservationKind::Spawned { path: p, .. } if *p == child),
             )
             .count();
         assert_eq!(spawns, 1, "no restart after graceful stop");
@@ -9816,8 +9786,8 @@ mod tests {
             },
         );
         wait_for(|| async {
-            system.tap_facts().iter().any(
-                |f| matches!(&f.kind, crate::tap::FactKind::Spawned { path: p, .. } if *p == path),
+            system.facts().iter().any(
+                |f| matches!(&f.kind, crate::observe::ObservationKind::Spawned { path: p, .. } if *p == path),
             )
         })
         .await;
@@ -9834,8 +9804,8 @@ mod tests {
 
         // Then the message was DELIVERED (behavior first)...
         wait_for(|| async {
-            system.tap_facts().iter().any(
-                |f| matches!(&f.kind, crate::tap::FactKind::Delivered { to, .. } if *to == path),
+            system.facts().iter().any(
+                |f| matches!(&f.kind, crate::observe::ObservationKind::Delivered { to, .. } if *to == path),
             )
         })
         .await;
@@ -9863,8 +9833,8 @@ mod tests {
             vec![Arc::new(TypedEsAdapter::<Counter, Add>::new::<Add>())]
         });
         wait_for(|| async {
-            system.tap_facts().iter().any(
-                |f| matches!(&f.kind, crate::tap::FactKind::Spawned { path: p, .. } if *p == path),
+            system.facts().iter().any(
+                |f| matches!(&f.kind, crate::observe::ObservationKind::Spawned { path: p, .. } if *p == path),
             )
         })
         .await;
@@ -9913,8 +9883,8 @@ mod tests {
             vec![Arc::new(TypedEsAdapter::<Counter, Add>::new::<Add>())]
         });
         wait_for(|| async {
-            system.tap_facts().iter().any(
-                |f| matches!(&f.kind, crate::tap::FactKind::Spawned { path: p, .. } if *p == path),
+            system.facts().iter().any(
+                |f| matches!(&f.kind, crate::observe::ObservationKind::Spawned { path: p, .. } if *p == path),
             )
         })
         .await;
@@ -9989,8 +9959,8 @@ mod tests {
             vec![Arc::new(TypedEsAdapter::<Counter, Add>::new::<Add>())]
         });
         wait_for(|| async {
-            system.tap_facts().iter().any(
-                |f| matches!(&f.kind, crate::tap::FactKind::Spawned { path: p, .. } if *p == path),
+            system.facts().iter().any(
+                |f| matches!(&f.kind, crate::observe::ObservationKind::Spawned { path: p, .. } if *p == path),
             )
         })
         .await;
@@ -10035,8 +10005,8 @@ mod tests {
             || vec![Arc::new(TypedEsAdapter::<Counter, Add>::new::<Add>())],
         );
         wait_for(|| async {
-            system.tap_facts().iter().any(
-                |f| matches!(&f.kind, crate::tap::FactKind::Spawned { path: p, .. } if *p == path),
+            system.facts().iter().any(
+                |f| matches!(&f.kind, crate::observe::ObservationKind::Spawned { path: p, .. } if *p == path),
             )
         })
         .await;
@@ -10834,16 +10804,16 @@ mod tests {
             .await;
         wait_for(|| async { first.lock().len() == 1 && second.lock().len() == 1 }).await;
 
-        // Then the per-subscriber Delivered facts appear in the tap in
+        // Then the per-subscriber Delivered observations appear in
         // declaration order (the fan-out walks the table front to back).
-        let delivered: Vec<(ActorPath, u64)> = system
-            .tap_facts()
+        let delivered: Vec<ActorPath> = system
+            .facts()
             .into_iter()
             .filter_map(|f| match f.kind {
-                crate::tap::FactKind::Delivered { to, schema, .. }
+                crate::observe::ObservationKind::Delivered { to, schema, .. }
                     if schema == Shipped::schema_id() =>
                 {
-                    Some((to, f.offset))
+                    Some(to)
                 }
                 _ => None,
             })
@@ -10851,10 +10821,7 @@ mod tests {
         assert_eq!(delivered.len(), 2, "one Delivered per subscriber");
         assert_eq!(
             delivered,
-            [
-                (ActorPath::new("first"), delivered[0].1),
-                (ActorPath::new("second"), delivered[1].1),
-            ],
+            [ActorPath::new("first"), ActorPath::new("second"),],
             "declaration order = delivery order: {delivered:?}"
         );
     }
@@ -10964,20 +10931,20 @@ mod tests {
         // Then the event's Sent fact is schema-addressed, shares the
         // command's trace (one conversation) with a FRESH causality (the
         // publish is a NEW hop caused by the command hop).
-        let facts = system.tap_facts();
+        let facts = system.facts();
         let cmd_sent = facts
             .iter()
             .find(|f| {
                 matches!(
                     &f.kind,
-                    crate::tap::FactKind::Sent { dest, schema, .. }
+                    crate::observe::ObservationKind::Sent { dest, schema, .. }
                         if *dest == Address::Path(ActorPath::new("packer"))
                             && *schema == Pack::schema_id()
                 )
             })
             .expect("command Sent fact recorded");
         let cmd_trace = match &cmd_sent.kind {
-            crate::tap::FactKind::Sent { trace, .. } => *trace,
+            crate::observe::ObservationKind::Sent { trace, .. } => *trace,
             _ => unreachable!(),
         };
         let evt_sent = facts
@@ -10985,13 +10952,13 @@ mod tests {
             .find(|f| {
                 matches!(
                     &f.kind,
-                    crate::tap::FactKind::Sent { dest, schema, .. }
+                    crate::observe::ObservationKind::Sent { dest, schema, .. }
                         if *dest == Address::Schema(Shipped::schema_id())
                 )
             })
             .expect("broadcast Sent fact recorded");
         let (evt_dest, evt_trace) = match &evt_sent.kind {
-            crate::tap::FactKind::Sent { dest, trace, .. } => (dest.clone(), *trace),
+            crate::observe::ObservationKind::Sent { dest, trace, .. } => (dest.clone(), *trace),
             _ => unreachable!(),
         };
         assert_eq!(evt_dest, Address::Schema(Shipped::schema_id()));
@@ -11493,21 +11460,21 @@ mod tests {
         // forever).
         clock.advance(std::time::Duration::from_millis(200));
         wait_for(|| async {
-            let facts = system.tap_facts();
+            let facts = system.facts();
             let spawns = facts
                 .iter()
                 .filter(
-                    |f| matches!(&f.kind, crate::tap::FactKind::Spawned { path: p, .. } if *p == entity),
+                    |f| matches!(&f.kind, crate::observe::ObservationKind::Spawned { path: p, .. } if *p == entity),
                 )
                 .count();
             let last_spawn = facts
                 .iter()
                 .rposition(
-                    |f| matches!(&f.kind, crate::tap::FactKind::Spawned { path: p, .. } if *p == entity),
+                    |f| matches!(&f.kind, crate::observe::ObservationKind::Spawned { path: p, .. } if *p == entity),
                 );
             let passivated_after_respawn = match last_spawn {
                 Some(idx) => facts[idx + 1..].iter().any(
-                    |f| matches!(&f.kind, crate::tap::FactKind::Stopped { path: p, reason: crate::actor::StopReason::Passivated } if *p == entity),
+                    |f| matches!(&f.kind, crate::observe::ObservationKind::Stopped { path: p, reason: crate::actor::StopReason::Passivated } if *p == entity),
                 ),
                 None => false,
             };
@@ -11837,5 +11804,360 @@ mod tests {
         // round-trips.
         assert_eq!(v2.qty, 2);
         assert_eq!(v2.note, "");
+    }
+
+    // ---- observation handler (opt-in; the tap's replacement) ----
+
+    #[tokio::test]
+    async fn handler_receives_full_message_lifecycle_in_emission_order() {
+        // Given a test system (its observation log capturing everything)
+        // with one ES counter.
+        let (system, _clock) = ActorSystem::test();
+        let path = ActorPath::new("observed");
+        system.register_schema::<Add>();
+        system.register_schema::<Added>();
+        system.spawn_es::<Counter, _>(path.clone(), &json!({}), SpawnOpts::default(), || {
+            vec![Arc::new(TypedEsAdapter::<Counter, Add>::new::<Add>())]
+        });
+        wait_for_cursor(&system, &path, 0).await;
+
+        // When one command flows tell → commit.
+        system
+            .tell(path.clone(), Add { n: 7 })
+            .await
+            .expect("committed");
+
+        // Then the message lifecycle was observed in emission order:
+        // the Sent (route), Delivered (loop pickup), and Acked (commit)
+        // for THIS message appear in that relative order.
+        wait_for(|| async {
+            system
+                .facts()
+                .iter()
+                .any(|f| matches!(&f.kind, crate::observe::ObservationKind::Acked { .. }))
+        })
+        .await;
+        let kinds: Vec<&str> = system
+            .facts()
+            .iter()
+            .filter_map(|f| match &f.kind {
+                crate::observe::ObservationKind::Sent { .. } => Some("Sent"),
+                crate::observe::ObservationKind::Delivered { to, .. } if *to == path => {
+                    Some("Delivered")
+                }
+                crate::observe::ObservationKind::Acked { to, .. } if *to == path => Some("Acked"),
+                _ => None,
+            })
+            .collect();
+        let acked_pos = kinds.iter().position(|k| *k == "Acked").expect("acked");
+        let delivered_pos = kinds
+            .iter()
+            .position(|k| *k == "Delivered")
+            .expect("delivered");
+        assert!(
+            delivered_pos < acked_pos,
+            "Delivered precedes Acked: {kinds:?}"
+        );
+        // And exactly one Acked for one command.
+        assert_eq!(
+            kinds.iter().filter(|k| **k == "Acked").count(),
+            1,
+            "one command, one Acked observation: {kinds:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn runtime_disable_stops_observations_and_delivery_continues() {
+        // Given a counter whose first message was observed.
+        let (system, _clock) = ActorSystem::test();
+        let path = ActorPath::new("toggle-off");
+        system.register_schema::<Add>();
+        system.spawn_es::<Counter, _>(path.clone(), &json!({}), SpawnOpts::default(), || {
+            vec![Arc::new(TypedEsAdapter::<Counter, Add>::new::<Add>())]
+        });
+        wait_for_cursor(&system, &path, 0).await;
+        system
+            .tell(path.clone(), Add { n: 1 })
+            .await
+            .expect("committed");
+        wait_for(|| async {
+            !system
+                .facts()
+                .iter()
+                .filter(|f| matches!(&f.kind, crate::observe::ObservationKind::Acked { .. }))
+                .collect::<Vec<_>>()
+                .is_empty()
+        })
+        .await;
+        let observed_while_on = system.facts().len();
+
+        // When observation is disabled at runtime and more traffic flows.
+        system.clear_observation();
+        for n in 2..=5 {
+            system
+                .tell(path.clone(), Add { n })
+                .await
+                .expect("committed");
+        }
+
+        // Then the log froze at its pre-disable length…
+        assert_eq!(
+            system.facts().len(),
+            observed_while_on,
+            "no observations after clear"
+        );
+        // …while delivery itself continued (cursor + journal prove it).
+        wait_for_cursor(&system, &path, 5).await;
+        assert_eq!(system.journal_entries(&path).len(), 5);
+    }
+
+    #[tokio::test]
+    async fn runtime_enable_midstream_only_captures_the_tail() {
+        // Given a counter that committed 3 messages unobserved.
+        let (system, _clock) = ActorSystem::test();
+        let path = ActorPath::new("toggle-on");
+        system.register_schema::<Add>();
+        system.spawn_es::<Counter, _>(path.clone(), &json!({}), SpawnOpts::default(), || {
+            vec![Arc::new(TypedEsAdapter::<Counter, Add>::new::<Add>())]
+        });
+        wait_for_cursor(&system, &path, 0).await;
+        for n in 1..=3 {
+            system
+                .tell(path.clone(), Add { n })
+                .await
+                .expect("committed");
+        }
+        wait_for_cursor(&system, &path, 3).await;
+        let log = crate::observe::ObservationLog::default();
+        let before_enable = log.snapshot().len();
+
+        // When observation is enabled midstream and 2 more flow.
+        system.set_observation(log.handler());
+        for n in 4..=5 {
+            system
+                .tell(path.clone(), Add { n })
+                .await
+                .expect("committed");
+        }
+        wait_for_cursor(&system, &path, 5).await;
+
+        // Then the log holds only post-enable observations (it grew).
+        assert!(
+            log.snapshot().len() > before_enable,
+            "enable midstream starts capturing from now: {} -> {}",
+            before_enable,
+            log.snapshot().len()
+        );
+    }
+
+    #[tokio::test]
+    async fn handler_panic_is_isolated_from_the_message_path() {
+        // Given a counter with a PANICKING observation handler.
+        let (system, _clock) = ActorSystem::test();
+        let path = ActorPath::new("poisoned-handler");
+        system.register_schema::<Add>();
+        system.spawn_es::<Counter, _>(path.clone(), &json!({}), SpawnOpts::default(), || {
+            vec![Arc::new(TypedEsAdapter::<Counter, Add>::new::<Add>())]
+        });
+        wait_for_cursor(&system, &path, 0).await;
+        system.set_observation(Arc::new(|_observation| {
+            panic!("injected handler panic");
+        }));
+
+        // When a command is told (the handler will panic at the Sent site).
+        system
+            .tell(path.clone(), Add { n: 1 })
+            .await
+            .expect("the message still commits");
+
+        // Then the message committed (cursor + journal) — the handler
+        // panic never took down the message path — and the system still
+        // works for the next message.
+        wait_for_cursor(&system, &path, 1).await;
+        assert_eq!(system.journal_entries(&path).len(), 1);
+    }
+
+    #[tokio::test]
+    async fn dlq_independent_of_observation_state() {
+        // Given a DropNew mailbox of ONE on a system with observation
+        // DISABLED (production(): no handler installed).
+        let system = ActorSystem::new(SystemConfig::production());
+        let path = ActorPath::new("tiny-unobserved");
+        system.spawn_es::<Counter, _>(
+            path.clone(),
+            &json!({}),
+            SpawnOpts {
+                snapshot: SnapshotCadence::Off,
+                mailbox_capacity: 1,
+                mailbox_policy: OverloadPolicy::DropNew,
+                high_watermark: None,
+                passivation: None,
+            },
+            || vec![Arc::new(TypedEsAdapter::<Counter, Add>::new::<Add>())],
+        );
+        wait_for(|| async { system.inbox_cursor(&path).is_some() }).await;
+
+        // When more envelopes than the inbox holds are sent quickly.
+        for n in 1..=3_i64 {
+            let _ = system
+                .send(system.envelope(Add::schema_id(), path.clone(), json!({ "n": n })))
+                .await;
+        }
+
+        // Then the refusals still land in the DLQ even though nothing was
+        // observed (the DLQ is a DATA path, not an observation).
+        wait_for(|| async { system.dead_letter_count().await > 0 }).await;
+        let drained = system.drain_dead_letters();
+        assert!(
+            drained.iter().any(|l| l.envelope.schema == Add::schema_id()
+                && l.reason == crate::kernel::DeadLetterReason::InboxRefused),
+            "refused mail lands in the DLQ regardless of observation"
+        );
+    }
+
+    #[tokio::test]
+    async fn cursor_proves_batch_commit() {
+        // Given a counter (spawn-per-batch semantics: cursor starts at 0).
+        let (system, _clock) = ActorSystem::test();
+        let path = ActorPath::new("batch");
+        system.register_schema::<Add>();
+        system.spawn_es::<Counter, _>(path.clone(), &json!({}), SpawnOpts::default(), || {
+            vec![Arc::new(TypedEsAdapter::<Counter, Add>::new::<Add>())]
+        });
+        wait_for_cursor(&system, &path, 0).await;
+
+        // When 64 messages are told (the bench cadence's base batch).
+        for n in 0..64 {
+            system
+                .tell(path.clone(), Add { n })
+                .await
+                .expect("committed");
+        }
+
+        // Then the inbox cursor equals 64 EXACTLY when the state holds
+        // all 64 folds — the cursor is the commit proof.
+        wait_for_cursor(&system, &path, 64).await;
+        let total = system
+            .with_es_state::<Counter, _>(&path, |c| c.total)
+            .await
+            .expect("live state");
+        assert_eq!(total, 64 * 63 / 2, "every message folded exactly once");
+    }
+
+    #[tokio::test]
+    async fn backpressure_and_deadletter_observed_when_enabled() {
+        // Given a gated worker (capacity 8, watermark 2) whose first
+        // message blocks inside the handler — the Backpressured fixture.
+        let (system, _clock) = ActorSystem::test();
+        system.register_schema::<Add>();
+        let (sink_idx, sink) = open_sink();
+        let plain = ActorPath::new("observed-slow");
+        bind_sink(&plain, sink);
+        let opts = SpawnOpts {
+            mailbox_capacity: 8,
+            high_watermark: Some(2),
+            ..SpawnOpts::default()
+        };
+        system.spawn_service::<GatedWorker, _>(
+            plain.clone(),
+            &json!({ "sink": sink_idx }),
+            opts,
+            || {
+                vec![Arc::new(
+                    TypedServiceAdapter::<GatedWorker, Add>::new::<Add>(),
+                )]
+            },
+        );
+        wait_for(|| async { system.inbox_cursor(&plain).is_some() }).await;
+
+        // When the watermark is crossed (blocked handler + 3 queued).
+        for n in 0..4u64 {
+            let envelope = system.envelope(Add::schema_id(), plain.clone(), json!({ "n": n }));
+            system.send(envelope).await.expect("queued");
+        }
+        wait_for(|| async {
+            system
+                .facts()
+                .iter()
+                .any(|f| matches!(&f.kind, crate::observe::ObservationKind::Backpressured { path, .. } if *path == plain))
+        })
+        .await;
+        // Release the gate so the worker drains (clean shutdown).
+        WORKER_RELEASED.store(true, std::sync::atomic::Ordering::SeqCst);
+        WORKER_GATE.notify_waiters();
+        wait_for(|| async { sink_read(&plain).len() == 4 }).await;
+
+        // Then the up-crossing was observed exactly once (rate-limited).
+        let fires = system
+            .facts()
+            .iter()
+            .filter(|f| matches!(&f.kind, crate::observe::ObservationKind::Backpressured { path, .. } if *path == plain))
+            .count();
+        assert_eq!(fires, 1, "one Backpressured observation per crossing");
+    }
+
+    #[tokio::test]
+    async fn observation_disabled_by_default_constructs_nothing() {
+        // Given a production system (no handler installed).
+        let system = ActorSystem::new(SystemConfig::production());
+        assert!(!system.kernel.observing(), "off by default");
+
+        // When normal traffic flows and commits.
+        let path = ActorPath::new("quiet");
+        system.register_schema::<Add>();
+        system.spawn_es::<Counter, _>(path.clone(), &json!({}), SpawnOpts::default(), || {
+            vec![Arc::new(TypedEsAdapter::<Counter, Add>::new::<Add>())]
+        });
+        wait_for(|| async { system.inbox_cursor(&path).is_some() }).await;
+        for n in 0..8 {
+            system
+                .tell(path.clone(), Add { n })
+                .await
+                .expect("committed");
+        }
+
+        // Then the system is still off — nothing was ever constructed to
+        // observe with — and the messages committed anyway.
+        assert!(!system.kernel.observing(), "still off after traffic");
+        wait_for_cursor(&system, &path, 8).await;
+    }
+
+    #[tokio::test]
+    async fn watermark_latch_runs_without_a_handler() {
+        // Given a gated worker (capacity 8, watermark 2) on a system with
+        // NO handler: the latch logic must run (and re-arm) untethered
+        // from observation.
+        let system = ActorSystem::new(SystemConfig::production());
+        system.register_schema::<Add>();
+        let (sink_idx, sink) = open_sink();
+        let plain = ActorPath::new("unobserved-slow");
+        bind_sink(&plain, sink);
+        let opts = SpawnOpts {
+            mailbox_capacity: 8,
+            high_watermark: Some(2),
+            ..SpawnOpts::default()
+        };
+        system.spawn_service::<GatedWorker, _>(
+            plain.clone(),
+            &json!({ "sink": sink_idx }),
+            opts,
+            || {
+                vec![Arc::new(
+                    TypedServiceAdapter::<GatedWorker, Add>::new::<Add>(),
+                )]
+            },
+        );
+        wait_for(|| async { system.inbox_cursor(&plain).is_some() }).await;
+
+        // When the watermark is crossed while unobserved, then released.
+        for n in 0..4u64 {
+            let envelope = system.envelope(Add::schema_id(), plain.clone(), json!({ "n": n }));
+            system.send(envelope).await.expect("queued");
+        }
+        WORKER_RELEASED.store(true, std::sync::atomic::Ordering::SeqCst);
+        WORKER_GATE.notify_waiters();
+
+        // Then delivery completed intact — no panic, all four handled.
+        wait_for(|| async { sink_read(&plain).len() == 4 }).await;
     }
 }

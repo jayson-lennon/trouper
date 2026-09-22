@@ -55,17 +55,21 @@
 //!
 //! The kernel tables keep ONLY cross-actor state whose observations span
 //! actors: cells, journal store, live state slots (restart swaps them under
-//! the tables lock), specs/failures, replies/asks, projectors, dead letters,
-//! and the tap. The `caught_up` counter stays kernel-side by contract: the
+//! the tables lock), specs/failures, replies/asks, projectors, and dead
+//! letters. The `caught_up` counter stays kernel-side by contract: the
 //! projector cold-wake snapshots it across a re-spawn (which builds a fresh
 //! cell), so a cell-local counter would reset to zero and the wake would
 //! false-succeed on an incomplete fold.
 //!
-//! The message happy path acquires the kernel tables lock ZERO times (tap
-//! and store ride lock-free Arc handles); a send acquires it once (its Sent
-//! fact). The emit gates read the cell-local declarations mirror — the
-//! registry lock is off the message path too. Probe-counted under
-//! `cfg(test)` (`KERNEL_LOCKS`, `CELL_WAKEUPS`).
+//! Runtime observation is OPT-IN: the handler slot is a lock-free
+//! `ArcSwapOption` shared between the tables and the kernel handle — with
+//! no handler installed (the default) no observation is ever constructed,
+//! and the message happy path acquires the kernel tables lock ZERO times
+//! (the store rides a lock-free Arc handle; a send acquires the tables
+//! only to observe when a handler is installed). The emit gates read the
+//! cell-local declarations mirror — the registry lock is off the message
+//! path too. Probe-counted under `cfg(test)` (`KERNEL_LOCKS`,
+//! `CELL_WAKEUPS`).
 
 use parking_lot::Mutex;
 use std::collections::{HashMap, HashSet};
@@ -89,7 +93,7 @@ use crate::schema::SchemaId;
 ///
 /// Kept inspectable — dropped messages must stay observable, never silently
 /// vanish. `drain_dead_letters` hands retained envelopes to the host; the
-/// tap facts are the live observation surface.
+/// `DeadLettered` observation (opt-in) is the live observation surface.
 #[derive(Debug, Clone)]
 pub struct DeadLetter {
     /// The undeliverable payload's schema.
@@ -106,7 +110,7 @@ pub struct DeadLetter {
     pub envelope: Envelope,
 }
 
-/// An ask lifecycle event, recorded to the tap when an ask opens and settles.
+/// An ask lifecycle event, observed when an ask opens and settles.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum AskOutcome {
     /// The callee replied in time.
@@ -123,7 +127,7 @@ pub(crate) struct AskFact {
     #[allow(dead_code)] // ledger completeness; only `outcome` is asserted
     pub(crate) opened: bool,
     /// The settled outcome (None while open).
-    #[allow(dead_code)] // asserted by tests, projected via FactKind in prod
+    #[allow(dead_code)] // asserted by tests, projected via ObservationKind in prod
     pub(crate) outcome: Option<AskOutcome>,
     /// The callee's address.
     #[allow(dead_code)] // ledger completeness
@@ -151,23 +155,19 @@ pub(crate) struct KernelState {
     pub(crate) services: HashMap<ActorPath, Arc<tokio::sync::Mutex<Box<dyn DynServiceActor>>>>,
     /// Reply-slot leases (the mechanism half of reply addresses).
     pub(crate) replies: crate::reply::ReplyTable,
-    /// Ask lifecycle facts (the tap consumes these).
+    /// Ask lifecycle facts (the observation handler consumes these).
     pub(crate) ask_facts: Vec<AskFact>,
     /// Spawn args (genesis rebuild needs them at restart time).
     pub(crate) genesis_args: HashMap<ActorPath, Json>,
     /// Envelopes that could not be delivered or decoded.
     pub(crate) dead_letters: Vec<DeadLetter>,
-    /// The global observation ring (drop-oldest, self-locking — facts
-    /// are recorded wherever they happen, including without this lock).
-    pub(crate) tap: crate::tap::TapRing,
     /// Supervised children: path → spec.
     pub(crate) specs: HashMap<ActorPath, crate::supervision::ActorSpec>,
     /// Sliding-window failure records: path → window.
     pub(crate) failures: HashMap<ActorPath, crate::supervision::FailureWindow>,
     /// Per-projector caught-up counter: incremented every time a
     /// projector's catch-up completes. The wake path polls this counter
-    /// instead of scanning the evictable tap ring (the tap's CaughtUp
-    /// fact remains the host-observable marker). KERNEL-SIDE BY CONTRACT:
+    /// as its completeness signal. KERNEL-SIDE BY CONTRACT:
     /// the wake signal must survive cell teardown (wake_projector
     /// snapshots the count, re-spawns, and waits for it to move PAST —
     /// a cell-local counter would reset to 0 and false-succeed).
@@ -184,13 +184,13 @@ pub(crate) struct KernelState {
 
 impl Default for KernelState {
     fn default() -> Self {
-        Self::with_tap_capacity(4096)
+        Self::new()
     }
 }
 
 impl KernelState {
-    /// A fresh state with a tap ring of the given capacity.
-    pub fn with_tap_capacity(tap_capacity: usize) -> Self {
+    /// A fresh state: observation off (the handler slot starts `None`).
+    pub fn new() -> Self {
         Self {
             cells: HashMap::new(),
             journal_store: Arc::new(crate::journal::InMemoryJournalStore::new()),
@@ -201,21 +201,11 @@ impl KernelState {
             projectors: HashSet::new(),
             genesis_args: HashMap::new(),
             dead_letters: Vec::new(),
-            tap: crate::tap::TapRing::new(tap_capacity),
             specs: HashMap::new(),
             failures: HashMap::new(),
             caught_up: HashMap::new(),
             shutting_down: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
-    }
-}
-
-impl KernelState {
-    /// Records one fact to the tap ring: the sole observation surface
-    /// (drop-oldest; gaps appear when the RING drops). Fact offsets make
-    /// any loss visible.
-    pub fn record_fact(&mut self, ts: crate::clock::Timestamp, kind: crate::tap::FactKind) {
-        self.tap.push(ts, kind);
     }
 }
 
@@ -229,9 +219,12 @@ impl KernelState {
 /// bookkeeping work's mechanism deliverable).
 pub(crate) struct CountingKernelLock {
     tables: Mutex<KernelState>,
-    /// A SHARED clone of the state's tap ring (Arc interior): the message
-    /// path records facts without acquiring the tables.
-    tap: crate::tap::TapRing,
+    /// The shared observation handler slot: `None` = observation off (the
+    /// default — no observation is constructed, the load is the message
+    /// path's only cost), `Some(handler)` = every observation is handed to
+    /// the handler synchronously at the emission site. Panics inside the
+    /// handler are isolated from the message path.
+    observer: Arc<arc_swap::ArcSwapOption<crate::observe::ObservationHandler>>,
     /// A clone of the state's journal-store `Arc`: the append path clones
     /// the store without acquiring the tables (system-wide, set once in
     /// the core's assembly block before the lock is ever shared).
@@ -248,11 +241,31 @@ impl CountingKernelLock {
         self.tables.lock()
     }
 
-    /// Records one fact to the tap WITHOUT acquiring the tables (the ring
-    /// is self-locking and shared with the state) — the message path's
-    /// fact recorder.
-    pub(crate) fn tap_push(&self, ts: crate::clock::Timestamp, kind: crate::tap::FactKind) {
-        self.tap.push(ts, kind);
+    /// Whether a handler is installed — the observation sites' cheap gate:
+    /// a lock-free load, and nothing is constructed when it is `false`.
+    #[inline]
+    pub(crate) fn observing(&self) -> bool {
+        self.observer.load().is_some()
+    }
+
+    /// Hands one observation to the installed handler (if any).
+    ///
+    /// Panics inside the handler are isolated: observation must never take
+    /// down the message path. Handlers must not call back into the system
+    /// (see the [`crate::observe`] module docs).
+    pub(crate) fn observe(&self, observation: crate::observe::Observation) {
+        if let Some(handler) = self.observer.load().as_ref() {
+            let outcome = std::panic::catch_unwind(AssertUnwindSafe(|| handler(&observation)));
+            if outcome.is_err() {
+                tracing::error!("observation handler panicked; message path continued");
+            }
+        }
+    }
+
+    /// Replaces the observation handler at runtime (`None` = off). Takes
+    /// effect at the next emission site — in-flight handler calls finish.
+    pub(crate) fn set_observer(&self, handler: Option<crate::observe::ObservationHandler>) {
+        self.observer.store(handler.map(Arc::new));
     }
 
     /// The journal store handle, cloned WITHOUT acquiring the tables.
@@ -260,16 +273,17 @@ impl CountingKernelLock {
         self.store.clone()
     }
 
-    /// Wraps an already-built kernel state (the core's assembly block:
-    /// journal store + shutdown barrier swapped in before wrapping). The
-    /// tap ring and the journal-store `Arc` are CLONED out so the hot
-    /// path reads them without the tables.
-    pub(crate) fn with_state(tables: KernelState) -> Self {
-        let tap = tables.tap.clone();
+    /// Installs the initial handler at wrap time (the config-time
+    /// constructor path).
+    pub(crate) fn with_state_and_observer(
+        tables: KernelState,
+        handler: Option<crate::observe::ObservationHandler>,
+    ) -> Self {
+        let observer = Arc::new(arc_swap::ArcSwapOption::new(handler.map(Arc::new)));
         let store = tables.journal_store.clone();
         Self {
             tables: Mutex::new(tables),
-            tap,
+            observer,
             store,
         }
     }
@@ -665,16 +679,17 @@ async fn route_inner(
                 let endpoint = tee_endpoint;
                 if let Some(endpoint) = endpoint {
                     let _ = deliver_with_retry(&endpoint, copy).await;
-                    let mut kernel_table = kernel.lock();
-                    kernel_table.record_fact(
-                        origin_trace.causality_id.as_millis_ts(),
-                        crate::tap::FactKind::Sent {
-                            from: envelope.from.clone(),
-                            dest: Address::Path(tee_dest.clone()),
-                            schema: envelope.schema.clone(),
-                            trace: origin_trace,
-                        },
-                    );
+                    if kernel.observing() {
+                        kernel.observe(crate::observe::Observation::new(
+                            origin_trace.causality_id.as_millis_ts(),
+                            crate::observe::ObservationKind::Sent {
+                                from: envelope.from.clone(),
+                                dest: Address::Path(tee_dest.clone()),
+                                schema: envelope.schema.clone(),
+                                trace: origin_trace,
+                            },
+                        ));
+                    }
                 }
                 // No tee endpoint → the copy is silently dropped: a tee is
                 // best-effort by contract (never blocks the primary flow).
@@ -781,17 +796,16 @@ async fn route_inner(
                     return Ok(retry_path);
                 }
             }
-            {
-                let mut kernel = kernel.lock();
-                kernel.record_fact(
+            if kernel.observing() {
+                kernel.observe(crate::observe::Observation::new(
                     sent_trace.causality_id.as_millis_ts(),
-                    crate::tap::FactKind::Sent {
+                    crate::observe::ObservationKind::Sent {
                         from: sent_from,
                         dest: Address::Path(path.clone()),
                         schema: sent_schema,
                         trace: sent_trace,
                     },
-                );
+                ));
             }
             Ok(path)
         }
@@ -810,17 +824,16 @@ async fn route_inner(
                 return Err(envelope);
             };
             deliver_with_retry(&endpoint, envelope.clone()).await?;
-            {
-                let mut kernel = kernel.lock();
-                kernel.record_fact(
+            if kernel.observing() {
+                kernel.observe(crate::observe::Observation::new(
                     envelope.trace.causality_id.as_millis_ts(),
-                    crate::tap::FactKind::Sent {
+                    crate::observe::ObservationKind::Sent {
                         from: envelope.from.clone(),
                         dest: Address::Schema(schema.clone()),
                         schema: schema.clone(),
                         trace: envelope.trace,
                     },
-                );
+                ));
             }
             Ok(target)
         }
@@ -1027,17 +1040,19 @@ pub(crate) fn dead_letter(
         trace: envelope.trace,
         envelope: envelope.clone(),
     });
-    // The fact rides the self-locking tap — observation never needs the
-    // kernel tables.
-    kernel.tap_push(
-        envelope.trace.causality_id.as_millis_ts(),
-        crate::tap::FactKind::DeadLettered {
-            dest: envelope.dest.clone(),
-            schema: envelope.schema.clone(),
-            reason,
-            trace: envelope.trace,
-        },
-    );
+    // The DLQ push above is the DATA path (retained payloads, unconditional);
+    // only the observation is gated on a handler being installed.
+    if kernel.observing() {
+        kernel.observe(crate::observe::Observation::new(
+            envelope.trace.causality_id.as_millis_ts(),
+            crate::observe::ObservationKind::DeadLettered {
+                dest: envelope.dest.clone(),
+                schema: envelope.schema.clone(),
+                reason,
+                trace: envelope.trace,
+            },
+        ));
+    }
 }
 
 /// Delivers to an endpoint, honoring Block by awaiting capacity.
@@ -1109,14 +1124,16 @@ async fn direct_push(
         };
         (evicted, fire)
     };
-    if let Some(depth) = fire_watermark {
-        kernel.tap_push(
+    if let Some(depth) = fire_watermark
+        && kernel.observing()
+    {
+        kernel.observe(crate::observe::Observation::new(
             trace.causality_id.as_millis_ts(),
-            crate::tap::FactKind::Backpressured {
+            crate::observe::ObservationKind::Backpressured {
                 path: cell.path.clone(),
                 depth,
             },
-        );
+        ));
     }
     if let Some(evicted) = evicted {
         dead_letter(
@@ -1154,8 +1171,8 @@ pub(crate) async fn front_door_loop(
         // whole block — no depth read, no lock of any kind (the cell-local
         // flag answers "declared?"). The latch and the mark are CELL-LOCAL
         // now (single writer: this front door), so the enqueue path never
-        // takes the kernel lock — the Backpressured fact rides the
-        // self-locking tap.
+        // takes the kernel lock — the Backpressured observation rides the
+        // handler slot.
         if cell.has_watermark.load(std::sync::atomic::Ordering::SeqCst) {
             let depth = cell.inbox.lock().await.len() as u64;
             let wm = cell
@@ -1166,13 +1183,15 @@ pub(crate) async fn front_door_loop(
                     .watermark_fired
                     .swap(true, std::sync::atomic::Ordering::AcqRel)
             {
-                kernel.tap_push(
-                    envelope.trace.causality_id.as_millis_ts(),
-                    crate::tap::FactKind::Backpressured {
-                        path: cell.path.clone(),
-                        depth,
-                    },
-                );
+                if kernel.observing() {
+                    kernel.observe(crate::observe::Observation::new(
+                        envelope.trace.causality_id.as_millis_ts(),
+                        crate::observe::ObservationKind::Backpressured {
+                            path: cell.path.clone(),
+                            depth,
+                        },
+                    ));
+                }
             } else if depth <= wm {
                 cell.watermark_fired
                     .store(false, std::sync::atomic::Ordering::Release);
@@ -1476,16 +1495,19 @@ async fn step_es(ctx: &EsLoop) -> Step {
     let Some(envelope) = envelope else {
         return Step::Idle;
     };
-    // The Delivered fact rides the self-locking tap — observation on the
-    // message path never takes the kernel lock.
-    ctx.kernel.tap_push(
-        envelope.trace.causality_id.as_millis_ts(),
-        crate::tap::FactKind::Delivered {
-            to: ctx.path.clone(),
-            schema: envelope.schema.clone(),
-            trace: envelope.trace,
-        },
-    );
+    // The Delivered observation rides the handler slot — observation on
+    // the message path never takes the kernel lock, and constructs
+    // nothing when observation is off.
+    if ctx.kernel.observing() {
+        ctx.kernel.observe(crate::observe::Observation::new(
+            envelope.trace.causality_id.as_millis_ts(),
+            crate::observe::ObservationKind::Delivered {
+                to: ctx.path.clone(),
+                schema: envelope.schema.clone(),
+                trace: envelope.trace,
+            },
+        ));
+    }
 
     // 2. FIND the command entry for this schema (cell-local: spawn-static
     // config, written at spawn/restart, read per message).
@@ -1548,13 +1570,15 @@ async fn step_es(ctx: &EsLoop) -> Step {
             // The state may be poisoned — mark crashed and stop; the
             // supervisor rebuilds from the journal (never reuses `state`).
             ctx.cell.mark_crashed();
-            ctx.kernel.tap_push(
-                envelope.trace.causality_id.as_millis_ts(),
-                crate::tap::FactKind::Failed {
-                    path: ctx.path.clone(),
-                    error: "handler panic".to_owned(),
-                },
-            );
+            if ctx.kernel.observing() {
+                ctx.kernel.observe(crate::observe::Observation::new(
+                    envelope.trace.causality_id.as_millis_ts(),
+                    crate::observe::ObservationKind::Failed {
+                        path: ctx.path.clone(),
+                        error: "handler panic".to_owned(),
+                    },
+                ));
+            }
             let _ = poison;
             return Step::Crashed;
         }
@@ -1679,23 +1703,26 @@ async fn step_es(ctx: &EsLoop) -> Step {
     };
 
     // 6. ACK (the commit point: this message will never redeliver). The
-    // commit-point bookkeeping is cell-local + tap-direct: the last
-    // committed seq and the Acked fact land without the kernel lock (the
-    // seq is single-writer — this loop is the only appender for the path).
+    // commit-point bookkeeping is cell-local: the last committed seq and
+    // the inbox cursor land without the kernel lock (the seq and the
+    // cursor are single-writer — this loop is the only appender for the
+    // path). The Acked observation rides the handler slot.
     ctx.cell.inbox.lock().await.ack();
     if let Some(last) = seqs.last() {
         ctx.cell
             .last_event_seq
             .store(last.as_u64(), std::sync::atomic::Ordering::Release);
     }
-    ctx.kernel.tap_push(
-        envelope.trace.causality_id.as_millis_ts(),
-        crate::tap::FactKind::Acked {
-            to: ctx.path.clone(),
-            schema: envelope.schema.clone(),
-            trace: envelope.trace,
-        },
-    );
+    if ctx.kernel.observing() {
+        ctx.kernel.observe(crate::observe::Observation::new(
+            envelope.trace.causality_id.as_millis_ts(),
+            crate::observe::ObservationKind::Acked {
+                to: ctx.path.clone(),
+                schema: envelope.schema.clone(),
+                trace: envelope.trace,
+            },
+        ));
+    }
 
     // 7. APPLY (the same fold replay uses; state may now lag the journal
     // only if the process dies before this line — rebuild covers that).
@@ -1893,6 +1920,9 @@ impl crate::context::AskPort for KernelAskPort {
             // Open the lease and route the request envelope. Expired
             // leases are reaped here as a side effect of opening — a
             // dead asker's slot can never accumulate (no reaper task).
+            // The AskOpened observation is emitted from the HANDLE (the
+            // gate reads the lock-free slot), never under the tables lock
+            // — a handler that re-acquired the tables would deadlock.
             let now = clock.now();
             let (lease, receiver) = {
                 let mut kernel = kernel.lock();
@@ -1905,16 +1935,18 @@ impl crate::context::AskPort for KernelAskPort {
                     dest: dest.clone(),
                     trace,
                 });
-                kernel.record_fact(
-                    now,
-                    crate::tap::FactKind::AskOpened {
-                        from: ActorPath::new("anonymous"),
-                        dest: dest.clone(),
-                        trace,
-                    },
-                );
                 (lease, receiver)
             };
+            if kernel.observing() {
+                kernel.observe(crate::observe::Observation::new(
+                    now,
+                    crate::observe::ObservationKind::AskOpened {
+                        from: ActorPath::new("anonymous"),
+                        dest: dest.clone(),
+                        trace: crate::envelope::TraceCtx::root(),
+                    },
+                ));
+            }
             let trace = crate::envelope::TraceCtx::root();
             let envelope = Envelope::raw(
                 schema,
@@ -1951,22 +1983,26 @@ impl crate::context::AskPort for KernelAskPort {
         outcome: AskOutcome,
         trace: TraceCtx,
     ) {
-        let mut kernel = self.kernel.lock();
-        kernel.ask_facts.push(AskFact {
-            opened: false,
-            outcome: Some(outcome.clone()),
-            dest: dest.clone(),
-            trace,
-        });
-        kernel.record_fact(
-            trace.causality_id.as_millis_ts(),
-            crate::tap::FactKind::AskSettled { outcome, trace },
-        );
+        {
+            let mut kernel = self.kernel.lock();
+            kernel.ask_facts.push(AskFact {
+                opened: false,
+                outcome: Some(outcome.clone()),
+                dest: dest.clone(),
+                trace,
+            });
+            // Drop the lease: settled (consumed) or timed out (late
+            // replies land nowhere). The reply's `complete` already
+            // removed it on the Replied path; removal here is idempotent.
+            kernel.replies.cancel(&lease);
+        }
+        if self.kernel.observing() {
+            self.kernel.observe(crate::observe::Observation::new(
+                trace.causality_id.as_millis_ts(),
+                crate::observe::ObservationKind::AskSettled { outcome, trace },
+            ));
+        }
         let _ = dest;
-        // Drop the lease: settled (consumed) or timed out (late replies
-        // land nowhere). The reply's `complete` already removed it on the
-        // Replied path; removal here is idempotent.
-        kernel.replies.cancel(&lease);
     }
 }
 
@@ -2014,19 +2050,19 @@ pub(crate) async fn broadcast(
             .filter(|(path, _)| !member_paths.contains(path))
             .collect()
     };
-    // ONE Sent fact per publish (not per delivery): the broadcast itself is
-    // the observable event — a zero-subscriber publish still happened.
-    {
-        let mut kernel = kernel.lock();
-        kernel.record_fact(
+    // ONE Sent observation per publish (not per delivery): the broadcast
+    // itself is the observable event — a zero-subscriber publish still
+    // happened.
+    if kernel.observing() {
+        kernel.observe(crate::observe::Observation::new(
             envelope.trace.causality_id.as_millis_ts(),
-            crate::tap::FactKind::Sent {
+            crate::observe::ObservationKind::Sent {
                 from: envelope.from.clone(),
                 dest: crate::envelope::Address::Schema(schema.clone()),
                 schema: schema.clone(),
                 trace: envelope.trace,
             },
-        );
+        ));
     }
     for (_path, endpoint) in &targets {
         // Block backpressure: a full inbox stalls the publisher (loss is
@@ -2349,13 +2385,15 @@ async fn snapshot_now(ctx: &EsLoop, last: crate::journal::SeqNo) {
             ctx.cell
                 .snapshot_anchor_ms
                 .store(now.as_millis(), std::sync::atomic::Ordering::Release);
-            ctx.kernel.tap_push(
-                now,
-                crate::tap::FactKind::SnapshotTaken {
-                    path: ctx.path.clone(),
-                    seq: last,
-                },
-            );
+            if ctx.kernel.observing() {
+                ctx.kernel.observe(crate::observe::Observation::new(
+                    now,
+                    crate::observe::ObservationKind::SnapshotTaken {
+                        path: ctx.path.clone(),
+                        seq: last,
+                    },
+                ));
+            }
         }
     }
 }
@@ -2558,15 +2596,18 @@ async fn step_service(ctx: &ServiceLoop) -> Step {
         return Step::Idle;
     };
 
-    // The Delivered fact rides the self-locking tap (no kernel lock).
-    ctx.es.kernel.tap_push(
-        envelope.trace.causality_id.as_millis_ts(),
-        crate::tap::FactKind::Delivered {
-            to: ctx.es.path.clone(),
-            schema: envelope.schema.clone(),
-            trace: envelope.trace,
-        },
-    );
+    // The Delivered observation rides the handler slot (no kernel lock,
+    // nothing constructed when observation is off).
+    if ctx.es.kernel.observing() {
+        ctx.es.kernel.observe(crate::observe::Observation::new(
+            envelope.trace.causality_id.as_millis_ts(),
+            crate::observe::ObservationKind::Delivered {
+                to: ctx.es.path.clone(),
+                schema: envelope.schema.clone(),
+                trace: envelope.trace,
+            },
+        ));
+    }
 
     // 2. FIND the message entry (cell-local spawn-static config).
     let entry = {
@@ -2751,14 +2792,16 @@ pub(crate) async fn restart_es(
             },
             std::sync::atomic::Ordering::Release,
         );
-        kernel.record_fact(
-            ctx.clock.now(),
-            crate::tap::FactKind::Spawned {
-                path: ctx.path.clone(),
-                kind: crate::actor::ActorKind::EventSourced,
-                restart: true,
-            },
-        );
+        if ctx.kernel.observing() {
+            ctx.kernel.observe(crate::observe::Observation::new(
+                ctx.clock.now(),
+                crate::observe::ObservationKind::Spawned {
+                    path: ctx.path.clone(),
+                    kind: crate::actor::ActorKind::EventSourced,
+                    restart: true,
+                },
+            ));
+        }
     }
 
     // Fresh endpoint behind the SAME path: senders holding pre-crash
@@ -3012,26 +3055,31 @@ async fn escalate(
     stop_reason: crate::actor::StopReason,
 ) {
     {
-        let mut kernel = system.kernel.lock();
+        let kernel = system.kernel.lock();
         // The child is gone: clear its crash flag (cell-local now) and
-        // record the stop WITH its typed reason, then the escalation.
+        // observe the stop WITH its typed reason, then the escalation
+        // (both gated on a handler being installed).
         if let Some(cell) = kernel.cells.get(&spec.path).cloned() {
             cell.clear_crashed();
         }
-        kernel.record_fact(
-            system.clock.now(),
-            crate::tap::FactKind::Stopped {
-                path: spec.path.clone(),
-                reason: stop_reason,
-            },
-        );
-        kernel.record_fact(
-            system.clock.now(),
-            crate::tap::FactKind::Escalated {
-                path: spec.path.clone(),
-                reason: reason.to_owned(),
-            },
-        );
+        drop(kernel);
+        if system.kernel.observing() {
+            let now = system.clock.now();
+            system.kernel.observe(crate::observe::Observation::new(
+                now,
+                crate::observe::ObservationKind::Stopped {
+                    path: spec.path.clone(),
+                    reason: stop_reason,
+                },
+            ));
+            system.kernel.observe(crate::observe::Observation::new(
+                now,
+                crate::observe::ObservationKind::Escalated {
+                    path: spec.path.clone(),
+                    reason: reason.to_owned(),
+                },
+            ));
+        }
     }
     // Remove the child's slot (its identity leaves the registry). The
     // in-memory state dies too: only live actors hold state, and this

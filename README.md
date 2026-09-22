@@ -24,22 +24,28 @@ spawn or a harness step.)
 
 ### e2e
 
-Message benches share one matrix — batches of 1, 64, and 512 — and all
-completion is push-driven: benches await `Acked` tap facts (or ask
-replies), never poll actor state on a timer. The swarm keeps its
+Message benches share one matrix — batches of 64, 512, and 2048 (2048
+vs a Block inbox of 64 keeps producer-side blocking inside the measured
+body) — and all completion is push-driven: benches spin-yield on the
+destination's inbox cursor, which advances exactly at the kernel's
+commit point (journal append + ack; cursor ≥ base+N proves N
+committed), never poll actor state on a timed sleep. Ask benches
+settle on the reply itself; swarm settles on hand-registered sink
+counters. Benches run with observation DISABLED (the default) — the
+`observation_price` group measures the enabled cost separately. There
+is no single-message case: spawn + harness overhead dominated it.
+Numbers across matrix entries are NOT comparable 1:1 (per-batch spawn
+amortization differs); compare within a size. The swarm keeps its
 declared 32×receivers shape; payload_size and wide_tree are
 single-message by design (they price payload width, not batching).
 
 | Bench            | Case                        | Criterion time | Per message |                Rate |
 | ---------------- | --------------------------- | -------------: | ----------: | ------------------: |
-| tell_acked       | 1_messages                  |     367.765 µs |    367.8 µs |         2,719 msg/s |
-|                  | 64_messages                 |       1.847 ms |     28.9 µs |        34,655 msg/s |
+| tell_acked       | 64_messages                 |       1.847 ms |     28.9 µs |        34,655 msg/s |
 |                  | 512_messages                |      16.299 ms |     31.8 µs |        31,413 msg/s |
-| fire_and_forget  | 1_messages                  |     741.292 µs |    741.3 µs |         1,349 msg/s |
-|                  | 64_messages                 |       1.430 ms |     22.3 µs |        44,756 msg/s |
+| fire_and_forget  | 64_messages                 |       1.430 ms |     22.3 µs |        44,756 msg/s |
 |                  | 512_messages                |      14.822 ms |     28.9 µs |        34,544 msg/s |
-| producer_scaling | 1_message_1_producer        |     547.846 µs |    547.8 µs |         1,825 msg/s |
-|                  | 64_messages_1_producers     |       1.501 ms |     23.4 µs |        42,645 msg/s |
+| producer_scaling | 64_messages_1_producers     |       1.501 ms |     23.4 µs |        42,645 msg/s |
 |                  | 64_messages_2_producers     |     668.089 µs |     10.4 µs |        95,796 msg/s |
 |                  | 64_messages_4_producers     |     797.631 µs |     12.5 µs |        80,238 msg/s |
 |                  | 64_messages_8_producers     |     952.633 µs |     14.9 µs |        67,182 msg/s |
@@ -62,13 +68,10 @@ single-message by design (they price payload width, not batching).
 |                  | handlers_64_1_asks          |     800.697 µs |    800.7 µs |   1,249 roundtrip/s |
 |                  | handlers_64_64_asks         |      53.631 ms |    838.0 µs |   1,193 roundtrip/s |
 |                  | handlers_64_512_asks        |     411.278 ms |    803.3 µs |   1,245 roundtrip/s |
-| overload_block   | 1_message_1_producer        |      16.117 µs |     16.1 µs |        62,047 msg/s |
 |                  | 64_messages_16_producers    |     464.743 µs |      7.3 µs |       137,710 msg/s |
 |                  | 512_messages_16_producers   |      16.792 ms |     32.8 µs |        30,490 msg/s |
-| idle_fleet       | 1k_idle_1_messages          |      30.442 µs |     30.4 µs |        32,850 msg/s |
 |                  | 1k_idle_64_messages         |     466.120 µs |      7.3 µs |       137,304 msg/s |
 |                  | 1k_idle_512_messages        |      13.810 ms |     27.0 µs |        37,075 msg/s |
-|                  | 10k_idle_1_messages         |      31.302 µs |     31.3 µs |        31,947 msg/s |
 |                  | 10k_idle_64_messages        |     434.367 µs |      6.8 µs |       147,341 msg/s |
 |                  | 10k_idle_512_messages       |      14.146 ms |     27.6 µs |       36,195 msg/s |
 | swarm            | p32_r128                    |       6.145 ms |      1.5 µs |       666,594 msg/s |
@@ -80,8 +83,8 @@ single-message by design (they price payload width, not batching).
 What the shapes mean:
 
 - **tell_acked**: the COMMIT floor, one message through
-  send→fold→ack; batches of 64/512 price the per-message cost once
-  the entity is warm (~29-32 µs per message).
+  send→fold→ack; batches price the per-message cost once the entity
+  is warm.
 - **fire_and_forget**: the SEND floor — the same tell loop with no
   completion wait: channel accept + route, resolved at the front
   door. This is what an event-driven producer waits before its own
@@ -90,10 +93,8 @@ What the shapes mean:
   commit, so the inbox fills and backpressure engages (the same
   Block policy overload_block exercises); this measures the
   producer-side wait, not durability.
-- **producer_scaling**: 1/2/4/8 producers on one entity at 64 and 512
-  messages (the 1-message case runs one producer — distributing a
-  single message across producers measures nothing). Per-message cost
-  holds as producers grow.
+- **producer_scaling**: 1/2/4/8 producers on one entity at
+  64/512/2048 messages. Per-message cost holds as producers grow.
 - **payload_size**: one message per commit, 500 B to 1 MB payloads.
 - **wide_tree**: one commit with a huge array payload (100k / 1M
   nodes); 539 µs → 1.25 ms shows width costs, but far less than a
@@ -101,15 +102,19 @@ What the shapes mean:
 - **fanout**: ask roundtrips (request + reply) — 1/8/64 live echo
   services × 1/64/512 asks. Completion is the reply, no wait
   mechanism.
-- **overload_block**: 16 producers into a `Block` inbox at 64/512
-  messages (backpressure, no loss); the 1-message case is the same
-  entity with its inbox unfilled — the no-backpressure datapoint.
-- **idle_fleet**: one busy entity among 1k / 10k idle actors at 1/64/512
-  messages. Within noise of tell_acked; idle actors cost nothing.
+- **overload_block**: 16 producers into a `Block` inbox at
+  64/512/2048 messages (backpressure, no loss); 2048 keeps the
+  producers blocked inside the measured body.
+- **idle_fleet**: one busy entity among 1k / 10k idle actors at
+  64/512/2048 messages. Within noise of tell_acked; idle actors cost
+  nothing.
 - **swarm**: many-to-many at fleet scale (32 tells × every receiver),
   per-message cost at 4k/64k/1M messages in flight.
 - **projection_read**: how fast a UI can read a projector's state,
   typed closure vs JSON decode, per read.
+- **observation_price**: the same fire_and_forget body with a
+  counting observation handler installed vs disabled — the price of
+  watching the wire, paid ONLY when a handler is installed.
 
 ### micro
 

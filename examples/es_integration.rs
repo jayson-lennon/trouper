@@ -28,7 +28,7 @@ use trouper::actor::{CommandHandler, EventSourcedActor, MsgHandler, ServiceActor
 use trouper::context::{CmdCtx, MsgCtx};
 use trouper::prelude::*;
 
-use trouper::tap::FactKind;
+use trouper::observe::{ObservationHandler, ObservationKind};
 
 // ---- messages ------------------------------------------------------------
 
@@ -382,6 +382,34 @@ async fn main() {
         .init();
     let system = ActorSystem::new(SystemConfig::production());
 
+    // Opt-in observation: watch the flow for the two transfer outcomes.
+    let (completed, rejected): (
+        Arc<std::sync::atomic::AtomicBool>,
+        Arc<std::sync::atomic::AtomicBool>,
+    ) = (Arc::default(), Arc::default());
+    let observed_count: Arc<std::sync::atomic::AtomicUsize> = Arc::default();
+    system.set_observation({
+        let (completed, rejected, observed_count) =
+            (completed.clone(), rejected.clone(), observed_count.clone());
+        let handler: ObservationHandler = Arc::new(move |observation| {
+            observed_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            match &observation.kind {
+                ObservationKind::Delivered { schema, .. }
+                    if *schema == TransferCompleted::schema_id() =>
+                {
+                    completed.store(true, std::sync::atomic::Ordering::SeqCst);
+                }
+                ObservationKind::Delivered { schema, .. }
+                    if *schema == TransferRejected::schema_id() =>
+                {
+                    rejected.store(true, std::sync::atomic::Ordering::SeqCst);
+                }
+                _ => {}
+            }
+        });
+        handler
+    });
+
     // The partition spec validates against the schema table AT INSTALL —
     // but the Account builder registers its command schemas only when the
     // factory spawns the first entity. Declare the shard key up front.
@@ -452,14 +480,7 @@ async fn main() {
         )
         .await
         .expect("delivered");
-    wait(|| async {
-        system.tap_facts().iter().any(|f| {
-            matches!(&f.kind,
-                FactKind::Delivered { schema, .. }
-                    if *schema == TransferCompleted::schema_id())
-        })
-    })
-    .await;
+    wait(|| async { completed.load(std::sync::atomic::Ordering::SeqCst) }).await;
     println!("  -> t1 published by the service\n");
 
     // 2. A doomed transfer: carol (100) sends 500 to dave (100) — the
@@ -476,14 +497,7 @@ async fn main() {
         )
         .await
         .expect("delivered");
-    wait(|| async {
-        system.tap_facts().iter().any(|f| {
-            matches!(&f.kind,
-                FactKind::Delivered { schema, .. }
-                    if *schema == TransferRejected::schema_id())
-        })
-    })
-    .await;
+    wait(|| async { rejected.load(std::sync::atomic::Ordering::SeqCst) }).await;
     println!("  -> t2 rejected (overdraft)\n");
 
     // 3. A transfer against a FROZEN account: its set was never
@@ -506,8 +520,9 @@ async fn main() {
     // Give the tick sweep a few beats (100ms timeout window + margin).
     tokio::time::sleep(Duration::from_millis(500)).await;
 
-    // The observation surface: the tap ring (facts about everything) and
-    // the DLQ (frank's debit died there, envelope retained for resend).
+    // The observation surface: the live observation count (what the
+    // handler saw) and the DLQ (frank's debit died there, envelope
+    // retained for resend).
     let dlq = system.dead_letter_count().await;
     let dropped = system
         .dead_letter_reasons()
@@ -516,8 +531,8 @@ async fn main() {
         .filter(|r| r.starts_with("Undeliverable") || r.starts_with("Unresolvable"))
         .count();
     println!(
-        "final: tap facts = {}, dlq = {} ({} 'never settles' drops)",
-        system.tap_facts().len(),
+        "final: observations = {}, dlq = {} ({} 'never settles' drops)",
+        observed_count.load(std::sync::atomic::Ordering::SeqCst),
         dlq,
         dropped
     );

@@ -32,7 +32,7 @@ Entries are added or amended **only with human approval**.
 ---
 
 - (identity) trouper is a two-crate Rust workspace (edition 2024): `trouper`, the single-machine actor runtime, and `trouper_macros`, its proc-macro crate.
-- (runtime) All actor communication is mediated by the runtime: actors never hold channels directly; every send is routed by path or schema through the registry and emits a tap fact.
+- (runtime) All actor communication is mediated by the runtime: actors never hold channels directly; every send is routed by path or schema through the registry and emits a Sent observation when observation is enabled.
 - (runtime) Event-sourced actors are pure decision functions (sync `handle(&self)` returning events) with a single `apply` used for both live state application and replay; all other actors may perform side effects and use `ask`.
 - (runtime) The registry is kernel code, not an actor: path→endpoint slots, schema, schema→handler route, partition, projector-set, and router rule tables persist across actor restarts; actor identity is its registered path.
 - (runtime) Message schemas are runtime data: derived Rust types, hand-written impls, and external JSON descriptors register into the same schema table.
@@ -46,18 +46,18 @@ Entries are added or amended **only with human approval**.
 - (runtime) Actor spawning is builder-based: typed actors declare `handles`/`emits` inline; foreign actors supply JSON schema plus handle/apply closures; positional spawn functions remain as alternative entry points.
 - (runtime) Typed and foreign spawn builders register every declared handle and emit schema into the schema table; hand registration remains only where a def must exist before a builder runs (a partition set validates its shard key at install time).
 - (runtime) Actor `manifest()` defaults to an empty manifest; builders supply the contract kind and edges, making builder declarations the single source of an actor's declared surface.
-- (runtime) The ActorSystem exposes typed `tell` and `ask` entry points; ask is lease-backed with a mandatory timeout and settles with the same Replied/Timeout/Failed facts as in-actor asks.
-- (runtime) Event emission is declaration-filtered: the kernel drops events whose schema the actor has not declared, before journal append, with a dead-letter fact and a tracing error; journals therefore contain only declared schemas.
+- (runtime) The ActorSystem exposes typed `tell` and `ask` entry points; ask is lease-backed with a mandatory timeout and settles with the same Replied/Timeout/Failed observations as in-actor asks.
+- (runtime) Event emission is declaration-filtered: the kernel drops events whose schema the actor has not declared, before journal append, with a dead-letter and a tracing error; journals therefore contain only declared schemas.
 - (runtime) Outbound actor messages are declaration-enforced: every intent an actor records (send, publish, send_to_any, reply) is gated at flush against the actor's .emits, and undeclared messages drop with an UndeclaredEmit dead letter plus a tracing error.
 - (runtime) Partition sets are declarative specs resolved by the kernel at route time: senders keep addressing the public path; per-entity paths derive from a schema-declared shard key and entities activate on demand.
-- (runtime) Service-actor asks are lease-backed: every ask carries a mandatory timeout, the reply slot is a runtime lease that dies with the ask, and outcomes (Replied/Timeout/Failed) are tap facts.
-- (tap) The tap is a global bounded drop-oldest ring of facts that may drop under pressure; it is observation only — delivery never flows through it, and JSON projection happens only at the tap boundary (`Fact::to_json`).
-- (tap) Each tap fact carries a monotonic `offset`; the ring exposes its retained `[floor, next)` range, and offset gaps signal eviction.
-- (tap) The tap ring is the sole observation surface: facts are recorded to the bounded ring and read by the host; actors observe events only by declaring .handles on them.
-- (runtime) `tracing` is the developer-diagnostic channel; the tap is the product fact stream.
+- (runtime) Service-actor asks are lease-backed: every ask carries a mandatory timeout, the reply slot is a runtime lease that dies with the ask, and outcomes (Replied/Timeout/Failed) are observations.
+- (observability) Runtime observation is opt-in: a single user-installed handler closure (`ObservationHandler`); with no handler installed no observation messages are constructed. JSON projection exists only at the observation boundary (`Observation::to_json`).
+- (observability) The handler can be installed or removed at runtime through the system API (`set_observation`/`clear_observation`), and a handler panic is isolated from the message path; observations carry a timestamp and a runtime-event kind.
+- (observability) The handler is the sole observation surface: uncaptured observations are gone (no history — the DLQ is the only after-the-fact artifact the runtime keeps); actors observe events only by declaring .handles on them.
+- (runtime) `tracing` is the developer-diagnostic channel; the observation handler is the product event stream.
 - (runtime) `system.export()` returns a JSON-serializable `SystemExport` of the live system: schemas, actors (with ES state and inbox cursor), declared edges, observed edges, pools, partitions, and router rules; `SystemExport` round-trips through JSON losslessly.
 - (runtime) A ReportState command makes a StateReporter actor emit a journaled StateReported event whose payload is the JSON SystemExport document.
-- (runtime) Domain outcomes are events journaled like any other event; technical failures are handler panics, which supervision converts into restarts and `Failed`/`Escalated` tap facts.
+- (runtime) Domain outcomes are events journaled like any other event; technical failures are handler panics, which supervision converts into restarts and `Failed`/`Escalated` observations.
 - (runtime) All synchronous mutexes are parking_lot: lock() cannot fail, there is no poisoning, and a panic under a lock never wedges later lockers.
 - (runtime) Replies are point-to-point: a reply with no reply_to is dropped silently, never broadcast; every outbound actor message requires a declared .emits and is dropped with an UndeclaredEmit dead letter otherwise.
 - (runtime) Handler contexts (CmdCtx/MsgCtx) expose only tier-curated methods; the outbox, trace, and ask port are crate-private plumbing.
@@ -97,27 +97,27 @@ Entries are added or amended **only with human approval**.
 - (queries) projector_state wakes a projector-set entity if needed, awaits catch-up, and returns the complete fold; es_state is a best-effort capture of in-memory state only.
 - (queries) with_es_state/with_projector_state read entity and projector state typed under the state lock with no serialization; try_ variants are sync and non-blocking.
 - (queries) Typed reads cover live entities and projectors only: foreign actors read as JSON, passivated entities read None, and service-actor state is not a readable surface.
-- (lifecycle) A projector records a CaughtUp tap fact when its catch-up completes.
+- (lifecycle) A projector records a CaughtUp observation when its catch-up completes and observation is enabled.
 - (docs) The trouper crate's public API documentation follows std rustdoc style — consumer-relevant statements only, no implementation narration — and cargo doc runs warning-free.
 - (runtime) Actor inbox backpressure engages at the spawn-configured mailbox capacity: Block senders await room, and DropNew/DropOld refusals dead-letter through the front door.
 - (lifecycle) A restarted actor's front door is created with the original spawn's mailbox capacity and policy.
 - (runtime) The front-door task handles only refused deliveries: Block holds, dead letters, and the fallback notify; direct sends push the inbox and notify the loop themselves.
 - (registry) An Endpoint couples the front-door channel sender with the destination's live cell; restarts swap the endpoint while the cell persists across restart.
-- (queries) A set-owned projector wake completes on a kernel caught-up signal; the tap's CaughtUp fact remains the host-observable marker.
+- (queries) Projector set wakes complete on the kernel caught-up signal regardless of observation state; the CaughtUp observation is the host-observable marker when enabled.
 - (journal) A due-time snapshot check reads kernel-side anchors and loads the journal only when a snapshot is due.
 - (runtime) Ask reply leases are bounded: failed request deliveries cancel the lease and expired slots are pruned.
 - (bench) Criterion benches live in benches/e2e.rs (usage-shaped) and benches/micro.rs (component-shaped), run via cargo bench.
-- (bench) The e2e tell_acked bench measures the full send→fold→ack commit at batches of 1/64/512 messages; the fire_and_forget bench measures the sustained send-only price (channel accept + route) at the same cadence — its producer-side wait saturates to commit pace when the Block inbox fills, so it is not a durability or burst number.
+- (bench) The e2e tell_acked bench measures the full send→fold→ack commit at batches of 64/512/2048 messages; the fire_and_forget bench measures the sustained send-only price (channel accept + route) at the same cadence — its producer-side wait saturates to commit pace when the Block inbox fills, so it is not a durability or burst number.
 - (runtime) Message delivery wakes the actor's loop through a Notify signal fired by the sender on the direct-delivery path and by the front door on its fallback path; no fixed-interval polling exists on the message path.
-- (runtime) Per-actor mutable bookkeeping lives on the actor cell as lock-free state; the kernel tables lock guards cross-actor state only (an ES message's happy path acquires it zero times; a send acquires it once for its Sent fact).
+- (runtime) Per-actor mutable bookkeeping lives on the actor cell as lock-free state; the kernel tables lock guards cross-actor state only (with observation disabled an ES message's happy path acquires the tables zero times end to end).
 - (runtime) An idle actor's loop sleeps until its next due duty (snapshot cadence or passivation) or the next message, whichever comes first; an actor with no duties armed does not wake at all.
 - (runtime) A supervised child's crash is signaled by a Notify on the child's cell; supervision engines wake on the signal and read the crash flag lock-free instead of polling.
 - (bench) The idle_fleet bench includes a 10,000-idle-actor case, and examples/idle_burn.rs measures runtime CPU seconds for a duty-armed idle fleet (5,000 actors burn ~0.003 s CPU/s of wall vs ~0.28 s polled before this work).
-- (bench) Every e2e bench that commits messages measures batches of 1, 64, and 512 messages; swarm keeps its own declared per-case counts, and payload_size/wide_tree measure single committed messages.
-- (bench) Bench completion waits are push-driven: benches await Acked tap facts and ask replies, never poll actor state on a timer — the exception is swarm, whose measured body settles on hand-registered sink counters polled on a timer, out of scope for the push-wait conversion.
+- (bench) Every e2e bench that commits messages measures batches of 64, 512, and 2048 messages — no single-message case exists (spawn and harness overhead dominated it); swarm keeps its own declared per-case counts, and payload_size/wide_tree measure single committed messages. Benches run with observation disabled; the e2e observation_price group measures the enabled cost.
+- (bench) Bench completion is push-driven: benches spin-yield on the destination's inbox cursor — which advances exactly at the kernel commit point (journal append + ack), so cursor ≥ base+N proves N committed — and await ask replies; never poll actor state on a timed sleep (swarm settles on hand-registered sink counters by design).
 - (bench) Criterion throughput Elements equal the number of messages each iteration commits.
 - (schemas) The Event/Command derive maps every non-shard-key field to FieldTy::Json without inspecting its Rust type; no field type is a compile error.
 - (schemas) The Event/Command derive maps a #[schema(shard_key)] field to its real flat descriptor type, since shard keys are string or number values read at partition routing.
 - (schemas) The derive's schema name is the struct ident and descriptor field names are the Rust field idents; renames are serde's concern only, and the shard-key field must not be serde-renamed.
-- (runtime) An ES loop captures its state Arc at spawn and rebinds it at boot recovery, restart, and projector catch-up — the only moments the table's Arc is replaced; message steps read the cached state shell without the kernel tables lock (probe-counted: a tell→fold→ack window acquires the tables at most twice, the send's Sent fact plus the step's commit point).
+- (runtime) An ES loop captures its state Arc at spawn and rebinds it at boot recovery, restart, and projector catch-up — the only moments the table's Arc is replaced; message steps read the cached state shell without the kernel tables lock (probe-counted: with observation off, a tell→fold→ack window acquires the tables zero times — the step's commit point reads cell state directly).
 - (runtime) Emit-declaration gating on the message path reads a cell-local declaration mirror, seeded from the manifest at spawn and re-synced with the registry at the single declaration-mutation point (ActorSystemCore::declare_emits); the registry lock is off the step path.

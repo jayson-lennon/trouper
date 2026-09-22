@@ -1,16 +1,18 @@
 //! The emit contract: declared events flow, undeclared events are
-//! dropped BEFORE journal append (DeadLettered(UndeclaredEvent) fact +
-//! a tracing error). Journals only ever contain declared schemas, so
-//! `fold(journal) == state` holds even for a decision that mixes both.
+//! dropped BEFORE journal append (DeadLettered(UndeclaredEvent)
+//! observation + a tracing error). Journals only ever contain declared
+//! schemas, so `fold(journal) == state` holds even for a decision that
+//! mixes both.
 //!
 //! Run: `cargo run --example emit_contract`
 
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use std::sync::Arc;
 use tracing::Level;
 use trouper::actor::{CommandHandler, EventSourcedActor};
+use trouper::observe::{ObservationHandler, ObservationKind};
 use trouper::prelude::*;
-use trouper::tap::FactKind;
 
 #[derive(Command, Serialize, Deserialize, Clone)]
 struct Ping {
@@ -74,6 +76,22 @@ async fn main() {
         .with_max_level(Level::ERROR)
         .init();
     let system = ActorSystem::new(SystemConfig::production());
+    // Opt-in observation: count DeadLettered(UndeclaredEvent) drops in a
+    // handler-owned log.
+    let undeclared_drops: Arc<parking_lot::Mutex<usize>> = Arc::default();
+    system.set_observation({
+        let undeclared_drops = undeclared_drops.clone();
+        let handler: ObservationHandler = Arc::new(move |observation| {
+            if let ObservationKind::DeadLettered {
+                reason: trouper::kernel::DeadLetterReason::UndeclaredEvent,
+                ..
+            } = &observation.kind
+            {
+                *undeclared_drops.lock() += 1;
+            }
+        });
+        handler
+    });
 
     trouper::builder::spawn_es_builder::<Counter>(&system)
         .at(ActorPath::new("counter"))
@@ -93,31 +111,16 @@ async fn main() {
             .await
             .expect("delivered");
     }
-    wait(|| async {
-        system
-            .tap_facts()
-            .iter()
-            .filter(|f| matches!(&f.kind, FactKind::DeadLettered { reason, .. } if *reason == trouper::kernel::DeadLetterReason::UndeclaredEvent))
-            .count()
-            >= 3
-    })
-    .await;
+    wait(|| async { *undeclared_drops.lock() >= 3 }).await;
 
     let state = system
         .es_state(&ActorPath::new("counter"))
         .await
         .expect("state");
     println!("   declared events applied (seen = 1+2+3): {state:?}");
-    let undeclared = system
-        .tap_facts()
-        .iter()
-        .filter(|f| {
-            matches!(&f.kind, FactKind::DeadLettered { reason, .. }
-                if *reason == trouper::kernel::DeadLetterReason::UndeclaredEvent)
-        })
-        .count();
+    let undeclared = *undeclared_drops.lock();
     println!(
-        "   undeclared emits dropped pre-append: {undeclared} DeadLettered(UndeclaredEvent) facts (+ a tracing::error! each)"
+        "   undeclared emits dropped pre-append: {undeclared} DeadLettered(UndeclaredEvent) observations (+ a tracing::error! each)"
     );
     println!("   journals contain only declared schemas — replay stays fold-consistent");
     println!("emit_contract example complete");

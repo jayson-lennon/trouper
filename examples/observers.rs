@@ -16,12 +16,12 @@ use error_stack::Report;
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 use tracing::Level;
 use trouper::actor::{CommandHandler, EventSourcedActor, MsgHandler, ServiceActor};
+use trouper::observe::{ObservationHandler, ObservationKind};
 use trouper::prelude::*;
 use trouper::registry::RegistryError;
-use trouper::tap::FactKind;
 
 static SINK: OnceLock<Mutex<Vec<String>>> = OnceLock::new();
 
@@ -91,6 +91,31 @@ async fn main() {
         .init();
     let system = ActorSystem::new(SystemConfig::production());
 
+    // Opt-in observation: the handler (kept FAST — it only counts) feeds
+    // the demo's own tallies. Handlers must never call back into the
+    // system; fan the observations out and inspect them elsewhere.
+    let tallies: Arc<(
+        std::sync::atomic::AtomicUsize,
+        std::sync::atomic::AtomicUsize,
+        std::sync::atomic::AtomicUsize,
+    )> = Arc::default();
+    system.set_observation({
+        let tallies = tallies.clone();
+        let handler: ObservationHandler = Arc::new(move |observation| match observation.kind {
+            ObservationKind::Sent { .. } => {
+                tallies.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+            ObservationKind::Delivered { .. } => {
+                tallies.1.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+            ObservationKind::Acked { .. } => {
+                tallies.2.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+            _ => {}
+        });
+        handler
+    });
+
     // The traffic source: a plain actor the demo sends commands to.
     trouper::builder::spawn_service_builder::<Ticker>(&system)
         .at(ActorPath::new("ticker"))
@@ -98,30 +123,22 @@ async fn main() {
         .handles::<Tick>()
         .start();
 
-    // Traffic: 60 commands produce Sent/Delivered/Acked facts on the tap.
-    println!("== tap observation ==");
+    // Traffic: 60 commands produce Sent/Delivered/Acked observations.
+    println!("== observation handler ==");
     for _i in 0..60 {
         let _ = system
             .send(system.envelope(Tick::schema_id(), ActorPath::new("ticker"), json!({})))
             .await;
     }
     tokio::time::sleep(std::time::Duration::from_millis(150)).await;
-    let facts = system.tap_facts();
-    let sent = facts
-        .iter()
-        .filter(|f| matches!(f.kind, FactKind::Sent { .. }))
-        .count();
-    let delivered = facts
-        .iter()
-        .filter(|f| matches!(f.kind, FactKind::Delivered { .. }))
-        .count();
-    let acked = facts
-        .iter()
-        .filter(|f| matches!(f.kind, FactKind::Acked { .. }))
-        .count();
+    let (sent, delivered, acked) = (
+        tallies.0.load(std::sync::atomic::Ordering::SeqCst),
+        tallies.1.load(std::sync::atomic::Ordering::SeqCst),
+        tallies.2.load(std::sync::atomic::Ordering::SeqCst),
+    );
+    let observed = sent + delivered + acked;
     record(format!(
-        "tap recorded {} facts ({sent} Sent, {delivered} Delivered, {acked} Acked) for 60 commands",
-        facts.len()
+        "handler observed {observed} messages ({sent} Sent, {delivered} Delivered, {acked} Acked) for 60 commands"
     ));
 
     // Seed one dead letter: a live actor that does not handle the schema

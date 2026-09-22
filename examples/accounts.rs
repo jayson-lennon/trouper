@@ -24,8 +24,8 @@ use serde_json::json;
 use std::sync::{Arc, OnceLock};
 use tracing::Level;
 use trouper::actor::{CommandHandler, EventSourcedActor};
+use trouper::observe::{ObservationHandler, ObservationKind};
 use trouper::prelude::*;
-use trouper::tap::FactKind;
 
 // -- Commands -------------------------------------------------------------
 
@@ -145,6 +145,24 @@ async fn main() {
         .init();
     let system = ActorSystem::new(SystemConfig::production());
 
+    // Opt-in observation: the host installs a handler that appends every
+    // observation into a local log (a channel + drain thread is the
+    // production pattern; a log keeps this demo simple).
+    let log: Arc<parking_lot::Mutex<Vec<String>>> = Arc::default();
+    system.set_observation({
+        let log = log.clone();
+        let handler: ObservationHandler = Arc::new(move |observation| match &observation.kind {
+            ObservationKind::Failed { path, .. } => {
+                log.lock().push(format!("Failed×1 at {path}"));
+            }
+            ObservationKind::Spawned { restart: true, .. } => {
+                log.lock().push("Spawned{restart:true}".to_owned());
+            }
+            _ => {}
+        });
+        handler
+    });
+
     println!("== account demo ==");
 
     // The account lives under supervision (restart budget 3 per 10s).
@@ -201,20 +219,16 @@ async fn main() {
     // through the crash: the cursor never acked the un-acked poison).
     send(&system, Poison::schema_id(), 1).await;
     send(&system, Deposit::schema_id(), 10).await;
-    wait(|| async {
-        system
-            .tap_facts()
+    let failed = |log: &Arc<parking_lot::Mutex<Vec<String>>>| -> usize {
+        log.lock()
             .iter()
-            .any(|f| matches!(&f.kind, FactKind::Failed { path, .. } if *path == account))
-    })
-    .await;
-    let failed = system
-        .tap_facts()
-        .iter()
-        .filter(|f| matches!(&f.kind, FactKind::Failed { path, .. } if *path == account))
-        .count();
+            .filter(|l| l.starts_with("Failed"))
+            .count()
+    };
+    wait(|| async { failed(&log) > 0 }).await;
     tell(format!(
-        "tap fact seen: Failed×{failed} — handler panicked (supervision restarts)"
+        "observation seen: Failed×{} — handler panicked (supervision restarts)",
+        failed(&log)
     ));
 
     // -- 4. Life after restart ----------------------------------------------
@@ -222,14 +236,14 @@ async fn main() {
     // The rebuilt actor replays the journal (balance 70: declines change
     // nothing), the redelivered poison passes, the queued deposit lands.
     wait_for_balance(&system, &account, 80).await;
-    let restarted = system
-        .tap_facts()
+    let restarted = log
+        .lock()
         .iter()
-        .filter(|f| matches!(&f.kind, FactKind::Spawned { restart: true, .. }))
+        .filter(|l| l.contains("Spawned{restart:true}"))
         .count();
     assert!(restarted > 0, "supervision emitted Spawned{{restart:true}}");
     tell(format!(
-        "tap fact seen: Spawned{{restart}}×{restarted} — journal replay rebuilt the actor"
+        "observation seen: Spawned{{restart}}×{restarted} — journal replay rebuilt the actor"
     ));
     println!("   replay + redelivery → balance 80 (the crash never lost state or mail)");
 

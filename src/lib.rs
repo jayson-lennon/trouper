@@ -1,8 +1,8 @@
 //! # trouper
 //!
 //! A single-machine actor runtime whose product is the communication fabric:
-//! a runtime-level schema registry, envelope/trace metadata, a tap stream of
-//! facts, journal-backed event-sourced actors, declarative supervision, and
+//! a runtime-level schema registry, envelope/trace metadata, opt-in runtime
+//! observation, journal-backed event-sourced actors, declarative supervision, and
 //! dynamic add/remove of actors.
 //!
 //! The `examples/` directory in the repository is the tour: each file is a runnable scenario over the public API.
@@ -23,6 +23,7 @@ pub mod inbox;
 pub mod journal;
 pub mod json;
 pub mod kernel;
+pub mod observe;
 pub mod pool;
 pub mod registry;
 pub mod reply;
@@ -30,7 +31,6 @@ pub mod schema;
 pub mod state_report;
 pub mod supervision;
 pub mod system;
-pub mod tap;
 
 pub use crate::json::Json;
 

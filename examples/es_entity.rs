@@ -92,6 +92,22 @@ impl CommandHandler<MarketBell> for Account {
 #[tokio::main]
 async fn main() {
     let system = ActorSystem::new(SystemConfig::production());
+    // Opt-in observation: watch for a passivation Stopped{Passivated}.
+    let passivated_flag: Arc<std::sync::atomic::AtomicBool> = Arc::default();
+    system.set_observation({
+        let passivated_flag = passivated_flag.clone();
+        let handler: trouper::observe::ObservationHandler = Arc::new(move |observation| {
+            if let trouper::observe::ObservationKind::Stopped {
+                path,
+                reason: trouper::actor::StopReason::Passivated,
+            } = &observation.kind
+                && path.as_str() == "accts/alice"
+            {
+                passivated_flag.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+        });
+        handler
+    });
     system.register_schema::<AccountCmd>();
     system.register_schema::<AccountAdjusted>();
     system.register_schema::<MarketBell>();
@@ -158,18 +174,10 @@ async fn main() {
     println!("  (separate entities, separate journals, one public path)");
 
     // 2. Let them idle out: passivation is the KERNEL's call (60ms).
-    //    Observable as a Stopped{Passivated} fact, not a lost slot.
+    //    Observable as a Stopped{Passivated} observation, not a lost slot.
     tokio::time::sleep(Duration::from_millis(200)).await;
-    let passivated = system.tap_facts().iter().any(|f| {
-        matches!(
-            &f.kind,
-            trouper::tap::FactKind::Stopped {
-                path,
-                reason: trouper::actor::StopReason::Passivated,
-            } if path.as_str() == "accts/alice"
-        )
-    });
-    println!("after 60ms idle: alice passivated (Stopped fact) = {passivated}");
+    let passivated = passivated_flag.load(std::sync::atomic::Ordering::SeqCst);
+    println!("after 60ms idle: alice passivated (Stopped observation) = {passivated}");
     assert!(passivated, "the idle entity was passivated");
     let alice_journal = system.journal_schemas(&ActorPath::new("accts/alice"));
     println!(

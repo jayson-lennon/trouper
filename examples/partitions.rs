@@ -11,8 +11,8 @@ use std::sync::Arc;
 use tracing::Level;
 use trouper::actor::{CommandHandler, EventSourcedActor};
 use trouper::kernel::DeadLetterReason;
+use trouper::observe::{ObservationHandler, ObservationKind};
 use trouper::prelude::*;
-use trouper::tap::FactKind;
 
 #[derive(Command, Serialize, Deserialize, Clone)]
 struct KeyedAdd {
@@ -57,6 +57,21 @@ async fn main() {
         .with_max_level(Level::ERROR)
         .init();
     let system = ActorSystem::new(SystemConfig::production());
+    // Opt-in observation: the handler tallies ShardKeyMissing dead letters.
+    let missing_key: Arc<std::sync::atomic::AtomicUsize> = Arc::default();
+    system.set_observation({
+        let missing_key = missing_key.clone();
+        let handler: ObservationHandler = Arc::new(move |observation| {
+            if let ObservationKind::DeadLettered {
+                reason: DeadLetterReason::ShardKeyMissing,
+                ..
+            } = &observation.kind
+            {
+                missing_key.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+        });
+        handler
+    });
 
     // The partition spec below validates against the schema table AT
     // INSTALL TIME — but the Account builder registers KeyedAdd only when
@@ -124,16 +139,9 @@ async fn main() {
         .await
         .expect("routed (the dead-letter happens at the entity step)");
     wait(|| async { system.dead_letter_count().await > before }).await;
-    let missing = system
-        .tap_facts()
-        .iter()
-        .filter(|f| {
-            matches!(&f.kind, FactKind::DeadLettered { reason, .. }
-                if *reason == DeadLetterReason::ShardKeyMissing)
-        })
-        .count();
+    let missing = missing_key.load(std::sync::atomic::Ordering::SeqCst);
     println!(
-        "   keyless command dead-lettered ({missing} ShardKeyMissing fact); no entity activated"
+        "   keyless command dead-lettered ({missing} ShardKeyMissing observation); no entity activated"
     );
 
     let export = system.export().await;
