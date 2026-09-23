@@ -4480,8 +4480,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unknown_schema_inside_a_batch_dead_letters_alone() {
-        // Given a service actor whose entry handles `Add` ONLY, and a sink
+    async fn unknown_schema_inside_a_batch_dead_letters_alone() {        // Given a service actor whose entry handles `Add` ONLY, and a sink
         // for the good work (the Mark fixture is unhandled here).
         let (system, _clock) = ActorSystem::test();
         let path = ActorPath::new("batch-unknown");
@@ -4529,6 +4528,65 @@ mod tests {
             system.inbox_cursor(&path).map(|c| c.as_u64()),
             Some(3),
             "all three offsets committed (unknown one dead-lettered)"
+        );
+    }
+
+    #[tokio::test]
+    async fn mixed_schema_batch_resolves_entries_once_and_dead_letters_unknown_alone() {
+        // Given a service actor whose entry handles `Add` ONLY, and a sink
+        // for the good work (the Mark fixture is unhandled here).
+        let (system, _clock) = ActorSystem::test();
+        let path = ActorPath::new("batch-mixed");
+        let (idx, sink) = open_sink();
+        bind_sink(&path, sink.clone());
+        system.spawn_service::<Auditor, _>(
+            path.clone(),
+            &json!({ "sink": idx }),
+            SpawnOpts::default(),
+            || vec![Arc::new(TypedServiceAdapter::<Auditor, Add>::new::<Add>())],
+        );
+        system.register_schema::<Mark>();
+        wait_for(|| async {
+            system.facts().iter().any(
+                |f| matches!(&f.kind, crate::observe::ObservationKind::Spawned { path: p, .. } if *p == path),
+            )
+        })
+        .await;
+
+        // When a batch mixes BOTH schemas — known, unknown, known (the
+        // unknown lands between two good messages so the per-message
+        // find is exercised on both sides of the dead letter).
+        system
+            .send(system.envelope(Add::schema_id(), path.clone(), json!({ "n": 1 })))
+            .await
+            .expect("delivered");
+        system
+            .send(system.envelope(Mark::schema_id(), path.clone(), json!({ "tag": "x" })))
+            .await
+            .expect("delivered");
+        system
+            .send(system.envelope(Add::schema_id(), path.clone(), json!({ "n": 2 })))
+            .await
+            .expect("delivered");
+
+        // Then both known messages dispatched in order (the unknown one
+        // dead-lettered ALONE, between them, with UnknownSchema)...
+        wait_for(|| async { sink.lock().as_slice() == ["n=1", "n=2"] }).await;
+        let letters = system.drain_dead_letters();
+        assert_eq!(
+            letters
+                .iter()
+                .filter(|l| l.reason == crate::kernel::DeadLetterReason::UnknownSchema)
+                .count(),
+            1,
+            "exactly one UnknownSchema letter (the Mark): {letters:?}"
+        );
+        // ...and all three offsets committed — the dead letter did not
+        // stall the batch.
+        assert_eq!(
+            system.inbox_cursor(&path).map(|c| c.as_u64()),
+            Some(3),
+            "the whole mixed batch committed"
         );
     }
 
@@ -10625,7 +10683,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn send_to_a_live_actor_acquires_the_registry_at_most_twice() {
+    async fn send_to_a_live_actor_acquires_the_registry_once() {
         // Given a live service handler (no emits — a silent actor, so the
         // window has no fan-out noise).
         let (system, _clock) = ActorSystem::test();
@@ -10664,13 +10722,17 @@ mod tests {
             )
         })
         .await;
-        // ...and the send acquired the registry at most twice: shard-key
-        // extraction + endpoint resolution (GREEN target: coalesced into
-        // ONE acquisition per send; RED today: 3 — shard key + resolve +
-        // tee rule application).
+        // ...and a plain-path tell acquired the registry EXACTLY ONCE:
+        // the send's whole registry read (rules decision, tee resolve,
+        // BOTH set probes) AND the endpoint resolve in the same critical
+        // section — a plain path is neither partition nor projector set,
+        // so its endpoint resolves in the pass that already proved that.
+        // (Partition/projector destinations legitimately acquire again —
+        // resolve_partition may mutate the path and activate an entity —
+        // which is why the assertion is scoped to this plain-path shape.)
         assert!(
-            acquisitions <= 2,
-            "one tell must acquire the registry ≤2 times (acquired {acquisitions})"
+            acquisitions <= 1,
+            "one plain-path tell must acquire the registry once (acquired {acquisitions})"
         );
     }
 
@@ -10928,6 +10990,132 @@ mod tests {
         assert_eq!(
             acquisitions, 0,
             "an idle supervision engine must not acquire the kernel (acquired {acquisitions}×)"
+        );
+    }
+
+    /// A service actor that publishes `Smuggled` (never declared): the
+    /// FLUSH-time emit gate (service tier) drops the intent with an
+    /// `UndeclaredEmit` dead letter — the ES tier's pre-append gate has
+    /// its own test (`undeclared_emit_dropped_pre_append_with_trace_error`).
+    struct Smuggler;
+    impl ServiceActor for Smuggler {
+        fn manifest() -> ActorManifest {
+            // NOTE: deliberately does NOT declare Smuggled.
+            ActorManifest::new()
+                .handles::<Add>()
+                .kind(ActorKind::Service)
+        }
+        async fn start(
+            _args: &Json,
+        ) -> Result<Self, error_stack::Report<crate::registry::RegistryError>> {
+            Ok(Self)
+        }
+    }
+    impl MsgHandler<Add> for Smuggler {
+        async fn handle(&mut self, cmd: &Add, ctx: &mut crate::context::MsgCtx<'_>) {
+            ctx.publish(Smuggled { n: cmd.n });
+        }
+    }
+
+    /// A tracing-capture writer: appends every formatted line into the
+    /// shared buffer (the `MakeWriter` impl the flush-gate test reads).
+    struct CaptureWriter(Arc<parking_lot::Mutex<Vec<u8>>>);
+    impl std::io::Write for CaptureWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CaptureWriter {
+        type Writer = CaptureWriter;
+        fn make_writer(&'a self) -> Self::Writer {
+            CaptureWriter(self.0.clone())
+        }
+    }
+
+    /// Installs the ERROR-capture global subscriber EXACTLY ONCE per test
+    /// process (a global default is process-wide; parallel tests share
+    /// it). Returns the shared capture buffer.
+    fn tracing_error_capture() -> Arc<parking_lot::Mutex<Vec<u8>>> {
+        static CAPTURE: std::sync::OnceLock<Arc<parking_lot::Mutex<Vec<u8>>>> =
+            std::sync::OnceLock::new();
+        CAPTURE.get_or_init(|| {
+            let log: Arc<parking_lot::Mutex<Vec<u8>>> = Arc::default();
+            let subscriber = tracing_subscriber::fmt()
+                .with_max_level(tracing::Level::ERROR)
+                .with_writer(CaptureWriter(log.clone()))
+                .finish();
+            // A competing test binary or a prior init leaves this a no-op
+            // (Err) — the buffer still exists, the capture just best-effort.
+            let _ = tracing::subscriber::set_global_default(subscriber);
+            log
+        })
+        .clone()
+    }
+
+    #[tokio::test]
+    async fn undeclared_service_emit_dropped_at_flush_with_schema_and_trace_error() {
+        // Given the process-wide ERROR capture subscriber, and a smuggler
+        // service actor settled from its spawn.
+        let log = tracing_error_capture();
+        let (system, _clock) = ActorSystem::test();
+        let path = ActorPath::new("flush-gate");
+        system.register_schema::<Add>();
+        system.register_schema::<Smuggled>();
+        system.spawn_service::<Smuggler, _>(path.clone(), &json!({}), SpawnOpts::default(), || {
+            vec![Arc::new(TypedServiceAdapter::<Smuggler, Add>::new::<Add>())]
+        });
+        wait_for(|| async {
+            system.facts().iter().any(
+                |f| matches!(&f.kind, crate::observe::ObservationKind::Spawned { path: p, .. } if *p == path),
+            )
+        })
+        .await;
+
+        // When the actor publishes the undeclared schema from its handler.
+        system
+            .send(system.envelope(Add::schema_id(), path.clone(), json!({ "n": 4 })))
+            .await
+            .expect("delivered");
+        wait_for(|| async { !system.dead_letter_schemas().is_empty() }).await;
+
+        // Then the flush gate dropped the intent with an UndeclaredEmit
+        // dead letter CARRYING THE SCHEMA (the drop-path clone this test
+        // pins — the keep path borrows; only the dropped intent pays)...
+        let letters = system.drain_dead_letters();
+        assert_eq!(letters.len(), 1, "only the smuggled intent: {letters:?}");
+        assert_eq!(
+            letters[0].reason,
+            crate::kernel::DeadLetterReason::UndeclaredEmit
+        );
+        assert_eq!(
+            letters[0].schema,
+            Smuggled::schema_id(),
+            "the dead letter records the undeclared schema"
+        );
+        assert!(
+            system.facts().iter().any(|f| matches!(
+                &f.kind,
+                crate::observe::ObservationKind::DeadLettered { reason, .. }
+                    if *reason == crate::kernel::DeadLetterReason::UndeclaredEmit
+            )),
+            "DeadLettered(UndeclaredEmit) fact on the tap"
+        );
+        // ...the actor kept running (a gate drop is not a step failure)...
+        let cursor = system.inbox_cursor(&path).map(|c| c.as_u64());
+        assert_eq!(cursor, Some(1), "the command itself committed");
+        assert!(
+            !kernel_has_crash(&system, &path),
+            "the step continued; the actor was not failed"
+        );
+        // ...and the tracing error fired (flush gate's own log line).
+        let captured = String::from_utf8(log.lock().clone()).expect("utf8 log");
+        assert!(
+            captured.contains("undeclared emit dropped at flush"),
+            "tracing error captured: {captured:?}"
         );
     }
 

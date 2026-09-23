@@ -743,11 +743,16 @@ async fn route_inner(
             // RULES first: a matching rule places an observer relative to
             // the flow (Tee copies with a linked causality; Inline
             // interposes the observer in the primary's place).
-            let (delivery, primary_dest, tee_endpoint, set_specs) = {
+            let (delivery, primary_dest, tee_endpoint, set_specs, fast_endpoint) = {
                 // ONE critical section for the send's whole registry read:
                 // the rules decision, the tee copy's endpoint resolve, and
                 // BOTH set-table probes (a plain path pays one lock to
-                // learn it is neither partition nor projector set).
+                // learn it is neither partition nor projector set). A
+                // PLAIN destination resolves its endpoint in the same
+                // pass — the probes just proved it needs no set
+                // resolution, so the second lock is gone from the hot
+                // path. (A set destination resolves after
+                // resolve_partition, which may mutate the path.)
                 let reg = registry.lock();
                 let (delivery, primary_dest) = apply_rules(&reg, &envelope, path.clone());
                 let tee_endpoint = delivery
@@ -760,7 +765,12 @@ async fn route_inner(
                         .cloned()
                         .or_else(|| reg.projector_set_owning(path)),
                 );
-                (delivery, primary_dest, tee_endpoint, set_specs)
+                let fast_endpoint = if set_specs.0.is_none() && set_specs.1.is_none() {
+                    primary_dest.as_ref().or(Some(path)).and_then(|p| reg.resolve(p))
+                } else {
+                    None
+                };
+                (delivery, primary_dest, tee_endpoint, set_specs, fast_endpoint)
             };
             if let Some(tee) = delivery {
                 // Tee: deliver the copy BEFORE the primary (same position
@@ -825,9 +835,17 @@ async fn route_inner(
                     return Ok(path);
                 }
             };
-            let endpoint = {
-                let registry = registry.lock();
-                registry.resolve(&path)
+            let endpoint = match fast_endpoint {
+                // PLAIN PATH: resolved in the first critical section (the
+                // probes proved no set applies; `path` cannot mutate).
+                resolved @ Some(_) => resolved,
+                // SET PATH (or an unresolvable plain path): resolve AFTER
+                // resolve_partition — a partition/projector set may
+                // activate an entity and point `path` at it.
+                None => {
+                    let registry = registry.lock();
+                    registry.resolve(&path)
+                }
             };
             let endpoint = match endpoint {
                 Some(endpoint) => endpoint,
@@ -1648,19 +1666,22 @@ async fn step_es(ctx: &EsLoop) -> Step {
     // taken ONCE for the whole decide pass.
     let mut decisions: Vec<Outbox> = Vec::with_capacity(batch.len());
     let mut batch_events = crate::envelope::Events::new();
+    // PER-BATCH entry resolution (cell-local spawn-static config): ONE
+    // read-guard clone of the table per batch — the per-message find
+    // borrows from it (no per-message lock, no per-message Arc bump).
+    // The table is written only at spawn/restart; per-batch is the safe
+    // staleness bound (a re-attached entry is visible the batch after the
+    // write, never stale WITHIN a batch).
+    let batch_entries: Vec<Arc<dyn CommandEntry>> =
+        ctx.cell.entries.read().expect("entries lock").clone();
     {
         let state = ctx.state();
         let mut state = state.lock().await;
         for (_, envelope) in &batch {
-            // FIND the command entry for this schema (cell-local:
-            // spawn-static config, written at spawn/restart).
-            let entry = {
-                let entries = ctx.cell.entries.read().expect("entries lock");
-                entries
-                    .iter()
-                    .find(|e| e.schema() == envelope.schema)
-                    .cloned()
-            };
+            // FIND the command entry for this schema by reference.
+            let entry = batch_entries
+                .iter()
+                .find(|e| e.schema() == envelope.schema);
             let Some(entry) = entry else {
                 // Unknown schema: dead-letter THIS message (it can never
                 // be handled; redelivering it would be futile) and let
@@ -2409,14 +2430,22 @@ async fn flush_outbox(ctx: &EsLoop, mut outbox: Outbox) -> bool {
         let mut ok = Vec::new();
         let mut dropped = Vec::new();
         for intent in outbox.drain() {
-            // THE GATE: every outbound message declares itself. StopSelf
-            // is not a message — it passes untouched.
-            let verdict = intent
+            // THE GATE: every outbound message declares itself. The
+            // check BORROWS the schema — only a dropped intent pays a
+            // clone (its schema must outlive it for the tracing error
+            // and the dead-letter record). StopSelf is not a message —
+            // it passes untouched.
+            let undeclared = intent
                 .emitted_schema()
-                .map(|schema| (schema.clone(), declared_emits.contains(schema)));
-            match verdict {
-                Some((schema, false)) => dropped.push((intent, schema)),
-                _ => ok.push(intent),
+                .is_some_and(|schema| !declared_emits.contains(schema));
+            if undeclared {
+                let schema = intent
+                    .emitted_schema()
+                    .expect("undeclared intent has a schema")
+                    .clone();
+                dropped.push((intent, schema));
+            } else {
+                ok.push(intent);
             }
         }
         (ok, dropped)
@@ -2855,6 +2884,21 @@ async fn step_service(ctx: &ServiceLoop) -> Step {
     };
 
     let observing = ctx.es.kernel.observing();
+    // PER-BATCH entry resolution (cell-local spawn-static config): ONE
+    // read-guard clone of the table per batch — the per-message find
+    // borrows from it (no per-message lock, no per-message Arc bump).
+    // The table is written only at spawn/restart (the declaration-mutation
+    // point can run between steps), so per-batch is the safe staleness
+    // bound: a re-attached entry is visible no later than the batch after
+    // the write, exactly as the per-message read would have seen it
+    // within any single batch.
+    let batch_entries: Vec<Arc<dyn MsgEntry>> = ctx
+        .es
+        .cell
+        .msg_entries
+        .read()
+        .expect("msg entries lock")
+        .clone();
     for (offset, envelope) in batch {
         // COMMIT (the at-most-once handoff, at the same point the
         // single-message step acked: before this message's dispatch).
@@ -2870,14 +2914,10 @@ async fn step_service(ctx: &ServiceLoop) -> Step {
             ));
         }
 
-        // FIND the message entry (cell-local spawn-static config).
-        let entry = {
-            let entries = ctx.es.cell.msg_entries.read().expect("msg entries lock");
-            entries
-                .iter()
-                .find(|e| e.schema() == envelope.schema)
-                .cloned()
-        };
+        // FIND the message entry for this schema by reference.
+        let entry = batch_entries
+            .iter()
+            .find(|e| e.schema() == envelope.schema);
         let Some(entry) = entry else {
             dead_letter(
                 &ctx.es.kernel,
