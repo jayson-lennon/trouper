@@ -74,7 +74,7 @@ struct SaveFile {
 /// The ack: how many bytes were written. A save that did NOT succeed
 /// never produces this — it produces [`SaveFailed`] instead — so there is
 /// no `ok` flag to lie: the schema of the reply IS the outcome.
-#[derive(Event, Serialize, Deserialize, Debug)]
+#[derive(Event, Serialize, Deserialize, Debug, Clone)]
 struct SaveAck {
     bytes: i64,
 }

@@ -24,7 +24,7 @@ struct KeyedAdd {
     n: i64,
 }
 
-#[derive(Event, Serialize, Deserialize)]
+#[derive(Event, Serialize, Deserialize, Clone)]
 struct Added {
     #[allow(dead_code)]
     n: i64,

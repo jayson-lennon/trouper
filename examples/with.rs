@@ -30,7 +30,7 @@ struct Add {
     n: i64,
 }
 
-#[derive(Event, Debug, Deserialize, Serialize)]
+#[derive(Event, Debug, Deserialize, Serialize, Clone)]
 struct Added {
     // The `key` field is the shard key because this demo's projector
     // is a SET (per-key `seen/<key>` paths, activated on demand): the

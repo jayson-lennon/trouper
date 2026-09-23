@@ -26,7 +26,7 @@ struct Restock {
     qty: i64,
 }
 
-#[derive(Event, Serialize, Deserialize)]
+#[derive(Event, Serialize, Deserialize, Clone)]
 struct Restocked {
     #[allow(dead_code)] // folded via raw payload
     sku: String,

@@ -8,7 +8,7 @@ use trouper::prelude::*;
 #[test]
 fn exotic_field_types_derive_with_json_descriptors() {
     // Given a struct with field types no mapping table could name.
-    #[derive(Event, serde::Serialize, serde::Deserialize)]
+    #[derive(Event, serde::Serialize, serde::Deserialize, Clone)]
     #[allow(dead_code)] // descriptor data; exercised via schema_def only
     struct Probe {
         maybe: Option<uuid::Uuid>,
@@ -16,7 +16,7 @@ fn exotic_field_types_derive_with_json_descriptors() {
         items: Vec<String>,
         origin: StreamOrigin,
     }
-    #[derive(serde::Serialize, serde::Deserialize)]
+    #[derive(serde::Serialize, serde::Deserialize, Clone)]
     #[serde(rename_all = "snake_case")]
     enum StreamOrigin {
         Kernel,
@@ -35,7 +35,7 @@ fn exotic_field_types_derive_with_json_descriptors() {
 #[test]
 fn shard_key_field_maps_its_flat_type_and_reads_back() {
     // Given a struct whose string shard key rides beside an exotic field.
-    #[derive(Event, serde::Serialize, serde::Deserialize)]
+    #[derive(Event, serde::Serialize, serde::Deserialize, Clone)]
     #[allow(dead_code)] // descriptor data; exercised via schema_def only
     struct Shipped {
         #[schema(shard_key)]
@@ -64,7 +64,7 @@ fn shard_key_field_maps_its_flat_type_and_reads_back() {
 #[test]
 fn numeric_shard_key_maps_to_int_descriptor() {
     // Given a struct with a numeric shard key.
-    #[derive(Command, serde::Serialize, serde::Deserialize)]
+    #[derive(Command, serde::Serialize, serde::Deserialize, Clone)]
     struct Picked {
         #[schema(shard_key)]
         seq: u64,
@@ -83,7 +83,7 @@ fn numeric_shard_key_maps_to_int_descriptor() {
 #[test]
 fn serde_renamed_non_shard_field_keeps_the_rust_ident_descriptor() {
     // Given a field the serde mapping renames on the wire.
-    #[derive(Event, serde::Serialize, serde::Deserialize)]
+    #[derive(Event, serde::Serialize, serde::Deserialize, Clone)]
     #[serde(rename_all = "camelCase")]
     struct OrderShipped {
         order_id: String,
@@ -107,32 +107,32 @@ fn serde_renamed_non_shard_field_keeps_the_rust_ident_descriptor() {
 fn ty_override_accepts_all_descriptor_names() {
     // Given one struct per descriptor name, each overriding a field that
     // would otherwise map to Json.
-    #[derive(Event, serde::Serialize, serde::Deserialize)]
+    #[derive(Event, serde::Serialize, serde::Deserialize, Clone)]
     struct ProbeBool {
         #[schema(ty = "bool")]
         v: Vec<String>,
     }
-    #[derive(Event, serde::Serialize, serde::Deserialize)]
+    #[derive(Event, serde::Serialize, serde::Deserialize, Clone)]
     struct ProbeInt {
         #[schema(ty = "int")]
         v: Vec<String>,
     }
-    #[derive(Event, serde::Serialize, serde::Deserialize)]
+    #[derive(Event, serde::Serialize, serde::Deserialize, Clone)]
     struct ProbeFloat {
         #[schema(ty = "float")]
         v: Vec<String>,
     }
-    #[derive(Event, serde::Serialize, serde::Deserialize)]
+    #[derive(Event, serde::Serialize, serde::Deserialize, Clone)]
     struct ProbeStr {
         #[schema(ty = "str")]
         v: Vec<String>,
     }
-    #[derive(Event, serde::Serialize, serde::Deserialize)]
+    #[derive(Event, serde::Serialize, serde::Deserialize, Clone)]
     struct ProbeUuid {
         #[schema(ty = "uuid")]
         v: Vec<String>,
     }
-    #[derive(Event, serde::Serialize, serde::Deserialize)]
+    #[derive(Event, serde::Serialize, serde::Deserialize, Clone)]
     struct ProbeJson {
         #[schema(ty = "json")]
         v: Vec<String>,

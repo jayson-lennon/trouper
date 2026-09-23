@@ -223,6 +223,23 @@ impl AnyPayload {
         }
     }
 
+    /// Borrows the live value of the schema's registered type — the
+    /// borrowed-dispatch accessor. Unlike [`Self::downcast_ref`] (which
+    /// always yields an OWNED `T`), a live value is lent as `&T` with
+    /// zero copies; the service dispatch awaits the handler on this
+    /// borrow, rooted at the kernel's loop-local batch.
+    ///
+    /// Only the `Value` arm can answer: a `Bytes`/`Json` payload has no
+    /// live value to lend (a borrow cannot be materialized from wire
+    /// bytes) and yields `None` — replayed/erased deliveries take the
+    /// owned [`Self::downcast_ref`] decode instead, the door.
+    pub(crate) fn value_ref<T: 'static>(&self) -> Option<&T> {
+        match self {
+            AnyPayload::Value(value) => value.as_any().downcast_ref::<T>(),
+            AnyPayload::Bytes(_) | AnyPayload::Json(_) => None,
+        }
+    }
+
     /// A field's value as a string (the shard-key read). Live values
     /// answer from the derive-generated match; bytes decode the one
     /// field through the tree (a router-path read, off the hot fold).
@@ -268,6 +285,14 @@ fn json_string_of(value: &serde_json::Value) -> Option<String> {
 /// derive for every declared message type. `std::any::Any` alone cannot
 /// answer them: shard-key reads and journal encoding need the schema's
 /// field names, which only the type knows.
+///
+/// The `Clone` supertrait serves handler-side retention: the fabric
+/// itself never copies (a payload is an `Arc`), but a handler that
+/// stashes or re-sends a message clones its value explicitly — the
+/// bound guarantees every declared message type can. It sits behind
+/// `CloneablePayloadValue` (`Clone` requires `Self: Sized`) so the
+/// erased cell keeps its vtable shape and every public signature is
+/// unchanged.
 pub trait PayloadValue: Send + Sync + 'static {
     /// The value as `Any` — the downcast dispatch core.
     fn as_any(&self) -> &dyn std::any::Any;
@@ -277,7 +302,26 @@ pub trait PayloadValue: Send + Sync + 'static {
     /// The value's compact JSON-text encoding. The derive memoizes this
     /// (one serialization per value, shared by every later reader).
     fn to_json_bytes(&self) -> Arc<[u8]>;
+
+    /// A copy of the erased value (a dyn-safe `Clone`). Returns a
+    /// `Box` of the concrete type behind `self` — the handler-side
+    /// retention constructor, the only way to copy a value out of the
+    /// fabric's shared `Arc` without knowing its type.
+    fn clone_value(&self) -> Box<dyn PayloadValue>;
 }
+
+/// The `Self: Sized` companion of [`PayloadValue`]: blanket-implemented
+/// for every `PayloadValue` that is also `Clone` (every declared message
+/// type — the derive's contract requires it), so generic code (the
+/// send edge, typed replies, `downcast_ref`) keeps the plain `Clone`
+/// bound, and the erased cell gets a dyn-safe hook to the same copy.
+pub trait CloneablePayloadValue: PayloadValue + Clone {
+    fn clone_value_boxed(&self) -> Box<dyn PayloadValue> {
+        Box::new(self.clone())
+    }
+}
+
+impl<T: PayloadValue + Clone> CloneablePayloadValue for T {}
 
 impl<T: PayloadValue> PayloadValue for Arc<T> {
     fn as_any(&self) -> &dyn std::any::Any {
@@ -288,6 +332,9 @@ impl<T: PayloadValue> PayloadValue for Arc<T> {
     }
     fn to_json_bytes(&self) -> Arc<[u8]> {
         (**self).to_json_bytes()
+    }
+    fn clone_value(&self) -> Box<dyn PayloadValue> {
+        (**self).clone_value()
     }
 }
 
@@ -1177,6 +1224,46 @@ mod events_tests {
     #[derive(crate::schema::Event, Serialize, Deserialize, Clone)]
     struct Deposited {
         n: i64,
+    }
+
+    #[test]
+    fn value_ref_borrows_the_live_value_without_a_copy() {
+        // Given a payload wrapping a live value.
+        let payload = Payload::value(Deposited { n: 5 });
+
+        // When borrowing the typed value.
+        let fact: Option<&Deposited> = payload.inner().value_ref::<Deposited>();
+
+        // Then the borrow reads the wrapped value — zero clones, zero serde.
+        assert_eq!(fact.expect("live borrow").n, 5);
+    }
+
+    #[test]
+    fn value_ref_returns_none_for_the_wrong_type() {
+        // Given a payload wrapping a live Deposited.
+        let payload = Payload::value(Deposited { n: 5 });
+
+        // When borrowing it as a different live type.
+        let fact: Option<&StockReserved> = payload.inner().value_ref::<StockReserved>();
+
+        // Then nothing comes back (a TypeId miss, no decode).
+        assert!(fact.is_none());
+    }
+
+    #[test]
+    fn value_ref_cannot_lend_from_bytes_or_json_views() {
+        // Given a bytes payload (replay shape) and a Json view payload.
+        let bytes = Payload::bytes(PayloadBytes::from(Json::of(&Deposited { n: 9 })));
+        let view = Payload::json_view(json!({ "n": 9 }));
+
+        // When borrowing the declared type from each.
+        let from_bytes: Option<&Deposited> = bytes.inner().value_ref::<Deposited>();
+        let from_view: Option<&Deposited> = view.inner().value_ref::<Deposited>();
+
+        // Then neither lends a borrow — a wire shape has no live value;
+        // those deliveries take the owned downcast decode instead.
+        assert!(from_bytes.is_none());
+        assert!(from_view.is_none());
     }
 
     #[test]

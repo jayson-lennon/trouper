@@ -217,6 +217,12 @@ pub fn generate(input: TokenStream, kind: Kind) -> syn::Result<TokenStream> {
             fn to_json_bytes(&self) -> ::std::sync::Arc<[::std::primitive::u8]> {
                 ::trouper::envelope::payload_value_json_bytes(self)
             }
+
+            fn clone_value(
+                &self,
+            ) -> ::std::boxed::Box<dyn ::trouper::envelope::PayloadValue + 'static> {
+                ::std::boxed::Box::new(::std::clone::Clone::clone(self))
+            }
         }
     })
 }

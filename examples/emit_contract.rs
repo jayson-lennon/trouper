@@ -19,14 +19,14 @@ struct Ping {
     n: i64,
 }
 
-#[derive(Event, Serialize, Deserialize)]
+#[derive(Event, Serialize, Deserialize, Clone)]
 struct Ponged {
     #[allow(dead_code)]
     n: i64,
 }
 
 /// NEVER declared in any manifest — the counter emits it anyway.
-#[derive(Event, Serialize, Deserialize)]
+#[derive(Event, Serialize, Deserialize, Clone)]
 #[schema(description = "Emitted but never declared (the bug)")]
 struct SecretPing {
     #[allow(dead_code)]

@@ -43,7 +43,7 @@ struct StrictCmd {
     n: i64,
 }
 
-#[derive(Event, Serialize, Deserialize)]
+#[derive(Event, Serialize, Deserialize, Clone)]
 struct StrictOk {
     #[allow(dead_code)]
     n: i64,

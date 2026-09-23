@@ -37,7 +37,7 @@ struct Add {
     n: i64,
 }
 
-#[derive(Event, Debug, Serialize, Deserialize)]
+#[derive(Event, Debug, Serialize, Deserialize, Clone)]
 struct Added {
     n: i64,
 }
