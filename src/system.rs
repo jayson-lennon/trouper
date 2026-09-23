@@ -9964,6 +9964,15 @@ mod tests {
                 .expect("delivered");
         }
         wait_for_cursor(&system, &path, 3).await;
+        // The snapshot write lands after the commit (between batches):
+        // wait for it like a restart would (its presence in the journal).
+        wait_for(|| async {
+            system
+                .journal_entries(&path)
+                .iter()
+                .any(|e| matches!(e, crate::journal::JournalEntry::Snapshot { .. }))
+        })
+        .await;
 
         // When the store is loaded through the TRAIT (as a restart would).
         let store = system.journal_store_trait();

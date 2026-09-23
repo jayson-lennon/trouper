@@ -1572,125 +1572,163 @@ enum Step {
     Stop,
 }
 
-/// The atomic step, in order:
-/// peek → find entry → build ctx → catch_unwind dispatch (decide only)
-/// → journal.append → inbox.ack → apply → outbox flush → emit fan-out
-/// → maybe snapshot.
+/// The atomic step, batched. Per batch: snapshot up to N envelopes →
+/// per message: observe → find entry → decide (catch_unwind, pure) with
+/// events collected into ONE buffer → ONE journal append for the whole
+/// batch → commit every offset → one state-lock pass applying all events
+/// in order → per-message outbox flush (in-order effects) → emit fan-out
+/// with per-event (path, seq) stamps → maybe snapshot once at the batch's
+/// last seq.
+///
+/// The single-message invariants survive the batching:
+/// - NOTHING is appended or acked until every decision has succeeded; a
+///   decision panic leaves the whole batch queued (snapshots remove
+///   nothing; the fold is pure, replay is recomputed, and the journal
+///   never saw a partial batch).
+/// - An append failure leaves the whole batch queued (the store was not
+///   changed atomically; "never ack what isn't journaled").
+/// - The fan-out stamps stay per-event (each event zips with its own seq
+///   — append answers one seq per event, in order).
+/// - Unknown-schema and decode failures dead-letter THEIR message alone
+///   (never entering the batch buffer) and the batch continues.
 async fn step_es(ctx: &EsLoop) -> Step {
-    // 1. PEEK (clone, never consume: the ack is the commit point).
-    let envelope = {
+    // 1. SNAPSHOT up to the spawn's batch size (FIFO, nothing removed:
+    // the commit point is stage 6, after the append lands).
+    let batch_n = ctx.cell.step_batch;
+    let batch: Vec<(crate::inbox::InboxOffset, Envelope)> = {
         let mut inbox = ctx.cell.inbox.lock().await;
-        inbox.peek().cloned()
+        inbox.peek_up_to(batch_n)
     };
-    let Some(envelope) = envelope else {
+    if batch.is_empty() {
         return Step::Idle;
-    };
+    }
+
     // The Delivered observation rides the handler slot — observation on
     // the message path never takes the kernel lock, and constructs
     // nothing when observation is off.
-    if ctx.kernel.observing() {
-        ctx.kernel.observe(crate::observe::Observation::new(
-            envelope.trace.causality_id.as_millis_ts(),
-            crate::observe::ObservationKind::Delivered {
-                to: ctx.path.clone(),
-                schema: envelope.schema.clone(),
-                trace: envelope.trace,
-            },
-        ));
+    let observing = ctx.kernel.observing();
+    if observing {
+        for (_, envelope) in &batch {
+            ctx.kernel.observe(crate::observe::Observation::new(
+                envelope.trace.causality_id.as_millis_ts(),
+                crate::observe::ObservationKind::Delivered {
+                    to: ctx.path.clone(),
+                    schema: envelope.schema.clone(),
+                    trace: envelope.trace,
+                },
+            ));
+        }
     }
 
-    // 2. FIND the command entry for this schema (cell-local: spawn-static
-    // config, written at spawn/restart, read per message).
-    let entry = {
-        let entries = ctx.cell.entries.read().expect("entries lock");
-        entries
-            .iter()
-            .find(|e| e.schema() == envelope.schema)
-            .cloned()
-    };
-    let Some(entry) = entry else {
-        // Unknown schema: dead-letter and ADVANCE the cursor (the message
-        // can never be handled; redelivering it would be futile).
-        dead_letter(
-            &ctx.kernel,
-            &envelope,
-            crate::kernel::DeadLetterReason::UnknownSchema,
-            "no entry for this schema",
-        );
-        ctx.cell.inbox.lock().await.ack();
-        return Step::Work;
-    };
-
-    // 3+4. Build ctx, dispatch under catch_unwind. DECIDE ONLY: no state
-    // mutation, no journal write, no ack inside the handler.
-    let mut outbox = Outbox::new();
-    let dispatch_result = {
+    // 2+3+4. Per message: FIND the command entry, build ctx, dispatch under
+    // catch_unwind. DECIDE ONLY: no state mutation, no journal write, no
+    // commit inside the handler. Events collect into ONE ordered buffer;
+    // each message's outbox is kept for its own flush. The state lock is
+    // taken ONCE for the whole decide pass.
+    let mut decisions: Vec<Outbox> = Vec::with_capacity(batch.len());
+    let mut batch_events = crate::envelope::Events::new();
+    {
         let state = ctx.state();
         let mut state = state.lock().await;
-        let mut cmd_ctx = CmdCtx::new(
-            &ctx.path,
-            &envelope.trace,
-            envelope.reply_to.as_ref(),
-            ctx.view.as_ref(),
-            &mut outbox,
-        );
+        for (_, envelope) in &batch {
+            // FIND the command entry for this schema (cell-local:
+            // spawn-static config, written at spawn/restart).
+            let entry = {
+                let entries = ctx.cell.entries.read().expect("entries lock");
+                entries
+                    .iter()
+                    .find(|e| e.schema() == envelope.schema)
+                    .cloned()
+            };
+            let Some(entry) = entry else {
+                // Unknown schema: dead-letter THIS message (it can never
+                // be handled; redelivering it would be futile) and let
+                // the rest of the batch continue.
+                dead_letter(
+                    &ctx.kernel,
+                    envelope,
+                    crate::kernel::DeadLetterReason::UnknownSchema,
+                    "no entry for this schema",
+                );
+                decisions.push(Outbox::new());
+                continue;
+            };
 
-        std::panic::catch_unwind(AssertUnwindSafe(|| {
-            entry.dispatch(state.as_mut(), &envelope.payload, &mut cmd_ctx)
-        }))
-    };
-
-    let events = match dispatch_result {
-        Ok(Ok(events)) => events,
-        Ok(Err(report)) => {
-            // Decode failure: dead-letter and advance (kernel bug only if
-            // the schema registry and adapter disagree).
-            let reason = format!("{report}");
-            dead_letter(
-                &ctx.kernel,
-                &envelope,
-                crate::kernel::DeadLetterReason::Decode,
-                &reason,
+            let mut outbox = Outbox::new();
+            let mut cmd_ctx = CmdCtx::new(
+                &ctx.path,
+                &envelope.trace,
+                envelope.reply_to.as_ref(),
+                ctx.view.as_ref(),
+                &mut outbox,
             );
-            ctx.cell.inbox.lock().await.ack();
-            return Step::Work;
-        }
-        Err(poison) => {
-            // PANIC: nothing appended, nothing acked, outbox discarded.
-            // The state may be poisoned — mark crashed and stop; the
-            // supervisor rebuilds from the journal (never reuses `state`).
-            ctx.cell.mark_crashed();
-            if ctx.kernel.observing() {
-                ctx.kernel.observe(crate::observe::Observation::new(
-                    envelope.trace.causality_id.as_millis_ts(),
-                    crate::observe::ObservationKind::Failed {
-                        path: ctx.path.clone(),
-                        error: "handler panic".to_owned(),
-                    },
-                ));
-            }
-            let _ = poison;
-            return Step::Crashed;
-        }
-    };
 
-    // 4.5 EMIT FILTER (declaration enforcement, PRE-append). The declared
-    // surface is the only surface: events whose schema the actor never
-    // declared are dropped here — never journalled, never applied — with a
-    // DeadLettered fact + tracing error as the observable record. The step
-    // CONTINUES with the declared remainder: dropping is a state-consistent
-    // outcome (apply runs per appended event), while failing the step would
-    // burn restart budget on a static condition redelivery can never heal.
-    // The gate consults the CELL-LOCAL mirror (spawn-static config, synced
-    // at the declaration-mutation point): no registry lock, no kernel lock.
-    // One read-held pass partitions the buffer, the read guard DROPS, then
-    // the undeclared remainder is dead-lettered (no lock is held across the
-    // async dead-letter work).
+            let dispatch_result = std::panic::catch_unwind(AssertUnwindSafe(|| {
+                entry.dispatch(state.as_mut(), &envelope.payload, &mut cmd_ctx)
+            }));
+
+            match dispatch_result {
+                Ok(Ok(events)) => {
+                    for event in events {
+                        batch_events.push(event);
+                    }
+                    decisions.push(outbox);
+                }
+                Ok(Err(report)) => {
+                    // Decode failure: dead-letter this message alone and
+                    // continue (kernel bug only if the schema registry
+                    // and adapter disagree).
+                    let reason = format!("{report}");
+                    dead_letter(
+                        &ctx.kernel,
+                        envelope,
+                        crate::kernel::DeadLetterReason::Decode,
+                        &reason,
+                    );
+                    decisions.push(Outbox::new());
+                }
+                Err(poison) => {
+                    // PANIC: nothing appended, nothing committed, outboxes
+                    // discarded. The whole batch stays queued (snapshots
+                    // never removed anything) and the state may be
+                    // poisoned — mark crashed and stop; the supervisor
+                    // rebuilds from the journal (never reuses `state`).
+                    ctx.cell.mark_crashed();
+                    if observing {
+                        ctx.kernel.observe(crate::observe::Observation::new(
+                            envelope.trace.causality_id.as_millis_ts(),
+                            crate::observe::ObservationKind::Failed {
+                                path: ctx.path.clone(),
+                                error: "handler panic".to_owned(),
+                            },
+                        ));
+                    }
+                    let _ = poison;
+                    return Step::Crashed;
+                }
+            }
+        }
+    }
+    // 4.5 EMIT FILTER (declaration enforcement, PRE-append, whole batch).
+    // The declared surface is the only surface: events whose schema the
+    // actor never declared are dropped here — never journalled, never
+    // applied — with a DeadLettered fact + tracing error as the observable
+    // record. The step CONTINUES with the declared remainder: dropping is
+    // a state-consistent outcome (apply runs per appended event), while
+    // failing the step would burn restart budget on a static condition
+    // redelivery can never heal. The gate consults the CELL-LOCAL mirror
+    // (spawn-static config, synced at the declaration-mutation point): no
+    // registry lock, no kernel lock. One read-held pass partitions the
+    // buffer, the read guard DROPS, then the undeclared remainder is
+    // dead-lettered (no lock is held across the async dead-letter work).
+    // A dropped event dead-letters with a root trace: the envelope→command
+    // link is per-message and batching owns no per-event trace mapping —
+    // the schema + payload stay the full observable record.
     let (declared_events, undeclared) = {
         let declared_emits = ctx.cell.declared_emits.read().expect("declared emits lock");
         let mut declared = crate::envelope::Events::new();
         let mut undeclared = crate::envelope::Events::new();
-        for event in events {
+        for event in batch_events {
             if declared_emits.contains(&event.schema) {
                 declared.push(event);
             } else {
@@ -1706,14 +1744,13 @@ async fn step_es(ctx: &EsLoop) -> Step {
             "undeclared event dropped before journal append"
         );
         // The dropped EVENT is what died: it is dead-lettered as an
-        // envelope addressed back to the emitting actor (same trace,
-        // so the drop stays causally linked to the command). The
-        // envelope SHARES the event's payload (Arc bump).
+        // envelope addressed back to the emitting actor. The envelope
+        // SHARES the event's payload (Arc bump).
         let dropped = Envelope::raw(
             event.schema.clone(),
             crate::envelope::Address::Path(ctx.path.clone()),
             crate::envelope::Payload::shared(&event.payload),
-            envelope.trace,
+            crate::envelope::TraceCtx::root(),
         )
         .from(ctx.path.clone());
         dead_letter(
@@ -1725,26 +1762,34 @@ async fn step_es(ctx: &EsLoop) -> Step {
     }
     let events = declared_events;
 
-    // 5. JOURNAL APPEND (durable record first). The store is awaited
-    // OUTSIDE the kernel sync guard — a write-through backend gets
-    // "never ack what isn't journaled"; a failure aborts the step BEFORE
-    // the ack (the message stays queued; supervision treats it as a crash).
-    // NOTE: the declared/undeclared `envelope` binding above was consumed
-    // by the filter; the events own their traces now.
-    let seqs = {
+    // 5. JOURNAL APPEND — ONE call for the whole batch (durable record
+    // first). The store is awaited OUTSIDE the kernel sync guard — a
+    // write-through backend gets "never ack what isn't journaled"; a
+    // failure aborts the step BEFORE any commit (the whole batch stays
+    // queued; supervision treats it as a crash). An empty buffer (every
+    // message was unknown/decode-failed) skips the store entirely.
+    // PROJECTOR CHECKPOINT PATH: a stamped envelope IS a recorded fact
+    // from elsewhere (a projector consuming a broadcast copy) — its
+    // re-records journal as CatchUp checkpoints (append answers `None`
+    // slots when the seeding path already held the fact). A batch of
+    // stamped copies of the SAME foreign fact (the projector loop's
+    // steady shape) rides the catchup arm; anything else (plain commands,
+    // mixed runs) takes the plain append.
+    let seqs: Vec<crate::journal::SeqNo> = {
         let store = ctx.kernel.journal_store();
-        // A stamped envelope IS a recorded fact from elsewhere (a
-        // projector consuming a broadcast copy): journal the identity
-        // re-record as a CHECKPOINT — origin `CatchUp { source: the
-        // recording journal, seq }`, the same identity the seeding path
-        // writes. `CatchUp` is invisible to `scan` (a projector's
-        // journal is never another projector's source of truth) and
-        // idempotent against seeding. The append answers `None` when
-        // this journal already held the fact (seeded first): the step
-        // acks and skips to the next message (the fold already
-        // happened, or will, via the seed).
-        let (appended, apply_new) = match envelope.recorded_origin() {
-            Some(origin) => {
+        if events.is_empty() {
+            Vec::new()
+        } else {
+            let mut origins = batch.iter().filter_map(|(_, envelope)| envelope.recorded_origin());
+            let first = origins.next();
+            let all_same_origin = first.is_some()
+                && origins.all(|o| {
+                    let f = first.expect("checked");
+                    o.journal == f.journal && o.seq == f.seq
+                })
+                && batch.len() == batch.iter().filter(|(_, e)| e.recorded_origin().is_some()).count();
+            if all_same_origin {
+                let origin = first.expect("checked").clone();
                 let scanned: Vec<crate::journal::ScannedEvent> = events
                     .iter()
                     .map(|event| crate::journal::ScannedEvent {
@@ -1756,67 +1801,74 @@ async fn step_es(ctx: &EsLoop) -> Step {
                     .collect();
                 match store.append_catchup(&ctx.path, &scanned).await {
                     Ok(results) => {
-                        let apply_new = results.iter().all(|slot| slot.is_some());
-                        (
-                            Ok(events
-                                .iter()
-                                .map(|_| crate::journal::SeqNo::new(0))
-                                .collect::<Vec<_>>()),
-                            apply_new,
-                        )
+                        if !results.iter().all(|slot| slot.is_some()) {
+                            // Already checkpointed by the seeding path:
+                            // commit (durably held) and move on — replay
+                            // restores this fact from the journal.
+                            let mut inbox = ctx.cell.inbox.lock().await;
+                            for (offset, _) in &batch {
+                                inbox.commit_through(*offset);
+                            }
+                            return Step::Work;
+                        }
+                        events
+                            .iter()
+                            .map(|_| crate::journal::SeqNo::new(0))
+                            .collect::<Vec<_>>()
                     }
                     Err(report) => {
                         tracing::error!(actor = %ctx.path, error = ?report, "journal append failed");
-                        (Err(()), false)
+                        ctx.cell.mark_crashed();
+                        return Step::Crashed;
+                    }
+                }
+            } else {
+                match store.append(&ctx.path, &events).await {
+                    Ok(seqs) => seqs,
+                    Err(report) => {
+                        tracing::error!(actor = %ctx.path, error = ?report, "journal append failed");
+                        ctx.cell.mark_crashed();
+                        return Step::Crashed;
                     }
                 }
             }
-            None => match store.append(&ctx.path, &events).await {
-                Ok(seqs) => (Ok(seqs), true),
-                Err(report) => {
-                    tracing::error!(actor = %ctx.path, error = ?report, "journal append failed");
-                    (Err(()), false)
-                }
-            },
-        };
-        if appended.is_err() {
-            ctx.cell.mark_crashed();
-            return Step::Crashed;
         }
-        if !apply_new {
-            // Already checkpointed by the seeding path: ack (durably held)
-            // and move on — replay restores this fact from the journal.
-            ctx.cell.inbox.lock().await.ack();
-            return Step::Work;
-        }
-        appended.expect("append ok checked above")
     };
 
-    // 6. ACK (the commit point: this message will never redeliver). The
-    // commit-point bookkeeping is cell-local: the last committed seq and
-    // the inbox cursor land without the kernel lock (the seq and the
-    // cursor are single-writer — this loop is the only appender for the
-    // path). The Acked observation rides the handler slot.
-    ctx.cell.inbox.lock().await.ack();
+    // 6. COMMIT the whole batch (the commit point: none of these messages
+    // will ever redeliver). One inbox acquisition moves the cursor past
+    // every offset. The commit-point bookkeeping is cell-local: the last
+    // committed seq and the inbox cursor land without the kernel lock (the
+    // seq and the cursor are single-writer — this loop is the only
+    // appender for the path). Acked observations ride the handler slot.
+    {
+        let mut inbox = ctx.cell.inbox.lock().await;
+        for (offset, _) in &batch {
+            inbox.commit_through(*offset);
+        }
+    }
     if let Some(last) = seqs.last() {
         ctx.cell
             .last_event_seq
             .store(last.as_u64(), std::sync::atomic::Ordering::Release);
     }
-    if ctx.kernel.observing() {
-        ctx.kernel.observe(crate::observe::Observation::new(
-            envelope.trace.causality_id.as_millis_ts(),
-            crate::observe::ObservationKind::Acked {
-                to: ctx.path.clone(),
-                schema: envelope.schema.clone(),
-                trace: envelope.trace,
-            },
-        ));
+    if observing {
+        for (_, envelope) in &batch {
+            ctx.kernel.observe(crate::observe::Observation::new(
+                envelope.trace.causality_id.as_millis_ts(),
+                crate::observe::ObservationKind::Acked {
+                    to: ctx.path.clone(),
+                    schema: envelope.schema.clone(),
+                    trace: envelope.trace,
+                },
+            ));
+        }
     }
 
     // 7. APPLY (the same fold replay uses; state may now lag the journal
     // only if the process dies before this line — rebuild covers that).
-    {
+    // One state-lock pass over the whole batch's events, in order.
+    if !events.is_empty() {
         let state = ctx.state();
         let mut state = state.lock().await;
         for event in events.iter() {
@@ -1824,16 +1876,26 @@ async fn step_es(ctx: &EsLoop) -> Step {
         }
     }
 
-    // 8. OUTBOX FLUSH (deferred sends/replies, causality-linked). A
-    // StopSelf intent concludes the step with Step::Stop — sends recorded
-    // before it have already flushed (in-order).
-    let stop_self = flush_outbox(ctx, outbox).await;
+    // 8. OUTBOX FLUSH per message (deferred sends/replies, causality-
+    // linked, in-order across the batch: message k's effects land before
+    // message k+1's). A StopSelf intent concludes the step with Step::Stop
+    // — sends recorded before it have already flushed (in-order).
+    let mut stop_self = false;
+    for outbox in decisions {
+        if flush_outbox(ctx, outbox).await {
+            stop_self = true;
+            break;
+        }
+    }
 
     // 9. EMIT FAN-OUT (recorded, declared facts broadcast to every actor
     // that declared .handles — the named step exists so the order never
     // changes). Each copy is STAMPED with the recording (path, seq): a
     // consuming projector reads the stamp into its checkpoint, so a
     // restart never re-seeds (never double-folds) a fact it folded live.
+    // The batch fans out over the ONE zip: event k pairs with seq k
+    // (append answered one seq per event, in order), so stamps stay
+    // per-event correct.
     // A projector's own re-records fan out NOWHERE: they are checkpoint
     // writes of facts that were already broadcast when their source
     // recorded them (re-broadcasting would echo every consumed fact back
@@ -1845,7 +1907,9 @@ async fn step_es(ctx: &EsLoop) -> Step {
         fan_out_emits(ctx, events, &seqs).await;
     }
 
-    // 10. MAYBE SNAPSHOT (policy-gated, BETWEEN messages).
+    // 10. MAYBE SNAPSHOT (policy-gated, BETWEEN batches). The cadence
+    // anchors at the batch's LAST seq — a boundary crossed mid-batch
+    // snapshots after the batch commits, never mid-step.
     maybe_snapshot(ctx, seqs).await;
 
     if stop_self { Step::Stop } else { Step::Work }
@@ -2444,11 +2508,26 @@ async fn maybe_snapshot(ctx: &EsLoop, seqs: Vec<crate::journal::SeqNo>) {
         return;
     }
     let last = *seqs.last().expect("non-empty");
-    // Snapshot when the last committed event landed on an n-boundary.
-    if last.as_u64() % n != n - 1 {
+    // Snapshot at EVERY cadence boundary the batch crossed (or exactly
+    // hit): the anchors are the events at 1-based positions k*n — between
+    // batches, never mid-step. A single-event batch (trickle) hits at
+    // most one boundary, matching the legacy per-message shape exactly; a
+    // loaded batch that jumps several boundaries records each anchor (the
+    // journal keeps every snapshot; replay takes the last).
+    let first = seqs.first().expect("non-empty").as_u64();
+    let last_seq = last.as_u64();
+    if last_seq + 1 - first < n {
         return;
     }
-    snapshot_now(ctx, last).await;
+    let mut boundary = ((first + 1).div_ceil(n) * n).saturating_sub(1);
+    loop {
+        snapshot_now(ctx, crate::journal::SeqNo::new(boundary)).await;
+        let next = boundary + n;
+        if next > last_seq {
+            break;
+        }
+        boundary = next;
+    }
 }
 
 /// Writes one snapshot of the live state at `seq` (the shared tail of both
