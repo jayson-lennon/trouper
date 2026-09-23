@@ -2,3 +2,4 @@
 *.json
 .plans/
 Cargo.lock
+perf.data
