@@ -10,127 +10,72 @@ This crate is _not_ yet ready for general use. Built specifically for [`jinn`](h
 
 ## Benchmarks
 
-Usage-shaped end-to-end cycles (`cargo bench --bench e2e`) and component
-costs (`cargo bench --bench micro`), run with criterion on the
-development machine (Intel i5-10400, Linux, release profile). Numbers
-are the mean of the current baseline; treat them as shape and scale,
-not absolute promises; rerun `cargo bench` locally for your hardware.
-(The "Criterion time" column is the raw mean per iteration, exactly as
-`cargo bench` prints it; "Per message" divides by the case's element
-count; "Rate" names the unit per bench (msg, ask roundtrip, or frame
-read) instead of criterion's generic "elem". An element is always one
-committed message, one ask roundtrip, or one frame read — never a
-spawn or a harness step.)
+Three criterion suites (`cargo bench --bench competitors`, `--bench
+micro`, `--bench journal`) on the development machine (Intel i5-10400,
+12 threads, Linux, release profile). Numbers are criterion means from a
+quiet-machine run; treat them as shape and scale, not absolute
+promises — rerun `cargo bench` locally for your hardware. An element is
+always one fully processed message, one flush, or one frame read —
+never a spawn or a harness step.
 
-### e2e
+### competitors
 
-Message benches share one matrix — batches of 64, 512, and 2048 (2048
-vs a Block inbox of 64 keeps producer-side blocking inside the measured
-body) — and all completion is push-driven: benches spin-yield on the
-destination's inbox cursor, which advances exactly at the kernel's
-commit point (journal append + ack; cursor ≥ base+N proves N
-committed), never poll actor state on a timed sleep. Ask benches
-settle on the reply itself; swarm settles on hand-registered sink
-counters. Benches run with observation DISABLED (the default) — the
-`observation_price` group measures the enabled cost separately. There
-is no single-message case: spawn + harness overhead dominated it.
-Numbers across matrix entries are NOT comparable 1:1 (per-batch spawn
-amortization differs); compare within a size. The swarm keeps its
-declared 32×receivers shape; payload_size and wide_tree are
-single-message by design (they price payload width, not batching).
+The same prime-then-spam harness driving trouper, kameo, and ractor:
+one producer actor hot-loops `n` tells at one sink actor. Every send
+leaves a handler (actor→actor, the realistic shape) — nothing is
+injected at the edge. The harness owns kanal control channels: the
+producer parks inside its handler awaiting a start signal, the sink
+fires a done signal at the target count, and the criterion timed body
+is ONLY `start.send(())` → `done.recv()` (auditable in one 5-line
+function, byte-identical for every framework). Runtime construction,
+actor spawn, priming, and settle sit in `iter_batched`'s untimed setup;
+one element = one fully processed message. Mailboxes follow each
+framework's supported set:
 
-| Bench             | Case                       | Criterion time | Per message |               Rate |
-| ----------------- | -------------------------- | ------------: | ---------: | ----------------: |
-| tell_acked        | 64_messages                |      371.03 µs |     5.8 µs |      165,120 msg/s |
-|                   | 512_messages               |      13.325 ms |    26.0 µs |       38,099 msg/s |
-|                   | 2048_messages              |      55.081 ms |    26.9 µs |       36,754 msg/s |
-| fire_and_forget   | 64_messages                |      338.52 µs |     5.3 µs |      167,250 msg/s |
-|                   | 512_messages               |      10.875 ms |    21.2 µs |       46,612 msg/s |
-|                   | 2048_messages              |      51.818 ms |    25.3 µs |       38,901 msg/s |
-| producer_scaling  | 64_messages/1              |      334.30 µs |     5.2 µs |      171,420 msg/s |
-|                   | 64_messages/2              |      682.18 µs |    10.7 µs |       88,483 msg/s |
-|                   | 64_messages/4              |      1.0092 ms |    15.8 µs |       61,650 msg/s |
-|                   | 64_messages/8              |      1.2644 ms |    19.8 µs |       49,398 msg/s |
-|                   | 512_messages/1             |      13.173 ms |    25.7 µs |       38,591 msg/s |
-|                   | 512_messages/2             |      16.907 ms |    33.0 µs |       30,150 msg/s |
-|                   | 512_messages/4             |      19.497 ms |    38.1 µs |       26,007 msg/s |
-|                   | 512_messages/8             |      20.570 ms |    40.2 µs |       24,678 msg/s |
-|                   | 2048_messages/1            |      49.920 ms |    24.4 µs |       40,784 msg/s |
-|                   | 2048_messages/2            |      68.094 ms |    33.2 µs |       29,787 msg/s |
-|                   | 2048_messages/4            |      76.182 ms |    37.2 µs |       26,574 msg/s |
-|                   | 2048_messages/8            |      80.548 ms |    39.3 µs |       25,192 msg/s |
-| payload_size      | 500B                       |      845.48 µs |   845.5 µs |                  - |
-|                   | 2KB                        |      1.4123 ms |   1.412 ms |                  - |
-|                   | 64KB                       |      334.38 µs |   334.4 µs |                  - |
-|                   | 1MB                        |      960.53 µs |   960.5 µs |                  - |
-| wide_tree         | 100k_nodes                 |      941.64 µs |   941.6 µs |                  - |
-|                   | 1M_nodes                   |      1.6095 ms |   1.610 ms |                  - |
-| fanout            | handlers_1_1_asks          |      10.721 µs |    10.7 µs | 92,857 roundtrip/s |
-|                   | handlers_1_64_asks         |      677.79 µs |    10.6 µs | 94,076 roundtrip/s |
-|                   | handlers_1_512_asks        |      5.4277 ms |    10.6 µs | 93,881 roundtrip/s |
-|                   | handlers_8_1_asks          |      85.384 µs |    85.4 µs | 11,613 roundtrip/s |
-|                   | handlers_8_64_asks         |      5.4543 ms |    85.2 µs | 11,651 roundtrip/s |
-|                   | handlers_8_512_asks        |      43.952 ms |    85.8 µs | 11,602 roundtrip/s |
-|                   | handlers_64_1_asks         |      700.18 µs |   700.2 µs |  1,418 roundtrip/s |
-|                   | handlers_64_64_asks        |      43.670 ms |   682.3 µs |  1,450 roundtrip/s |
-|                   | handlers_64_512_asks       |      350.81 ms |   685.7 µs |  1,450 roundtrip/s |
-| overload_block    | producers_16_64_messages   |      504.02 µs |     7.9 µs |      120,000 msg/s |
-|                   | producers_16_512_messages  |      18.696 ms |    36.5 µs |       26,920 msg/s |
-|                   | producers_16_2048_messages |      78.556 ms |    38.4 µs |       25,806 msg/s |
-| idle_fleet        | 1k_idle_64_messages        |      230.65 µs |     3.6 µs |      258,160 msg/s |
-|                   | 1k_idle_512_messages       |      13.015 ms |    25.4 µs |       38,466 msg/s |
-|                   | 1k_idle_2048_messages      |      50.733 ms |    24.8 µs |       39,676 msg/s |
-|                   | 10k_idle_64_messages       |      201.65 µs |     3.1 µs |      300,780 msg/s |
-|                   | 10k_idle_512_messages      |      12.426 ms |    24.3 µs |       39,832 msg/s |
-|                   | 10k_idle_2048_messages     |      53.943 ms |    26.3 µs |       37,083 msg/s |
-| projection_read   | hot_typed_64_frames        |      7.5592 µs |   118.1 ns |   8,444,500 read/s |
-|                   | hot_json_64_frames         |      391.15 ms |   6.112 ms |         163 read/s |
-| swarm             | p32_r128                   |      3.2905 ms |     0.8 µs |    1,236,600 msg/s |
-|                   | p128_r512                  |      13.233 ms |     0.8 µs |    1,232,800 msg/s |
-|                   | p512_r2048                 |      62.710 ms |     1.2 µs |    1,031,900 msg/s |
-| observation_price | 64_messages_off            |      370.92 µs |     5.8 µs |      153,390 msg/s |
-|                   | 64_messages_on             |      651.19 µs |    10.2 µs |       92,899 msg/s |
-|                   | 512_messages_off           |      10.894 ms |    21.3 µs |       46,127 msg/s |
-|                   | 512_messages_on            |      10.763 ms |    21.0 µs |       46,729 msg/s |
+| leg               | mailbox                                    |
+| ----------------- | ------------------------------------------ |
+| trouper           | bounded-64 (its default, Block policy)     |
+| trouper-unbounded | 2^20-capacity Block (no true unbounded)    |
+| kameo             | bounded-64 (its default)                   |
+| kameo-unbounded   | native unbounded                           |
+| ractor            | native unbounded (core has no bounded API) |
 
-What the shapes mean:
+trouper's producer declares `.emits::<Tick>()` at spawn — the flush
+gate dead-letters undeclared outbound schemas, so that declaration is
+part of its send path.
 
-- **tell_acked**: the COMMIT floor, one message through
-  send→fold→ack; batches price the per-message cost once the entity
-  is warm.
-- **fire_and_forget**: the SEND floor — the same tell loop with no
-  completion wait: channel accept + route, resolved at the front
-  door. This is what an event-driven producer waits before its own
-  next message; the delta vs tell_acked is the fold+ack+observation
-  cost. SUSTAINED LOOP ONLY: tells arrive faster than the entity can
-  commit, so the inbox fills and backpressure engages (the same
-  Block policy overload_block exercises); this measures the
-  producer-side wait, not durability.
-- **producer_scaling**: 1/2/4/8 producers on one entity at
-  64/512/2048 messages. Per-message cost holds as producers grow.
-- **payload_size**: one message per commit, 500 B to 1 MB payloads.
-- **wide_tree**: one commit with a huge array payload (100k / 1M
-  nodes); 810 µs → 1.41 ms shows width costs, but far less than a
-  per-node walk would.
-- **fanout**: ask roundtrips (request + reply) — 1/8/64 live echo
-  services × 1/64/512 asks. Completion is the reply, no wait
-  mechanism.
-- **overload_block**: 16 producers into a `Block` inbox at
-  64/512/2048 messages (backpressure, no loss); 2048 keeps the
-  producers blocked inside the measured body.
-- **idle_fleet**: one busy entity among 1k / 10k idle actors at
-  64/512/2048 messages. Within noise of tell_acked; idle actors cost
-  nothing.
-- **swarm**: many-to-many at fleet scale (32 tells × every receiver),
-  aggregate per-message cost at 4k/64k/1M messages in flight —
-  sub-microsecond per message (service sinks, no journaling).
-- **projection_read**: how fast a UI can read a projector's state,
-  typed closure vs JSON decode, per read.
-- **observation_price**: the same fire_and_forget body with a
-  counting observation handler installed vs disabled — the price of
-  watching the wire, paid ONLY when a handler is installed.
+| Leg               | n    | Criterion time | Per message | Rate          |
+| ----------------- | ---- | -------------: | ----------: | ------------: |
+| trouper           | 64   |       318.5 µs |    4.98 µs  |   200,923 msg/s |
+|                   | 512  |         3.97 ms |    7.75 µs |   129,063 msg/s |
+|                   | 2048 |         4.92 ms |    2.40 µs |   416,096 msg/s |
+| trouper-unbounded | 64   |       332.8 µs |    5.20 µs  |   192,308 msg/s |
+|                   | 512  |       970.3 µs |    1.90 µs  |   527,699 msg/s |
+|                   | 2048 |         3.45 ms |    1.69 µs |   593,014 msg/s |
+| kameo             | 64   |       276.9 µs |    4.33 µs  |   231,106 msg/s |
+|                   | 512  |       432.2 µs |    0.84 µs  | 1,184,539 msg/s |
+|                   | 2048 |         1.27 ms |    0.62 µs | 1,618,594 msg/s |
+| kameo-unbounded   | 64   |       267.9 µs |    4.19 µs  |   238,886 msg/s |
+|                   | 512  |       749.5 µs |    1.46 µs  |   683,138 msg/s |
+|                   | 2048 |       786.4 µs |    0.38 µs  | 2,604,278 msg/s |
+| ractor            | 64   |       263.5 µs |    4.12 µs  |   242,872 msg/s |
+|                   | 512  |       580.3 µs |    1.13 µs  |   882,339 msg/s |
+|                   | 2048 |       785.3 µs |    0.38 µs  | 2,607,808 msg/s |
+
+Shape read: at small batches every framework is parked near the same
+wake-up floor (~260-330 µs covers the producer's resume, the whole
+in-flight batch, and the done signal). As the batch grows, per-message
+cost separates: the unbounded kameo/ractor mailboxes climb toward
+~2.6M msg/s while trouper's journaled-style path — every tell is
+schema-routed, outbox-recorded, and flush-gated — holds ~420-590K msg/s
+at 2048. That is the architectural trade trouper makes for its
+registry/journal guarantees, priced honestly against the plain tell
+machines.
 
 ### micro
+
+Component costs without a running system: in-memory journal append
+(per-batch ns) and replay/restart costs. `cargo bench --bench micro`.
 
 | Bench                            | Case            |      Mean |
 | -------------------------------- | --------------- | -------: |
@@ -140,6 +85,17 @@ What the shapes mean:
 | in_memory_journal_replay_restart | journal_1000    | 54.080 µs |
 |                                  | journal_10000   | 566.30 µs |
 |                                  | repeat_load_10k | 765.40 µs |
+
+### journal
+
+SQLite-backed tell commits through the daow journal
+(`cargo bench --bench journal --features daow`). `tell_acked` prices
+the full send→fold→journal-ack cycle per medium (`:memory:` = the pure
+SQLite floor; disk = WAL fsyncs included); system + journal build once
+and each iteration gets a fresh entity in untimed setup, so the timed
+body is only the tells plus the commit-cursor wait.
+`flush_price` prices one direct store flush at two batch sizes — the
+write-behind drain the ack path defers.
 
 Also see `examples/idle_burn.rs`, a CPU-seconds probe for idle fleets
 (5,000 duty-armed idle actors burn ~0.003 CPU-seconds per second of

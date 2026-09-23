@@ -15,12 +15,12 @@ use std::time::Duration;
 use trouper::actor::{ActorKind, ActorPath as Path, EventSourcedActor};
 use trouper::builder::spawn_es_builder;
 use trouper::context::CmdCtx;
-use trouper::journal_daow::DaowConfig;
-use trouper::journal::{JournalArgs, SeqNo, StoreControlMessage};
-use trouper::{json, json::Json};
 use trouper::envelope::Events;
+use trouper::journal::{JournalArgs, SeqNo, StoreControlMessage};
+use trouper::journal_daow::DaowConfig;
 use trouper::schema::{ActorManifest, Command, Schema};
 use trouper::system::{ActorSystem, SystemConfig};
+use trouper::{json, json::Json};
 
 // ── Fixtures ─────────────────────────────────────────────────────────────
 
@@ -94,7 +94,10 @@ impl TestDb {
 
 /// A pool over `:memory:` (daow forces max_size = 1 there).
 fn memory_pool() -> daow::Pool {
-    daow::Pool::builder().path(":memory:").build().expect("pool")
+    daow::Pool::builder()
+        .path(":memory:")
+        .build()
+        .expect("pool")
 }
 
 /// A store built directly (no `ActorSystem`) — the store-level tests.
@@ -227,12 +230,7 @@ async fn tick(system: &ActorSystem, path: &Path, n: i64) {
         .await
         .expect("tell accepted");
     for _ in 0..200_000_000 {
-        if system
-            .inbox_cursor(path)
-            .map(|c| c.as_u64())
-            .unwrap_or(0)
-            > base
-        {
+        if system.inbox_cursor(path).map(|c| c.as_u64()).unwrap_or(0) > base {
             return;
         }
         tokio::task::yield_now().await;
@@ -388,7 +386,10 @@ async fn fresh_store_continues_the_global_ingest_order() {
         .build()
         .await
         .expect("rebuild");
-    args.store.append(&Path::new("b"), &[event(3)]).await.expect("append b");
+    args.store
+        .append(&Path::new("b"), &[event(3)])
+        .await
+        .expect("append b");
 
     // Then the new append's ingest continues ABOVE the stored max — a
     // reset counter would have reused low values.
@@ -404,9 +405,17 @@ async fn fresh_store_continues_the_global_ingest_order() {
         .await
         .expect("load")
         .expect("journal a");
-    let max_a = replay_a.events.iter().map(|e| e.ingest_seq).max().expect("a");
+    let max_a = replay_a
+        .events
+        .iter()
+        .map(|e| e.ingest_seq)
+        .max()
+        .expect("a");
     let b0 = replay_b.events.first().expect("b0").ingest_seq;
-    assert!(b0 > max_a, "ingest continues above the stored max ({b0} > {max_a})");
+    assert!(
+        b0 > max_a,
+        "ingest continues above the stored max ({b0} > {max_a})"
+    );
 }
 
 #[tokio::test]
@@ -428,13 +437,18 @@ async fn buffered_append_fails_the_write_and_the_tick_reports_and_recovers() {
 
     // When events append (the ack path succeeds — buffered) and a manual
     // flush hits the fault.
-    args.store.append(&path, &[event(1), event(2)]).await.expect("buffered");
+    args.store
+        .append(&path, &[event(1), event(2)])
+        .await
+        .expect("buffered");
     let flushed = args.store.flush().await;
 
     // Then the flush FAILS, the control closure reports it, and the load
     // still sees both events (the buffer was retained, not dropped).
     assert!(flushed.is_err(), "flush must fail while the fault stands");
-    let msg = rx.try_recv().expect("control closure notified of the flush failure");
+    let msg = rx
+        .try_recv()
+        .expect("control closure notified of the flush failure");
     let op = match msg {
         StoreControlMessage::Error { op, .. } => op,
     };
@@ -446,7 +460,11 @@ async fn buffered_append_fails_the_write_and_the_tick_reports_and_recovers() {
         .await
         .expect("load")
         .expect("journal");
-    assert_eq!(replay.events.len(), 2, "buffer retained through the failure");
+    assert_eq!(
+        replay.events.len(),
+        2,
+        "buffer retained through the failure"
+    );
 
     // And when the fault is removed, the next flush succeeds with the
     // SAME entries (retried, never dropped) — the DB now holds them.
@@ -491,7 +509,10 @@ async fn scan_unions_buffer_and_db_excluding_catchup_entries() {
         ingest_seq: 999,
         event: event(7),
     }];
-    let seeded = store.append_catchup(&projector, &scanned).await.expect("seed");
+    let seeded = store
+        .append_catchup(&projector, &scanned)
+        .await
+        .expect("seed");
     assert_eq!(seeded, vec![Some(SeqNo::new(1))], "catch-up seed appended");
 
     // When scanning for the schema.
@@ -519,14 +540,20 @@ async fn catchup_seed_is_idempotent_across_passivation_via_db_check() {
         event: event(7),
     }];
     let projector = Path::new("projector");
-    let first = store.append_catchup(&projector, &scanned).await.expect("seed");
+    let first = store
+        .append_catchup(&projector, &scanned)
+        .await
+        .expect("seed");
     assert_eq!(first, vec![Some(SeqNo::new(0))]);
     store.flush().await.expect("flush");
     store.passivated(&projector).await.expect("passivate");
 
     // When the SAME origin is re-seeded after reactivation (a fresh
     // buffer that cannot know the origin — only the DB check can).
-    let again = store.append_catchup(&projector, &scanned).await.expect("re-seed");
+    let again = store
+        .append_catchup(&projector, &scanned)
+        .await
+        .expect("re-seed");
 
     // Then it is suppressed — the projector never double-folds.
     assert_eq!(again, vec![None], "DB EXISTS check suppressed the re-seed");
@@ -540,7 +567,10 @@ async fn passivated_flushes_drops_and_reactivation_continues_seq() {
     let pool_memory = memory_pool();
     let _ = pool_memory; // (store owns its pool; kept for symmetry)
     let path = Path::new("cold");
-    store.append(&path, &[event(1), event(2)]).await.expect("append");
+    store
+        .append(&path, &[event(1), event(2)])
+        .await
+        .expect("append");
     store.flush().await.expect("flush");
     store.append(&path, &[event(3)]).await.expect("append");
 
@@ -559,7 +589,11 @@ async fn passivated_flushes_drops_and_reactivation_continues_seq() {
     assert_eq!(seqs, [0, 1, 2], "stored seqs are dense");
 
     let next = store.append(&path, &[event(4)]).await.expect("append");
-    assert_eq!(next, vec![SeqNo::new(3)], "append continues at the stored max seq");
+    assert_eq!(
+        next,
+        vec![SeqNo::new(3)],
+        "append continues at the stored max seq"
+    );
 }
 
 #[tokio::test]
@@ -580,7 +614,10 @@ async fn purge_drops_rows_and_next_spawn_replays_nothing() {
 
     // And the ingest counter did NOT reset: the new append's ingest
     // continues above the purged event's (a reset would hand out 0).
-    store.append(&Path::new("other"), &[event(1)]).await.expect("o");
+    store
+        .append(&Path::new("other"), &[event(1)])
+        .await
+        .expect("o");
     let replay = store
         .load(&Path::new("other"))
         .await
@@ -596,7 +633,10 @@ async fn load_unions_buffer_over_db_with_snapshot_precedence() {
     // higher snapshot) in the buffer.
     let store = memory_store(DaowConfig::default()).await;
     let path = Path::new("union");
-    store.append(&path, &[event(1), event(2)]).await.expect("db part");
+    store
+        .append(&path, &[event(1), event(2)])
+        .await
+        .expect("db part");
     store.flush().await.expect("flush");
     store
         .append_snapshot(&path, SeqNo::new(2), json!({ "v": 2 }), 0)
@@ -611,8 +651,16 @@ async fn load_unions_buffer_over_db_with_snapshot_precedence() {
     // snapshot, and the tail strictly after it.
     assert_eq!(replay.events.len(), 3, "no dup, no loss");
     let snap = replay.snapshot.expect("snapshot");
-    assert_eq!(snap.seq(), SeqNo::new(2), "buffer snapshot wins (higher seq)");
-    assert_eq!(replay.tail.len(), 0, "tail is strictly post-snapshot (none)");
+    assert_eq!(
+        snap.seq(),
+        SeqNo::new(2),
+        "buffer snapshot wins (higher seq)"
+    );
+    assert_eq!(
+        replay.tail.len(),
+        0,
+        "tail is strictly post-snapshot (none)"
+    );
 }
 
 // ── System-level end-to-end ──────────────────────────────────────────────
@@ -848,7 +896,11 @@ async fn shutdown_flush_failure_reaches_control_after_shutdown_returns() {
     // retry build proves is the schema+pool stay usable. The retained-
     // buffer property is asserted directly in
     // `buffered_append_fails_the_write_and_the_tick_reports_and_recovers`.)
-    retry.store.flush().await.expect("pool usable after failure");
+    retry
+        .store
+        .flush()
+        .await
+        .expect("pool usable after failure");
 }
 
 #[tokio::test]

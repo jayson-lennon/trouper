@@ -600,7 +600,8 @@ mod tests {
         assert_eq!(first.as_str(), "ReserveStock");
         // ...and the fallback cache was populated at most once — later
         // reads share the entry.
-        let after = crate::kernel::SCHEMA_ID_CACHE_MISSES.load(std::sync::atomic::Ordering::Relaxed);
+        let after =
+            crate::kernel::SCHEMA_ID_CACHE_MISSES.load(std::sync::atomic::Ordering::Relaxed);
         assert!(after - before <= 1, "cache miss at most once per type");
     }
 

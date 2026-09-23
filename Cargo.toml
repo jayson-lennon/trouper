@@ -70,13 +70,21 @@ trybuild = "1"
 criterion = { version = "0.7", features = ["html_reports"] }
 # On-disk SQLite databases for the daow journal tests and benches.
 tempfile = "3"
-
-[[bench]]
-name = "e2e"
-harness = false
+# Competitor bench (benches/competitors.rs): the same prime-then-spam
+# harness drives kameo and ractor service-actor tells. Dev-only: the
+# published crate never links them.
+kameo = "0.22"
+ractor = "0.16"
+# The harness control channels: created sync in the bench, awaited async
+# inside the actors (one dependency serving both sides of the harness).
+kanal = "0.1"
 
 [[bench]]
 name = "micro"
+harness = false
+
+[[bench]]
+name = "competitors"
 harness = false
 
 [[bench]]

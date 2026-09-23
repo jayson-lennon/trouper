@@ -1,5 +1,5 @@
 //! Journal persistence benchmarks: the SQLite backend's price over a
-//! live system, against the same house rules as `e2e`.
+//! live system.
 //!
 //! Every bench measures COMPLETE processing: the destination's INBOX
 //! CURSOR advances exactly at the kernel's commit point, journal append
@@ -30,14 +30,14 @@ use criterion::{Criterion, criterion_group, criterion_main};
 use trouper::actor::{ActorKind, ActorPath, EventSourcedActor};
 use trouper::builder::spawn_es_builder;
 use trouper::context::CmdCtx;
+use trouper::envelope::Events;
 use trouper::journal::JournalArgs;
 use trouper::journal_daow::DaowConfig;
 use trouper::json::Json;
-use trouper::envelope::Events;
 use trouper::schema::{ActorManifest, Command, Schema};
 use trouper::system::{ActorSystem, SystemConfig};
 
-// ── Fixtures (mirrors the e2e counting entity) ───────────────────────────
+// ── Fixtures ─────────────────────────────────────────────────────────────
 
 #[derive(Clone, Command, serde::Serialize, serde::Deserialize)]
 struct Tick {
@@ -158,80 +158,54 @@ async fn wait_committed_spawn(system: &ActorSystem, path: &ActorPath) {
 fn tell_acked_daow(c: &mut Criterion) {
     // :memory: — daow forces max_size=1, so writer and reads share one
     // connection; the pure SQLite floor.
-    {
-        let rt0 = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("setup rt");
-        let args = rt0.block_on(async {
-            JournalArgs::daow(trouper_daow_memory_pool(), bench_config())
-                .build()
-                .await
-                .expect("journal args (memory)")
-        });
-        let (system, rt) = spawn_system(args);
-        let iterations = Iterations(std::sync::atomic::AtomicU64::new(0));
-
-        let mut group = c.benchmark_group("journal/tell_acked/memory");
-        group.sample_size(30);
-        for size in [64u64, 512, 2_048] {
-            group.throughput(criterion::Throughput::Elements(size));
-            group.bench_function(format!("{size}_messages"), |b| {
-                b.iter(|| {
-                    rt.block_on(async {
-                        let path = iterations.next_path("bench/journal-mem");
-                        spawn_accum(&system, &path).await;
-                        let base = system
-                            .inbox_cursor(&path)
-                            .map(|c| c.as_u64())
-                            .unwrap_or(0);
-                        for n in 0..size as i64 {
-                            system
-                                .tell(path.clone(), Tick { n })
-                                .await
-                                .expect("tell accepted");
-                        }
-                        wait_committed(&system, base, &path, size).await;
-                    });
-                });
-            });
-        }
-        group.finish();
-        rt.block_on(system.shutdown_graceful(Duration::from_secs(30)));
-    }
+    tell_acked_media(c, "memory", trouper_daow_memory_pool(), "bench/journal-mem");
 
     // On-disk — WAL fsyncs included: the deployment shape.
-    {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let db_path = dir.path().join("bench.db").display().to_string();
-        let _ = &dir;
-        let pool = daow::Pool::builder().path(db_path).max_size(2).build().expect("pool");
+    let dir = tempfile::tempdir().expect("tempdir");
+    let db_path = dir.path().join("bench.db").display().to_string();
+    let pool = daow::Pool::builder()
+        .path(db_path)
+        .max_size(2)
+        .build()
+        .expect("pool");
+    tell_acked_media(c, "disk", pool, "bench/journal-disk");
+}
+
+/// One journal medium of `tell_acked`: system + journal build ONCE, then
+/// per measured iteration a FRESH entity path is spawned in the untimed
+/// `iter_batched` setup and the timed routine is only tells + the
+/// commit-cursor wait (complete processing per Throughput::Elements).
+fn tell_acked_media(c: &mut Criterion, label: &str, pool: daow::Pool, prefix: &str) {
+    // Setup runtime: `JournalArgs::daow(..).build()` is async (pool probe
+    // + migrations) and must run BEFORE the measured system exists. A
+    // throwaway current-thread rt for those two awaits — nothing else.
+    let args = {
         let rt0 = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .expect("setup rt");
-        let args = rt0.block_on(async {
-            JournalArgs::daow(pool, bench_config())
-                .build()
-                .await
-                .expect("journal args (disk)")
-        });
-        let (system, rt) = spawn_system(args);
-        let iterations = Iterations(std::sync::atomic::AtomicU64::new(0));
+        rt0.block_on(JournalArgs::daow(pool, bench_config()).build())
+            .expect("journal args")
+    };
+    let (system, rt) = spawn_system(args);
+    let iterations = Iterations(std::sync::atomic::AtomicU64::new(0));
 
-        let mut group = c.benchmark_group("journal/tell_acked/disk");
-        group.sample_size(30);
-        for size in [64u64, 512, 2_048] {
-            group.throughput(criterion::Throughput::Elements(size));
-            group.bench_function(format!("{size}_messages"), |b| {
-                b.iter(|| {
+    let mut group = c.benchmark_group(format!("journal/tell_acked/{label}"));
+    group.sample_size(30);
+    for size in [64u64, 512, 2_048] {
+        group.throughput(criterion::Throughput::Elements(size));
+        group.bench_function(format!("{size}_messages"), |b| {
+            b.iter_batched(
+                || {
                     rt.block_on(async {
-                        let path = iterations.next_path("bench/journal-disk");
+                        let path = iterations.next_path(prefix);
                         spawn_accum(&system, &path).await;
-                        let base = system
-                            .inbox_cursor(&path)
-                            .map(|c| c.as_u64())
-                            .unwrap_or(0);
+                        let base = system.inbox_cursor(&path).map(|c| c.as_u64()).unwrap_or(0);
+                        (path, base)
+                    })
+                },
+                |(path, base)| {
+                    rt.block_on(async {
                         for n in 0..size as i64 {
                             system
                                 .tell(path.clone(), Tick { n })
@@ -240,16 +214,20 @@ fn tell_acked_daow(c: &mut Criterion) {
                         }
                         wait_committed(&system, base, &path, size).await;
                     });
-                });
-            });
-        }
-        group.finish();
-        rt.block_on(system.shutdown_graceful(Duration::from_secs(30)));
+                },
+                criterion::BatchSize::PerIteration,
+            );
+        });
     }
+    group.finish();
+    rt.block_on(system.shutdown_graceful(Duration::from_secs(30)));
 }
 
 fn trouper_daow_memory_pool() -> daow::Pool {
-    daow::Pool::builder().path(":memory:").build().expect("pool")
+    daow::Pool::builder()
+        .path(":memory:")
+        .build()
+        .expect("pool")
 }
 
 // ── flush_price: the durable-commit cost, isolated ───────────────────────
@@ -267,7 +245,11 @@ fn flush_price(c: &mut Criterion) {
     ];
     let disk_pool = |dir: &tempfile::TempDir, name: &str| {
         let db_path = dir.path().join(name).display().to_string();
-        daow::Pool::builder().path(db_path).max_size(2).build().expect("pool")
+        daow::Pool::builder()
+            .path(db_path)
+            .max_size(2)
+            .build()
+            .expect("pool")
     };
     for (name, pool) in [
         ("memory", trouper_daow_memory_pool()),

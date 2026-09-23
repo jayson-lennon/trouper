@@ -100,11 +100,16 @@ fn main() {
         let path = ActorPath::new("flame/target");
 
         if service_leg {
-            system.spawn_service::<Sink, _>(path.clone(), &Json::default(), SpawnOpts::default(), || {
-                vec![Arc::new(
-                    trouper::actor::TypedServiceAdapter::<Sink, Ping>::new::<Ping>(),
-                )]
-            });
+            system.spawn_service::<Sink, _>(
+                path.clone(),
+                &Json::default(),
+                SpawnOpts::default(),
+                || {
+                    vec![Arc::new(
+                        trouper::actor::TypedServiceAdapter::<Sink, Ping>::new::<Ping>(),
+                    )]
+                },
+            );
         } else {
             system.spawn_es::<Accum, _>(
                 path.clone(),

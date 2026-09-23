@@ -106,16 +106,18 @@ Entries are added or amended **only with human approval**.
 - (queries) Projector set wakes complete on the kernel caught-up signal regardless of observation state; the CaughtUp observation is the host-observable marker when enabled.
 - (journal) A due-time snapshot check reads kernel-side anchors and loads the journal only when a snapshot is due.
 - (runtime) Ask reply leases are bounded: failed request deliveries cancel the lease and expired slots are pruned.
-- (bench) Criterion benches live in benches/e2e.rs (usage-shaped) and benches/micro.rs (component-shaped), run via cargo bench.
-- (bench) The e2e tell_acked bench measures the full send→fold→ack commit at batches of 64/512/2048 messages; the fire_and_forget bench measures the sustained send-only price (channel accept + route) at the same cadence — its producer-side wait saturates to commit pace when the Block inbox fills, so it is not a durability or burst number.
+- (bench) Criterion benches live in benches/competitors.rs (framework tell comparison), benches/micro.rs, and benches/journal.rs, run via cargo bench.
+- (bench) The competitors bench times one producer actor hot-looping n tells at one sink actor per framework (trouper, kameo, ractor) at n of 64, 512, and 2048; setup (runtime, actors, priming) is excluded from timing via iter_batched, and the timed body is only a kanal start signal and done signal.
+- (bench) Competitor completion is harness-owned: the producer parks awaiting a kanal start channel inside its handler, and the sink fires a kanal done channel at the target count — the bench thread never touches actor handles.
+- (bench) Mailbox shapes in the competitors bench follow each framework's supported set: kameo runs bounded-64 and unbounded, trouper runs bounded-64 and a large-capacity Block inbox as its unbounded leg, and ractor runs unbounded.
+- (bench) The journal bench times SQLite-backed tell commits at :memory: and on-disk media plus a direct store flush, with system and journal setup outside the timed body.
 - (runtime) Message delivery wakes the actor's loop through a Notify signal fired by the sender on the direct-delivery path and by the front door on its fallback path; no fixed-interval polling exists on the message path.
 - (runtime) Per-actor mutable bookkeeping lives on the actor cell as lock-free state; the kernel tables lock guards cross-actor state only (with observation disabled an ES message's happy path acquires the tables zero times end to end).
 - (runtime) An idle actor's loop sleeps until its next due duty (snapshot cadence or passivation) or the next message, whichever comes first; an actor with no duties armed does not wake at all.
 - (runtime) A supervised child's crash is signaled by a Notify on the child's cell; supervision engines wake on the signal and read the crash flag lock-free instead of polling.
-- (bench) The idle_fleet bench includes a 10,000-idle-actor case, and examples/idle_burn.rs measures runtime CPU seconds for a duty-armed idle fleet (5,000 actors burn ~0.003 s CPU/s of wall vs ~0.28 s polled before this work).
-- (bench) Every e2e bench that commits messages measures batches of 64, 512, and 2048 messages — no single-message case exists (spawn and harness overhead dominated it); swarm keeps its own declared per-case counts, and payload_size/wide_tree measure single committed messages. Benches run with observation disabled; the e2e observation_price group measures the enabled cost.
-- (bench) Bench completion is push-driven: benches spin-yield on the destination's inbox cursor — which advances exactly at the kernel commit point (journal append + ack), so cursor ≥ base+N proves N committed — and await ask replies; never poll actor state on a timed sleep (swarm settles on hand-registered sink counters by design).
-- (bench) Criterion throughput Elements equal the number of messages each iteration commits.
+- (bench) examples/idle_burn.rs measures runtime CPU seconds for a duty-armed idle fleet (5,000 actors burn ~0.003 s CPU/s of wall vs ~0.28 s polled before this work).
+- (bench) Bench completion is push-driven: benches spin-yield on the destination's inbox cursor — which advances exactly at the kernel commit point (journal append + ack), so cursor ≥ base+N proves N committed — and await ask replies; never poll actor state on a timed sleep.
+- (bench) Criterion throughput Elements equal the number of messages each iteration fully processes (commits in the journal bench; counts at the sink in the competitors bench).
 - (schemas) The Event/Command derive maps every non-shard-key field to FieldTy::Json without inspecting its Rust type; no field type is a compile error.
 - (schemas) The Event/Command derive maps a #[schema(shard_key)] field to its real flat descriptor type, since shard keys are string or number values read at partition routing.
 - (schemas) The derive's schema name is the struct ident and descriptor field names are the Rust field idents; renames are serde's concern only, and the shard-key field must not be serde-renamed.
@@ -126,7 +128,7 @@ Entries are added or amended **only with human approval**.
 - (journal) The daow backend's passivated hint flushes the path's buffer to SQLite and drops it; reactivation replays from SQLite and appends continue at the stored max seq.
 - (runtime) Journal stores install only at system construction, through SystemConfig's journal args (store plus an optional control-message closure); no post-construction setter exists.
 - (journal) The control-message closure receives synchronous store messages (currently errors only); with none installed store errors are only traced.
-- (bench) The journal bench (benches/journal.rs, requires the daow feature) measures the daow backend over in-memory and on-disk SQLite.
+- (bench) The journal bench (benches/journal.rs, requires the daow feature) measures the daow backend over in-memory and on-disk SQLite; tell_acked spawns a fresh entity per iteration in untimed setup, so the timed body is only tells plus the commit-cursor wait.
 - (schemas) A schema's SchemaDef and SchemaId are cached per-type in statics; repeated reads allocate nothing.
 - (runtime) Trace and causality ids are clock+counter generated (v7-layout, no getrandom); LeaseId shares the scheme.
 - (runtime) Service actor handlers dispatch inline on the actor loop task; no task is spawned per message.

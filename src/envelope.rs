@@ -700,10 +700,8 @@ mod tests {
         // Given the id-minting probes (each `next_uuid_shaped_id` bumps
         // the clock-read counter once and the getrandom-skipped counter
         // once; a real `Uuid::now_v7` call would skip the bump).
-        crate::kernel::ID_CLOCK_READS
-            .store(0, std::sync::atomic::Ordering::Relaxed);
-        crate::kernel::GETRANDOM_SKIPPED
-            .store(0, std::sync::atomic::Ordering::Relaxed);
+        crate::kernel::ID_CLOCK_READS.store(0, std::sync::atomic::Ordering::Relaxed);
+        crate::kernel::GETRANDOM_SKIPPED.store(0, std::sync::atomic::Ordering::Relaxed);
         const ROOTS: u64 = 1_000;
 
         // When minting ROOTS trace contexts: root() pays 2 ids (trace +
@@ -887,7 +885,8 @@ fn next_uuid_shaped_id() -> Uuid {
             }
         }
     };
-    let counter = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed) & 0x3FFF_FFFF_FFFF_FFFF;
+    let counter =
+        COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed) & 0x3FFF_FFFF_FFFF_FFFF;
     let high = (millis << 16) | 0x7000 | ((counter >> 50) & 0xFFF);
     let low = 0x8000_0000_0000_0000 | (counter & 0x3FFF_FFFF_FFFF_FFFF);
     #[cfg(test)]
@@ -989,7 +988,10 @@ fn counter_ids_read_back_their_millisecond_timestamp() {
 
     // Then it falls inside the generation window (the packed millis is
     // the REAL clock — observation timestamps stay truthful).
-    assert!((before_ms..=after_ms).contains(&ts), "ts {ts} outside {before_ms}..{after_ms}");
+    assert!(
+        (before_ms..=after_ms).contains(&ts),
+        "ts {ts} outside {before_ms}..{after_ms}"
+    );
 }
 
 #[test]

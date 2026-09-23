@@ -4119,11 +4119,7 @@ mod tests {
             }
         }
         impl MsgHandler<BoomService> for ServicePhoenix {
-            async fn handle(
-                &mut self,
-                msg: BoomService,
-                _ctx: &mut crate::context::MsgCtx<'_>,
-            ) {
+            async fn handle(&mut self, msg: BoomService, _ctx: &mut crate::context::MsgCtx<'_>) {
                 if msg.why == "poison"
                     && !CRASHED_YET.swap(true, std::sync::atomic::Ordering::SeqCst)
                 {
@@ -4150,10 +4146,10 @@ mod tests {
                     args,
                     SpawnOpts::default(),
                     || {
-                        vec![Arc::new(TypedServiceAdapter::<
-                            ServicePhoenix,
-                            BoomService,
-                        >::new::<BoomService>())]
+                        vec![Arc::new(
+                            TypedServiceAdapter::<ServicePhoenix, BoomService>::new::<BoomService>(
+                            ),
+                        )]
                     },
                 );
             }),
@@ -4240,11 +4236,7 @@ mod tests {
             }
         }
         impl MsgHandler<Mark> for QueuePoison {
-            async fn handle(
-                &mut self,
-                msg: Mark,
-                _ctx: &mut crate::context::MsgCtx<'_>,
-            ) {
+            async fn handle(&mut self, msg: Mark, _ctx: &mut crate::context::MsgCtx<'_>) {
                 if msg.tag == "poison" {
                     panic!("injected service handler panic");
                 }
@@ -4256,7 +4248,11 @@ mod tests {
             path.clone(),
             &json!({ "sink": idx }),
             SpawnOpts::default(),
-            || vec![Arc::new(TypedServiceAdapter::<QueuePoison, Mark>::new::<Mark>())],
+            || {
+                vec![Arc::new(TypedServiceAdapter::<QueuePoison, Mark>::new::<
+                    Mark,
+                >())]
+            },
         );
         wait_for(|| async {
             system.facts().iter().any(
@@ -4336,12 +4332,9 @@ mod tests {
             batch: 1,
             ..SpawnOpts::default()
         };
-        system.spawn_service::<Auditor, _>(
-            path.clone(),
-            &json!({ "sink": idx }),
-            opts,
-            || vec![Arc::new(TypedServiceAdapter::<Auditor, Add>::new::<Add>())],
-        );
+        system.spawn_service::<Auditor, _>(path.clone(), &json!({ "sink": idx }), opts, || {
+            vec![Arc::new(TypedServiceAdapter::<Auditor, Add>::new::<Add>())]
+        });
 
         // When three messages trickle in one at a time.
         for n in 1..=3_i64 {
@@ -4382,8 +4375,7 @@ mod tests {
         wait_for(|| async {
             sink.lock().as_slice()
                 == [
-                    "n=1", "n=2", "n=3", "n=4", "n=5", "n=6", "n=7", "n=8", "n=9",
-                    "n=10",
+                    "n=1", "n=2", "n=3", "n=4", "n=5", "n=6", "n=7", "n=8", "n=9", "n=10",
                 ]
         })
         .await;
@@ -4425,11 +4417,7 @@ mod tests {
             }
         }
         impl MsgHandler<Mark> for MidBatchPhoenix {
-            async fn handle(
-                &mut self,
-                msg: Mark,
-                _ctx: &mut crate::context::MsgCtx<'_>,
-            ) {
+            async fn handle(&mut self, msg: Mark, _ctx: &mut crate::context::MsgCtx<'_>) {
                 if msg.tag == "poison"
                     && !CRASHED_YET.swap(true, std::sync::atomic::Ordering::SeqCst)
                 {
@@ -4456,10 +4444,9 @@ mod tests {
                     args,
                     SpawnOpts::default(),
                     || {
-                        vec![Arc::new(TypedServiceAdapter::<
-                            MidBatchPhoenix,
-                            Mark,
-                        >::new::<Mark>())]
+                        vec![Arc::new(
+                            TypedServiceAdapter::<MidBatchPhoenix, Mark>::new::<Mark>(),
+                        )]
                     },
                 );
             }),
@@ -4475,27 +4462,15 @@ mod tests {
         // When poison lands FIRST and two good messages queue behind it
         // (the whole run fits one default-size batch).
         system
-            .send(system.envelope(
-                Mark::schema_id(),
-                child.clone(),
-                json!({ "tag": "poison" }),
-            ))
+            .send(system.envelope(Mark::schema_id(), child.clone(), json!({ "tag": "poison" })))
             .await
             .expect("poison delivered");
         system
-            .send(system.envelope(
-                Mark::schema_id(),
-                child.clone(),
-                json!({ "tag": "good1" }),
-            ))
+            .send(system.envelope(Mark::schema_id(), child.clone(), json!({ "tag": "good1" })))
             .await
             .expect("good1 delivered");
         system
-            .send(system.envelope(
-                Mark::schema_id(),
-                child.clone(),
-                json!({ "tag": "good2" }),
-            ))
+            .send(system.envelope(Mark::schema_id(), child.clone(), json!({ "tag": "good2" })))
             .await
             .expect("good2 delivered");
 
@@ -4530,11 +4505,7 @@ mod tests {
 
         // And the fresh instance handles NEW mail normally.
         system
-            .send(system.envelope(
-                Mark::schema_id(),
-                child.clone(),
-                json!({ "tag": "after" }),
-            ))
+            .send(system.envelope(Mark::schema_id(), child.clone(), json!({ "tag": "after" })))
             .await
             .expect("after delivered");
         wait_for(|| async { sink.lock().as_slice() == ["after"] }).await;
@@ -4630,16 +4601,9 @@ mod tests {
         system.register_schema::<Add>();
         system.register_schema::<Note>();
         let path = ActorPath::new("batch-stop");
-        system.spawn_service::<StopNote, _>(
-            path.clone(),
-            &json!({}),
-            SpawnOpts::default(),
-            || {
-                vec![Arc::new(
-                    TypedServiceAdapter::<StopNote, Add>::new::<Add>(),
-                )]
-            },
-        );
+        system.spawn_service::<StopNote, _>(path.clone(), &json!({}), SpawnOpts::default(), || {
+            vec![Arc::new(TypedServiceAdapter::<StopNote, Add>::new::<Add>())]
+        });
         wait_for(|| async {
             system.facts().iter().any(
                 |f| matches!(&f.kind, crate::observe::ObservationKind::Spawned { path: p, .. } if *p == path),
@@ -4683,12 +4647,9 @@ mod tests {
             mailbox_capacity: 4,
             ..SpawnOpts::default()
         };
-        system.spawn_service::<Auditor, _>(
-            path.clone(),
-            &json!({ "sink": idx }),
-            opts,
-            || vec![Arc::new(TypedServiceAdapter::<Auditor, Add>::new::<Add>())],
-        );
+        system.spawn_service::<Auditor, _>(path.clone(), &json!({ "sink": idx }), opts, || {
+            vec![Arc::new(TypedServiceAdapter::<Auditor, Add>::new::<Add>())]
+        });
 
         // When eight senders race a batched consumer (each awaits its
         // tell: Block backpressure paces them; batches free room in
@@ -4743,10 +4704,9 @@ mod tests {
             .await
             .expect("delivered");
         wait_for(|| async { sink.lock().len() == 1 }).await;
-        let spawns_before =
-            crate::kernel::TASK_SPAWNS.load(std::sync::atomic::Ordering::Relaxed);
-        let inline_before = crate::kernel::INLINE_SERVICE_DISPATCH
-            .load(std::sync::atomic::Ordering::Relaxed);
+        let spawns_before = crate::kernel::TASK_SPAWNS.load(std::sync::atomic::Ordering::Relaxed);
+        let inline_before =
+            crate::kernel::INLINE_SERVICE_DISPATCH.load(std::sync::atomic::Ordering::Relaxed);
 
         // When ten messages flow through the service step.
         for n in 1..=10_i64 {
@@ -4759,16 +4719,17 @@ mod tests {
 
         // Then every dispatch ran INLINE on the loop task and the
         // runtime spawned NOTHING for the ten steps.
-        let spawns_after =
-            crate::kernel::TASK_SPAWNS.load(std::sync::atomic::Ordering::Relaxed);
-        let inline_after = crate::kernel::INLINE_SERVICE_DISPATCH
-            .load(std::sync::atomic::Ordering::Relaxed);
+        let spawns_after = crate::kernel::TASK_SPAWNS.load(std::sync::atomic::Ordering::Relaxed);
+        let inline_after =
+            crate::kernel::INLINE_SERVICE_DISPATCH.load(std::sync::atomic::Ordering::Relaxed);
         assert_eq!(
-            inline_after - inline_before, 10,
+            inline_after - inline_before,
+            10,
             "each step dispatched inline"
         );
         assert_eq!(
-            spawns_after - spawns_before, 0,
+            spawns_after - spawns_before,
+            0,
             "no task spawned per service message"
         );
     }
@@ -10036,7 +9997,8 @@ mod tests {
             events: &[crate::envelope::Event],
         ) -> Result<Vec<crate::journal::SeqNo>, error_stack::Report<crate::journal::JournalError>>
         {
-            self.appends.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.appends
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             self.inner.append(path, events).await
         }
 
@@ -10077,9 +10039,10 @@ mod tests {
         // Given a system built with a counting store via `with_journal` —
         // the construction-time install (no post-construction setter).
         let store = InstalledStore::new();
-        let system = ActorSystem::new(SystemConfig::production().with_journal(
-            crate::journal::JournalArgs::new(store.clone()),
-        ));
+        let system = ActorSystem::new(
+            SystemConfig::production()
+                .with_journal(crate::journal::JournalArgs::new(store.clone())),
+        );
         system.register_schema::<Add>();
         system.register_schema::<Added>();
         let path = ActorPath::new("installed");
@@ -10114,8 +10077,7 @@ mod tests {
 
         // When probing the installed store and control handler.
         let store = system.journal_store_trait();
-        let is_default_memory =
-            crate::journal::downcast_in_memory(&store).is_some();
+        let is_default_memory = crate::journal::downcast_in_memory(&store).is_some();
 
         // Then the in-memory default is intact and no control handler
         // exists (behavior unchanged for consumers that never opt in).

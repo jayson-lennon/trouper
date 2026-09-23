@@ -44,14 +44,14 @@
 use crate::actor::ActorPath;
 use crate::envelope::Event;
 use crate::journal::{
-    ControlHandler, EventOrigin, JournaledEvent, Journal, JournalEntry, JournalError,
-    JournalStore, JournalArgs, Replay, ScannedEvent, SeqNo, StoreControlMessage, WireEvent,
+    ControlHandler, EventOrigin, Journal, JournalArgs, JournalEntry, JournalError, JournalStore,
+    JournaledEvent, Replay, ScannedEvent, SeqNo, StoreControlMessage, WireEvent,
 };
 use error_stack::{Report, ResultExt};
 use rusqlite::OptionalExtension as _;
 use std::collections::{HashMap, HashSet};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 // ── Configuration ────────────────────────────────────────────────────────
@@ -388,10 +388,8 @@ impl Shared {
         let weak = Arc::downgrade(self);
         let interval = self.flush_interval;
         tokio::spawn(async move {
-            let mut tick = tokio::time::interval_at(
-                tokio::time::Instant::now() + interval,
-                interval,
-            );
+            let mut tick =
+                tokio::time::interval_at(tokio::time::Instant::now() + interval, interval);
             tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             loop {
                 tick.tick().await;
@@ -593,16 +591,13 @@ fn collect_pending(shared: &Shared) -> Vec<PendingFlush> {
             }
             // The DB-side snapshot check happens inside the cycle (only
             // the highest buffer snapshot matters); carry the latest one.
-            let snapshot = buffer
-                .journal
-                .last_snapshot()
-                .map(|entry| match entry {
-                    JournalEntry::Snapshot { seq, state } => PendingSnapshotRow {
-                        seq: *seq,
-                        state: state.to_string(),
-                    },
-                    _ => unreachable!("last_snapshot returns a snapshot"),
-                });
+            let snapshot = buffer.journal.last_snapshot().map(|entry| match entry {
+                JournalEntry::Snapshot { seq, state } => PendingSnapshotRow {
+                    seq: *seq,
+                    state: state.to_string(),
+                },
+                _ => unreachable!("last_snapshot returns a snapshot"),
+            });
             Some(PendingFlush {
                 path: path.clone(),
                 events,
@@ -644,10 +639,7 @@ async fn write_pending(
 
 /// The transaction: events (multi-row) + snapshots (upsert) in one
 /// `BEGIN IMMEDIATE … COMMIT` on a single pooled connection.
-async fn write_pending_tx(
-    pool: &daow::Pool,
-    pending: &[PendingFlush],
-) -> Result<(), daow::Error> {
+async fn write_pending_tx(pool: &daow::Pool, pending: &[PendingFlush]) -> Result<(), daow::Error> {
     let pending = pending.to_vec();
     pool.with_conn(move |conn| {
         conn.execute_batch("BEGIN IMMEDIATE")?;
@@ -873,7 +865,9 @@ fn rebuild_journal(
 
 /// Decodes stored rows into the replay's event list.
 fn decode_events(rows: Vec<StoredEventRow>) -> Result<Vec<JournaledEvent>, Report<JournalError>> {
-    rows.into_iter().map(StoredEventRow::into_journaled).collect()
+    rows.into_iter()
+        .map(StoredEventRow::into_journaled)
+        .collect()
 }
 
 /// Decodes the stored latest-snapshot row, if any.
@@ -919,10 +913,7 @@ fn build_replay(
                 }
             }
             JournalEntry::Snapshot { seq, state } => {
-                let buffer_is_newer = snapshot
-                    .as_ref()
-                    .map(|db| seq > &db.seq())
-                    .unwrap_or(true);
+                let buffer_is_newer = snapshot.as_ref().map(|db| seq > &db.seq()).unwrap_or(true);
                 if buffer_is_newer {
                     snapshot = Some(JournalEntry::Snapshot {
                         seq: *seq,
@@ -1018,9 +1009,10 @@ impl JournalStore for DaowJournalStore {
                 watermark: 0,
             });
             let ingest = self.shared.ingest_seq.fetch_add(1, Ordering::SeqCst);
-            let seq = buffer
-                .journal
-                .append_event_with_origin(scanned.event.clone(), origin, ingest);
+            let seq =
+                buffer
+                    .journal
+                    .append_event_with_origin(scanned.event.clone(), origin, ingest);
             results.push(Some(seq));
         }
         Ok(results)
@@ -1040,33 +1032,26 @@ impl JournalStore for DaowJournalStore {
             .with_conn(move |conn| {
                 // One `IN (…) WHERE kind = 0` query: the DB-side scan
                 // filter (recorded facts only, ascending arrival).
-                let placeholders = names
-                    .iter()
-                    .map(|_| "?")
-                    .collect::<Vec<_>>()
-                    .join(", ");
+                let placeholders = names.iter().map(|_| "?").collect::<Vec<_>>().join(", ");
                 let sql = format!(
                     "SELECT journal, seq, schema, payload, origin, ingest_seq \
                      FROM trouper_journal_events WHERE kind = {KIND_RECORDED} \
                      AND schema IN ({placeholders}) ORDER BY ingest_seq ASC"
                 );
                 let mut stmt = conn.prepare(&sql)?;
-                let mapped = stmt.query_map(
-                    rusqlite::params_from_iter(names.iter()),
-                    |row| {
-                        Ok((
-                            row.get::<_, String>(0)?,
-                            StoredEventRow {
-                                seq: row.get(1)?,
-                                kind: KIND_RECORDED, // filtered in SQL (kind = 0)
-                                schema: row.get(2)?,
-                                payload: row.get(3)?,
-                                origin_json: row.get(4)?,
-                                ingest_seq: row.get(5)?,
-                            },
-                        ))
-                    },
-                )?;
+                let mapped = stmt.query_map(rusqlite::params_from_iter(names.iter()), |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        StoredEventRow {
+                            seq: row.get(1)?,
+                            kind: KIND_RECORDED, // filtered in SQL (kind = 0)
+                            schema: row.get(2)?,
+                            payload: row.get(3)?,
+                            origin_json: row.get(4)?,
+                            ingest_seq: row.get(5)?,
+                        },
+                    ))
+                })?;
                 mapped
                     .collect::<Result<Vec<_>, _>>()
                     .map_err(daow::Error::from)
@@ -1084,8 +1069,10 @@ impl JournalStore for DaowJournalStore {
 
         // Buffer union: pending entries the DB has not seen yet, plus the
         // dedup key so a row already collected cannot double-appear.
-        let mut seen: HashSet<(ActorPath, u64)> =
-            found.iter().map(|s| (s.journal.clone(), s.seq.as_u64())).collect();
+        let mut seen: HashSet<(ActorPath, u64)> = found
+            .iter()
+            .map(|s| (s.journal.clone(), s.seq.as_u64()))
+            .collect();
         let journals = self.shared.journals.lock();
         for (path, buffer) in journals.iter() {
             for entry in buffer.journal.entries() {
@@ -1126,10 +1113,7 @@ impl JournalStore for DaowJournalStore {
         Ok(())
     }
 
-    async fn load(
-        &self,
-        path: &ActorPath,
-    ) -> Result<Option<Replay>, Report<JournalError>> {
+    async fn load(&self, path: &ActorPath) -> Result<Option<Replay>, Report<JournalError>> {
         // Drain lock: DB rows and the buffer are read as one view.
         let _guard = self.shared.drain.lock().await;
 
@@ -1182,10 +1166,7 @@ impl JournalStore for DaowJournalStore {
         Ok(())
     }
 
-    async fn passivated(
-        &self,
-        path: &ActorPath,
-    ) -> Result<(), Report<JournalError>> {
+    async fn passivated(&self, path: &ActorPath) -> Result<(), Report<JournalError>> {
         // Cold storage: flush this path best-effort (a failure is
         // reported and the rows stay buffered — the hint never blocks
         // passivation), then drop the buffer entry entirely. The next
@@ -1202,22 +1183,17 @@ impl JournalStore for DaowJournalStore {
         Ok(())
     }
 
-    async fn purge(
-        &self,
-        path: &ActorPath,
-    ) -> Result<(), Report<JournalError>> {
+    async fn purge(&self, path: &ActorPath) -> Result<(), Report<JournalError>> {
         let _guard = self.shared.drain.lock().await;
         let journal = path.to_string();
         self.shared
             .pool
             .with_conn(move |conn| {
-                let mut events = conn.prepare_cached(
-                    "DELETE FROM trouper_journal_events WHERE journal = ?1",
-                )?;
+                let mut events =
+                    conn.prepare_cached("DELETE FROM trouper_journal_events WHERE journal = ?1")?;
                 events.execute(rusqlite::params![journal])?;
-                let mut snapshots = conn.prepare_cached(
-                    "DELETE FROM trouper_journal_snapshots WHERE journal = ?1",
-                )?;
+                let mut snapshots = conn
+                    .prepare_cached("DELETE FROM trouper_journal_snapshots WHERE journal = ?1")?;
                 snapshots.execute(rusqlite::params![journal])?;
                 Ok(())
             })

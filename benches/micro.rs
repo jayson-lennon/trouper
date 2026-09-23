@@ -1,5 +1,5 @@
 //! Component-shaped benchmarks: the journal store's isolated costs, which
-//! e2e benches cannot separate from routing and dispatch. These track the
+//! system-level benches cannot separate from routing and dispatch. These track the
 //! planned journal-store restructure. The store is the in-memory
 //! implementation (the only one); a durable backend would carry its own
 //! cost on top of every number here.

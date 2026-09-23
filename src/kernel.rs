@@ -1780,14 +1780,20 @@ async fn step_es(ctx: &EsLoop) -> Step {
         if events.is_empty() {
             Vec::new()
         } else {
-            let mut origins = batch.iter().filter_map(|(_, envelope)| envelope.recorded_origin());
+            let mut origins = batch
+                .iter()
+                .filter_map(|(_, envelope)| envelope.recorded_origin());
             let first = origins.next();
             let all_same_origin = first.is_some()
                 && origins.all(|o| {
                     let f = first.expect("checked");
                     o.journal == f.journal && o.seq == f.seq
                 })
-                && batch.len() == batch.iter().filter(|(_, e)| e.recorded_origin().is_some()).count();
+                && batch.len()
+                    == batch
+                        .iter()
+                        .filter(|(_, e)| e.recorded_origin().is_some())
+                        .count();
             if all_same_origin {
                 let origin = first.expect("checked").clone();
                 let scanned: Vec<crate::journal::ScannedEvent> = events
@@ -2764,7 +2770,10 @@ struct PanicIsolated<F>(F);
 impl<F: Future> Future for PanicIsolated<F> {
     type Output = Result<F::Output, Box<dyn std::any::Any + Send>>;
 
-    fn poll(self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> std::task::Poll<Self::Output> {
+    fn poll(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Self::Output> {
         // Projection by structural pin: the wrapper adds no unpin
         // requirement, so `map_unchecked_mut` is sound (the inner field's
         // pin state is the wrapper's).

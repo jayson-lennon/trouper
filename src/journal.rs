@@ -543,7 +543,10 @@ impl JournalArgs {
     /// Wraps a custom store (control: none — add one with
     /// [`JournalArgs::with_control`]).
     pub fn new(store: std::sync::Arc<dyn JournalStore>) -> Self {
-        Self { store, control: None }
+        Self {
+            store,
+            control: None,
+        }
     }
 
     /// Attaches the host's store-control handler.

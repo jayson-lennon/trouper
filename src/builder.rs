@@ -619,9 +619,7 @@ impl<P: crate::actor::Projector> ProjectorBuilder<P> {
     pub fn start(self) -> ActorPath {
         let (system, path, consumed, args, opts) = self.validated_parts();
         let armed = system.arm_projector::<P>(&path, &consumed, &args, opts);
-        trouper::kernel::spawn_tracked(crate::system::catch_up_projector(
-            system, armed, consumed,
-        ));
+        trouper::kernel::spawn_tracked(crate::system::catch_up_projector(system, armed, consumed));
         path
     }
 
