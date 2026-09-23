@@ -391,6 +391,74 @@ pub(crate) fn bump_serde_calls() {
 #[cfg(test)]
 pub(crate) static SERDE_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// Hand-written `Schema` impls' first `schema_id()` per type (test builds
+/// only) — the one allocation the fallback cache ever pays; the derive's
+/// static-name arm never lands here.
+#[cfg(test)]
+pub(crate) fn bump_schema_id_cache_misses() {
+    SCHEMA_ID_CACHE_MISSES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+#[cfg(test)]
+pub(crate) static SCHEMA_ID_CACHE_MISSES: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// `SchemaId` clones on the Static arm (test builds only) — copies, per
+/// the two-arm id deliverable; the counter proves the hot path's clones
+/// land there.
+#[cfg(test)]
+pub(crate) fn bump_static_schema_clones() {
+    STATIC_SCHEMA_CLONES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+#[cfg(test)]
+pub(crate) static STATIC_SCHEMA_CLONES: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Uuid-shaped id generations that skipped `getrandom` (test builds only)
+/// — the counter the trace-id deliverable ("zero getrandom on the tell
+/// path") reads.
+#[cfg(test)]
+pub(crate) fn bump_getrandom_skipped() {
+    GETRANDOM_SKIPPED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+#[cfg(test)]
+pub(crate) static GETRANDOM_SKIPPED: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Real clock reads consumed by the id generator (test builds only).
+#[cfg(test)]
+pub(crate) fn bump_id_clock_reads() {
+    ID_CLOCK_READS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+#[cfg(test)]
+pub(crate) static ID_CLOCK_READS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Service-step handler dispatches run ON the actor loop task (test builds
+/// only) — pairs with [`TASK_SPAWNS`]: a step that dispatches inline bumps
+/// this instead of spawning.
+#[cfg(test)]
+pub(crate) fn bump_inline_service_dispatch() {
+    INLINE_SERVICE_DISPATCH.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+#[cfg(test)]
+pub(crate) static INLINE_SERVICE_DISPATCH: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// `tokio::spawn` calls anywhere in the runtime (test builds only) — the
+/// per-message spawn deliverable reads the delta across service steps.
+#[cfg(test)]
+pub(crate) fn bump_task_spawns() {
+    TASK_SPAWNS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+#[cfg(test)]
+pub(crate) static TASK_SPAWNS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// Kernel-facing handle for one running actor loop.
 pub(crate) struct ActorHandle {
     /// The kill switch: signaled on graceful stop.

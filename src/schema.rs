@@ -8,6 +8,7 @@
 //! serde defaults, so an older payload decodes into the newest type.
 
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::json::Json;
@@ -216,14 +217,55 @@ impl SchemaDef {
 /// Prefer deriving the impl with the [`Event`] / [`Command`] derives —
 /// they generate `schema_def` from the struct's fields. Hand-write the
 /// impl only for complex or foreign descriptors.
-pub trait Schema {
+pub trait Schema: 'static {
     /// The type's schema descriptor.
     fn schema_def() -> SchemaDef;
 
+    /// The type's schema name when it is a compile-time constant.
+    ///
+    /// The derive supplies this (the struct ident); hand-written impls
+    /// keep the default `None` and take the per-type cached path in
+    /// [`Schema::schema_id`].
+    fn schema_name() -> Option<&'static str> {
+        None
+    }
+
     /// The type's stable [`SchemaId`].
+    ///
+    /// Zero heap allocation after the first call per type: a derived
+    /// schema's id wraps its `&'static str` name (a clone is a copy); a
+    /// hand-written impl's id is built once and cached per type (later
+    /// reads are a map hit plus an `Arc` refcount bump).
     fn schema_id() -> SchemaId {
-        let def = Self::schema_def();
-        def.id()
+        match Self::schema_name() {
+            Some(name) => SchemaId::static_name(name),
+            None => cached_schema_id::<Self>(),
+        }
+    }
+}
+
+/// The per-type cached id for hand-written [`Schema`] impls (the derive
+/// supplies a `'static` name and never lands here). One entry per type
+/// per process: the first `schema_id()` call builds it, every later read
+/// shares it.
+fn cached_schema_id<S: Schema + ?Sized>() -> SchemaId {
+    use std::collections::hash_map::Entry;
+    static CACHE: std::sync::OnceLock<parking_lot::Mutex<HashMap<std::any::TypeId, SchemaId>>> =
+        std::sync::OnceLock::new();
+    let cache = CACHE.get_or_init(|| parking_lot::Mutex::new(HashMap::new()));
+    let mut cache = cache.lock();
+    match cache.entry(std::any::TypeId::of::<S>()) {
+        Entry::Vacant(slot) => {
+            // TEST PROBE: the fallback cache miss is the one allocation a
+            // hand-written impl's schema_id ever pays (see the counters in
+            // kernel.rs — the derive's static arm never lands here).
+            #[cfg(test)]
+            crate::kernel::bump_schema_id_cache_misses();
+            let id = SchemaId::new(&S::schema_def().name);
+            slot.insert(id.clone());
+            id
+        }
+        Entry::Occupied(slot) => slot.get().clone(),
     }
 }
 
@@ -358,14 +400,34 @@ impl Clone for ActorManifest {
 /// Identity is the name alone — no version component. A payload that
 /// evolves does so additively (new fields carry serde defaults); a truly
 /// breaking shape is a NEW schema with a new name.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(transparent)]
-pub struct SchemaId(Arc<str>);
+///
+/// Representation: derived schemas hold their name as a `&'static str`
+/// (a clone is a copy — the hot send path clones ids per message);
+/// runtime-built names (`SchemaId::new` / `parse`) hold an `Arc<str>`.
+/// Equality and hashing compare the NAME either way, so a static and a
+/// dynamic id for the same schema are interchangeable in every map and
+/// route check.
+#[derive(Debug)]
+pub struct SchemaId(Repr);
+
+#[derive(Debug, Clone)]
+enum Repr {
+    /// The derive's arm: the name lives in static storage.
+    Static(&'static str),
+    /// A runtime-built name (JSON descriptors, tests, foreign paths).
+    Dynamic(Arc<str>),
+}
 
 impl SchemaId {
     /// Builds the identifier from the schema's name.
     pub fn new(name: &str) -> Self {
-        Self(name.into())
+        Self(Repr::Dynamic(name.into()))
+    }
+
+    /// Wraps a compile-time schema name — zero allocation, a clone is a
+    /// copy. The derive's arm ([`Schema::schema_name`]).
+    pub(crate) fn static_name(name: &'static str) -> Self {
+        Self(Repr::Static(name))
     }
 
     /// Parses an existing id string.
@@ -377,23 +439,80 @@ impl SchemaId {
     /// readable.
     pub fn parse(s: &str) -> Option<Self> {
         let name = s.split_once('@').map_or(s, |(name, _)| name);
-        Some(Self(name.into()))
+        Some(Self::new(name))
     }
 
     /// The schema name.
     pub fn name(&self) -> &str {
-        &self.0
+        self.0.as_str()
     }
 
     /// The identifier as a string slice.
     pub fn as_str(&self) -> &str {
-        &self.0
+        self.0.as_str()
+    }
+}
+
+impl Repr {
+    fn as_str(&self) -> &str {
+        match self {
+            Repr::Static(name) => name,
+            Repr::Dynamic(name) => name,
+        }
+    }
+}
+
+impl Clone for SchemaId {
+    fn clone(&self) -> Self {
+        // TEST PROBE: a Static clone is a copy — the hot-path deliverable
+        // (counted, then produced). Dynamic clones are an Arc refcount bump.
+        let repr = match &self.0 {
+            Repr::Static(name) => {
+                #[cfg(test)]
+                crate::kernel::bump_static_schema_clones();
+                Repr::Static(name)
+            }
+            Repr::Dynamic(name) => Repr::Dynamic(Arc::clone(name)),
+        };
+        Self(repr)
+    }
+}
+
+/// Identity is the name: the representation arm never leaks into
+/// comparisons (a `Static("A")` and a `Dynamic("A")` must collide in
+/// every route map).
+impl PartialEq for SchemaId {
+    fn eq(&self, other: &Self) -> bool {
+        self.0.as_str() == other.0.as_str()
+    }
+}
+
+impl Eq for SchemaId {}
+
+impl std::hash::Hash for SchemaId {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.0.as_str().hash(state);
+    }
+}
+
+/// The string form — the same shape the old `Arc<str>` newtype
+/// serialized (a transparent JSON string), so journals and exports from
+/// before the split stay readable.
+impl Serialize for SchemaId {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(self.0.as_str())
+    }
+}
+
+impl<'de> Deserialize<'de> for SchemaId {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        String::deserialize(deserializer).map(|s| Self::new(&s))
     }
 }
 
 impl std::fmt::Display for SchemaId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.0)
+        f.write_str(self.0.as_str())
     }
 }
 
@@ -424,6 +543,122 @@ mod tests {
                 description: Some("Ask an inventory to hold stock for an order.".into()),
             }
         }
+    }
+
+    #[test]
+    fn static_and_dynamic_arms_are_equal_and_hash_alike() {
+        // Given the same schema name in both representation arms.
+        let stat = SchemaId::static_name("StockReserved");
+        let dynamic = SchemaId::new("StockReserved");
+
+        // When comparing and hashing them.
+        // Then they are equal (identity is the name, never the arm)...
+        assert_eq!(stat, dynamic);
+        assert_eq!(dynamic, stat);
+        // ...and they hash into the same bucket (route maps must fork
+        // by name, not by representation).
+        use std::hash::BuildHasher;
+        let hasher =
+            std::hash::BuildHasherDefault::<std::collections::hash_map::DefaultHasher>::new();
+        let hash_of = |id: &SchemaId| {
+            let mut h = hasher.build_hasher();
+            std::hash::Hash::hash(id, &mut h);
+            std::hash::Hasher::finish(&h)
+        };
+        assert_eq!(hash_of(&stat), hash_of(&dynamic));
+    }
+
+    #[test]
+    fn schema_id_clone_of_the_static_arm_is_a_copy() {
+        // Given a derived schema's id (the static arm).
+        let id = SchemaId::static_name("Tick");
+        let before = crate::kernel::STATIC_SCHEMA_CLONES.load(std::sync::atomic::Ordering::Relaxed);
+
+        // When cloning it.
+        let copy = id.clone();
+
+        // Then the clone was the static arm's copy path — the hot send
+        // path's per-message id clone allocates nothing.
+        assert_eq!(copy, id);
+        assert_eq!(copy.as_str(), "Tick");
+        let after = crate::kernel::STATIC_SCHEMA_CLONES.load(std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(after - before, 1, "static clone takes the copy path");
+    }
+
+    #[test]
+    fn hand_written_schema_id_is_cached_per_type() {
+        // Given a hand-written Schema impl (no static name).
+        let before =
+            crate::kernel::SCHEMA_ID_CACHE_MISSES.load(std::sync::atomic::Ordering::Relaxed);
+
+        // When reading its id twice.
+        let first = ReserveStock::schema_id();
+        let second = ReserveStock::schema_id();
+
+        // Then the two reads agree...
+        assert_eq!(first, second);
+        assert_eq!(first.as_str(), "ReserveStock");
+        // ...and the fallback cache was populated at most once — later
+        // reads share the entry.
+        let after = crate::kernel::SCHEMA_ID_CACHE_MISSES.load(std::sync::atomic::Ordering::Relaxed);
+        assert!(after - before <= 1, "cache miss at most once per type");
+    }
+
+    #[test]
+    fn derived_schema_id_takes_the_static_arm() {
+        // Given a derive-declared schema.
+        #[derive(crate::Event, serde::Serialize, serde::Deserialize, Clone)]
+        struct CacheProbe {
+            n: i64,
+        }
+
+        // When reading its id repeatedly.
+        let first = CacheProbe::schema_id();
+        let misses_before =
+            crate::kernel::SCHEMA_ID_CACHE_MISSES.load(std::sync::atomic::Ordering::Relaxed);
+        let clones_before =
+            crate::kernel::STATIC_SCHEMA_CLONES.load(std::sync::atomic::Ordering::Relaxed);
+        let repeated = CacheProbe::schema_id();
+        let copy = repeated.clone();
+
+        // Then every read is the zero-alloc static arm: no fallback-cache
+        // miss ever fires, and the clone counts as the copy path.
+        assert_eq!(first, repeated);
+        assert_eq!(first.as_str(), "CacheProbe");
+        assert_eq!(copy, first);
+        let misses_after =
+            crate::kernel::SCHEMA_ID_CACHE_MISSES.load(std::sync::atomic::Ordering::Relaxed);
+        let clones_after =
+            crate::kernel::STATIC_SCHEMA_CLONES.load(std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(
+            misses_after - misses_before,
+            0,
+            "derived schemas never touch the TypeId fallback"
+        );
+        assert_eq!(clones_after - clones_before, 1, "clone was the copy path");
+    }
+
+    #[test]
+    fn schema_def_descriptor_is_shared_across_reads() {
+        // Given a derived schema.
+        #[derive(crate::Event, serde::Serialize, serde::Deserialize, Clone)]
+        struct DefProbe {
+            n: i64,
+        }
+
+        // When reading the descriptor twice.
+        let first = DefProbe::schema_def();
+        let second = DefProbe::schema_def();
+
+        // Then both reads agree with the hand-written equivalent.
+        let hand = SchemaDef {
+            name: "DefProbe".into(),
+            kind: SchemaKind::Event,
+            fields: vec![FieldDef::required("n", FieldTy::Json)],
+            description: None,
+        };
+        assert_eq!(first, hand);
+        assert_eq!(second, hand);
     }
 
     #[test]

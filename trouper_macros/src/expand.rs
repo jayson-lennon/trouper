@@ -171,6 +171,7 @@ pub fn generate(input: TokenStream, kind: Kind) -> syn::Result<TokenStream> {
 
     let kind_variant = quote::format_ident!("{}", kind.variant());
     let name = ident.to_string();
+    let name_static = syn::LitStr::new(&name, ident.span());
     let description = match description {
         Some(text) => quote! { ::std::option::Option::Some(::std::string::String::from(#text)) },
         None => quote! { ::std::option::Option::None },
@@ -181,13 +182,23 @@ pub fn generate(input: TokenStream, kind: Kind) -> syn::Result<TokenStream> {
 
     Ok(quote! {
         impl ::trouper::schema::Schema for #ident {
+            fn schema_name() -> ::std::option::Option<&'static ::std::primitive::str> {
+                ::std::option::Option::Some(#name_static)
+            }
+
             fn schema_def() -> ::trouper::schema::SchemaDef {
-                ::trouper::schema::SchemaDef {
-                    name: ::std::string::String::from(#name),
-                    kind: ::trouper::schema::SchemaKind::#kind_variant,
-                    fields: ::std::vec![#(#field_defs),*],
-                    description: #description,
-                }
+                // The descriptor is a per-type static: built once (first
+                // read), every later read clones the shared `Arc` — the
+                // schema id rides the static-name arm, so the hot path
+                // never touches this either.
+                static DEF: ::std::sync::LazyLock<::trouper::schema::SchemaDef> =
+                    ::std::sync::LazyLock::new(|| ::trouper::schema::SchemaDef {
+                        name: ::std::string::String::from(#name),
+                        kind: ::trouper::schema::SchemaKind::#kind_variant,
+                        fields: ::std::vec![#(#field_defs),*],
+                        description: #description,
+                    });
+                DEF.clone()
             }
         }
 
