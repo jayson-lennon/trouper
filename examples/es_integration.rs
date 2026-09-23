@@ -196,7 +196,7 @@ impl ServiceActor for Ticker {
 struct TickBeat;
 
 impl MsgHandler<TickBeat> for Ticker {
-    async fn handle(&mut self, _msg: TickBeat, ctx: &mut MsgCtx<'_>) {
+    async fn handle(&mut self, _msg: &TickBeat, ctx: &mut MsgCtx<'_>) {
         self.count += 1;
         ctx.publish(&Tick { n: self.count });
     }
@@ -270,7 +270,7 @@ impl TransferService {
 }
 
 impl MsgHandler<TransferCmd> for TransferService {
-    async fn handle(&mut self, cmd: TransferCmd, ctx: &mut MsgCtx<'_>) {
+    async fn handle(&mut self, cmd: &TransferCmd, ctx: &mut MsgCtx<'_>) {
         let now_ms = ctx.recv_ts().as_millis();
         println!("  [{now_ms}] transfer {} requested", cmd.transfer_id);
         self.pending.insert(
@@ -307,7 +307,7 @@ impl MsgHandler<TransferCmd> for TransferService {
 }
 
 impl MsgHandler<TransferCompleted> for TransferService {
-    async fn handle(&mut self, fact: TransferCompleted, ctx: &mut MsgCtx<'_>) {
+    async fn handle(&mut self, fact: &TransferCompleted, ctx: &mut MsgCtx<'_>) {
         let Some(pending) = self.pending.get_mut(&fact.transfer_id) else {
             return; // not ours (or already swept): idempotent no-op
         };
@@ -345,14 +345,14 @@ impl MsgHandler<TransferCompleted> for TransferService {
                     pending.amount,
                     pending.credit_account
                 );
-                ctx.publish(&fact);
+                ctx.publish(&fact.clone());
             }
         }
     }
 }
 
 impl MsgHandler<TransferRejected> for TransferService {
-    async fn handle(&mut self, fact: TransferRejected, ctx: &mut MsgCtx<'_>) {
+    async fn handle(&mut self, fact: &TransferRejected, ctx: &mut MsgCtx<'_>) {
         if self.pending.remove(&fact.transfer_id).is_some() {
             println!(
                 "  [{}] transfer {} REJECTED by {} (balance {}, needed {})",
@@ -368,7 +368,7 @@ impl MsgHandler<TransferRejected> for TransferService {
 }
 
 impl MsgHandler<Tick> for TransferService {
-    async fn handle(&mut self, _tick: Tick, ctx: &mut MsgCtx<'_>) {
+    async fn handle(&mut self, _tick: &Tick, ctx: &mut MsgCtx<'_>) {
         self.sweep_stale(ctx.recv_ts().as_millis(), ctx);
     }
 }

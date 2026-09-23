@@ -85,7 +85,7 @@ impl ServiceActor for Worker {
 }
 
 impl MsgHandler<WorkJob> for Worker {
-    async fn handle(&mut self, msg: WorkJob, ctx: &mut MsgCtx<'_>) {
+    async fn handle(&mut self, msg: &WorkJob, ctx: &mut MsgCtx<'_>) {
         log(format!("[{}] finished job {}", self.id, msg.id));
         ctx.publish(&JobDone { id: msg.id });
     }
@@ -108,7 +108,7 @@ impl ServiceActor for JobSupervisor {
 }
 
 impl MsgHandler<Escalated> for JobSupervisor {
-    async fn handle(&mut self, msg: Escalated, _ctx: &mut MsgCtx<'_>) {
+    async fn handle(&mut self, msg: &Escalated, _ctx: &mut MsgCtx<'_>) {
         // The policy point: budget exhausted ⇒ this demo RETIRES the
         // worker (a restart loop would re-enter the same budget). A
         // real system might page an operator, respawn at a new path,
@@ -236,7 +236,7 @@ fn spawn_crashy(sys: &ActorSystem, path: ActorPath, args: &serde_json::Value) {
         }
     }
     impl MsgHandler<WorkJob> for Crashy {
-        async fn handle(&mut self, _msg: WorkJob, _ctx: &mut MsgCtx<'_>) {
+        async fn handle(&mut self, _msg: &WorkJob, _ctx: &mut MsgCtx<'_>) {
             panic!("crashy worker always dies");
         }
     }

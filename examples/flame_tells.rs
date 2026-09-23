@@ -79,7 +79,7 @@ impl ServiceActor for Sink {
 }
 
 impl trouper::actor::MsgHandler<Ping> for Sink {
-    async fn handle(&mut self, _msg: Ping, _ctx: &mut MsgCtx<'_>) {}
+    async fn handle(&mut self, _msg: &Ping, _ctx: &mut MsgCtx<'_>) {}
 }
 
 fn main() {

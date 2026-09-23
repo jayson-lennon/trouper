@@ -2767,6 +2767,14 @@ pub(crate) struct ServiceLoop {
 /// down the loop task.
 struct PanicIsolated<F>(F);
 
+/// The stand-in marker for a handler panic surfaced through the unified
+/// dispatch `Err` (the poison box is discarded — the cell's crashed flag
+/// is the durable record, supervision reads that).
+enum DispatchFailure {
+    Decode(error_stack::Report<crate::actor::DispatchError>),
+    Panic,
+}
+
 impl<F: Future> Future for PanicIsolated<F> {
     type Output = Result<F::Output, Box<dyn std::any::Any + Send>>;
 
@@ -2872,27 +2880,12 @@ async fn step_service(ctx: &ServiceLoop) -> Step {
             continue;
         };
 
-        // DECODE (sync — decode failures dead-letter cleanly). The payload
-        // is borrowed: decode downcasts the live value (zero serde) or
-        // reads the shared bytes — it never copies the message body.
-        let decoded = match entry.decode(&envelope.payload) {
-            Ok(msg) => msg,
-            Err(report) => {
-                let reason = format!("{report}");
-                dead_letter(
-                    &ctx.es.kernel,
-                    &envelope,
-                    crate::kernel::DeadLetterReason::Decode,
-                    &reason,
-                );
-                continue;
-            }
-        };
-
-        // DISPATCH (inline on the loop task, panic-isolated).
         let trace = envelope.trace;
         let reply_to = envelope.reply_to.clone();
         let mut outbox = Outbox::new();
+        // DECODE + DISPATCH (inline on the loop task, panic-isolated).
+        // The payload is BORROWED: the adapter lends the live value to the
+        // handler (`&M`, zero copies) or decodes a wire shape at the door.
         let dispatched = {
             let mut msg_ctx = crate::context::MsgCtx::new(
                 &path,
@@ -2903,20 +2896,49 @@ async fn step_service(ctx: &ServiceLoop) -> Step {
                 Some(&ask_port),
             );
             let mut service = service.lock().await;
-            let fut = entry.dispatch(service.as_mut(), decoded, &mut msg_ctx);
-            #[cfg(test)]
-            crate::kernel::bump_inline_service_dispatch();
-            PanicIsolated(fut).await
+            match entry.dispatch(service.as_mut(), &envelope.payload, &mut msg_ctx) {
+                Ok(fut) => {
+                    #[cfg(test)]
+                    crate::kernel::bump_inline_service_dispatch();
+                    if PanicIsolated(fut).await.is_err() {
+                        Err(DispatchFailure::Panic)
+                    } else {
+                        Ok(())
+                    }
+                }
+                Err(report) => Err(DispatchFailure::Decode(report)),
+            }
         };
-        if let Err(_poison) = dispatched {
-            // Handler panicked: mark crashed (supervision restarts via
-            // `start`). This message was already consumed at handoff (the
-            // same at-most-once window as the single-message step); every
-            // LATER snapshot is still fully queued (nothing was removed),
-            // so no tail surgery is needed. The outbox dies with the
-            // dispatch — nothing recorded, the standing contract.
-            ctx.es.cell.mark_crashed();
-            return Step::Crashed;
+        match dispatched {
+            Ok(()) => {}
+            Err(DispatchFailure::Panic) => {
+                // Handler panicked: mark crashed (supervision restarts via
+                // `start`). This message was already consumed at handoff (the
+                // same at-most-once window as the single-message step); every
+                // LATER snapshot is still fully queued (nothing was removed),
+                // so no tail surgery is needed. The outbox dies with the
+                // dispatch — nothing recorded, the standing contract.
+                ctx.es.cell.mark_crashed();
+                return Step::Crashed;
+            }
+            Err(DispatchFailure::Decode(report)) => {
+                // Decode failure: dead-letter THIS message alone and
+                // continue the batch (one bad envelope never costs the
+                // rest of the run).
+                let reason = format!("{report}");
+                dead_letter(
+                    &ctx.es.kernel,
+                    &envelope,
+                    crate::kernel::DeadLetterReason::Decode,
+                    &reason,
+                );
+                if flush_outbox(&ctx.es, outbox).await {
+                    return Step::Stop;
+                }
+                // Effects already flushed for this message; the next one
+                // starts on a fresh outbox.
+                continue;
+            }
         }
 
         // FLUSH deferred effects from THIS message before the next one

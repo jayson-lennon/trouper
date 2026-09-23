@@ -2819,7 +2819,7 @@ mod tests {
         }
     }
     impl MsgHandler<PingAsk> for Pinger {
-        async fn handle(&mut self, _msg: PingAsk, _ctx: &mut crate::context::MsgCtx<'_>) {}
+        async fn handle(&mut self, _msg: &PingAsk, _ctx: &mut crate::context::MsgCtx<'_>) {}
     }
 
     #[tokio::test]
@@ -3029,7 +3029,7 @@ mod tests {
             }
         }
         impl MsgHandler<Add> for Parked {
-            async fn handle(&mut self, _msg: Add, _ctx: &mut crate::context::MsgCtx<'_>) {
+            async fn handle(&mut self, _msg: &Add, _ctx: &mut crate::context::MsgCtx<'_>) {
                 if !PARK_ONE.swap(true, std::sync::atomic::Ordering::SeqCst) {
                     PARKING.store(true, std::sync::atomic::Ordering::SeqCst);
                     // Park until the test ends (dropped sender).
@@ -3341,7 +3341,7 @@ mod tests {
             }
         }
         impl MsgHandler<Add> for Forwarder {
-            async fn handle(&mut self, _cmd: Add, ctx: &mut crate::context::MsgCtx<'_>) {
+            async fn handle(&mut self, _cmd: &Add, ctx: &mut crate::context::MsgCtx<'_>) {
                 ctx.send(Address::Path(ActorPath::new("echo")), Ping { n: 0 }, None);
             }
         }
@@ -3360,7 +3360,7 @@ mod tests {
             }
         }
         impl MsgHandler<Ping> for Echo {
-            async fn handle(&mut self, _msg: Ping, _ctx: &mut crate::context::MsgCtx<'_>) {}
+            async fn handle(&mut self, _msg: &Ping, _ctx: &mut crate::context::MsgCtx<'_>) {}
         }
 
         let (system, _clock) = ActorSystem::test();
@@ -3620,7 +3620,7 @@ mod tests {
             }
         }
         impl MsgHandler<EscalatedMsg> for Overseer {
-            async fn handle(&mut self, msg: EscalatedMsg, _ctx: &mut crate::context::MsgCtx<'_>) {
+            async fn handle(&mut self, msg: &EscalatedMsg, _ctx: &mut crate::context::MsgCtx<'_>) {
                 if let Some(s) = SINK_BY_PATH
                     .get_or_init(|| parking_lot::Mutex::new(HashMap::new()))
                     .lock()
@@ -4035,13 +4035,13 @@ mod tests {
     }
 
     impl MsgHandler<Added> for Auditor {
-        async fn handle(&mut self, msg: Added, _ctx: &mut crate::context::MsgCtx<'_>) {
+        async fn handle(&mut self, msg: &Added, _ctx: &mut crate::context::MsgCtx<'_>) {
             self.sink.lock().push(format!("Added:{}", msg.n));
         }
     }
 
     impl MsgHandler<Add> for Auditor {
-        async fn handle(&mut self, msg: Add, _ctx: &mut crate::context::MsgCtx<'_>) {
+        async fn handle(&mut self, msg: &Add, _ctx: &mut crate::context::MsgCtx<'_>) {
             self.sink.lock().push(format!("n={}", msg.n));
         }
     }
@@ -4119,13 +4119,13 @@ mod tests {
             }
         }
         impl MsgHandler<BoomService> for ServicePhoenix {
-            async fn handle(&mut self, msg: BoomService, _ctx: &mut crate::context::MsgCtx<'_>) {
+            async fn handle(&mut self, msg: &BoomService, _ctx: &mut crate::context::MsgCtx<'_>) {
                 if msg.why == "poison"
                     && !CRASHED_YET.swap(true, std::sync::atomic::Ordering::SeqCst)
                 {
                     panic!("injected service handler panic");
                 }
-                self.sink.lock().push(msg.why);
+                self.sink.lock().push(msg.why.clone());
             }
         }
 
@@ -4236,11 +4236,11 @@ mod tests {
             }
         }
         impl MsgHandler<Mark> for QueuePoison {
-            async fn handle(&mut self, msg: Mark, _ctx: &mut crate::context::MsgCtx<'_>) {
+            async fn handle(&mut self, msg: &Mark, _ctx: &mut crate::context::MsgCtx<'_>) {
                 if msg.tag == "poison" {
                     panic!("injected service handler panic");
                 }
-                self.sink.lock().push(msg.tag);
+                self.sink.lock().push(msg.tag.clone());
             }
         }
 
@@ -4417,13 +4417,13 @@ mod tests {
             }
         }
         impl MsgHandler<Mark> for MidBatchPhoenix {
-            async fn handle(&mut self, msg: Mark, _ctx: &mut crate::context::MsgCtx<'_>) {
+            async fn handle(&mut self, msg: &Mark, _ctx: &mut crate::context::MsgCtx<'_>) {
                 if msg.tag == "poison"
                     && !CRASHED_YET.swap(true, std::sync::atomic::Ordering::SeqCst)
                 {
                     panic!("injected mid-batch panic");
                 }
-                self.sink.lock().push(msg.tag);
+                self.sink.lock().push(msg.tag.clone());
             }
         }
 
@@ -4588,7 +4588,7 @@ mod tests {
             }
         }
         impl MsgHandler<Add> for StopNote {
-            async fn handle(&mut self, cmd: Add, ctx: &mut crate::context::MsgCtx<'_>) {
+            async fn handle(&mut self, cmd: &Add, ctx: &mut crate::context::MsgCtx<'_>) {
                 if cmd.n == 1 {
                     // Record a send then stop: the send must flush before
                     // the step concludes.
@@ -4759,8 +4759,8 @@ mod tests {
             }
         }
         impl MsgHandler<Add> for Echo {
-            async fn handle(&mut self, msg: Add, ctx: &mut crate::context::MsgCtx<'_>) {
-                ctx.reply(msg);
+            async fn handle(&mut self, msg: &Add, ctx: &mut crate::context::MsgCtx<'_>) {
+                ctx.reply(msg.clone());
             }
         }
 
@@ -4778,7 +4778,7 @@ mod tests {
             }
         }
         impl MsgHandler<Boom> for Asker {
-            async fn handle(&mut self, _msg: Boom, ctx: &mut crate::context::MsgCtx<'_>) {
+            async fn handle(&mut self, _msg: &Boom, ctx: &mut crate::context::MsgCtx<'_>) {
                 let reply = ctx
                     .ask_json(
                         Address::Path(ActorPath::new("echo")),
@@ -4858,7 +4858,7 @@ mod tests {
             }
         }
         impl MsgHandler<Add> for Silent {
-            async fn handle(&mut self, _msg: Add, _ctx: &mut crate::context::MsgCtx<'_>) {}
+            async fn handle(&mut self, _msg: &Add, _ctx: &mut crate::context::MsgCtx<'_>) {}
         }
 
         struct Asker;
@@ -4875,7 +4875,7 @@ mod tests {
             }
         }
         impl MsgHandler<Boom> for Asker {
-            async fn handle(&mut self, _msg: Boom, ctx: &mut crate::context::MsgCtx<'_>) {
+            async fn handle(&mut self, _msg: &Boom, ctx: &mut crate::context::MsgCtx<'_>) {
                 let reply = ctx
                     .ask_json(
                         Address::Path(ActorPath::new("silent")),
@@ -4970,7 +4970,7 @@ mod tests {
             }
         }
         impl MsgHandler<Add> for Silent {
-            async fn handle(&mut self, _msg: Add, _ctx: &mut crate::context::MsgCtx<'_>) {}
+            async fn handle(&mut self, _msg: &Add, _ctx: &mut crate::context::MsgCtx<'_>) {}
         }
 
         static FAILED_RESULTS: std::sync::OnceLock<Mutex<Vec<String>>> = std::sync::OnceLock::new();
@@ -4989,7 +4989,7 @@ mod tests {
             }
         }
         impl MsgHandler<Boom> for Asker {
-            async fn handle(&mut self, _msg: Boom, ctx: &mut crate::context::MsgCtx<'_>) {
+            async fn handle(&mut self, _msg: &Boom, ctx: &mut crate::context::MsgCtx<'_>) {
                 // Long timeout: the lease is reaped before the asker's own
                 // timeout could fire — isolating the Failed path.
                 let outcome = ctx
@@ -5107,7 +5107,7 @@ mod tests {
             }
         }
         impl MsgHandler<Added> for Collector {
-            async fn handle(&mut self, msg: Added, _ctx: &mut crate::context::MsgCtx<'_>) {
+            async fn handle(&mut self, msg: &Added, _ctx: &mut crate::context::MsgCtx<'_>) {
                 RECEIVED
                     .get_or_init(|| Mutex::new(Vec::new()))
                     .lock()
@@ -5131,7 +5131,7 @@ mod tests {
             }
         }
         impl MsgHandler<Add> for Responder {
-            async fn handle(&mut self, cmd: Add, ctx: &mut crate::context::MsgCtx<'_>) {
+            async fn handle(&mut self, cmd: &Add, ctx: &mut crate::context::MsgCtx<'_>) {
                 let dest: crate::envelope::Address = ctx
                     .reply_dest()
                     .unwrap_or_else(|| crate::envelope::Address::Path(ctx.self_path().clone()));
@@ -5690,7 +5690,7 @@ mod tests {
             ActorPath::new("overseer2")
         }
         impl MsgHandler<EscalatedMsg2> for Overseer2 {
-            async fn handle(&mut self, msg: EscalatedMsg2, _ctx: &mut crate::context::MsgCtx<'_>) {
+            async fn handle(&mut self, msg: &EscalatedMsg2, _ctx: &mut crate::context::MsgCtx<'_>) {
                 if let Some(sink) = sink_table().lock().get(&overseer_path().to_string()) {
                     sink.lock().push(format!("escalated:{}", msg.escalated));
                 }
@@ -7053,8 +7053,8 @@ mod tests {
             }
         }
         impl MsgHandler<Add> for Echo {
-            async fn handle(&mut self, msg: Add, ctx: &mut crate::context::MsgCtx<'_>) {
-                ctx.reply(msg);
+            async fn handle(&mut self, msg: &Add, ctx: &mut crate::context::MsgCtx<'_>) {
+                ctx.reply(msg.clone());
             }
         }
 
@@ -7103,7 +7103,7 @@ mod tests {
             }
         }
         impl MsgHandler<Add> for Silent {
-            async fn handle(&mut self, _msg: Add, _ctx: &mut crate::context::MsgCtx<'_>) {}
+            async fn handle(&mut self, _msg: &Add, _ctx: &mut crate::context::MsgCtx<'_>) {}
         }
 
         crate::builder::spawn_service_builder::<Silent>(&system)
@@ -7166,7 +7166,7 @@ mod tests {
             }
         }
         impl MsgHandler<Add> for Silent {
-            async fn handle(&mut self, _msg: Add, _ctx: &mut crate::context::MsgCtx<'_>) {}
+            async fn handle(&mut self, _msg: &Add, _ctx: &mut crate::context::MsgCtx<'_>) {}
         }
 
         crate::builder::spawn_service_builder::<Silent>(&system)
@@ -8431,7 +8431,7 @@ mod tests {
             }
         }
         impl MsgHandler<Add> for Forwarder {
-            async fn handle(&mut self, msg: Add, ctx: &mut crate::context::MsgCtx<'_>) {
+            async fn handle(&mut self, msg: &Add, ctx: &mut crate::context::MsgCtx<'_>) {
                 self.sink.lock().push(format!("seen={}", msg.n));
                 let dest = Address::Path(ActorPath::new(self.forward_to.as_str()));
                 ctx.send(dest, msg.clone(), None);
@@ -8454,7 +8454,7 @@ mod tests {
             }
         }
         impl MsgHandler<Add> for Final {
-            async fn handle(&mut self, msg: Add, _ctx: &mut crate::context::MsgCtx<'_>) {
+            async fn handle(&mut self, msg: &Add, _ctx: &mut crate::context::MsgCtx<'_>) {
                 self.sink.lock().push(format!("n={}", msg.n));
             }
         }
@@ -8560,7 +8560,7 @@ mod tests {
     }
 
     impl MsgHandler<Add> for GatedWorker {
-        async fn handle(&mut self, msg: Add, _ctx: &mut crate::context::MsgCtx<'_>) {
+        async fn handle(&mut self, msg: &Add, _ctx: &mut crate::context::MsgCtx<'_>) {
             if msg.n == 0 {
                 gate_wait().await;
             }
@@ -9031,7 +9031,7 @@ mod tests {
         }
     }
     impl MsgHandler<Add> for StopService {
-        async fn handle(&mut self, _msg: Add, _ctx: &mut crate::context::MsgCtx<'_>) {}
+        async fn handle(&mut self, _msg: &Add, _ctx: &mut crate::context::MsgCtx<'_>) {}
     }
 
     #[tokio::test]
@@ -9066,7 +9066,7 @@ mod tests {
             }
         }
         impl MsgHandler<Add> for GlobalStopService {
-            async fn handle(&mut self, _msg: Add, _ctx: &mut crate::context::MsgCtx<'_>) {}
+            async fn handle(&mut self, _msg: &Add, _ctx: &mut crate::context::MsgCtx<'_>) {}
         }
 
         let (system, _clock) = ActorSystem::test();
@@ -9229,7 +9229,7 @@ mod tests {
             }
         }
         impl MsgHandler<Add> for SelfStopper {
-            async fn handle(&mut self, cmd: Add, ctx: &mut crate::context::MsgCtx<'_>) {
+            async fn handle(&mut self, cmd: &Add, ctx: &mut crate::context::MsgCtx<'_>) {
                 ctx.send(
                     Address::Path(ActorPath::new(self.target.as_str())),
                     Add { n: cmd.n },
@@ -9285,7 +9285,7 @@ mod tests {
             }
         }
         impl MsgHandler<Add> for StopOnFirst {
-            async fn handle(&mut self, _cmd: Add, ctx: &mut crate::context::MsgCtx<'_>) {
+            async fn handle(&mut self, _cmd: &Add, ctx: &mut crate::context::MsgCtx<'_>) {
                 ctx.stop_self();
             }
         }
@@ -9343,7 +9343,7 @@ mod tests {
             }
         }
         impl MsgHandler<Add> for SelfStopper2 {
-            async fn handle(&mut self, _cmd: Add, ctx: &mut crate::context::MsgCtx<'_>) {
+            async fn handle(&mut self, _cmd: &Add, ctx: &mut crate::context::MsgCtx<'_>) {
                 ctx.stop_self();
             }
         }
@@ -10204,7 +10204,7 @@ mod tests {
             }
         }
         impl MsgHandler<Add> for Bouncer {
-            async fn handle(&mut self, msg: Add, ctx: &mut crate::context::MsgCtx<'_>) {
+            async fn handle(&mut self, msg: &Add, ctx: &mut crate::context::MsgCtx<'_>) {
                 if msg.n < 3 {
                     ctx.send(
                         Address::Path(self.peer.clone()),
@@ -10358,18 +10358,18 @@ mod tests {
     }
 
     impl MsgHandler<Pack> for Edged {
-        async fn handle(&mut self, msg: Pack, ctx: &mut crate::context::MsgCtx<'_>) {
+        async fn handle(&mut self, msg: &Pack, ctx: &mut crate::context::MsgCtx<'_>) {
             self.sink
                 .lock()
                 .push(format!("{}:pack:{}", self.tag, msg.order));
             // Announce the outcome as an event: every Shipped subscriber
             // gets a copy (the outbox-intent broadcast path).
-            ctx.publish(&Shipped { order: msg.order });
+            ctx.publish(&Shipped { order: msg.order.clone() });
         }
     }
 
     impl MsgHandler<KeyedAdd> for Edged {
-        async fn handle(&mut self, msg: KeyedAdd, _ctx: &mut crate::context::MsgCtx<'_>) {
+        async fn handle(&mut self, msg: &KeyedAdd, _ctx: &mut crate::context::MsgCtx<'_>) {
             self.sink
                 .lock()
                 .push(format!("{}:keyed:{}", self.tag, msg.n));
@@ -10377,7 +10377,7 @@ mod tests {
     }
 
     impl MsgHandler<Shipped> for Edged {
-        async fn handle(&mut self, msg: Shipped, _ctx: &mut crate::context::MsgCtx<'_>) {
+        async fn handle(&mut self, msg: &Shipped, _ctx: &mut crate::context::MsgCtx<'_>) {
             if self.stall_ms > 0 {
                 // Deliberately slow handler: the delivery loop for THIS
                 // subscriber is busy while later fan-outs queue up.
@@ -11072,6 +11072,73 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn service_dispatch_borrows_the_live_value_zero_serde_zero_copy() {
+        // Given a handler of typed Pack commands (the borrowed dispatch)
+        // and a second actor whose handler FORWARDS the Pack (the
+        // router-shape handler: it pays its one explicit clone).
+        let (system, _clock) = ActorSystem::test();
+        let sink = spawn_edged(&system, "borrow-dispatch", "bd", true, false).await;
+        wait_for(|| async { system.lookup_slot(&ActorPath::new("borrow-dispatch")) }).await;
+
+        struct Router;
+        impl ServiceActor for Router {
+            fn manifest() -> ActorManifest {
+                ActorManifest::new()
+                    .handles::<Pack>()
+                    .emits::<Pack>()
+                    .kind(ActorKind::Service)
+            }
+            async fn start(
+                _args: &Json,
+            ) -> Result<Self, error_stack::Report<crate::registry::RegistryError>> {
+                Ok(Self)
+            }
+        }
+        impl MsgHandler<Pack> for Router {
+            async fn handle(&mut self, msg: &Pack, ctx: &mut crate::context::MsgCtx<'_>) {
+                // Retention is explicit at the user level: the borrow is
+                // free; the clone is the router's own paid copy.
+                ctx.send(
+                    crate::envelope::Address::Path(ActorPath::new("borrow-dispatch")),
+                    msg.clone(),
+                    None,
+                );
+            }
+        }
+        crate::builder::spawn_service_builder::<Router>(&system)
+            .at(ActorPath::new("borrow-router"))
+            .handles::<Pack>()
+            .start();
+        wait_for(|| async {
+            system.inbox_cursor(&ActorPath::new("borrow-router")).is_some()
+        })
+        .await;
+
+        // When the command rides the full service path: actor-to-actor
+        // send (live value) → route → inbox → borrowed dispatch →
+        // handle → forward (one explicit clone) → borrowed dispatch.
+        let before = crate::kernel::SERDE_CALLS.load(std::sync::atomic::Ordering::Relaxed);
+        system
+            .tell(
+                ActorPath::new("borrow-router"),
+                Pack { order: "bd-1".into() },
+            )
+            .await
+            .expect("delivered");
+        let after = crate::kernel::SERDE_CALLS.load(std::sync::atomic::Ordering::Relaxed);
+
+        // Then the forwarded copy arrived and NO serde ran anywhere —
+        // two borrowed dispatches and one user-level clone, zero trees.
+        wait_for(|| async { !sink.lock().is_empty() }).await;
+        assert_eq!(sink.lock().as_slice(), ["bd:pack:bd-1"]);
+        assert_eq!(
+            after - before,
+            0,
+            "the borrowed service dispatch must not serialize anywhere"
+        );
+    }
+
+    #[tokio::test]
     async fn shard_key_missing_still_dead_letters_the_copy() {
         // The typed field() read behind shard-key extraction: a missing
         // key reads as None (the DLQ contract), a present one resolves.
@@ -11222,7 +11289,7 @@ mod tests {
             }
         }
         impl MsgHandler<AskReq> for Echo {
-            async fn handle(&mut self, msg: AskReq, ctx: &mut crate::context::MsgCtx<'_>) {
+            async fn handle(&mut self, msg: &AskReq, ctx: &mut crate::context::MsgCtx<'_>) {
                 ctx.reply(AskRes { n: msg.n });
             }
         }
@@ -11284,7 +11351,7 @@ mod tests {
             }
         }
         impl MsgHandler<Kick> for Caller {
-            async fn handle(&mut self, _msg: Kick, ctx: &mut crate::context::MsgCtx<'_>) {
+            async fn handle(&mut self, _msg: &Kick, ctx: &mut crate::context::MsgCtx<'_>) {
                 let reply = ctx
                     .ask(
                         crate::envelope::Address::Path(ActorPath::new("echo")),
@@ -11315,7 +11382,7 @@ mod tests {
             }
         }
         impl MsgHandler<AskReq> for Echo {
-            async fn handle(&mut self, msg: AskReq, ctx: &mut crate::context::MsgCtx<'_>) {
+            async fn handle(&mut self, msg: &AskReq, ctx: &mut crate::context::MsgCtx<'_>) {
                 ctx.reply(AskRes { n: msg.n });
             }
         }

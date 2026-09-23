@@ -131,7 +131,7 @@ mod trouper_leg {
     }
 
     impl MsgHandler<Prime> for Producer {
-        async fn handle(&mut self, msg: Prime, ctx: &mut MsgCtx<'_>) {
+        async fn handle(&mut self, msg: &Prime, ctx: &mut MsgCtx<'_>) {
             self.prime_ack
                 .take()
                 .expect("prime ack handle")
@@ -149,7 +149,7 @@ mod trouper_leg {
             // records the intent; the kernel flushes it after this
             // message (the prime) commits — the whole loop leaves
             // through this one handler execution.
-            let sink = msg.sink;
+            let sink = msg.sink.clone();
             for _ in 0..self.target {
                 ctx.send(Address::Path(sink.clone()), Tick, None);
             }
@@ -173,7 +173,7 @@ mod trouper_leg {
     }
 
     impl MsgHandler<Tick> for Sink {
-        async fn handle(&mut self, _msg: Tick, _ctx: &mut MsgCtx<'_>) {
+        async fn handle(&mut self, _msg: &Tick, _ctx: &mut MsgCtx<'_>) {
             self.seen += 1;
             if self.seen == self.target {
                 self.done

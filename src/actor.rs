@@ -179,9 +179,14 @@ pub trait ServiceActor: Send + 'static {
 /// Typed sugar for service actors, mirroring [`CommandHandler`].
 pub trait MsgHandler<M>: ServiceActor {
     /// Handles one typed message.
+    ///
+    /// The message arrives by shared borrow — the fabric's live value,
+    /// lent from the envelope (zero copies, zero serde). Clone the value
+    /// (or its fields) explicitly where the handler retains or forwards
+    /// it; read-only handlers pay nothing.
     fn handle(
         &mut self,
-        msg: M,
+        msg: &M,
         ctx: &mut crate::context::MsgCtx<'_>,
     ) -> impl Future<Output = ()> + Send;
 }
@@ -667,25 +672,32 @@ pub trait MsgEntry: Send + Sync {
     /// The message schema this entry decodes.
     fn schema(&self) -> SchemaId;
 
-    /// Decodes the JSON payload into a boxed `Any` of the handler's type
-    /// (the decode side runs synchronously, so decode failures dead-letter
-    /// cleanly).
+    /// Runs the typed handler for one envelope.
+    ///
+    /// The borrow-first dispatch: a live value (`Value` fabric arm) is
+    /// lent to the handler as `&M` — zero copies, zero serde. A wire
+    /// shape (`Bytes`/`Json`: erased ingress, replay) has no live value
+    /// to lend, so it decodes into an owned `M` — the fabric's one
+    /// shape-changing door — and the owned copy dispatches the same
+    /// handler.
+    ///
+    /// The future borrows the state and the message; the kernel awaits
+    /// it INLINE on the loop task, so the borrow is rooted at the
+    /// loop-local batch and every await is covered.
     ///
     /// # Errors
     ///
-    /// [`DispatchError::Decode`] when the payload does not match.
-    fn decode(
-        &self,
-        payload: &crate::envelope::Payload,
-    ) -> Result<Box<dyn std::any::Any + Send>, error_stack::Report<DispatchError>>;
-
-    /// Runs the typed handler against the boxed message (consumes it).
+    /// [`DispatchError::Decode`] when the payload does not match (the
+    /// message dead-letters cleanly; the decode runs synchronously).
     fn dispatch<'a>(
         &'a self,
         state: &'a mut dyn DynServiceActor,
-        msg: Box<dyn std::any::Any + Send>,
+        payload: &'a crate::envelope::Payload,
         ctx: &'a mut crate::context::MsgCtx<'_>,
-    ) -> std::pin::Pin<Box<dyn Future<Output = ()> + Send + 'a>>;
+    ) -> Result<
+        std::pin::Pin<Box<dyn Future<Output = ()> + Send + 'a>>,
+        error_stack::Report<DispatchError>,
+    >;
 }
 
 /// Generic adapter: erases `A`'s handler for message type `M`.
@@ -715,37 +727,39 @@ where
         self.schema.clone()
     }
 
-    fn decode(
-        &self,
-        payload: &crate::envelope::Payload,
-    ) -> Result<Box<dyn std::any::Any + Send>, error_stack::Report<DispatchError>> {
-        // Downcast first (zero serde on the live path); only wire bytes
-        // that arrived without a value decode here.
-        let msg: M = payload.inner().downcast_ref::<M>().ok_or_else(|| {
+    fn dispatch<'a>(
+        &'a self,
+        state: &'a mut dyn DynServiceActor,
+        payload: &'a crate::envelope::Payload,
+        ctx: &'a mut crate::context::MsgCtx<'_>,
+    ) -> Result<
+        std::pin::Pin<Box<dyn Future<Output = ()> + Send + 'a>>,
+        error_stack::Report<DispatchError>,
+    > {
+        // BORROW FIRST (zero serde, zero copies on the live path): the
+        // handler receives the fabric's live value by reference.
+        if let Some(msg) = payload.inner().value_ref::<M>() {
+            let typed = state
+                .as_any_service_mut::<A>()
+                .expect("service adapter/type mismatch — kernel bug");
+            return Ok(Box::pin(typed.state.handle(msg, ctx)));
+        }
+        // WIRE DOOR: bytes that arrived without a live value (erased
+        // ingress, replay) decode into an owned `M` — the one
+        // shape-changing transition; the owned copy runs the same
+        // handler. Wrong-shaped payloads fail here and dead-letter.
+        let decoded: M = payload.inner().downcast_ref::<M>().ok_or_else(|| {
             error_stack::Report::new(DispatchError::Decode(format!(
                 "message {} did not match its schema",
                 self.schema
             )))
         })?;
-        Ok(Box::new(msg))
-    }
-
-    fn dispatch<'a>(
-        &'a self,
-        state: &'a mut dyn DynServiceActor,
-        msg: Box<dyn std::any::Any + Send>,
-        ctx: &'a mut crate::context::MsgCtx<'_>,
-    ) -> std::pin::Pin<Box<dyn Future<Output = ()> + Send + 'a>> {
-        Box::pin(async move {
-            let typed = state
-                .as_any_service_mut::<A>()
-                .expect("service adapter/type mismatch — kernel bug");
-            let msg = match msg.downcast::<M>() {
-                Ok(msg) => *msg,
-                Err(_) => panic!("service message type mismatch — kernel bug"),
-            };
-            typed.state.handle(msg, ctx).await;
-        })
+        let typed = state
+            .as_any_service_mut::<A>()
+            .expect("service adapter/type mismatch — kernel bug");
+        Ok(Box::pin(async move {
+            typed.state.handle(&decoded, ctx).await;
+        }))
     }
 }
 

@@ -67,9 +67,9 @@ impl ServiceActor for ParseRouter {
 }
 
 impl MsgHandler<DocumentSaved> for ParseRouter {
-    async fn handle(&mut self, msg: DocumentSaved, ctx: &mut MsgCtx<'_>) {
+    async fn handle(&mut self, msg: &DocumentSaved, ctx: &mut MsgCtx<'_>) {
         log(format!("[router] translating {} into parse work", msg.uri));
-        ctx.send_to_any(ParseDocument { uri: msg.uri });
+        ctx.send_to_any(ParseDocument { uri: msg.uri.clone() });
     }
 }
 
@@ -98,9 +98,9 @@ impl ServiceActor for Parser {
 }
 
 impl MsgHandler<ParseDocument> for Parser {
-    async fn handle(&mut self, msg: ParseDocument, ctx: &mut MsgCtx<'_>) {
+    async fn handle(&mut self, msg: &ParseDocument, ctx: &mut MsgCtx<'_>) {
         log(format!("[{}] parsed {}", self.id, msg.uri));
-        ctx.publish(&DocumentParsed { uri: msg.uri });
+        ctx.publish(&DocumentParsed { uri: msg.uri.clone() });
     }
 }
 
@@ -119,7 +119,7 @@ impl ServiceActor for MetricsRecorder {
 }
 
 impl MsgHandler<DocumentSaved> for MetricsRecorder {
-    async fn handle(&mut self, msg: DocumentSaved, _ctx: &mut MsgCtx<'_>) {
+    async fn handle(&mut self, msg: &DocumentSaved, _ctx: &mut MsgCtx<'_>) {
         log(format!("[metrics] counted saved: {}", msg.uri));
     }
 }
@@ -158,7 +158,7 @@ async fn main() {
         }
     }
     impl MsgHandler<SaveCmd> for Saver {
-        async fn handle(&mut self, msg: SaveCmd, ctx: &mut MsgCtx<'_>) {
+        async fn handle(&mut self, msg: &SaveCmd, ctx: &mut MsgCtx<'_>) {
             ctx.publish(&DocumentSaved {
                 uri: msg.uri.clone(),
             });

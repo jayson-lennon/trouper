@@ -60,10 +60,10 @@ impl ServiceActor for Fulfillment {
 }
 
 impl MsgHandler<Ship> for Fulfillment {
-    async fn handle(&mut self, msg: Ship, ctx: &mut MsgCtx<'_>) {
+    async fn handle(&mut self, msg: &Ship, ctx: &mut MsgCtx<'_>) {
         log(format!("[fulfillment] shipped {}", msg.order));
         // The announcement: every handler of the EVENT gets a copy.
-        ctx.publish(&Shipped { order: msg.order });
+        ctx.publish(&Shipped { order: msg.order.clone() });
     }
 }
 
@@ -83,7 +83,7 @@ impl ServiceActor for Billing {
 }
 
 impl MsgHandler<Shipped> for Billing {
-    async fn handle(&mut self, msg: Shipped, _ctx: &mut MsgCtx<'_>) {
+    async fn handle(&mut self, msg: &Shipped, _ctx: &mut MsgCtx<'_>) {
         log(format!(
             "[billing] invoiced {} (from the announcement)",
             msg.order
@@ -107,7 +107,7 @@ impl ServiceActor for Auditor {
 }
 
 impl MsgHandler<Shipped> for Auditor {
-    async fn handle(&mut self, msg: Shipped, _ctx: &mut MsgCtx<'_>) {
+    async fn handle(&mut self, msg: &Shipped, _ctx: &mut MsgCtx<'_>) {
         log(format!("[auditor] recorded Shipped({})", msg.order));
     }
 }

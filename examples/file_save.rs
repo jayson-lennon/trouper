@@ -133,7 +133,7 @@ impl<S: FileStore + Default> ServiceActor for FileSaver<S> {
 }
 
 impl<S: FileStore + Default> MsgHandler<SaveFile> for FileSaver<S> {
-    async fn handle(&mut self, msg: SaveFile, ctx: &mut MsgCtx<'_>) {
+    async fn handle(&mut self, msg: &SaveFile, ctx: &mut MsgCtx<'_>) {
         match self.save(&msg.path, &msg.contents).await {
             Ok(ack) => {
                 // Point-to-point: to the asker when asked, silently
@@ -172,7 +172,7 @@ impl ServiceActor for SaveAudit {
 }
 
 impl MsgHandler<SaveFailed> for SaveAudit {
-    async fn handle(&mut self, fact: SaveFailed, _ctx: &mut MsgCtx<'_>) {
+    async fn handle(&mut self, fact: &SaveFailed, _ctx: &mut MsgCtx<'_>) {
         AUDIT
             .lock()
             .push(format!("{} ({})", fact.path, fact.reason));

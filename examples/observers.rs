@@ -81,7 +81,7 @@ impl ServiceActor for Ticker {
 }
 
 impl MsgHandler<Tick> for Ticker {
-    async fn handle(&mut self, _msg: Tick, _ctx: &mut MsgCtx<'_>) {}
+    async fn handle(&mut self, _msg: &Tick, _ctx: &mut MsgCtx<'_>) {}
 }
 
 #[tokio::main]

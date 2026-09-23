@@ -59,7 +59,7 @@ static TAKEN: AtomicU64 = AtomicU64::new(0);
 static RETURNED: AtomicU64 = AtomicU64::new(0);
 
 impl MsgHandler<Checkout> for PoolService {
-    async fn handle(&mut self, _msg: Checkout, ctx: &mut MsgCtx<'_>) {
+    async fn handle(&mut self, _msg: &Checkout, ctx: &mut MsgCtx<'_>) {
         let taken = TAKEN.fetch_add(1, Ordering::SeqCst) + 1;
         let returned = RETURNED.load(Ordering::SeqCst);
         println!("[pool] checkout #{taken}");
@@ -68,7 +68,7 @@ impl MsgHandler<Checkout> for PoolService {
 }
 
 impl MsgHandler<Checkin> for PoolService {
-    async fn handle(&mut self, _msg: Checkin, ctx: &mut MsgCtx<'_>) {
+    async fn handle(&mut self, _msg: &Checkin, ctx: &mut MsgCtx<'_>) {
         let returned = RETURNED.fetch_add(1, Ordering::SeqCst) + 1;
         let taken = TAKEN.load(Ordering::SeqCst);
         println!("[pool] checkin #{returned}");
