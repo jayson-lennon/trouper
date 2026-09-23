@@ -493,8 +493,13 @@ pub(crate) struct ActorHandle {
 pub(crate) struct ActorCell {
     /// The actor's path (its identity).
     pub(crate) path: ActorPath,
-    /// The runtime-owned inbox (survives endpoint swaps).
-    pub(crate) inbox: tokio::sync::Mutex<Inbox>,
+    /// The runtime-owned inbox (survives endpoint swaps). The guard is a
+    /// SYNC lock (parking_lot): every critical section is a synchronous
+    /// body — push, peek, commit, close — never held across an await
+    /// (audited site-by-site; the guard scopes are minimal by
+    /// construction). The async machinery (a semaphore wake per message)
+    /// bought nothing here.
+    pub(crate) inbox: parking_lot::Mutex<Inbox>,
     /// The spawn-configured mailbox capacity. The front door and every
     /// restart derive their channel depth from it (D4: restarts keep the
     /// spawn's capacity, not a default).
@@ -599,7 +604,7 @@ impl ActorCell {
     ) -> Self {
         Self {
             path,
-            inbox: tokio::sync::Mutex::new(inbox),
+            inbox: parking_lot::Mutex::new(inbox),
             mailbox_capacity,
             mailbox_policy,
             step_batch: batch.max(1),
@@ -1206,7 +1211,7 @@ async fn direct_push(
     // accepted outcomes (plain Ok and DropOld's queued-anyway eviction) —
     // the watermark depth includes the new envelope either way.
     let (evicted, fire_watermark): (Option<Envelope>, Option<u64>) = {
-        let mut inbox = cell.inbox.lock().await;
+        let mut inbox = cell.inbox.lock();
         let evicted = match inbox.push(envelope) {
             Ok(_) => None,
             Err(refused) if refused.queued_anyway() => Some(refused.into_envelope()),
@@ -1280,7 +1285,7 @@ pub(crate) async fn front_door_loop(
         // takes the kernel lock — the Backpressured observation rides the
         // handler slot.
         if cell.has_watermark.load(std::sync::atomic::Ordering::SeqCst) {
-            let depth = cell.inbox.lock().await.len() as u64;
+            let depth = cell.inbox.lock().len() as u64;
             let wm = cell
                 .watermark_high
                 .load(std::sync::atomic::Ordering::Acquire);
@@ -1337,7 +1342,7 @@ async fn push_holding_block(
     let mut attempt = 0usize;
     loop {
         let refusal = {
-            let mut inbox = cell.inbox.lock().await;
+            let mut inbox = cell.inbox.lock();
             match inbox.push(envelope.clone()) {
                 Ok(_) => return true,
                 Err(refused) => refused,
@@ -1612,7 +1617,7 @@ async fn step_es(ctx: &EsLoop) -> Step {
     // the commit point is stage 6, after the append lands).
     let batch_n = ctx.cell.step_batch;
     let batch: Vec<(crate::inbox::InboxOffset, Envelope)> = {
-        let mut inbox = ctx.cell.inbox.lock().await;
+        let mut inbox = ctx.cell.inbox.lock();
         inbox.peek_up_to(batch_n)
     };
     if batch.is_empty() {
@@ -1827,7 +1832,7 @@ async fn step_es(ctx: &EsLoop) -> Step {
                             // Already checkpointed by the seeding path:
                             // commit (durably held) and move on — replay
                             // restores this fact from the journal.
-                            let mut inbox = ctx.cell.inbox.lock().await;
+                            let mut inbox = ctx.cell.inbox.lock();
                             for (offset, _) in &batch {
                                 inbox.commit_through(*offset);
                             }
@@ -1864,7 +1869,7 @@ async fn step_es(ctx: &EsLoop) -> Step {
     // seq and the cursor are single-writer — this loop is the only
     // appender for the path). Acked observations ride the handler slot.
     {
-        let mut inbox = ctx.cell.inbox.lock().await;
+        let mut inbox = ctx.cell.inbox.lock();
         for (offset, _) in &batch {
             inbox.commit_through(*offset);
         }
@@ -2620,7 +2625,7 @@ async fn maybe_snapshot_on_idle(ctx: &EsLoop) {
 /// Closes the inbox on stop; teardown (or the sweep) flushes undelivered
 /// entries to the DLQ.
 async fn drain_inbox_on_stop(ctx: &EsLoop) {
-    let mut inbox = ctx.cell.inbox.lock().await;
+    let mut inbox = ctx.cell.inbox.lock();
     inbox.close();
     inbox.reopen();
     drop(inbox);
@@ -2676,12 +2681,12 @@ async fn maybe_passivate(ctx: &EsLoop) -> bool {
     // inbox). Then drain: process what's queued — the ES step is sync,
     // so this is bounded by capacity.
     {
-        let mut inbox = ctx.cell.inbox.lock().await;
+        let mut inbox = ctx.cell.inbox.lock();
         inbox.close();
     }
     loop {
         let has_mail = {
-            let mut inbox = ctx.cell.inbox.lock().await;
+            let mut inbox = ctx.cell.inbox.lock();
             inbox.peek().is_some()
         };
         if !has_mail {
@@ -2820,7 +2825,7 @@ async fn step_service(ctx: &ServiceLoop) -> Step {
     // 1. SNAPSHOT up to the spawn's batch size (FIFO, nothing removed).
     let batch_n = ctx.es.cell.step_batch;
     let batch: Vec<(crate::inbox::InboxOffset, Envelope)> = {
-        let mut inbox = ctx.es.cell.inbox.lock().await;
+        let mut inbox = ctx.es.cell.inbox.lock();
         inbox.peek_up_to(batch_n)
     };
     let Some((_, first)) = batch.first() else {
@@ -2853,7 +2858,7 @@ async fn step_service(ctx: &ServiceLoop) -> Step {
     for (offset, envelope) in batch {
         // COMMIT (the at-most-once handoff, at the same point the
         // single-message step acked: before this message's dispatch).
-        ctx.es.cell.inbox.lock().await.commit_through(offset);
+        ctx.es.cell.inbox.lock().commit_through(offset);
         if observing {
             ctx.es.kernel.observe(crate::observe::Observation::new(
                 envelope.trace.causality_id.as_millis_ts(),
@@ -3077,7 +3082,7 @@ pub(crate) async fn restart_es(
     // Redelivery: the cursor never moved; the crash-loop left the inbox
     // open-and-queued. Reopen and run a fresh loop over the SAME cell.
     {
-        let mut inbox = ctx.cell.inbox.lock().await;
+        let mut inbox = ctx.cell.inbox.lock();
         inbox.reopen();
     }
     let (_shutdown_tx, shutdown_rx) = watch::channel(false);

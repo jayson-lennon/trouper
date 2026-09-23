@@ -1842,7 +1842,7 @@ impl ActorSystemCore {
             let kernel = self.kernel.lock();
             let mut drained = Vec::new();
             if let Some(cell) = kernel.cells.get(path)
-                && let Ok(mut inbox) = cell.inbox.try_lock()
+                && let Some(mut inbox) = cell.inbox.try_lock()
             {
                 inbox.close();
                 while let Some(envelope) = inbox.pop_discard() {
@@ -1967,7 +1967,6 @@ impl ActorSystemCore {
                 let cursor = kernel.cells.get(&path).and_then(|cell| {
                     cell.inbox
                         .try_lock()
-                        .ok()
                         .map(|inbox| inbox.cursor().as_u64())
                 });
                 let has_state = kernel.es_state.contains_key(&path);
@@ -2077,26 +2076,25 @@ impl ActorSystemCore {
 
     /// How many envelopes are queued at `path` (inspection/tests).
     pub async fn inbox_debug_len(&self, path: &ActorPath) -> usize {
-        // Clone the Arc out of the kernel guard, then await the inbox
-        // lock without holding the kernel's std Mutex.
+        // Clone the Arc out of the kernel guard; the inbox guard itself is
+        // a sync parking_lot lock (taken and dropped inside the call).
         let cell = {
             let kernel = self.kernel.lock();
             kernel.cells.get(path).cloned()
         };
-        match cell {
-            Some(cell) => cell.inbox.lock().await.len(),
-            None => 0,
-        }
+        cell.map_or(0, |cell| cell.inbox.lock().len())
     }
 
     /// The cursor of an actor's inbox (inspection).
     pub fn inbox_cursor(&self, path: &ActorPath) -> Option<InboxOffset> {
         let kernel = self.kernel.lock();
         kernel.cells.get(path).map(|cell| {
+            // Busy inbox (a loop mid-step): the cursor is mid-flight —
+            // report the zero offset rather than blocking the inspector.
             cell.inbox
                 .try_lock()
                 .map(|inbox| inbox.cursor())
-                .unwrap_or_else(|_| InboxOffset::zero())
+                .unwrap_or(InboxOffset::zero())
         })
     }
 
