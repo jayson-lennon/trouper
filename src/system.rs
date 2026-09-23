@@ -4201,6 +4201,118 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn panicking_service_handler_with_messages_queued_behind() {
+        // Given an UNSUPERVISED service actor whose handler panics on the
+        // poison tag, with good work inspectable through a shared sink.
+        let (system, _clock) = ActorSystem::test();
+        let path = ActorPath::new("queued-behind");
+        let (idx, sink) = open_sink();
+        bind_sink(&path, sink.clone());
+
+        struct QueuePoison {
+            sink: Arc<Mutex<Vec<String>>>,
+        }
+        impl ServiceActor for QueuePoison {
+            fn manifest() -> ActorManifest {
+                ActorManifest::new()
+                    .handles::<Mark>()
+                    .kind(ActorKind::Service)
+            }
+            async fn start(
+                args: &Json,
+            ) -> Result<Self, error_stack::Report<crate::registry::RegistryError>> {
+                let idx = args["sink"].as_i64().expect("sink idx") as usize;
+                Ok(Self {
+                    sink: sinks().lock()[idx].clone(),
+                })
+            }
+        }
+        impl MsgHandler<Mark> for QueuePoison {
+            async fn handle(
+                &mut self,
+                msg: Mark,
+                _ctx: &mut crate::context::MsgCtx<'_>,
+            ) {
+                if msg.tag == "poison" {
+                    panic!("injected service handler panic");
+                }
+                self.sink.lock().push(msg.tag);
+            }
+        }
+
+        system.spawn_service::<QueuePoison, _>(
+            path.clone(),
+            &json!({ "sink": idx }),
+            SpawnOpts::default(),
+            || vec![Arc::new(TypedServiceAdapter::<QueuePoison, Mark>::new::<Mark>())],
+        );
+        wait_for(|| async {
+            system.facts().iter().any(
+                |f| matches!(&f.kind, crate::observe::ObservationKind::Spawned { path: p, .. } if *p == path),
+            )
+        })
+        .await;
+
+        // When the poison lands FIRST and two good messages queue behind
+        // it (all delivered before the handler consumes the poison).
+        system
+            .send(system.envelope(Mark::schema_id(), path.clone(), json!({ "tag": "poison" })))
+            .await
+            .expect("poison delivered");
+        system
+            .send(system.envelope(Mark::schema_id(), path.clone(), json!({ "tag": "y1" })))
+            .await
+            .expect("y1 delivered");
+        system
+            .send(system.envelope(Mark::schema_id(), path.clone(), json!({ "tag": "y2" })))
+            .await
+            .expect("y2 delivered");
+
+        // The poison is consumed (acked at handoff), the handler panics,
+        // and the loop task marks the cell crashed.
+        wait_for_crash(&system, &path).await;
+
+        // Then the panic leaves the queued tail QUEUED: nothing was
+        // dead-lettered, and the crash is the only observable outcome.
+        let letters = system.drain_dead_letters();
+        assert!(
+            letters.is_empty(),
+            "a service panic never dead-letters the tail: {letters:?}"
+        );
+        assert_eq!(
+            sink.lock().as_slice(),
+            [] as [String; 0],
+            "the good messages never ran before the crash"
+        );
+
+        // And the cursor proves the poison was acked at handoff (the
+        // at-most-once contract) while y1/y2 stay queued behind it.
+        assert_eq!(
+            system.inbox_cursor(&path).map(|c| c.as_u64()),
+            Some(1),
+            "poison consumed at handoff; the tail stays queued"
+        );
+
+        // Cleanup: stop the crashed actor (its queued tail lands in the
+        // DLQ as StoppedWithMail — the visible fate of a queue behind a
+        // crashed service actor whose supervision never restarts it).
+        system.stop(&path).await;
+        let letters = system.drain_dead_letters();
+        assert!(
+            letters
+                .iter()
+                .any(|l| l.reason == crate::kernel::DeadLetterReason::StoppedWithMail),
+            "the queued tail survives to the DLQ on teardown: {letters:?}"
+        );
+    }
+
+    /// The service-tier `Mark` fixture (panic-tag + queued-behind tests).
+    #[derive(Command, Serialize, Deserialize, Clone)]
+    struct Mark {
+        tag: String,
+    }
+
+    #[tokio::test]
     async fn service_steps_dispatch_inline_without_spawning_tasks() {
         // Given a service actor and a healthy baseline of the runtime's
         // own spawn counter — taken only once the actor's loop task is
