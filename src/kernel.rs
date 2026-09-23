@@ -978,12 +978,26 @@ async fn resolve_partition(
     Ok(Some(entity_path))
 }
 
-/// Schema-aware shard-key extraction from an envelope's payload.
+/// Schema-aware shard-key extraction from an envelope's payload. A live
+/// value answers from the derive-generated `field()` match — zero serde,
+/// no JSON view built; the registry/Json fallback serves replayed/erased
+/// payloads (Bytes) whose live value no longer exists.
 fn extract_key(
     registry: &crate::system::CountingRegistryLock,
     envelope: &Envelope,
     key_field: &str,
 ) -> Option<String> {
+    // LIVE VALUE FIRST: the derive's field() read (the shard-key field is
+    // declared, so every live value answers it). A JSON-view payload
+    // answers through the view directly — also no new materialization.
+    if let Some(key) = envelope.payload.field(key_field) {
+        if !key.is_empty() {
+            return Some(key);
+        }
+    }
+    // FALLBACK (the door): bytes/replay payloads decode for the read —
+    // and live values whose key is genuinely absent fall through too,
+    // preserving the registry-def contract (missing key → None → DLQ).
     let reg = registry.lock();
     let payload = envelope.payload_json();
     match reg.schema(&envelope.schema) {

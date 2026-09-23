@@ -7738,6 +7738,53 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn live_partition_send_resolves_the_key_without_a_json_view() {
+        // Given a partition set over "accounts" (the string `account`
+        // shard key).
+        let (system, _clock) = ActorSystem::test();
+        install_key_partition(&system, "accounts2").expect("install");
+
+        // When a LIVE payload is partition-sent (the fabric's typed send,
+        // not the bytes door).
+        let e = Envelope::json(
+            KeyedAdd::schema_id(),
+            crate::envelope::Address::Path(ActorPath::new("accounts2")),
+            KeyedAdd {
+                n: 8,
+                account: "a-8".into(),
+            },
+            TraceCtx::root(),
+        );
+        system.send(e).await.expect("resolved");
+
+        // Then the entity for the key activated and folded the command —
+        // the derive-generated field() read resolved the partition.
+        wait_for(|| async {
+            system
+                .es_state(&ActorPath::new("accounts2/a-8"))
+                .await
+                .and_then(|s| s["total"].as_i64())
+                == Some(8)
+        })
+        .await;
+        let state = system
+            .es_state(&ActorPath::new("accounts2/a-8"))
+            .await
+            .expect("live entity");
+        assert_eq!(state["total"], json!(8));
+
+        // And the routing read is FIELD-BASED: `field()` answers the
+        // declared shard key from the live value (the probe the runtime
+        // extract_key rides), while an undeclared field reads None.
+        let payload = crate::envelope::Payload::value(KeyedAdd {
+            n: 1,
+            account: "probe".into(),
+        });
+        assert_eq!(payload.field("account"), Some("probe".to_owned()));
+        assert_eq!(payload.field("n"), None);
+    }
+
+    #[tokio::test]
     async fn partition_spec_without_key_field_rejected() {
         // Given a system whose command schema has NO shard-key field.
         let (system, _clock) = ActorSystem::test();
