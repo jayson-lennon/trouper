@@ -389,8 +389,11 @@ impl<'a> MsgCtx<'a> {
         self.core.outbox.push_stop_self();
     }
 
-    /// Records a send to `dest` (typed: the schema id comes from the
-    /// message type, the payload from serde).
+    /// Records a send to `dest` with an explicit schema id and hand-built
+    /// JSON payload. (Erased-surface seam: exercised by the context tests;
+    /// the typed send is the production path — live values ride the
+    /// fabric, this hatch exists for callers holding trees.)
+    #[allow(dead_code)]
     pub(crate) fn send_json(
         &mut self,
         dest: Address,
@@ -405,6 +408,25 @@ impl<'a> MsgCtx<'a> {
             self.core.child_trace(),
         )
         .from(self.core.self_path.clone());
+        if let Some(reply_to) = reply_to {
+            envelope = envelope.reply_to(reply_to);
+        }
+        self.core.outbox.push_send(envelope);
+    }
+
+    /// The payload-generic send: the typed send's engine (the
+    /// [`Self::send_json`] sibling for live values — envelope
+    /// construction, reply-to stamping, and the send intent, with the
+    /// payload already in fabric shape).
+    pub(crate) fn send_payload(
+        &mut self,
+        dest: Address,
+        schema: SchemaId,
+        payload: crate::envelope::Payload,
+        reply_to: Option<Address>,
+    ) {
+        let mut envelope = Envelope::raw(schema, dest, payload, self.core.child_trace())
+            .from(self.core.self_path.clone());
         if let Some(reply_to) = reply_to {
             envelope = envelope.reply_to(reply_to);
         }
@@ -571,17 +593,28 @@ impl<'a> MsgCtx<'a> {
     /// acknowledged. The typed sibling of [`MsgCtx::publish`] — publish
     /// reaches everyone, send_to_any reaches one. Zero handlers ⇒ the
     /// envelope is dead-lettered.
-    pub fn send_to_any<M: Message>(&mut self, msg: &M) {
-        let payload = Json::of(&msg);
+    ///
+    /// The message moves into the fabric as a live value (zero serde,
+    /// zero copies); `M: Clone` comes from the `PayloadValue` contract.
+    pub fn send_to_any<M: Message + crate::envelope::PayloadValue>(&mut self, msg: M) {
         let schema = M::schema_id();
-        self.send_json(Address::Schema(schema.clone()), schema, payload, None);
+        let payload = crate::envelope::Payload::value(msg);
+        self.send_payload(Address::Schema(schema.clone()), schema, payload, None);
     }
 
     /// Records a send to `dest`; delivered after the current message is
     /// acknowledged. Typed: the schema id comes from the message type.
-    pub fn send<M: Message>(&mut self, dest: Address, msg: &M, reply_to: Option<Address>) {
-        let payload = Json::of(&msg);
-        self.send_json(dest, M::schema_id(), payload, reply_to);
+    /// The message moves into the fabric as a live value (zero serde,
+    /// zero copies) — clone at the call site when the value is needed
+    /// after the send.
+    pub fn send<M: Message + crate::envelope::PayloadValue>(
+        &mut self,
+        dest: Address,
+        msg: M,
+        reply_to: Option<Address>,
+    ) {
+        let payload = crate::envelope::Payload::value(msg);
+        self.send_payload(dest, M::schema_id(), payload, reply_to);
     }
 
     /// Records an event broadcast to every `.handles` declarant of the
@@ -727,7 +760,7 @@ mod tests {
         // When sending a command.
         ctx.send(
             Address::Path(ActorPath::new("inventory.west")),
-            &ReserveStock { qty: 2 },
+            ReserveStock { qty: 2 },
             None,
         );
 
@@ -836,8 +869,8 @@ mod tests {
         let mut outbox = Outbox::new();
         let path = ActorPath::new("a");
         let mut ctx = MsgCtx::new(&path, &trace, None, &view, &mut outbox, None);
-        ctx.send(Address::Path(ActorPath::new("b")), &Ping, None);
-        ctx.send(Address::Path(ActorPath::new("c")), &Pong, None);
+        ctx.send(Address::Path(ActorPath::new("b")), Ping, None);
+        ctx.send(Address::Path(ActorPath::new("c")), Pong, None);
 
         // When draining.
         let count = outbox.drain().count();
@@ -857,7 +890,7 @@ mod tests {
         let mut ctx = MsgCtx::new(&path, &trace, None, &view, &mut outbox, None);
 
         // When it sends.
-        ctx.send(Address::Path(ActorPath::new("b")), &Ping, None);
+        ctx.send(Address::Path(ActorPath::new("b")), Ping, None);
 
         // Then the effect is deferred identically.
         assert_eq!(outbox.len(), 1);
@@ -1004,7 +1037,7 @@ mod tests {
             let mut typed = MsgCtx::new(&path, &trace, None, &view, &mut typed_outbox, None);
             typed.send(
                 Address::Path(ActorPath::new("inventory")),
-                &ReserveStock { qty: 2 },
+                ReserveStock { qty: 2 },
                 None,
             );
         }

@@ -44,7 +44,7 @@ struct Tick {
     n: i64,
 }
 
-#[derive(trouper::Event, serde::Serialize, serde::Deserialize)]
+#[derive(trouper::Event, serde::Serialize, serde::Deserialize, Clone)]
 struct Ticked {
     n: i64,
 }

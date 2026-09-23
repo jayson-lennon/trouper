@@ -151,7 +151,7 @@ mod trouper_leg {
             // through this one handler execution.
             let sink = msg.sink;
             for _ in 0..self.target {
-                ctx.send(Address::Path(sink.clone()), &Tick, None);
+                ctx.send(Address::Path(sink.clone()), Tick, None);
             }
         }
     }

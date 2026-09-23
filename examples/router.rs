@@ -69,7 +69,7 @@ impl ServiceActor for ParseRouter {
 impl MsgHandler<DocumentSaved> for ParseRouter {
     async fn handle(&mut self, msg: DocumentSaved, ctx: &mut MsgCtx<'_>) {
         log(format!("[router] translating {} into parse work", msg.uri));
-        ctx.send_to_any(&ParseDocument { uri: msg.uri });
+        ctx.send_to_any(ParseDocument { uri: msg.uri });
     }
 }
 

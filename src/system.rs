@@ -3342,7 +3342,7 @@ mod tests {
         }
         impl MsgHandler<Add> for Forwarder {
             async fn handle(&mut self, _cmd: Add, ctx: &mut crate::context::MsgCtx<'_>) {
-                ctx.send(Address::Path(ActorPath::new("echo")), &Ping { n: 0 }, None);
+                ctx.send(Address::Path(ActorPath::new("echo")), Ping { n: 0 }, None);
             }
         }
 
@@ -5137,7 +5137,7 @@ mod tests {
                     .unwrap_or_else(|| crate::envelope::Address::Path(ctx.self_path().clone()));
                 ctx.send(
                     dest,
-                    &Added { n: cmd.n },
+                    Added { n: cmd.n },
                     Some(crate::envelope::Address::Path(ctx.self_path().clone())),
                 );
             }
@@ -8434,7 +8434,7 @@ mod tests {
             async fn handle(&mut self, msg: Add, ctx: &mut crate::context::MsgCtx<'_>) {
                 self.sink.lock().push(format!("seen={}", msg.n));
                 let dest = Address::Path(ActorPath::new(self.forward_to.as_str()));
-                ctx.send(dest, &msg, None);
+                ctx.send(dest, msg.clone(), None);
             }
         }
         #[derive(Default)]
@@ -9232,7 +9232,7 @@ mod tests {
             async fn handle(&mut self, cmd: Add, ctx: &mut crate::context::MsgCtx<'_>) {
                 ctx.send(
                     Address::Path(ActorPath::new(self.target.as_str())),
-                    &Add { n: cmd.n },
+                    Add { n: cmd.n },
                     None,
                 );
                 ctx.stop_self();
@@ -10208,7 +10208,7 @@ mod tests {
                 if msg.n < 3 {
                     ctx.send(
                         Address::Path(self.peer.clone()),
-                        &Add { n: msg.n + 1 },
+                        Add { n: msg.n + 1 },
                         None,
                     );
                 }

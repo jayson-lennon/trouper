@@ -61,7 +61,7 @@ impl MsgHandler<Checkout> for PoolService {
         // The durable hop: tell the LOGGER ENTITY its command; the entity
         // records the PoolEvent fact (append-before-ack) — that journal
         // entry IS the durable history.
-        ctx.send(Address::Path(ActorPath::new("pool.log")), &Checkout, None);
+        ctx.send(Address::Path(ActorPath::new("pool.log")), Checkout, None);
     }
 }
 
@@ -70,7 +70,7 @@ impl MsgHandler<Checkin> for PoolService {
         let returned = RETURNED.fetch_add(1, Ordering::SeqCst) + 1;
         let _taken = TAKEN.load(Ordering::SeqCst);
         println!("[pool] checkin #{returned}");
-        ctx.send(Address::Path(ActorPath::new("pool.log")), &Checkin, None);
+        ctx.send(Address::Path(ActorPath::new("pool.log")), Checkin, None);
     }
 }
 

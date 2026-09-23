@@ -296,7 +296,7 @@ impl MsgHandler<TransferCmd> for TransferService {
         };
         ctx.send(
             Address::Path(ActorPath::new(set)),
-            &TransferDebit {
+            TransferDebit {
                 account: cmd.from.clone(),
                 transfer_id: cmd.transfer_id.clone(),
                 delta: -cmd.amount,
@@ -325,7 +325,7 @@ impl MsgHandler<TransferCompleted> for TransferService {
                 );
                 ctx.send(
                     Address::Path(ActorPath::new("accts")),
-                    &TransferDebit {
+                    TransferDebit {
                         account: credit,
                         transfer_id,
                         delta: pending.amount,
