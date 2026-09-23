@@ -858,6 +858,10 @@ fn next_uuid_shaped_id() -> Uuid {
     let counter = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed) & 0x3FFF_FFFF_FFFF_FFFF;
     let high = (millis << 16) | 0x7000 | ((counter >> 50) & 0xFFF);
     let low = 0x8000_0000_0000_0000 | (counter & 0x3FFF_FFFF_FFFF_FFFF);
+    #[cfg(test)]
+    // TEST PROBE: every id minted here is one `Uuid::now_v7` NOT paid —
+    // no getrandom, no float pow (the tell-path deliverable).
+    crate::kernel::bump_getrandom_skipped();
     Uuid::from_u64_pair(high, low)
 }
 
