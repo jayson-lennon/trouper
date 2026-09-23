@@ -210,7 +210,7 @@ async fn main() {
     //    re-activated at step 3 (inside her idle window); a passivated
     //    entity receives nothing (publish never activates, never
     //    phantom-delivers).
-    system.publish(&MarketBell { ring: 5 }).await;
+    system.publish(MarketBell { ring: 5 }).await;
     tokio::time::sleep(Duration::from_millis(30)).await;
     let alice3 = system
         .es_state(&ActorPath::new("accts/alice"))

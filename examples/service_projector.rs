@@ -63,7 +63,7 @@ impl MsgHandler<Checkout> for PoolService {
         let taken = TAKEN.fetch_add(1, Ordering::SeqCst) + 1;
         let returned = RETURNED.load(Ordering::SeqCst);
         println!("[pool] checkout #{taken}");
-        ctx.publish(&PoolDrained { taken, returned });
+        ctx.publish(PoolDrained { taken, returned });
     }
 }
 
@@ -72,7 +72,7 @@ impl MsgHandler<Checkin> for PoolService {
         let returned = RETURNED.fetch_add(1, Ordering::SeqCst) + 1;
         let taken = TAKEN.load(Ordering::SeqCst);
         println!("[pool] checkin #{returned}");
-        ctx.publish(&PoolDrained { taken, returned });
+        ctx.publish(PoolDrained { taken, returned });
     }
 }
 

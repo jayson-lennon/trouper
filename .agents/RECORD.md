@@ -37,6 +37,7 @@ Entries are added or amended **only with human approval**.
 - (runtime) The registry is kernel code, not an actor: path→endpoint slots, schema, schema→handler route, partition, projector-set, and router rule tables persist across actor restarts; actor identity is its registered path.
 - (runtime) Message schemas are runtime data: derived Rust types, hand-written impls, and external JSON descriptors register into the same schema table.
 - (payloads) Envelope payloads are live typed values behind Arc<dyn PayloadValue>; handlers downcast and no JSON tree exists anywhere on the message path.
+- (payloads) Service handlers borrow the live value (&M, zero copies) and replies/asks carry the payload end to end; serde exists only at the doors — the journal, erased ingress, and the public ask's lazy Json edge.
 - (payloads) Every declared message type generates field-by-name reads and a lazy memoized JSON-text encoding from its derive.
 - (payloads) Bytes exist only at two doors — erased ingress and the journal — wrapped in the PayloadBytes newtype.
 - (schemas) Message identity is the schema name alone; schemas carry no version marker.
@@ -61,7 +62,7 @@ Entries are added or amended **only with human approval**.
 - (runtime) All synchronous mutexes are parking_lot: lock() cannot fail, there is no poisoning, and a panic under a lock never wedges later lockers.
 - (runtime) Replies are point-to-point: a reply with no reply_to is dropped silently, never broadcast; every outbound actor message requires a declared .emits and is dropped with an UndeclaredEmit dead letter otherwise.
 - (runtime) Handler contexts (CmdCtx/MsgCtx) expose only tier-curated methods; the outbox, trace, and ask port are crate-private plumbing.
-- (runtime) Handler effects are typed: ctx reply/publish/send take Message values (Schema + serde), derive the schema id from the type, and serialize at intent time; raw value escape hatches remain (\*\_json methods, Event::new, into_inner).
+- (runtime) Handler effects are typed: ctx reply/publish/send take Message values by value (Schema + PayloadValue), derive the schema id from the type, and wrap the live value into the fabric at intent time (zero serde); raw value escape hatches remain (\*\_json methods, Event::new, into_inner).
 - (values) The runtime's public value type is trouper::Json, a newtype over the internal JSON tree; serde_json types do not appear in public signatures.
 - (runtime) Command handlers return an Events buffer (inline for two events, heap beyond) and construct events from typed values via IntoEvent.
 - (runtime) Event folds extract payloads by schema name via Event::as_fact::<T>() (downcast; a replayed event decodes from its bytes); unmatched schemas are ignored.
@@ -93,6 +94,7 @@ Entries are added or amended **only with human approval**.
 - (projections) A projector is an event-sourced actor whose consumed facts are re-recorded into its own journal; the journaled origins are its checkpoint and catch-up seeds whatever the journal lacks.
 - (projections) The journal store assigns every recorded fact a globally monotonic ingest_seq at append time; projectors fold in ingest_seq order and scans return origin-recorded entries only.
 - (routing) A projector set declares consumption with a shard key: broadcast copies of a consumed schema resolve a key per copy and activate the owning projector on demand, like a told command.
+- (routing) Shard-key extraction reads the live payload's derive-generated field() (zero serde); wire bytes decode one field at the door as the fallback.
 - (journal) The store is told passivated(path) when an idle entity leaves memory; a failing hint is logged and never blocks passivation.
 - (queries) projector_state wakes a projector-set entity if needed, awaits catch-up, and returns the complete fold; es_state is a best-effort capture of in-memory state only.
 - (queries) with_es_state/with_projector_state read entity and projector state typed under the state lock with no serialization; try_ variants are sync and non-blocking.

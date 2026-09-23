@@ -87,7 +87,7 @@ impl ServiceActor for Worker {
 impl MsgHandler<WorkJob> for Worker {
     async fn handle(&mut self, msg: &WorkJob, ctx: &mut MsgCtx<'_>) {
         log(format!("[{}] finished job {}", self.id, msg.id));
-        ctx.publish(&JobDone { id: msg.id });
+        ctx.publish(JobDone { id: msg.id });
     }
 }
 
@@ -163,7 +163,7 @@ async fn main() {
     // Work flows via send_to_any: the route table rotates one copy per
     // send across the workers that declared WorkJob.
     for id in 0..6_u32 {
-        let _ = system.send_to_any(&WorkJob { id }).await;
+        let _ = system.send_to_any(WorkJob { id }).await;
     }
     tokio::time::sleep(std::time::Duration::from_millis(150)).await;
 

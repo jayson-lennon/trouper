@@ -1342,21 +1342,17 @@ impl ActorSystemCore {
         route(&self.registry, &self.kernel, &self.shutting_down, envelope).await
     }
 
-    /// Typed fire-and-forget: serializes `value` under `C`'s schema and
-    /// routes it as a system-root send. Sugar over
-    /// [ActorSystem::send](crate::system::ActorSystemCore::send) +
-    /// [ActorSystem::envelope](crate::system::ActorSystemCore::envelope) with
-    /// the payload built by serde.
+    /// Typed fire-and-forget: wraps `value` as the fabric's LIVE value
+    /// under `C`'s schema (zero serde — serialization happens only at
+    /// the doors: the journal, or a reader that materializes the JSON
+    /// view) and routes it as a system-root send. Sugar over
+    /// [ActorSystem::send](crate::system::ActorSystemCore::send) with
+    /// the envelope built from the live value.
     ///
     /// # Errors
     ///
     /// Returns the original envelope back when `dest` does not resolve
     /// (callers dead-letter or retry).
-    ///
-    /// # Panics
-    ///
-    /// Panics when `C` cannot serialize — a programmer error (serde only
-    /// fails on pathological map keys), not a domain outcome.
     pub async fn tell<C>(&self, dest: ActorPath, value: C) -> Result<ActorPath, Envelope>
     where
         C: Schema + serde::Serialize + Send + Sync + crate::envelope::PayloadValue + 'static,
@@ -1365,49 +1361,41 @@ impl ActorSystemCore {
         self.send(envelope).await
     }
 
-    /// Typed one-of send: serializes `value` under `M`'s schema and
-    /// delivers exactly one copy to one of the actors that declared
-    /// `.handles::<M>()` — round-robin through the route table (each call
-    /// advances the shared rotation; see [`Registry::route`]). Zero
-    /// handlers ⇒ the envelope returns as the error (same contract as an
-    /// unrouted tell). The receiver cannot distinguish this from a
-    /// direct [ActorSystem::tell](crate::system::ActorSystemCore::tell).
+    /// Typed one-of send: wraps `value` as the fabric's LIVE value under
+    /// `M`'s schema (zero serde) and delivers exactly one copy to one of
+    /// the actors that declared `.handles::<M>()` — round-robin through
+    /// the route table (each call advances the shared rotation; see
+    /// [`Registry::route`]). Zero handlers ⇒ the envelope returns as the
+    /// error (same contract as an unrouted tell). The receiver cannot
+    /// distinguish this from a direct
+    /// [ActorSystem::tell](crate::system::ActorSystemCore::tell).
     ///
     /// # Errors
     ///
     /// Returns the original envelope back when no handler for `M` is
     /// registered.
-    ///
-    /// # Panics
-    ///
-    /// Panics when `M` cannot serialize — a programmer error (serde only
-    /// fails on pathological map keys), not a domain outcome.
-    pub async fn send_to_any<M>(&self, value: &M) -> Result<ActorPath, Envelope>
+    pub async fn send_to_any<M>(&self, value: M) -> Result<ActorPath, Envelope>
     where
-        M: Schema
-            + serde::Serialize
-            + Clone
-            + Send
-            + Sync
-            + crate::envelope::PayloadValue
-            + 'static,
+        M: Schema + crate::envelope::PayloadValue,
     {
         let schema = M::schema_id();
         let envelope = Envelope::json(
             schema.clone(),
             Address::Schema(schema.clone()),
-            value.clone(),
+            value,
             TraceCtx::root(),
         );
         self.send(envelope).await
     }
 
-    /// Typed ask from outside the system: serializes `value` under `C`'s
-    /// schema, opens a reply lease, and awaits the reply under the
-    /// mandatory `timeout`. The lease settles with the same
-    /// Replied/Timeout/Failed facts an in-actor ask produces (see
-    /// `crate::kernel::KernelAskPort`); a timed-out ask's late reply
-    /// lands nowhere.
+    /// Typed ask from outside the system: wraps `value` as the fabric's
+    /// LIVE value under `C`'s schema (zero serde), opens a reply lease,
+    /// and awaits the reply under the mandatory `timeout`. The lease
+    /// settles with the same Replied/Timeout/Failed facts an in-actor
+    /// ask produces (see `crate::kernel::KernelAskPort`); a timed-out
+    /// ask's late reply lands nowhere. The reply materializes its JSON
+    /// view lazily (memoized) — the Json return is the host-facing
+    /// contract edge.
     ///
     /// Trace root is the entry point, matching
     /// [ActorSystem::send](crate::system::ActorSystemCore::send).
@@ -1418,11 +1406,6 @@ impl ActorSystemCore {
     /// is registered at `dest` via
     /// [`crate::builder::SpawnBuilder::handles`], when the ask times
     /// out, or when the lease dies before the reply.
-    ///
-    /// # Panics
-    ///
-    /// Panics when `C` cannot serialize — a programmer error (serde only
-    /// fails on pathological map keys), not a domain outcome.
     pub async fn ask<C>(
         &self,
         dest: ActorPath,
@@ -1449,35 +1432,22 @@ impl ActorSystemCore {
         .await
     }
 
-    /// Typed event broadcast from outside the system: serializes `value`
-    /// under `M`'s schema and fans it out to EVERY actor that declared
-    /// `.handles::<M>()` — one copy each. Zero handlers ⇒ silent no-op:
+    /// Typed event broadcast from outside the system: wraps `value` as
+    /// the fabric's LIVE value under `M`'s schema (zero serde) and fans
+    /// it out to EVERY actor that declared `.handles::<M>()` — one copy
+    /// each (the fan-out shares one payload: a refcount bump per
+    /// subscriber, never a value copy). Zero handlers ⇒ silent no-op:
     /// events are news, not work orders. Trace root is the entry point,
     /// matching [ActorSystem::send](crate::system::ActorSystemCore::send).
-    ///
-    /// Serialization is eager; the returned future borrows only `self`,
-    /// so callers' spawned futures stay `Send` without an `M: Sync`
-    /// bound.
-    ///
-    /// # Panics
-    ///
-    /// Panics when `M` cannot serialize — a programmer error (serde only
-    /// fails on pathological map keys), not a domain outcome.
-    pub fn publish<M>(&self, value: &M) -> impl std::future::Future<Output = ()> + Send + '_
+    pub fn publish<M>(&self, value: M) -> impl std::future::Future<Output = ()> + Send + '_
     where
-        M: Schema
-            + serde::Serialize
-            + Clone
-            + Send
-            + Sync
-            + crate::envelope::PayloadValue
-            + 'static,
+        M: Schema + crate::envelope::PayloadValue,
     {
         let schema = M::schema_id();
         let envelope = Envelope::json(
             schema.clone(),
             Address::Schema(schema.clone()),
-            value.clone(),
+            value,
             TraceCtx::root(),
         );
         async move {
@@ -4592,7 +4562,7 @@ mod tests {
                 if cmd.n == 1 {
                     // Record a send then stop: the send must flush before
                     // the step concludes.
-                    ctx.publish(&Note { n: 0 });
+                    ctx.publish(Note { n: 0 });
                     ctx.stop_self();
                 }
             }
@@ -5522,7 +5492,7 @@ mod tests {
         // Announce Shipped from outside the system: the fixture is
         // subscribed to it, so the publish traffic is real.
         system
-            .publish(&Shipped {
+            .publish(Shipped {
                 order: "o-x".into(),
             })
             .await;
@@ -9807,7 +9777,7 @@ mod tests {
         // Then the re-spawned entity still receives broadcasts: its
         // handle was re-declared by the factory's builder.
         system
-            .publish(&Shipped {
+            .publish(Shipped {
                 order: "o-post".into(),
             })
             .await;
@@ -10411,7 +10381,7 @@ mod tests {
                 .push(format!("{}:pack:{}", self.tag, msg.order));
             // Announce the outcome as an event: every Shipped subscriber
             // gets a copy (the outbox-intent broadcast path).
-            ctx.publish(&Shipped { order: msg.order.clone() });
+            ctx.publish(Shipped { order: msg.order.clone() });
         }
     }
 
@@ -10498,7 +10468,7 @@ mod tests {
 
         // When one event is published from outside the system.
         system
-            .publish(&Shipped {
+            .publish(Shipped {
                 order: "o-1".into(),
             })
             .await;
@@ -10591,7 +10561,7 @@ mod tests {
 
         // When an event is published (and given time to "deliver").
         system
-            .publish(&Shipped {
+            .publish(Shipped {
                 order: "o-3".into(),
             })
             .await;
@@ -10612,7 +10582,7 @@ mod tests {
 
         // When exactly one event is published.
         system
-            .publish(&Shipped {
+            .publish(Shipped {
                 order: "o-fan".into(),
             })
             .await;
@@ -10642,7 +10612,7 @@ mod tests {
         // When four one-of sends flow through send_to_any.
         for i in 0..4 {
             system
-                .send_to_any(&Pack {
+                .send_to_any(Pack {
                     order: format!("o-{i}"),
                 })
                 .await
@@ -11036,7 +11006,7 @@ mod tests {
         // When MANY events are published at it (copies, not routed sends).
         for i in 0..8 {
             system
-                .publish(&Shipped {
+                .publish(Shipped {
                     order: format!("o-{i}"),
                 })
                 .await;
@@ -11256,7 +11226,7 @@ mod tests {
 
         // When an Add arrives as a PUBLISHED copy (broadcast transport,
         // not a routed send).
-        system.publish(&Add { n: 41 }).await;
+        system.publish(Add { n: 41 }).await;
 
         // Then the copy dispatched through the ES path: the decision ran,
         // the event appended pre-ack, and replay rebuilds the same state.
@@ -11574,24 +11544,24 @@ mod tests {
         // When publishes and one-of sends interleave: publish fan-outs
         // hit every handler; send_to_any rotates over the SAME cursor.
         system
-            .send_to_any(&Pack {
+            .send_to_any(Pack {
                 order: "s-0".into(),
             })
             .await
             .expect("routed");
         system
-            .publish(&Shipped {
+            .publish(Shipped {
                 order: "pub-0".into(),
             })
             .await;
         system
-            .send_to_any(&Pack {
+            .send_to_any(Pack {
                 order: "s-1".into(),
             })
             .await
             .expect("routed");
         system
-            .publish(&Shipped {
+            .publish(Shipped {
                 order: "pub-1".into(),
             })
             .await;
@@ -11691,7 +11661,7 @@ mod tests {
 
         // When one event is published.
         system
-            .publish(&Shipped {
+            .publish(Shipped {
                 order: "o-6".into(),
             })
             .await;
@@ -11712,7 +11682,7 @@ mod tests {
 
         // When an event is published after the stop.
         system
-            .publish(&Shipped {
+            .publish(Shipped {
                 order: "o-7".into(),
             })
             .await;
@@ -11731,7 +11701,7 @@ mod tests {
 
         // When an event is published, THEN a second actor subscribes.
         system
-            .publish(&Shipped {
+            .publish(Shipped {
                 order: "o-8".into(),
             })
             .await;
@@ -11743,7 +11713,7 @@ mod tests {
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         assert!(late.lock().is_empty());
         system
-            .publish(&Shipped {
+            .publish(Shipped {
                 order: "o-9".into(),
             })
             .await;
@@ -11762,12 +11732,12 @@ mod tests {
 
         // When two events are published back to back.
         system
-            .publish(&Shipped {
+            .publish(Shipped {
                 order: "first".into(),
             })
             .await;
         system
-            .publish(&Shipped {
+            .publish(Shipped {
                 order: "second".into(),
             })
             .await;
@@ -11856,7 +11826,7 @@ mod tests {
 
         // When one event is published and both deliveries settle.
         system
-            .publish(&Shipped {
+            .publish(Shipped {
                 order: "o-order".into(),
             })
             .await;
@@ -11897,7 +11867,7 @@ mod tests {
         // stays busy for ~120ms while they arrive).
         for order in ["m-1", "m-2", "m-3", "m-4"] {
             system
-                .publish(&Shipped {
+                .publish(Shipped {
                     order: order.into(),
                 })
                 .await;
@@ -11950,7 +11920,7 @@ mod tests {
         });
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         system
-            .publish(&Shipped {
+            .publish(Shipped {
                 order: "o-swept".into(),
             })
             .await;
@@ -12066,7 +12036,7 @@ mod tests {
 
         // When an event is published mid-restart.
         system
-            .publish(&Shipped {
+            .publish(Shipped {
                 order: "o-restart".into(),
             })
             .await;

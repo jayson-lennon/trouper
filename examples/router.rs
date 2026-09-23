@@ -100,7 +100,7 @@ impl ServiceActor for Parser {
 impl MsgHandler<ParseDocument> for Parser {
     async fn handle(&mut self, msg: &ParseDocument, ctx: &mut MsgCtx<'_>) {
         log(format!("[{}] parsed {}", self.id, msg.uri));
-        ctx.publish(&DocumentParsed { uri: msg.uri.clone() });
+        ctx.publish(DocumentParsed { uri: msg.uri.clone() });
     }
 }
 
@@ -159,7 +159,7 @@ async fn main() {
     }
     impl MsgHandler<SaveCmd> for Saver {
         async fn handle(&mut self, msg: &SaveCmd, ctx: &mut MsgCtx<'_>) {
-            ctx.publish(&DocumentSaved {
+            ctx.publish(DocumentSaved {
                 uri: msg.uri.clone(),
             });
         }

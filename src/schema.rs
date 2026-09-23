@@ -276,7 +276,8 @@ pub use trouper_macros::{Command, Event};
 
 /// A type that round-trips the wire: a schema contract with serde on both
 /// ends. The bound for typed effect methods — the schema id comes from the
-/// type, the payload from serde.
+/// type; the payload rides the fabric as a live value (serde exists only
+/// at the doors: the journal and erased ingress).
 ///
 /// Blanket-implemented: any `Schema` type with both serde derives is a
 /// `Message`.

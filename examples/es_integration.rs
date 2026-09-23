@@ -198,7 +198,7 @@ struct TickBeat;
 impl MsgHandler<TickBeat> for Ticker {
     async fn handle(&mut self, _msg: &TickBeat, ctx: &mut MsgCtx<'_>) {
         self.count += 1;
-        ctx.publish(&Tick { n: self.count });
+        ctx.publish(Tick { n: self.count });
     }
 }
 
@@ -345,7 +345,7 @@ impl MsgHandler<TransferCompleted> for TransferService {
                     pending.amount,
                     pending.credit_account
                 );
-                ctx.publish(&fact.clone());
+                ctx.publish(fact.clone());
             }
         }
     }

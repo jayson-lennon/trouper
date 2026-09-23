@@ -147,7 +147,7 @@ impl<S: FileStore + Default> MsgHandler<SaveFile> for FileSaver<S> {
                 };
                 ctx.reply(fact.clone());
                 // The fact channel: observers (and tellers' audits) see it.
-                ctx.publish(&fact);
+                ctx.publish(fact);
             }
         }
     }

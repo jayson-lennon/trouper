@@ -635,13 +635,13 @@ impl<'a> MsgCtx<'a> {
 
     /// Records an event broadcast to every `.handles` declarant of the
     /// schema; delivered after the current message is acknowledged. Typed:
-    /// the schema id comes from the message type. Zero subscribers is a
-    /// silent no-op: events are news, not work orders.
-    pub fn publish<M: Message + crate::envelope::PayloadValue + Clone>(&mut self, msg: &M) {
-        // The live value rides the fabric (zero serde); only the journal
-        // door serializes it later. `M: Clone` comes from `Message`'s
-        // supertrait bounds via the adapter contract.
-        let payload = crate::envelope::Payload::value(msg.clone());
+    /// the schema id comes from the message type. The event moves into
+    /// the fabric as a live value (zero serde) — the fan-out shares one
+    /// payload across subscribers (refcount bumps, never value copies).
+    /// Zero subscribers is a silent no-op: events are news, not work
+    /// orders.
+    pub fn publish<M: Message + crate::envelope::PayloadValue>(&mut self, msg: M) {
+        let payload = crate::envelope::Payload::value(msg);
         self.publish_payload(M::schema_id(), payload);
     }
 
@@ -842,7 +842,7 @@ mod tests {
         let mut ctx = MsgCtx::new(&path, &trace, None, &view, &mut outbox, None);
 
         // When publishing an event.
-        ctx.publish(&StockReserved { qty: 2 });
+        ctx.publish(StockReserved { qty: 2 });
 
         // Then a broadcast intent is pending, addressed to the schema.
         let drained: Vec<_> = outbox.drain().collect();
@@ -1018,7 +1018,7 @@ mod tests {
         let mut raw_outbox = Outbox::new();
         {
             let mut typed = MsgCtx::new(&path, &trace, None, &view, &mut typed_outbox, None);
-            typed.publish(&StockReserved { qty: 2 });
+            typed.publish(StockReserved { qty: 2 });
         }
         {
             let mut raw = MsgCtx::new(&path, &trace, None, &view, &mut raw_outbox, None);

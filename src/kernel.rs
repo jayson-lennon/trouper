@@ -990,10 +990,12 @@ fn extract_key(
     // LIVE VALUE FIRST: the derive's field() read (the shard-key field is
     // declared, so every live value answers it). A JSON-view payload
     // answers through the view directly — also no new materialization.
-    if let Some(key) = envelope.payload.field(key_field) {
-        if !key.is_empty() {
-            return Some(key);
-        }
+    if envelope
+        .payload
+        .field(key_field)
+        .is_some_and(|key| !key.is_empty())
+    {
+        return envelope.payload.field(key_field);
     }
     // FALLBACK (the door): bytes/replay payloads decode for the read —
     // and live values whose key is genuinely absent fall through too,
@@ -2486,7 +2488,7 @@ fn dead_letter_schema(ctx: &EsLoop, intent: &crate::context::Intent, schema: &Sc
         } => Envelope::raw(
             schema.clone(),
             to.clone(),
-            crate::envelope::Payload::shared(&payload),
+            crate::envelope::Payload::shared(payload),
             *trace,
         ),
         crate::context::Intent::StopSelf => return,

@@ -46,31 +46,32 @@ part of its send path.
 
 | Leg               | n    | Criterion time | Per message | Rate          |
 | ----------------- | ---- | -------------: | ----------: | ------------: |
-| trouper           | 64   |       318.5 µs |    4.98 µs  |   200,923 msg/s |
-|                   | 512  |         3.97 ms |    7.75 µs |   129,063 msg/s |
-|                   | 2048 |         4.92 ms |    2.40 µs |   416,096 msg/s |
-| trouper-unbounded | 64   |       332.8 µs |    5.20 µs  |   192,308 msg/s |
-|                   | 512  |       970.3 µs |    1.90 µs  |   527,699 msg/s |
-|                   | 2048 |         3.45 ms |    1.69 µs |   593,014 msg/s |
-| kameo             | 64   |       276.9 µs |    4.33 µs  |   231,106 msg/s |
-|                   | 512  |       432.2 µs |    0.84 µs  | 1,184,539 msg/s |
-|                   | 2048 |         1.27 ms |    0.62 µs | 1,618,594 msg/s |
-| kameo-unbounded   | 64   |       267.9 µs |    4.19 µs  |   238,886 msg/s |
-|                   | 512  |       749.5 µs |    1.46 µs  |   683,138 msg/s |
-|                   | 2048 |       786.4 µs |    0.38 µs  | 2,604,278 msg/s |
-| ractor            | 64   |       263.5 µs |    4.12 µs  |   242,872 msg/s |
-|                   | 512  |       580.3 µs |    1.13 µs  |   882,339 msg/s |
-|                   | 2048 |       785.3 µs |    0.38 µs  | 2,607,808 msg/s |
+| trouper           | 64   |       316.6 µs |    4.90 µs |   202,163 msg/s |
+|                   | 512  |        3.79 ms |    7.40 µs |   135,088 msg/s |
+|                   | 2048 |        4.89 ms |    2.40 µs |   419,187 msg/s |
+| trouper-unbounded | 64   |       338.5 µs |    5.30 µs |   189,069 msg/s |
+|                   | 512  |       949.4 µs |    1.90 µs |   539,277 msg/s |
+|                   | 2048 |        3.46 ms |    1.70 µs |   591,461 msg/s |
+| kameo             | 64   |       267.0 µs |    4.20 µs |   239,696 msg/s |
+|                   | 512  |       435.1 µs |     850 ns | 1,176,618 msg/s |
+|                   | 2048 |       913.2 µs |     446 ns | 2,242,673 msg/s |
+| kameo-unbounded   | 64   |       282.4 µs |    4.40 µs |   226,661 msg/s |
+|                   | 512  |       395.0 µs |     772 ns | 1,296,045 msg/s |
+|                   | 2048 |       791.4 µs |     386 ns | 2,587,901 msg/s |
+| ractor            | 64   |       263.8 µs |    4.10 µs |   242,566 msg/s |
+|                   | 512  |       376.4 µs |     735 ns | 1,360,147 msg/s |
+|                   | 2048 |       677.4 µs |     331 ns | 3,023,506 msg/s |
 
 Shape read: at small batches every framework is parked near the same
-wake-up floor (~260-330 µs covers the producer's resume, the whole
+wake-up floor (~260-340 µs covers the producer's resume, the whole
 in-flight batch, and the done signal). As the batch grows, per-message
 cost separates: the unbounded kameo/ractor mailboxes climb toward
-~2.6M msg/s while trouper's journaled-style path — every tell is
-schema-routed, outbox-recorded, and flush-gated — holds ~420-590K msg/s
-at 2048. That is the architectural trade trouper makes for its
-registry/journal guarantees, priced honestly against the plain tell
-machines.
+~2.6-3.0M msg/s while trouper's journaled-style path — every tell is
+schema-routed, outbox-recorded, and flush-gated, with the payload as a
+live value end to end (zero serde on the message path; serde exists
+only at the journal door) — holds ~420-590K msg/s at 2048. That is the
+architectural trade trouper makes for its registry/journal guarantees,
+priced honestly against the plain tell machines.
 
 ### micro
 
@@ -79,12 +80,12 @@ Component costs without a running system: in-memory journal append
 
 | Bench                            | Case            |      Mean |
 | -------------------------------- | --------------- | -------: |
-| in_memory_journal_append         | batch_1         | 71.79 ns |
-|                                  | batch_8         | 32.55 ns |
-|                                  | batch_64        | 27.79 ns |
-| in_memory_journal_replay_restart | journal_1000    | 54.080 µs |
-|                                  | journal_10000   | 566.30 µs |
-|                                  | repeat_load_10k | 765.40 µs |
+| in_memory_journal_append         | batch_1         | 72.02 ns |
+|                                  | batch_8         | 32.04 ns |
+|                                  | batch_64        | 27.58 ns |
+| in_memory_journal_replay_restart | journal_1000    | 53.62 µs |
+|                                  | journal_10000   | 561.07 µs |
+|                                  | repeat_load_10k | 743.88 µs |
 
 ### journal
 

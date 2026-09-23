@@ -63,7 +63,7 @@ impl MsgHandler<Ship> for Fulfillment {
     async fn handle(&mut self, msg: &Ship, ctx: &mut MsgCtx<'_>) {
         log(format!("[fulfillment] shipped {}", msg.order));
         // The announcement: every handler of the EVENT gets a copy.
-        ctx.publish(&Shipped { order: msg.order.clone() });
+        ctx.publish(Shipped { order: msg.order.clone() });
     }
 }
 
@@ -155,7 +155,7 @@ async fn main() {
     // 3. A direct announcement from outside the system (no actor in
     //    the middle): billing AND the auditor each get one copy.
     system
-        .publish(&Shipped {
+        .publish(Shipped {
             order: "ord-3".into(),
         })
         .await;
