@@ -839,6 +839,7 @@ mod tests {
             crate::inbox::Inbox::new(capacity, crate::inbox::OverloadPolicy::DropNew),
             capacity,
             crate::inbox::OverloadPolicy::DropNew,
+            1,
         ));
         (rx, Endpoint::new(tx, cell))
     }

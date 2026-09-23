@@ -68,6 +68,11 @@ pub struct SpawnOpts {
     pub high_watermark: Option<u64>,
     /// Idle passivation config; `None` = the actor lives until stopped.
     pub passivation: Option<Passivation>,
+    /// How many queued messages one wake's step may drain and commit as a
+    /// batch (default 64). A trickle load drains exactly what is queued —
+    /// batch 1 is byte-identical to the per-message step; a loaded run
+    /// amortizes the wake/lock/commit across up to N messages.
+    pub batch: usize,
 }
 
 impl Default for SpawnOpts {
@@ -78,6 +83,7 @@ impl Default for SpawnOpts {
             mailbox_policy: OverloadPolicy::Block,
             high_watermark: None,
             passivation: None,
+            batch: 64,
         }
     }
 }
@@ -917,6 +923,7 @@ impl ActorSystemCore {
             },
             high_watermark: opts.high_watermark,
             passivation: opts.passivation,
+            batch: opts.batch.max(1),
         }
     }
 
@@ -1026,6 +1033,7 @@ impl ActorSystemCore {
             Inbox::new(opts.mailbox_capacity.max(1), opts.mailbox_policy),
             opts.mailbox_capacity.max(1),
             opts.mailbox_policy,
+            opts.batch,
         ));
         let mut registry = self.registry.lock();
         registry
@@ -1206,6 +1214,7 @@ impl ActorSystemCore {
             Inbox::new(opts.mailbox_capacity.max(1), opts.mailbox_policy),
             opts.mailbox_capacity.max(1),
             opts.mailbox_policy,
+            opts.batch,
         ));
         {
             let mut registry = self.registry.lock();
@@ -2828,6 +2837,7 @@ mod tests {
                 mailbox_policy: OverloadPolicy::Block,
                 high_watermark: None,
                 passivation: None,
+                ..SpawnOpts::default()
             },
             || vec![Arc::new(TypedEsAdapter::<Counter, Add>::new::<Add>())],
         );
@@ -2889,6 +2899,7 @@ mod tests {
                 mailbox_policy: OverloadPolicy::Block,
                 high_watermark: None,
                 passivation: None,
+                ..SpawnOpts::default()
             },
             || {
                 vec![
@@ -3116,6 +3127,7 @@ mod tests {
                 mailbox_policy: OverloadPolicy::DropNew,
                 high_watermark: None,
                 passivation: None,
+                ..SpawnOpts::default()
             },
             || vec![Arc::new(TypedEsAdapter::<Counter, Add>::new::<Add>())],
         );
@@ -4313,6 +4325,402 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn batched_service_step_batch_of_one_matches_the_legacy_step() {
+        // Given a service actor spawned with an explicit batch of ONE and
+        // a sink for its side effects.
+        let (system, _clock) = ActorSystem::test();
+        let path = ActorPath::new("batch-one");
+        let (idx, sink) = open_sink();
+        bind_sink(&path, sink.clone());
+        let opts = SpawnOpts {
+            batch: 1,
+            ..SpawnOpts::default()
+        };
+        system.spawn_service::<Auditor, _>(
+            path.clone(),
+            &json!({ "sink": idx }),
+            opts,
+            || vec![Arc::new(TypedServiceAdapter::<Auditor, Add>::new::<Add>())],
+        );
+
+        // When three messages trickle in one at a time.
+        for n in 1..=3_i64 {
+            system
+                .send(system.envelope(Add::schema_id(), path.clone(), json!({ "n": n })))
+                .await
+                .expect("delivered");
+        }
+
+        // Then every message ran exactly once, in order — the batch-1
+        // step is behaviorally the legacy per-message step.
+        wait_for(|| async { sink.lock().as_slice() == ["n=1", "n=2", "n=3"] }).await;
+    }
+
+    #[tokio::test]
+    async fn batched_service_step_drains_a_full_queue_in_one_pass() {
+        // Given a service actor with the default batch (64) and a sink.
+        let (system, _clock) = ActorSystem::test();
+        let path = ActorPath::new("batch-drain");
+        let (idx, sink) = open_sink();
+        bind_sink(&path, sink.clone());
+        system.spawn_service::<Auditor, _>(
+            path.clone(),
+            &json!({ "sink": idx }),
+            SpawnOpts::default(),
+            || vec![Arc::new(TypedServiceAdapter::<Auditor, Add>::new::<Add>())],
+        );
+
+        // When a burst of TEN queues up faster than the loop wakes.
+        for n in 1..=10_i64 {
+            system
+                .send(system.envelope(Add::schema_id(), path.clone(), json!({ "n": n })))
+                .await
+                .expect("delivered");
+        }
+
+        // Then every message ran exactly once, in order.
+        wait_for(|| async {
+            sink.lock().as_slice()
+                == [
+                    "n=1", "n=2", "n=3", "n=4", "n=5", "n=6", "n=7", "n=8", "n=9",
+                    "n=10",
+                ]
+        })
+        .await;
+        assert_eq!(
+            system.inbox_cursor(&path).map(|c| c.as_u64()),
+            Some(10),
+            "the whole batch committed"
+        );
+    }
+
+    #[tokio::test]
+    async fn handler_panic_mid_batch_consumes_only_through_the_poison() {
+        // Given a supervised service actor that panics on its FIRST poison
+        // (healed after restart) and a sink for good work.
+        let (system, _clock) = ActorSystem::test();
+        let child = ActorPath::new("mid-batch-phoenix");
+        let (idx, sink) = open_sink();
+        bind_sink(&child, sink.clone());
+
+        static CRASHED_YET: std::sync::atomic::AtomicBool =
+            std::sync::atomic::AtomicBool::new(false);
+
+        struct MidBatchPhoenix {
+            sink: Arc<Mutex<Vec<String>>>,
+        }
+        impl ServiceActor for MidBatchPhoenix {
+            fn manifest() -> ActorManifest {
+                ActorManifest::new()
+                    .handles::<Mark>()
+                    .kind(ActorKind::Service)
+            }
+            async fn start(
+                args: &Json,
+            ) -> Result<Self, error_stack::Report<crate::registry::RegistryError>> {
+                let idx = args["sink"].as_i64().expect("sink idx") as usize;
+                Ok(Self {
+                    sink: sinks().lock()[idx].clone(),
+                })
+            }
+        }
+        impl MsgHandler<Mark> for MidBatchPhoenix {
+            async fn handle(
+                &mut self,
+                msg: Mark,
+                _ctx: &mut crate::context::MsgCtx<'_>,
+            ) {
+                if msg.tag == "poison"
+                    && !CRASHED_YET.swap(true, std::sync::atomic::Ordering::SeqCst)
+                {
+                    panic!("injected mid-batch panic");
+                }
+                self.sink.lock().push(msg.tag);
+            }
+        }
+
+        let spec = crate::supervision::ActorSpec {
+            path: child.clone(),
+            parent: None,
+            restart: crate::supervision::RestartPolicy::Permanent,
+            budget: crate::supervision::RestartBudget::per(5, std::time::Duration::from_secs(10)),
+            backoff: crate::supervision::Backoff {
+                base: std::time::Duration::from_millis(5),
+                max: std::time::Duration::from_millis(20),
+                factor: 2.0,
+            },
+            args: json!({ "sink": idx }),
+            spawn: Arc::new(move |sys: &ActorSystem, path: &ActorPath, args: &Json| {
+                sys.spawn_service::<MidBatchPhoenix, _>(
+                    path.clone(),
+                    args,
+                    SpawnOpts::default(),
+                    || {
+                        vec![Arc::new(TypedServiceAdapter::<
+                            MidBatchPhoenix,
+                            Mark,
+                        >::new::<Mark>())]
+                    },
+                );
+            }),
+        };
+        system.spawn(spec);
+        wait_for(|| async {
+            system.facts().iter().any(
+                |f| matches!(&f.kind, crate::observe::ObservationKind::Spawned { path: p, .. } if *p == child),
+            )
+        })
+        .await;
+
+        // When poison lands FIRST and two good messages queue behind it
+        // (the whole run fits one default-size batch).
+        system
+            .send(system.envelope(
+                Mark::schema_id(),
+                child.clone(),
+                json!({ "tag": "poison" }),
+            ))
+            .await
+            .expect("poison delivered");
+        system
+            .send(system.envelope(
+                Mark::schema_id(),
+                child.clone(),
+                json!({ "tag": "good1" }),
+            ))
+            .await
+            .expect("good1 delivered");
+        system
+            .send(system.envelope(
+                Mark::schema_id(),
+                child.clone(),
+                json!({ "tag": "good2" }),
+            ))
+            .await
+            .expect("good2 delivered");
+
+        // The poison panics the handler; supervision re-spawns the child
+        // (second Spawned fact).
+        wait_for(|| async {
+            system
+                .facts()
+                .iter()
+                .filter(|f| {
+                    matches!(&f.kind, crate::observe::ObservationKind::Spawned { path: p, .. } if *p == child)
+                })
+                .count()
+                >= 2
+        })
+        .await;
+
+        // Then the crash+restart left the FRESH cell empty: the poison was
+        // consumed at handoff (at-most-once — never redelivered), and the
+        // messages queued behind it died WITH the old cell (a supervised
+        // service restart is a fresh spawn on a fresh inbox — the standing
+        // contract, identical under the per-message step). Nothing landed
+        // in the DLQ and nothing re-ran.
+        assert!(
+            sink.lock().is_empty(),
+            "no queued message re-ran after the restart"
+        );
+        assert!(
+            system.drain_dead_letters().is_empty(),
+            "the dropped tail is the standing at-most-once contract, not a DLQ event"
+        );
+
+        // And the fresh instance handles NEW mail normally.
+        system
+            .send(system.envelope(
+                Mark::schema_id(),
+                child.clone(),
+                json!({ "tag": "after" }),
+            ))
+            .await
+            .expect("after delivered");
+        wait_for(|| async { sink.lock().as_slice() == ["after"] }).await;
+    }
+
+    #[tokio::test]
+    async fn unknown_schema_inside_a_batch_dead_letters_alone() {
+        // Given a service actor whose entry handles `Add` ONLY, and a sink
+        // for the good work (the Mark fixture is unhandled here).
+        let (system, _clock) = ActorSystem::test();
+        let path = ActorPath::new("batch-unknown");
+        let (idx, sink) = open_sink();
+        bind_sink(&path, sink.clone());
+        system.spawn_service::<Auditor, _>(
+            path.clone(),
+            &json!({ "sink": idx }),
+            SpawnOpts::default(),
+            || vec![Arc::new(TypedServiceAdapter::<Auditor, Add>::new::<Add>())],
+        );
+        system.register_schema::<Mark>();
+        wait_for(|| async {
+            system.facts().iter().any(
+                |f| matches!(&f.kind, crate::observe::ObservationKind::Spawned { path: p, .. } if *p == path),
+            )
+        })
+        .await;
+
+        // When an unknown-schema message sits FIRST in a batch of three.
+        system
+            .send(system.envelope(Mark::schema_id(), path.clone(), json!({ "tag": "x" })))
+            .await
+            .expect("delivered");
+        system
+            .send(system.envelope(Add::schema_id(), path.clone(), json!({ "n": 1 })))
+            .await
+            .expect("delivered");
+        system
+            .send(system.envelope(Add::schema_id(), path.clone(), json!({ "n": 2 })))
+            .await
+            .expect("delivered");
+
+        // Then only the unknown message dead-letters (UnknownSchema); the
+        // rest of the batch still runs, in order.
+        wait_for(|| async { sink.lock().as_slice() == ["n=1", "n=2"] }).await;
+        wait_for(|| async {
+            system
+                .drain_dead_letters()
+                .iter()
+                .any(|l| l.reason == crate::kernel::DeadLetterReason::UnknownSchema)
+        })
+        .await;
+        assert_eq!(
+            system.inbox_cursor(&path).map(|c| c.as_u64()),
+            Some(3),
+            "all three offsets committed (unknown one dead-lettered)"
+        );
+    }
+
+    #[tokio::test]
+    async fn stop_self_inside_a_batch_stops_after_the_prior_messages_flushed() {
+        // Given a self-stopping actor whose FIRST handled message records
+        // a send and a stop, with more messages queued behind it.
+        #[derive(Event, serde::Serialize, serde::Deserialize, Clone)]
+        struct Note {
+            n: i64,
+        }
+        #[derive(Serialize, Deserialize, Clone)]
+        struct StopNote;
+        impl ServiceActor for StopNote {
+            fn manifest() -> ActorManifest {
+                ActorManifest::new()
+                    .handles::<Add>()
+                    .emits::<Note>()
+                    .kind(ActorKind::Service)
+            }
+            async fn start(
+                _args: &Json,
+            ) -> Result<Self, error_stack::Report<crate::registry::RegistryError>> {
+                Ok(Self)
+            }
+        }
+        impl MsgHandler<Add> for StopNote {
+            async fn handle(&mut self, cmd: Add, ctx: &mut crate::context::MsgCtx<'_>) {
+                if cmd.n == 1 {
+                    // Record a send then stop: the send must flush before
+                    // the step concludes.
+                    ctx.publish(&Note { n: 0 });
+                    ctx.stop_self();
+                }
+            }
+        }
+        let (system, _clock) = ActorSystem::test();
+        system.register_schema::<Add>();
+        system.register_schema::<Note>();
+        let path = ActorPath::new("batch-stop");
+        system.spawn_service::<StopNote, _>(
+            path.clone(),
+            &json!({}),
+            SpawnOpts::default(),
+            || {
+                vec![Arc::new(
+                    TypedServiceAdapter::<StopNote, Add>::new::<Add>(),
+                )]
+            },
+        );
+        wait_for(|| async {
+            system.facts().iter().any(
+                |f| matches!(&f.kind, crate::observe::ObservationKind::Spawned { path: p, .. } if *p == path),
+            )
+        })
+        .await;
+
+        // When the stop lands FIRST with a second command queued behind.
+        system
+            .send(system.envelope(Add::schema_id(), path.clone(), json!({ "n": 1 })))
+            .await
+            .expect("delivered");
+        system
+            .send(system.envelope(Add::schema_id(), path.clone(), json!({ "n": 2 })))
+            .await
+            .expect("delivered");
+
+        // Then the actor stops (Normal) and its recorded send flushed
+        // before the stop concluded (the Delivered-to-stop order is the
+        // standing contract; here we pin the send's flush side: the
+        // published fact reaches a subscriber-or-DLQ, never vanishes).
+        wait_for(|| async { stopped_with(&system, &path, crate::actor::StopReason::Normal) }).await;
+        wait_for(|| async {
+            system
+                .facts()
+                .iter()
+                .any(|f| matches!(&f.kind, crate::observe::ObservationKind::Sent { schema, .. } if *schema == Note::schema_id()))
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn block_producer_unblocks_when_a_batch_commits() {
+        // Given a Block mailbox of FOUR on a batched service actor.
+        let (system, _clock) = ActorSystem::test();
+        system.register_schema::<Add>();
+        let path = ActorPath::new("batch-block");
+        let (idx, sink) = open_sink();
+        bind_sink(&path, sink.clone());
+        let opts = SpawnOpts {
+            mailbox_capacity: 4,
+            ..SpawnOpts::default()
+        };
+        system.spawn_service::<Auditor, _>(
+            path.clone(),
+            &json!({ "sink": idx }),
+            opts,
+            || vec![Arc::new(TypedServiceAdapter::<Auditor, Add>::new::<Add>())],
+        );
+
+        // When eight senders race a batched consumer (each awaits its
+        // tell: Block backpressure paces them; batches free room in
+        // chunks).
+        let burst = (1..=8_i64).map(|n| {
+            let system = system.clone();
+            let path = path.clone();
+            async move {
+                let _ = system
+                    .send(system.envelope(Add::schema_id(), path, json!({ "n": n })))
+                    .await
+                    .map_err(|_| "refused")?;
+                Ok::<(), &str>(())
+            }
+        });
+        let sent = futures::future::join_all(burst).await;
+        let refused = sent.iter().filter(|r| r.is_err()).count();
+
+        // Then nothing was refused and all eight processed in order.
+        assert_eq!(refused, 0, "Block never refuses: {sent:?}");
+        wait_for(|| async { sink.lock().len() == 8 }).await;
+        let lines = sink.lock().clone();
+        let numbers: Vec<i64> = lines
+            .iter()
+            .filter_map(|l| l.strip_prefix("n=").and_then(|v| v.parse().ok()))
+            .collect();
+        let mut sorted = numbers.clone();
+        sorted.sort();
+        assert_eq!(sorted, numbers, "per-sender FIFO held");
+    }
+
+    #[tokio::test]
     async fn service_steps_dispatch_inline_without_spawning_tasks() {
         // Given a service actor and a healthy baseline of the runtime's
         // own spawn counter — taken only once the actor's loop task is
@@ -4875,6 +5283,7 @@ mod tests {
             },
             8,
             OverloadPolicy::Block,
+            1,
         ));
         system
             .registry
@@ -10461,6 +10870,7 @@ mod tests {
                 passivation: Some(Passivation {
                     idle_for: std::time::Duration::from_secs(60),
                 }),
+                ..SpawnOpts::default()
             },
             || vec![Arc::new(TypedEsAdapter::<Counter, Add>::new::<Add>())],
         );
@@ -11459,6 +11869,7 @@ mod tests {
                             },
                             1,
                             OverloadPolicy::Block,
+                            1,
                         )),
                     ),
                 )
@@ -12452,6 +12863,7 @@ mod tests {
                 mailbox_policy: OverloadPolicy::DropNew,
                 high_watermark: None,
                 passivation: None,
+                ..SpawnOpts::default()
             },
             || vec![Arc::new(TypedEsAdapter::<Counter, Add>::new::<Add>())],
         );

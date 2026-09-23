@@ -697,6 +697,7 @@ fn overload_block(c: &mut Criterion) {
                 mailbox_policy: OverloadPolicy::Block,
                 high_watermark: None,
                 passivation: None,
+                ..SpawnOpts::default()
             },
             || {
                 vec![Arc::new(

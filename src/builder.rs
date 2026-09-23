@@ -162,6 +162,14 @@ impl<A: crate::actor::EventSourcedActor> SpawnBuilder<A> {
         self
     }
 
+    /// How many queued messages one wake's step may drain and commit as a
+    /// batch (default 64). A trickle load behaves per-message; a loaded run
+    /// amortizes the wake/lock/commit across up to `n` messages.
+    pub fn batch(mut self, n: usize) -> Self {
+        self.opts.batch = n;
+        self
+    }
+
     /// Inbox depth at which a `Backpressured` fact fires (once/crossing).
     pub fn high_watermark(mut self, depth: u64) -> Self {
         self.opts.high_watermark = Some(depth);
@@ -318,6 +326,14 @@ impl<A: ServiceActor> ServiceBuilder<A> {
         self
     }
 
+    /// How many queued messages one wake's step may drain and commit as a
+    /// batch (default 64). A trickle load behaves per-message; a loaded run
+    /// amortizes the wake/lock/commit across up to `n` messages.
+    pub fn batch(mut self, n: usize) -> Self {
+        self.opts.batch = n;
+        self
+    }
+
     /// Inbox depth at which a `Backpressured` fact fires.
     pub fn high_watermark(mut self, depth: u64) -> Self {
         self.opts.high_watermark = Some(depth);
@@ -440,6 +456,14 @@ impl ForeignBuilder {
     pub fn mailbox(mut self, capacity: usize, policy: crate::inbox::OverloadPolicy) -> Self {
         self.opts.mailbox_capacity = capacity;
         self.opts.mailbox_policy = policy;
+        self
+    }
+
+    /// How many queued messages one wake's step may drain and commit as a
+    /// batch (default 64). A trickle load behaves per-message; a loaded run
+    /// amortizes the wake/lock/commit across up to `n` messages.
+    pub fn batch(mut self, n: usize) -> Self {
+        self.opts.batch = n;
         self
     }
 

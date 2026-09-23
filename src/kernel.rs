@@ -502,6 +502,10 @@ pub(crate) struct ActorCell {
     /// The spawn-configured inbox overload policy (drives the front-door
     /// channel depth and the Block hold-retry).
     pub(crate) mailbox_policy: crate::inbox::OverloadPolicy,
+    /// The spawn-configured step batch size: how many queued messages one
+    /// wake's step may drain and commit (spawn-static; read by the loop
+    /// each step without a lock).
+    pub(crate) step_batch: usize,
     /// Whether this actor declared a high-watermark at spawn. When false,
     /// the front door skips its watermark check entirely — the enqueue
     /// path never takes the kernel lock for it (D: the lock-free fast
@@ -584,18 +588,21 @@ impl ActorCell {
     /// Creates a cell with a fresh inbox; the endpoint arrives on start.
     /// Cell-local bookkeeping starts at its defaults (never worked, never
     /// committed, unanchored, not crashed, no watermark); the spawn site
-    /// stamps the idle window, cadence, and passivation config.
+    /// stamps the idle window, cadence, and passivation config. `batch` is
+    /// the spawn's step drain size (clamped to at least 1).
     pub fn new(
         path: ActorPath,
         inbox: Inbox,
         mailbox_capacity: usize,
         mailbox_policy: crate::inbox::OverloadPolicy,
+        batch: usize,
     ) -> Self {
         Self {
             path,
             inbox: tokio::sync::Mutex::new(inbox),
             mailbox_capacity,
             mailbox_policy,
+            step_batch: batch.max(1),
             has_watermark: std::sync::atomic::AtomicBool::new(false),
             handle: tokio::sync::Mutex::new(None),
             work: Arc::new(Notify::new()),
@@ -2690,86 +2697,43 @@ impl<F: Future> Future for PanicIsolated<F> {
     }
 }
 
-/// One service step: peek → decode (sync) → dispatch (async) → ack.
+/// One service step, batched: snapshot up to N → dispatch+commit each in
+/// order. One inbox acquisition, one loop wake, one pass.
 ///
-/// Service messages are consumed on HANDOFF (ack before dispatch): there is
-/// no journal to replay from, so redelivery after a crash would re-run
-/// side effects — at-most-once semantics are the honest contract here.
+/// Service messages are consumed on HANDOFF (commit before dispatch):
+/// there is no journal to replay from, so redelivery after a crash would
+/// re-run side effects — at-most-once semantics are the honest contract
+/// here. The batch keeps every message's commit at exactly the point the
+/// single-message step acked (before its dispatch); what amortizes is the
+/// WAKE (one loop iteration + one inbox lock for up to N messages), not
+/// the commit. A parked handler therefore still leaves the messages behind
+/// it fully queued and visible (stop-time DLQ flush, watermark depth), and
+/// a step killed mid-batch loses nothing the per-message step kept.
 ///
 /// Dispatch runs INLINE on the loop task (no per-message `tokio::spawn`):
-/// the handler future is awaited through [`PanicIsolated`], so a handler
-/// panic marks the cell crashed and returns `Step::Crashed` — the same
-/// outcome the old spawned-task shape produced via a `JoinError` — while
-/// the loop still serializes messages (one handler at a time).
+/// each handler future is awaited through [`PanicIsolated`], so a handler
+/// panic marks the cell crashed and returns `Step::Crashed` — the loop
+/// task itself is not torn down. The inbox serializes: one handler at a
+/// time. Per-message outbox flushes stay INSIDE the batch loop, so message
+/// k's sends still land before message k+1's (cross-message ordering
+/// preserved; batching amortizes the wake/lock, never the intent order).
 async fn step_service(ctx: &ServiceLoop) -> Step {
-    // 1. PEEK the envelope.
-    let envelope = {
+    // 1. SNAPSHOT up to the spawn's batch size (FIFO, nothing removed).
+    let batch_n = ctx.es.cell.step_batch;
+    let batch: Vec<(crate::inbox::InboxOffset, Envelope)> = {
         let mut inbox = ctx.es.cell.inbox.lock().await;
-        inbox.peek().cloned()
+        inbox.peek_up_to(batch_n)
     };
-    let Some(envelope) = envelope else {
+    let Some((_, first)) = batch.first() else {
         return Step::Idle;
     };
+    let _ = first;
 
-    // The Delivered observation rides the handler slot (no kernel lock,
-    // nothing constructed when observation is off).
-    if ctx.es.kernel.observing() {
-        ctx.es.kernel.observe(crate::observe::Observation::new(
-            envelope.trace.causality_id.as_millis_ts(),
-            crate::observe::ObservationKind::Delivered {
-                to: ctx.es.path.clone(),
-                schema: envelope.schema.clone(),
-                trace: envelope.trace,
-            },
-        ));
-    }
-
-    // 2. FIND the message entry (cell-local spawn-static config).
-    let entry = {
-        let entries = ctx.es.cell.msg_entries.read().expect("msg entries lock");
-        entries
-            .iter()
-            .find(|e| e.schema() == envelope.schema)
-            .cloned()
-    };
-    let Some(entry) = entry else {
-        dead_letter(
-            &ctx.es.kernel,
-            &envelope,
-            crate::kernel::DeadLetterReason::UnknownSchema,
-            "no entry for this schema",
-        );
-        ctx.es.cell.inbox.lock().await.ack();
-        return Step::Work;
-    };
-
-    // 3. DECODE (sync — decode failures dead-letter cleanly). The payload
-    // is borrowed: decode downcasts the live value (zero serde) or reads
-    // the shared bytes — it never copies the message body.
-    let decoded = match entry.decode(&envelope.payload) {
-        Ok(msg) => msg,
-        Err(report) => {
-            let reason = format!("{report}");
-            dead_letter(
-                &ctx.es.kernel,
-                &envelope,
-                crate::kernel::DeadLetterReason::Decode,
-                &reason,
-            );
-            ctx.es.cell.inbox.lock().await.ack();
-            return Step::Work;
-        }
-    };
-
-    // 4. CONSUME (ack) — at-most-once handoff to the handler.
-    ctx.es.cell.inbox.lock().await.ack();
-
-    // 5. DISPATCH (inline on the loop task, panic-isolated). The handler
-    // future is awaited through PanicIsolated: no task is spawned per
-    // message (the old shape paid a spawn + JoinHandle + oneshot hop per
-    // dispatch), while a handler panic still lands as Step::Crashed —
-    // state may be poisoned, the loop task is not. The inbox serializes:
-    // one handler runs at a time, exactly as before.
+    // 2. DISPATCH each snapshot inline, in order. Delivered observations
+    // ride the handler slot (no kernel lock, nothing constructed when
+    // observation is off). Unknown-schema and decode failures dead-letter
+    // THEIR message alone and continue the batch (one bad envelope never
+    // costs the rest of the run).
     let path = ctx.es.path.clone();
     let service = {
         let kernel = ctx.es.kernel.lock();
@@ -2785,38 +2749,98 @@ async fn step_service(ctx: &ServiceLoop) -> Step {
         kernel: ctx.es.kernel.clone(),
         clock: ctx.es.clock.clone(),
     };
-    let trace = envelope.trace;
-    let reply_to = envelope.reply_to.clone();
-    let mut outbox = Outbox::new();
-    let dispatched = {
-        let mut msg_ctx = crate::context::MsgCtx::new(
-            &path,
-            &trace,
-            reply_to.as_ref(),
-            view.as_ref(),
-            &mut outbox,
-            Some(&ask_port),
-        );
-        let mut service = service.lock().await;
-        let fut = entry.dispatch(service.as_mut(), decoded, &mut msg_ctx);
-        #[cfg(test)]
-        crate::kernel::bump_inline_service_dispatch();
-        PanicIsolated(fut).await
-    };
-    if let Err(_poison) = dispatched {
-        // Handler panicked: mark crashed (supervision restarts via `start`).
-        // The outbox dies with the dispatch — nothing recorded, the same
-        // contract the spawned-task shape kept.
-        ctx.es.cell.mark_crashed();
-        return Step::Crashed;
+
+    let observing = ctx.es.kernel.observing();
+    for (offset, envelope) in batch {
+        // COMMIT (the at-most-once handoff, at the same point the
+        // single-message step acked: before this message's dispatch).
+        ctx.es.cell.inbox.lock().await.commit_through(offset);
+        if observing {
+            ctx.es.kernel.observe(crate::observe::Observation::new(
+                envelope.trace.causality_id.as_millis_ts(),
+                crate::observe::ObservationKind::Delivered {
+                    to: ctx.es.path.clone(),
+                    schema: envelope.schema.clone(),
+                    trace: envelope.trace,
+                },
+            ));
+        }
+
+        // FIND the message entry (cell-local spawn-static config).
+        let entry = {
+            let entries = ctx.es.cell.msg_entries.read().expect("msg entries lock");
+            entries
+                .iter()
+                .find(|e| e.schema() == envelope.schema)
+                .cloned()
+        };
+        let Some(entry) = entry else {
+            dead_letter(
+                &ctx.es.kernel,
+                &envelope,
+                crate::kernel::DeadLetterReason::UnknownSchema,
+                "no entry for this schema",
+            );
+            continue;
+        };
+
+        // DECODE (sync — decode failures dead-letter cleanly). The payload
+        // is borrowed: decode downcasts the live value (zero serde) or
+        // reads the shared bytes — it never copies the message body.
+        let decoded = match entry.decode(&envelope.payload) {
+            Ok(msg) => msg,
+            Err(report) => {
+                let reason = format!("{report}");
+                dead_letter(
+                    &ctx.es.kernel,
+                    &envelope,
+                    crate::kernel::DeadLetterReason::Decode,
+                    &reason,
+                );
+                continue;
+            }
+        };
+
+        // DISPATCH (inline on the loop task, panic-isolated).
+        let trace = envelope.trace;
+        let reply_to = envelope.reply_to.clone();
+        let mut outbox = Outbox::new();
+        let dispatched = {
+            let mut msg_ctx = crate::context::MsgCtx::new(
+                &path,
+                &trace,
+                reply_to.as_ref(),
+                view.as_ref(),
+                &mut outbox,
+                Some(&ask_port),
+            );
+            let mut service = service.lock().await;
+            let fut = entry.dispatch(service.as_mut(), decoded, &mut msg_ctx);
+            #[cfg(test)]
+            crate::kernel::bump_inline_service_dispatch();
+            PanicIsolated(fut).await
+        };
+        if let Err(_poison) = dispatched {
+            // Handler panicked: mark crashed (supervision restarts via
+            // `start`). This message was already consumed at handoff (the
+            // same at-most-once window as the single-message step); every
+            // LATER snapshot is still fully queued (nothing was removed),
+            // so no tail surgery is needed. The outbox dies with the
+            // dispatch — nothing recorded, the standing contract.
+            ctx.es.cell.mark_crashed();
+            return Step::Crashed;
+        }
+
+        // FLUSH deferred effects from THIS message before the next one
+        // runs (cross-message ordering: k's sends land before k+1's). A
+        // StopSelf intent concludes the step — sends recorded before it
+        // have flushed (in-order); the loop exits after this step.
+        if flush_outbox(&ctx.es, outbox).await {
+            return Step::Stop;
+        }
     }
 
-    // 6. FLUSH deferred effects from the handler. A StopSelf intent
-    // concludes the step with Step::Stop — sends recorded before it have
-    // already flushed (in-order).
-    let stop_self = flush_outbox(&ctx.es, outbox).await;
-
-    if stop_self { Step::Stop } else { Step::Work }
+    Step::Work
 }
 
 /// Restarts a crashed ES actor (spec algorithm):

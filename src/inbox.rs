@@ -212,46 +212,58 @@ impl Inbox {
             .map(|(offset, envelope)| (InboxOffset::new(offset), envelope))
     }
 
-    /// Drains up to `n` un-acked entries, oldest first, in FIFO order.
+    /// Snapshots up to `n` un-acked entries, oldest first, in FIFO order,
+    /// WITHOUT removing them and WITHOUT moving the cursor.
     ///
-    /// The CURSOR DOES NOT MOVE: draining takes the entries out of the
-    /// queue without committing them. The caller commits the whole drained
-    /// run with [`Inbox::commit_through`] (the batch commit point), or
-    /// hands a suffix back with [`Inbox::requeue`] (the service panic
-    /// path). A drained-but-uncommitted entry is neither acked nor
-    /// redeliverable until one of those runs — only the actor's own loop
-    /// holds the inbox across a step, so nothing can observe the gap.
+    /// This is the batch step's read: the loop dispatches the snapshots in
+    /// order, committing each with [`Inbox::commit_through`] at the same
+    /// point the single-message step acked (service: before dispatch; ES:
+    /// after the journal append). Entries the step has not committed yet
+    /// stay fully queued — stop-time DLQ flushes, watermark depth reads,
+    /// and the restart cursor all see them exactly as the per-message step
+    /// would have. Nothing leaves the inbox before its commit point, so a
+    /// step killed mid-batch loses nothing the old step would have kept.
     ///
-    /// Fewer than `n` entries drain when the queue is shorter (trickle
-    /// loads drain exactly what is queued; batch 1 collapses to peek+ack).
-    pub fn drain_up_to(&mut self, n: usize) -> Vec<(InboxOffset, Envelope)> {
-        let take = n.min(self.queue.len());
+    /// Fewer than `n` come back when the queue is shorter — a trickle load
+    /// snapshots exactly what is queued, and batch 1 costs one clone (the
+    /// old peek's clone).
+    pub fn peek_up_to(&mut self, n: usize) -> Vec<(InboxOffset, Envelope)> {
+        // The queue front is the cursor (the push/ack/evict paths keep
+        // them aligned; the filter is the same defensive gate peek has).
+        if !self
+            .queue
+            .front()
+            .is_some_and(|(offset, _)| *offset == self.cursor)
+        {
+            return Vec::new();
+        }
         self.queue
-            .drain(..take)
-            .map(|(offset, envelope)| (InboxOffset::new(offset), envelope))
+            .iter()
+            .take(n)
+            .map(|(offset, envelope)| (InboxOffset::new(*offset), envelope.clone()))
             .collect()
     }
 
     /// Atomically advances the cursor past `offset` — the batch commit.
     ///
-    /// Pops every queued entry at or before `offset` (drained entries were
-    /// already removed by [`Inbox::drain_up_to`]; this catches the
-    /// `DropOld` holes the cursor jumps on the push path) and sets the
-    /// cursor to `offset + 1`. One call commits the whole batch: there is
-    /// no partially-advanced state between the old cursor and the new one.
+    /// Pops every queued entry at or before `offset` (a batch step
+    /// commits message-by-message with ever-larger offsets; the final
+    /// call pops the whole run) and sets the cursor to `offset + 1`.
+    /// One call is one commit point: there is no partially-advanced
+    /// state between the old cursor and the new one.
     ///
     /// # Panics
     ///
     /// Panics under the same contract as [`Inbox::ack`]: `offset` past the
-    /// write head is a runtime bug (only the runtime drains and commits).
+    /// write head is a runtime bug (only the runtime peeks and commits).
     pub fn commit_through(&mut self, offset: InboxOffset) {
         let offset = offset.as_u64();
         if offset >= self.next_offset {
             panic!("inbox committed past the write head at {offset}");
         }
-        // A batch commit never rewinds: `offset` is the last entry of a
-        // drained run, so it is at or after the cursor by construction
-        // (drain_up_to only hands out entries at/after the cursor).
+        // A batch commit never rewinds: `offset` is an entry the step has
+        // fully processed, so it is at or after the cursor by construction
+        // (peek_up_to only hands out entries at/after the cursor).
         while self
             .queue
             .front()
@@ -260,48 +272,6 @@ impl Inbox {
             self.queue.pop_front();
         }
         self.cursor = offset + 1;
-    }
-
-    /// Hands a drained suffix BACK to the queue, in order, at its ORIGINAL
-    /// offsets, and rewinds the cursor to just past `last_committed` —
-    /// the service panic path's undo of an uncommitted drain tail.
-    ///
-    /// After the call, [`Inbox::peek`] returns exactly the first requeued
-    /// entry (redelivery resumes at it), and every offset before it is
-    /// committed. Offsets are never rewritten: the inbox's offset space
-    /// stays monotonic across the round trip.
-    ///
-    /// # Panics
-    ///
-    /// Panics if any returned offset is at or before `last_committed` (a
-    /// runtime bug: the step would requeue an entry it already committed).
-    pub fn requeue(
-        &mut self,
-        entries: impl IntoIterator<Item = (InboxOffset, Envelope)>,
-        last_committed: InboxOffset,
-    ) {
-        let last_committed = last_committed.as_u64();
-        let mut restored: VecDeque<(u64, Envelope)> = entries
-            .into_iter()
-            .map(|(offset, envelope)| {
-                assert!(
-                    offset.as_u64() > last_committed,
-                    "requeued offset {} at/below the commit point {last_committed}",
-                    offset.as_u64()
-                );
-                (offset.as_u64(), envelope)
-            })
-            .collect();
-        if restored.is_empty() {
-            return;
-        }
-        // The requeued run was drained from the queue FRONT, so it is
-        // contiguous with whatever is queued behind it: restored entries
-        // go before the existing queue, oldest first.
-        for (offset, envelope) in restored.drain(..).rev() {
-            self.queue.push_front((offset, envelope));
-        }
-        self.cursor = last_committed + 1;
     }
 
     /// The number of entries waiting between the cursor and the write head.
@@ -491,79 +461,81 @@ mod tests {
     }
 
     #[test]
-    fn drain_up_to_returns_fifo_entries_without_moving_the_cursor() {
+    fn peek_up_to_returns_fifo_snapshots_without_moving_the_cursor() {
         // Given an inbox holding three envelopes.
         let mut inbox = Inbox::new(8, OverloadPolicy::Block);
         for n in 1..=3 {
             inbox.push(envelope(n)).expect("push");
         }
 
-        // When draining two.
-        let drained = inbox.drain_up_to(2);
+        // When snapshotting two.
+        let batch = inbox.peek_up_to(2);
 
-        // Then the drained pairs are FIFO with their push offsets, and the
-        // cursor did NOT move (nothing is committed yet).
+        // Then the snapshots are FIFO with their offsets, the queue still
+        // holds everything, and the cursor did NOT move.
         assert_eq!(
-            drained.iter().map(|(o, _)| o.as_u64()).collect::<Vec<_>>(),
+            batch.iter().map(|(o, _)| o.as_u64()).collect::<Vec<_>>(),
             vec![0, 1]
         );
-        assert_eq!(drained[0].1.payload_json()["n"].as_u64(), Some(1));
-        assert_eq!(drained[1].1.payload_json()["n"].as_u64(), Some(2));
+        assert_eq!(batch[0].1.payload_json()["n"].as_u64(), Some(1));
+        assert_eq!(batch[1].1.payload_json()["n"].as_u64(), Some(2));
         assert_eq!(inbox.cursor(), InboxOffset::new(0));
-        assert_eq!(inbox.len(), 1, "only envelope 3 stays queued");
+        assert_eq!(inbox.len(), 3, "peek_up_to removes nothing");
     }
 
     #[test]
-    fn drain_up_to_takes_what_is_queued_when_shorter_than_n() {
-        // Given an inbox holding two envelopes and a drain budget of five.
+    fn peek_up_to_takes_what_is_queued_when_shorter_than_n() {
+        // Given an inbox holding two envelopes and a batch budget of five.
         let mut inbox = Inbox::new(8, OverloadPolicy::Block);
         inbox.push(envelope(1)).expect("push");
         inbox.push(envelope(2)).expect("push");
 
-        // When draining up to five.
-        let drained = inbox.drain_up_to(5);
+        // When snapshotting up to five.
+        let batch = inbox.peek_up_to(5);
 
-        // Then exactly the two queued entries drain (trickle behavior).
-        assert_eq!(drained.len(), 2);
-        assert!(inbox.is_empty());
+        // Then exactly the two queued entries come back (trickle behavior).
+        assert_eq!(batch.len(), 2);
+        assert_eq!(inbox.len(), 2);
 
-        // And a drain on an empty inbox yields nothing.
-        assert!(inbox.drain_up_to(5).is_empty());
+        // And a snapshot of a drained inbox yields nothing.
+        let mut empty = Inbox::new(4, OverloadPolicy::Block);
+        assert!(empty.peek_up_to(5).is_empty());
     }
 
     #[test]
     fn commit_through_advances_the_cursor_atomically() {
-        // Given an inbox whose first two entries are drained.
+        // Given an inbox whose first two entries are snapshotted.
         let mut inbox = Inbox::new(8, OverloadPolicy::Block);
         for n in 1..=3 {
             inbox.push(envelope(n)).expect("push");
         }
-        let drained = inbox.drain_up_to(2);
+        let batch = inbox.peek_up_to(2);
 
-        // When committing through the last drained offset.
-        let last = drained.last().expect("non-empty").0;
+        // When committing through the last batch offset.
+        let last = batch.last().expect("non-empty").0;
         inbox.commit_through(last);
 
         // Then the cursor sits exactly past the batch and the third
         // envelope is what a peek returns.
         assert_eq!(inbox.cursor(), InboxOffset::new(2));
+        assert_eq!(inbox.len(), 1);
         let front = inbox.peek().expect("front");
         assert_eq!(front.payload_json()["n"].as_u64(), Some(3));
     }
 
     #[test]
     fn commit_through_pops_live_entries_it_jumps_over() {
-        // Given an inbox where entries were pushed AFTER a partial drain
-        // (a batch committed while more mail queued behind it).
+        // Given an inbox where entries were pushed AFTER a snapshot (new
+        // mail queues behind a batch that is mid-flight).
         let mut inbox = Inbox::new(8, OverloadPolicy::Block);
         for n in 1..=2 {
             inbox.push(envelope(n)).expect("push");
         }
-        let drained = inbox.drain_up_to(1);
+        let batch = inbox.peek_up_to(1);
         inbox.push(envelope(3)).expect("push");
 
-        // When committing through the single drained entry.
-        inbox.commit_through(drained[0].0);
+        // When committing through the single snapshotted entry.
+        inbox.commit_through(batch[0].0);
 
         // Then the cursor moved past it and the queue still holds the
         // later entries in order (nothing live was dropped).
@@ -571,6 +543,34 @@ mod tests {
         assert_eq!(inbox.len(), 2);
         let front = inbox.peek().expect("front");
         assert_eq!(front.payload_json()["n"].as_u64(), Some(2));
+    }
+
+    #[test]
+    fn snapshot_commit_round_trip_leaves_no_residue() {
+        // Given an inbox holding three entries.
+        let mut inbox = Inbox::new(8, OverloadPolicy::Block);
+        for n in 1..=3 {
+            inbox.push(envelope(n)).expect("push");
+        }
+
+        // When snapshotting all and committing message-by-message (the
+        // batch step's shape: the offset grows as the batch progresses).
+        let batch = inbox.peek_up_to(3);
+        for (offset, _) in &batch {
+            inbox.commit_through(*offset);
+        }
+
+        // Then everything is committed and the offset space stays
+        // monotonic for the next push.
+        assert!(inbox.is_empty());
+        assert_eq!(inbox.cursor(), InboxOffset::new(3));
+        let next = inbox.push(envelope(9)).expect("push");
+        assert!(next.as_u64() >= 3);
+
+        // And a fresh snapshot sees only the new entry.
+        let again = inbox.peek_up_to(4);
+        assert_eq!(again.len(), 1);
+        assert_eq!(again[0].1.payload_json()["n"].as_u64(), Some(9));
     }
 
     #[test]
@@ -587,79 +587,6 @@ mod tests {
     }
 
     #[test]
-    fn requeue_round_trips_a_drained_suffix_with_original_offsets() {
-        // Given an inbox whose three entries were drained.
-        let mut inbox = Inbox::new(8, OverloadPolicy::Block);
-        for n in 1..=3 {
-            inbox.push(envelope(n)).expect("push");
-        }
-        let drained = inbox.drain_up_to(3);
-        assert_eq!(inbox.len(), 0);
-
-        // When the first entry's effects commit and the suffix comes back
-        // (the panic path: dispatch died on entry 2).
-        inbox.commit_through(drained[0].0);
-        inbox.requeue(drained[1..].to_vec(), drained[0].0);
-
-        // Then the queue holds the suffix again, at its ORIGINAL offsets,
-        // and peek returns exactly entry 2 (redelivery resumes there).
-        assert_eq!(inbox.cursor(), InboxOffset::new(1));
-        assert_eq!(inbox.len(), 2);
-        let front = inbox.peek().expect("front");
-        assert_eq!(front.payload_json()["n"].as_u64(), Some(2));
-
-        // And the offset space stays monotonic: the next push continues
-        // past every offset ever assigned (3), never reuses one.
-        let next = inbox.push(envelope(9)).expect("push");
-        assert!(next.as_u64() > drained[2].0.as_u64());
-
-        // And the requeued entries drain again in FIFO order (restart
-        // replays the queue from the cursor).
-        let again = inbox.drain_up_to(4);
-        assert_eq!(
-            again.iter().map(|(_, e)| e.payload_json()["n"].as_u64()).collect::<Vec<_>>(),
-            vec![Some(2), Some(3), Some(9)]
-        );
-        assert_eq!(
-            again.iter().map(|(o, _)| o.as_u64()).collect::<Vec<_>>(),
-            vec![1, 2, 3]
-        );
-    }
-
-    #[test]
-    fn requeue_with_an_empty_suffix_is_a_no_op() {
-        // Given an inbox whose single entry was drained and committed.
-        let mut inbox = Inbox::new(4, OverloadPolicy::Block);
-        inbox.push(envelope(1)).expect("push");
-        let drained = inbox.drain_up_to(1);
-        inbox.commit_through(drained[0].0);
-
-        // When requeueing nothing.
-        inbox.requeue(Vec::new(), drained[0].0);
-
-        // Then the cursor stands and the inbox is empty (a panic on the
-        // LAST batch entry requeues no tail).
-        assert_eq!(inbox.cursor(), InboxOffset::new(1));
-        assert!(inbox.is_empty());
-    }
-
-    #[test]
-    #[should_panic(expected = "at/below the commit point")]
-    fn requeue_of_an_already_committed_offset_panics() {
-        // Given an inbox whose first entry was drained and committed.
-        let mut inbox = Inbox::new(8, OverloadPolicy::Block);
-        inbox.push(envelope(1)).expect("push");
-        inbox.push(envelope(2)).expect("push");
-        let drained = inbox.drain_up_to(2);
-        inbox.commit_through(drained[0].0);
-
-        // When the committed entry itself is handed back (a runtime bug).
-        inbox.requeue(drained.clone(), drained[0].0);
-
-        // Then the offset guard panics: requeue never rewinds a commit.
-    }
-
-    #[test]
     fn drop_old_holes_stay_committed_through_a_batch() {
         // Given a capacity-2 DropOld inbox that evicted its first entry.
         let mut inbox = Inbox::new(2, OverloadPolicy::DropOld);
@@ -668,15 +595,15 @@ mod tests {
         let evicted = inbox.push(envelope(3)).expect_err("eviction");
         assert!(evicted.queued_anyway(), "envelope 1 was evicted");
 
-        // When draining the live pair and committing through the last.
-        let drained = inbox.drain_up_to(4);
-        assert_eq!(drained.len(), 2, "only envelopes 2 and 3 are live");
+        // When snapshotting the live pair and committing through the last.
+        let batch = inbox.peek_up_to(4);
+        assert_eq!(batch.len(), 2, "only envelopes 2 and 3 are live");
         assert_eq!(
-            drained.iter().map(|(o, _)| o.as_u64()).collect::<Vec<_>>(),
+            batch.iter().map(|(o, _)| o.as_u64()).collect::<Vec<_>>(),
             vec![1, 2],
             "offsets stay monotonic across the eviction hole"
         );
-        let last = drained.last().expect("non-empty").0;
+        let last = batch.last().expect("non-empty").0;
         inbox.commit_through(last);
 
         // Then the cursor jumped the hole AND the batch in one commit.
