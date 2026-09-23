@@ -43,8 +43,8 @@ pub(crate) enum Intent {
         to: Address,
         /// The reply schema (tracing) — may be the request's schema id.
         schema: SchemaId,
-        /// The reply payload.
-        payload: Json,
+        /// The reply payload (the fabric shape: live value or wire).
+        payload: crate::envelope::Payload,
         /// The trace of the message being replied to (causality links).
         trace: TraceCtx,
     },
@@ -92,12 +92,13 @@ impl Outbox {
         self.intents.push(Intent::Broadcast(envelope));
     }
 
-    /// Records a reply intent (resolved at flush time).
+    /// Records a reply intent (resolved at flush time). The payload
+    /// moves in untouched — a live value stays live to the receiver.
     pub(crate) fn push_reply(
         &mut self,
         to: Address,
         schema: SchemaId,
-        payload: Json,
+        payload: crate::envelope::Payload,
         trace: TraceCtx,
     ) {
         self.intents.push(Intent::Reply {
@@ -263,7 +264,7 @@ pub(crate) trait AskPort: Send + Sync {
         &self,
         dest: Address,
         schema: SchemaId,
-        payload: Json,
+        payload: crate::envelope::Payload,
         ttl: std::time::Duration,
     ) -> AskChannelFuture;
 
@@ -319,7 +320,7 @@ pub(crate) async fn ask_via_port(
     port: &dyn AskPort,
     dest: Address,
     schema: SchemaId,
-    payload: Json,
+    payload: crate::envelope::Payload,
     timeout: std::time::Duration,
     trace: TraceCtx,
 ) -> Result<Json, error_stack::Report<AskError>> {
@@ -335,7 +336,7 @@ pub(crate) async fn ask_via_port_payload(
     port: &dyn AskPort,
     dest: Address,
     schema: SchemaId,
-    payload: Json,
+    payload: crate::envelope::Payload,
     timeout: std::time::Duration,
     trace: TraceCtx,
 ) -> Result<crate::envelope::Payload, error_stack::Report<AskError>> {
@@ -445,18 +446,15 @@ impl<'a> MsgCtx<'a> {
         self.core.outbox.push_broadcast(envelope);
     }
 
-    /// The payload-generic reply engine (typed reply's core). The reply
-    /// slot world is still JSON-shaped (typed slots are a later phase);
-    /// the payload materializes its view here — memoized, so the encode
-    /// happens at most once.
+    /// The payload-generic reply engine (typed reply's core). The
+    /// payload moves into the intent untouched — a live value rides the
+    /// fabric all the way to the asker's downcast (zero serde); the
+    /// materialized view exists only if a reader later asks.
     pub(crate) fn reply_payload(&mut self, schema: SchemaId, payload: crate::envelope::Payload) {
         if let Some(reply_to) = self.core.reply_to().cloned() {
-            self.core.outbox.push_reply(
-                reply_to,
-                schema,
-                payload.json().clone(),
-                self.core.child_trace(),
-            );
+            self.core
+                .outbox
+                .push_reply(reply_to, schema, payload, self.core.child_trace());
         }
     }
 
@@ -484,9 +482,12 @@ impl<'a> MsgCtx<'a> {
     #[allow(dead_code)]
     pub(crate) fn reply_json(&mut self, schema: SchemaId, payload: Json) {
         if let Some(reply_to) = self.core.reply_to() {
-            self.core
-                .outbox
-                .push_reply(reply_to.clone(), schema, payload, self.core.child_trace());
+            self.core.outbox.push_reply(
+                reply_to.clone(),
+                schema,
+                crate::envelope::Payload::json_view(payload),
+                self.core.child_trace(),
+            );
         }
     }
 
@@ -525,12 +526,21 @@ impl<'a> MsgCtx<'a> {
         timeout: std::time::Duration,
     ) -> Result<Json, error_stack::Report<AskError>> {
         let port = self.port.expect("ask requires a port (service tier)");
-        ask_via_port(port, dest, schema, payload, timeout, *self.core.trace).await
+        ask_via_port(
+            port,
+            dest,
+            schema,
+            crate::envelope::Payload::json_view(payload),
+            timeout,
+            *self.core.trace,
+        )
+        .await
     }
 
     /// Typed ask: the request's schema id and payload come from the
     /// message type — the typed sibling of [`MsgCtx::ask_json`]. The
     /// timeout is required; only service actors can ask (see [`CmdCtx`]).
+    /// The request moves into the fabric as a live value (zero serde).
     ///
     /// The reply arrives as raw JSON this pass, matching
     /// [`crate::system::ActorSystemCore::ask`]'s return; decode it with the
@@ -540,19 +550,22 @@ impl<'a> MsgCtx<'a> {
     ///
     /// [`AskError::Unresolved`] when the destination does not resolve,
     /// the ask times out, or the lease dies before the reply.
-    ///
-    /// # Panics
-    ///
-    /// Panics when the request cannot serialize — a programmer error
-    /// (serde only fails on pathological map keys), not a domain outcome.
-    pub async fn ask<M: Message>(
+    pub async fn ask<M: Message + crate::envelope::PayloadValue>(
         &mut self,
         dest: Address,
-        req: &M,
+        req: M,
         timeout: std::time::Duration,
     ) -> Result<Json, error_stack::Report<AskError>> {
-        let payload = Json::of(req);
-        self.ask_json(dest, M::schema_id(), payload, timeout).await
+        let port = self.port.expect("ask requires a port (service tier)");
+        ask_via_port(
+            port,
+            dest,
+            M::schema_id(),
+            crate::envelope::Payload::value(req),
+            timeout,
+            *self.core.trace,
+        )
+        .await
     }
 
     /// Typed ask: sends `req` and downcasts the reply into the declared
@@ -568,10 +581,13 @@ impl<'a> MsgCtx<'a> {
     /// # Panics
     ///
     /// Panics when there is no ask port (service tier required).
-    pub async fn ask_typed<M: Message, R: Message + crate::envelope::PayloadValue + Clone>(
+    pub async fn ask_typed<
+        M: Message + crate::envelope::PayloadValue,
+        R: Message + crate::envelope::PayloadValue + Clone,
+    >(
         &mut self,
         dest: Address,
-        req: &M,
+        req: M,
         timeout: std::time::Duration,
     ) -> Result<R, error_stack::Report<AskError>> {
         let port = self.port.expect("ask requires a port (service tier)");
@@ -579,7 +595,7 @@ impl<'a> MsgCtx<'a> {
             port,
             dest,
             M::schema_id(),
-            Json::of(req),
+            crate::envelope::Payload::value(req),
             timeout,
             *self.core.trace,
         )
@@ -985,7 +1001,7 @@ mod tests {
                 assert_eq!(a, b);
                 assert_eq!(*sa, Reserved::schema_id());
                 assert_eq!(sa, sb);
-                assert_eq!(pa, pb);
+                assert_eq!(pa.json(), pb.json());
             }
             _ => panic!("expected reply intents"),
         }

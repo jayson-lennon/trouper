@@ -2024,7 +2024,7 @@ impl crate::context::AskPort for KernelAskPort {
         &self,
         dest: Address,
         schema: SchemaId,
-        payload: Json,
+        payload: crate::envelope::Payload,
         ttl: std::time::Duration,
     ) -> std::pin::Pin<
         Box<
@@ -2108,13 +2108,8 @@ impl crate::context::AskPort for KernelAskPort {
                 ));
             }
             let trace = crate::envelope::TraceCtx::root();
-            let envelope = Envelope::raw(
-                schema,
-                dest.clone(),
-                crate::envelope::Payload::json_view(payload),
-                trace,
-            )
-            .reply_to(Address::Slot(lease));
+            let envelope =
+                Envelope::raw(schema, dest.clone(), payload, trace).reply_to(Address::Slot(lease));
             match deliver_with_retry(&endpoint, envelope).await {
                 Ok(()) => Ok((lease, receiver)),
                 Err(_) => {
@@ -2294,28 +2289,22 @@ async fn resolve_reply(
     shutting_down: &std::sync::atomic::AtomicBool,
     to: Address,
     schema: SchemaId,
-    payload: Json,
+    payload: crate::envelope::Payload,
     trace: TraceCtx,
 ) {
     match to {
         Address::Slot(lease) => {
             // Mechanism: complete the lease if it is still live; a dead
             // (expired/pruned) slot just drops the reply — the asker is
-            // gone, and the ask timed out on its side already.
-            kernel
-                .lock()
-                .replies
-                .complete(&lease, crate::envelope::Payload::json_view(payload));
+            // gone, and the ask timed out on its side already. The live
+            // value completes the slot AS IS — the asker downcasts it
+            // (zero serde on the whole reply path).
+            kernel.lock().replies.complete(&lease, payload);
         }
         Address::Schema(_) => {
             // A schema-addressed reply is an ordinary routed send (the
             // route table picks a handler).
-            let envelope = Envelope::raw(
-                schema,
-                to,
-                crate::envelope::Payload::json_view(payload),
-                trace,
-            );
+            let envelope = Envelope::raw(schema, to, payload, trace);
             if let Err(undeliverable) = route(registry, kernel, shutting_down, envelope).await {
                 dead_letter(
                     kernel,
@@ -2328,12 +2317,7 @@ async fn resolve_reply(
         Address::Path(path) => {
             // Durable name: an ordinary envelope (any actor may have moved
             // on; unresolvable replies dead-letter like any send).
-            let envelope = Envelope::raw(
-                schema,
-                Address::Path(path.clone()),
-                crate::envelope::Payload::json_view(payload),
-                trace,
-            );
+            let envelope = Envelope::raw(schema, Address::Path(path.clone()), payload, trace);
             if let Err(undeliverable) = route(registry, kernel, shutting_down, envelope).await {
                 dead_letter(
                     kernel,
@@ -2481,11 +2465,14 @@ fn dead_letter_schema(ctx: &EsLoop, intent: &crate::context::Intent, schema: &Sc
             envelope.clone()
         }
         crate::context::Intent::Reply {
-            to, payload, trace, ..
+            to,
+            payload,
+            trace,
+            ..
         } => Envelope::raw(
             schema.clone(),
             to.clone(),
-            crate::envelope::Payload::json_view(payload.clone()),
+            crate::envelope::Payload::shared(&payload),
             *trace,
         ),
         crate::context::Intent::StopSelf => return,

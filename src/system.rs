@@ -1430,9 +1430,9 @@ impl ActorSystemCore {
         timeout: std::time::Duration,
     ) -> Result<Json, error_stack::Report<crate::context::AskError>>
     where
-        C: Schema + serde::Serialize + Clone + Send + Sync + 'static,
+        C: Schema + crate::envelope::PayloadValue,
     {
-        let payload = Json::of(&value);
+        let payload = crate::envelope::Payload::value(value);
         let port = crate::kernel::KernelAskPort {
             registry: self.registry.clone(),
             kernel: self.kernel.clone(),
@@ -1508,10 +1508,10 @@ impl ActorSystemCore {
         timeout: std::time::Duration,
     ) -> Result<R, error_stack::Report<crate::context::AskError>>
     where
-        C: Schema + serde::Serialize + Clone + Send + Sync + 'static,
+        C: Schema + crate::envelope::PayloadValue,
         R: Schema + crate::envelope::PayloadValue + Clone + serde::de::DeserializeOwned + 'static,
     {
-        let payload = Json::of(&value);
+        let payload = crate::envelope::Payload::value(value);
         let port = crate::kernel::KernelAskPort {
             registry: self.registry.clone(),
             kernel: self.kernel.clone(),
@@ -11336,6 +11336,109 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn ask_reply_rides_the_fabric_zero_serde() {
+        // Given an Echo answering AskReq with the typed ctx.reply.
+        let (system, _clock) = ActorSystem::test();
+        struct Echo;
+        impl ServiceActor for Echo {
+            fn manifest() -> ActorManifest {
+                ActorManifest::new().kind(ActorKind::Service)
+            }
+            async fn start(
+                _args: &Json,
+            ) -> Result<Self, error_stack::Report<crate::registry::RegistryError>> {
+                Ok(Self)
+            }
+        }
+        impl MsgHandler<AskReq> for Echo {
+            async fn handle(&mut self, msg: &AskReq, ctx: &mut crate::context::MsgCtx<'_>) {
+                ctx.reply(AskRes { n: msg.n * 2 });
+            }
+        }
+        crate::builder::spawn_service_builder::<Echo>(&system)
+            .at(ActorPath::new("echo-fabric"))
+            .handles::<AskReq>()
+            .emits::<AskRes>()
+            .start();
+        wait_for(|| async { system.inbox_cursor(&ActorPath::new("echo-fabric")).is_some() }).await;
+
+        // When the typed ask round-trips with the serde probe open (the
+        // request moves in as a live value; the reply leaves ctx.reply as
+        // a live value and completes the slot untouched).
+        let before = crate::kernel::SERDE_CALLS.load(std::sync::atomic::Ordering::Relaxed);
+        let reply: AskRes = system
+            .ask_typed(
+                ActorPath::new("echo-fabric"),
+                AskReq { n: 20 },
+                std::time::Duration::from_secs(2),
+            )
+            .await
+            .expect("replied");
+        let after = crate::kernel::SERDE_CALLS.load(std::sync::atomic::Ordering::Relaxed);
+
+        // Then the reply is the correct live value and NO serde ran on
+        // the whole ask→reply→downcast round trip.
+        assert_eq!(reply.n, 40);
+        assert_eq!(
+            after - before,
+            0,
+            "a typed ask/reply must ride the fabric without serializing"
+        );
+    }
+
+    #[tokio::test]
+    async fn ask_typed_request_moves_without_serde_at_the_send_edge() {
+        // Given an Echo whose handler records what it received.
+        static SEEN: std::sync::Mutex<Vec<i64>> = std::sync::Mutex::new(Vec::new());
+        let (system, _clock) = ActorSystem::test();
+        struct Echo;
+        impl ServiceActor for Echo {
+            fn manifest() -> ActorManifest {
+                ActorManifest::new().kind(ActorKind::Service)
+            }
+            async fn start(
+                _args: &Json,
+            ) -> Result<Self, error_stack::Report<crate::registry::RegistryError>> {
+                Ok(Self)
+            }
+        }
+        impl MsgHandler<AskReq> for Echo {
+            async fn handle(&mut self, msg: &AskReq, ctx: &mut crate::context::MsgCtx<'_>) {
+                SEEN.lock().unwrap().push(msg.n);
+                ctx.reply(AskRes { n: msg.n });
+            }
+        }
+        crate::builder::spawn_service_builder::<Echo>(&system)
+            .at(ActorPath::new("echo-req"))
+            .handles::<AskReq>()
+            .emits::<AskRes>()
+            .start();
+        wait_for(|| async { system.inbox_cursor(&ActorPath::new("echo-req")).is_some() }).await;
+
+        // When the request is asked with the serde probe open.
+        let before = crate::kernel::SERDE_CALLS.load(std::sync::atomic::Ordering::Relaxed);
+        let reply: AskRes = system
+            .ask_typed(
+                ActorPath::new("echo-req"),
+                AskReq { n: 7 },
+                std::time::Duration::from_secs(2),
+            )
+            .await
+            .expect("replied");
+        let after = crate::kernel::SERDE_CALLS.load(std::sync::atomic::Ordering::Relaxed);
+
+        // Then the request arrived as the live value (the handler read
+        // `n` straight off the borrow) with zero serde on the path.
+        assert_eq!(reply.n, 7);
+        assert_eq!(SEEN.lock().unwrap().as_slice(), [7]);
+        assert_eq!(
+            after - before,
+            0,
+            "the ask request leg must move without serializing"
+        );
+    }
+
+    #[tokio::test]
     async fn ctx_ask_round_trips_a_typed_request() {
         // Given a caller service actor that asks a replying actor with
         // the TYPED ctx.ask (schema id and payload from the type).
@@ -11355,7 +11458,7 @@ mod tests {
                 let reply = ctx
                     .ask(
                         crate::envelope::Address::Path(ActorPath::new("echo")),
-                        &AskReq { n: 21 },
+                        AskReq { n: 21 },
                         std::time::Duration::from_secs(2),
                     )
                     .await;
