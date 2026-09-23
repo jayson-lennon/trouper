@@ -451,6 +451,8 @@ pub(crate) static INLINE_SERVICE_DISPATCH: std::sync::atomic::AtomicU64 =
 
 /// `tokio::spawn` calls anywhere in the runtime (test builds only) — the
 /// per-message spawn deliverable reads the delta across service steps.
+/// Runtime spawn sites go through [`spawn_tracked`]; test-only spawns
+/// (clock fakes, ui harnesses) do not.
 #[cfg(test)]
 pub(crate) fn bump_task_spawns() {
     TASK_SPAWNS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -458,6 +460,19 @@ pub(crate) fn bump_task_spawns() {
 
 #[cfg(test)]
 pub(crate) static TASK_SPAWNS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// The runtime's spawn funnel: every task the RUNTIME starts passes here
+/// (production it is a bare spawn; test builds it also counts). The
+/// service-step deliverable is "zero of these per message".
+pub(crate) fn spawn_tracked<F>(fut: F) -> tokio::task::JoinHandle<F::Output>
+where
+    F: std::future::Future + Send + 'static,
+    F::Output: Send + 'static,
+{
+    #[cfg(test)]
+    bump_task_spawns();
+    tokio::spawn(fut)
+}
 
 /// Kernel-facing handle for one running actor loop.
 pub(crate) struct ActorHandle {
@@ -2649,11 +2664,43 @@ pub(crate) struct ServiceLoop {
     pub(crate) es: EsLoop,
 }
 
+/// A future whose POLLS are panic-isolated: a handler panic unwinds out of
+/// `poll`, is captured here, and surfaces as `Err(poison)` — the async
+/// twin of `step_es`'s `catch_unwind` around the sync decision call.
+///
+/// Why poll-level (not around the whole await): `catch_unwind` cannot
+/// span `.await` — the wrapper is the only way to keep real-waker
+/// semantics (handlers legitimately await `ctx.ask` and internal I/O)
+/// while still turning any panic into `Step::Crashed` instead of tearing
+/// down the loop task.
+struct PanicIsolated<F>(F);
+
+impl<F: Future> Future for PanicIsolated<F> {
+    type Output = Result<F::Output, Box<dyn std::any::Any + Send>>;
+
+    fn poll(self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> std::task::Poll<Self::Output> {
+        // Projection by structural pin: the wrapper adds no unpin
+        // requirement, so `map_unchecked_mut` is sound (the inner field's
+        // pin state is the wrapper's).
+        let inner = unsafe { self.map_unchecked_mut(|s| &mut s.0) };
+        match std::panic::catch_unwind(AssertUnwindSafe(|| inner.poll(cx))) {
+            Ok(poll) => poll.map(Ok),
+            Err(poison) => std::task::Poll::Ready(Err(poison)),
+        }
+    }
+}
+
 /// One service step: peek → decode (sync) → dispatch (async) → ack.
 ///
 /// Service messages are consumed on HANDOFF (ack before dispatch): there is
 /// no journal to replay from, so redelivery after a crash would re-run
 /// side effects — at-most-once semantics are the honest contract here.
+///
+/// Dispatch runs INLINE on the loop task (no per-message `tokio::spawn`):
+/// the handler future is awaited through [`PanicIsolated`], so a handler
+/// panic marks the cell crashed and returns `Step::Crashed` — the same
+/// outcome the old spawned-task shape produced via a `JoinError` — while
+/// the loop still serializes messages (one handler at a time).
 async fn step_service(ctx: &ServiceLoop) -> Step {
     // 1. PEEK the envelope.
     let envelope = {
@@ -2717,10 +2764,12 @@ async fn step_service(ctx: &ServiceLoop) -> Step {
     // 4. CONSUME (ack) — at-most-once handoff to the handler.
     ctx.es.cell.inbox.lock().await.ack();
 
-    // 5. DISPATCH (async, impure) — spawned so handler panics surface as a
-    // JoinHandle error instead of tearing down the loop task itself; the
-    // loop awaits the handle, so one actor still processes one message at
-    // a time (its inbox serializes).
+    // 5. DISPATCH (inline on the loop task, panic-isolated). The handler
+    // future is awaited through PanicIsolated: no task is spawned per
+    // message (the old shape paid a spawn + JoinHandle + oneshot hop per
+    // dispatch), while a handler panic still lands as Step::Crashed —
+    // state may be poisoned, the loop task is not. The inbox serializes:
+    // one handler runs at a time, exactly as before.
     let path = ctx.es.path.clone();
     let service = {
         let kernel = ctx.es.kernel.lock();
@@ -2731,17 +2780,15 @@ async fn step_service(ctx: &ServiceLoop) -> Step {
             .expect("service present for a running loop")
     };
     let view = ctx.es.view.clone();
-    let entry = entry.clone();
     let ask_port = KernelAskPort {
         registry: ctx.es.registry.clone(),
         kernel: ctx.es.kernel.clone(),
         clock: ctx.es.clock.clone(),
     };
-    let (outbox_tx, outbox_rx) = tokio::sync::oneshot::channel();
     let trace = envelope.trace;
     let reply_to = envelope.reply_to.clone();
-    let handle = tokio::spawn(async move {
-        let mut outbox = Outbox::new();
+    let mut outbox = Outbox::new();
+    let dispatched = {
         let mut msg_ctx = crate::context::MsgCtx::new(
             &path,
             &trace,
@@ -2751,18 +2798,18 @@ async fn step_service(ctx: &ServiceLoop) -> Step {
             Some(&ask_port),
         );
         let mut service = service.lock().await;
-        entry
-            .dispatch(service.as_mut(), decoded, &mut msg_ctx)
-            .await;
-        let _ = outbox_tx.send(outbox);
-    });
-    let outbox = if handle.await.is_err() {
+        let fut = entry.dispatch(service.as_mut(), decoded, &mut msg_ctx);
+        #[cfg(test)]
+        crate::kernel::bump_inline_service_dispatch();
+        PanicIsolated(fut).await
+    };
+    if let Err(_poison) = dispatched {
         // Handler panicked: mark crashed (supervision restarts via `start`).
+        // The outbox dies with the dispatch — nothing recorded, the same
+        // contract the spawned-task shape kept.
         ctx.es.cell.mark_crashed();
         return Step::Crashed;
-    } else {
-        outbox_rx.await.unwrap_or_default()
-    };
+    }
 
     // 6. FLUSH deferred effects from the handler. A StopSelf intent
     // concludes the step with Step::Stop — sends recorded before it have
@@ -2897,8 +2944,8 @@ pub(crate) async fn restart_es(
         inbox.reopen();
     }
     let (_shutdown_tx, shutdown_rx) = watch::channel(false);
-    tokio::spawn(front_door_loop(ctx.cell.clone(), ctx.kernel.clone(), rx));
-    tokio::spawn(es_actor_loop(ctx.clone(), shutdown_rx));
+    spawn_tracked(front_door_loop(ctx.cell.clone(), ctx.kernel.clone(), rx));
+    spawn_tracked(es_actor_loop(ctx.clone(), shutdown_rx));
     Ok(())
 }
 

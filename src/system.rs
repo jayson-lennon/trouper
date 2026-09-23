@@ -433,7 +433,7 @@ impl ActorSystem {
         let child_cell = self.kernel.lock().cells.get(&spec.path).cloned();
         let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
         self.child_shutdowns.lock().push(_shutdown_tx);
-        tokio::spawn(crate::kernel::supervise_child(
+        crate::kernel::spawn_tracked(crate::kernel::supervise_child(
             engine,
             engine_spec,
             child_cell,
@@ -1280,7 +1280,7 @@ impl ActorSystemCore {
         let kernel_table = self.kernel.clone();
         let front_cell = cell.clone();
         let front_kernel = self.kernel.clone();
-        tokio::spawn(async move {
+        crate::kernel::spawn_tracked(async move {
             // Start the instance inside the task; a start failure leaves
             // the slot present (senders get a closed door) and the crash
             // recorded for supervision.
@@ -1303,8 +1303,12 @@ impl ActorSystemCore {
             }
             let _ = (&view, &registry);
             let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
-            tokio::spawn(crate::kernel::front_door_loop(front_cell, front_kernel, rx));
-            let task = tokio::spawn(crate::kernel::service_actor_loop(
+            crate::kernel::spawn_tracked(crate::kernel::front_door_loop(
+                front_cell,
+                front_kernel,
+                rx,
+            ));
+            let task = crate::kernel::spawn_tracked(crate::kernel::service_actor_loop(
                 crate::kernel::ServiceLoop { es: loop_ctx },
                 shutdown_rx,
             ));
@@ -4064,6 +4068,189 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(2)).await;
         }
         panic!("service handler never ran");
+    }
+
+    #[tokio::test]
+    async fn panicking_service_handler_crashes_the_step_and_supervision_restarts() {
+        // Given a supervised service actor whose handler panics ONLY on
+        // the first Boom, then succeeds (and a good Boom result is
+        // observable through a shared sink).
+        let (system, _clock) = ActorSystem::test();
+        let child = ActorPath::new("service-phoenix");
+        let (idx, sink) = open_sink();
+        bind_sink(&child, sink.clone());
+
+        static CRASHED_YET: std::sync::atomic::AtomicBool =
+            std::sync::atomic::AtomicBool::new(false);
+
+        #[derive(Command, Serialize, Deserialize, Clone)]
+        struct BoomService {
+            why: String,
+        }
+
+        struct ServicePhoenix {
+            sink: Arc<Mutex<Vec<String>>>,
+        }
+        impl ServiceActor for ServicePhoenix {
+            fn manifest() -> ActorManifest {
+                ActorManifest::new()
+                    .handles::<BoomService>()
+                    .kind(ActorKind::Service)
+            }
+            async fn start(
+                args: &Json,
+            ) -> Result<Self, error_stack::Report<crate::registry::RegistryError>> {
+                let idx = args["sink"].as_i64().expect("sink idx") as usize;
+                Ok(Self {
+                    sink: sinks().lock()[idx].clone(),
+                })
+            }
+        }
+        impl MsgHandler<BoomService> for ServicePhoenix {
+            async fn handle(
+                &mut self,
+                msg: BoomService,
+                _ctx: &mut crate::context::MsgCtx<'_>,
+            ) {
+                if msg.why == "poison"
+                    && !CRASHED_YET.swap(true, std::sync::atomic::Ordering::SeqCst)
+                {
+                    panic!("injected service handler panic");
+                }
+                self.sink.lock().push(msg.why);
+            }
+        }
+
+        let spec = crate::supervision::ActorSpec {
+            path: child.clone(),
+            parent: None,
+            restart: crate::supervision::RestartPolicy::Permanent,
+            budget: crate::supervision::RestartBudget::per(5, std::time::Duration::from_secs(10)),
+            backoff: crate::supervision::Backoff {
+                base: std::time::Duration::from_millis(5),
+                max: std::time::Duration::from_millis(20),
+                factor: 2.0,
+            },
+            args: json!({ "sink": idx }),
+            spawn: Arc::new(move |sys: &ActorSystem, path: &ActorPath, args: &Json| {
+                sys.spawn_service::<ServicePhoenix, _>(
+                    path.clone(),
+                    args,
+                    SpawnOpts::default(),
+                    || {
+                        vec![Arc::new(TypedServiceAdapter::<
+                            ServicePhoenix,
+                            BoomService,
+                        >::new::<BoomService>())]
+                    },
+                );
+            }),
+        };
+
+        // When the child runs under supervision, takes the poison (panic
+        // mid-handler), and then receives a good message.
+        system.spawn(spec);
+        wait_for(|| async {
+            system.facts().iter().any(
+                |f| matches!(&f.kind, crate::observe::ObservationKind::Spawned { path, .. } if *path == child),
+            )
+        })
+        .await;
+        system
+            .send(system.envelope(
+                BoomService::schema_id(),
+                child.clone(),
+                json!({ "why": "poison" }),
+            ))
+            .await
+            .expect("poison delivered");
+        // The engine re-runs the spec's spawn closure (a service child
+        // restarts as a FRESH spawn): the second Spawned fact for the
+        // path is the restart proof (there is no journal, so no
+        // Spawned{restart:true} on this tier).
+        wait_for(|| async {
+            system
+                .facts()
+                .iter()
+                .filter(|f| {
+                    matches!(&f.kind, crate::observe::ObservationKind::Spawned { path, .. } if *path == child)
+                })
+                .count()
+                >= 2
+        })
+        .await;
+        system
+            .send(system.envelope(
+                BoomService::schema_id(),
+                child.clone(),
+                json!({ "why": "healed" }),
+            ))
+            .await
+            .expect("good delivered");
+
+        // Then the fresh instance handled the good message — the crash
+        // was Step::Crashed (cell flagged, fresh loop), never a dead
+        // loop task or a torn-down actor.
+        for _ in 0..2_000 {
+            if sink.lock().as_slice() == ["healed"] {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+        }
+        panic!("restarted service never handled the follow-up message");
+    }
+
+    #[tokio::test]
+    async fn service_steps_dispatch_inline_without_spawning_tasks() {
+        // Given a service actor and a healthy baseline of the runtime's
+        // own spawn counter — taken only once the actor's loop task is
+        // observably up (the loop's spawn lands AFTER the Spawned fact,
+        // so the baseline must not race it).
+        let (system, _clock) = ActorSystem::test();
+        let path = ActorPath::new("inline-probe");
+        let (idx, sink) = open_sink();
+        bind_sink(&path, sink.clone());
+        system.spawn_service::<Auditor, _>(
+            path.clone(),
+            &json!({ "sink": idx }),
+            SpawnOpts::default(),
+            || vec![Arc::new(TypedServiceAdapter::<Auditor, Add>::new::<Add>())],
+        );
+        // One warm message: its delivery proves the loop task is running
+        // (and all its spawn bookkeeping is done).
+        system
+            .send(system.envelope(Add::schema_id(), path.clone(), json!({ "n": 0 })))
+            .await
+            .expect("delivered");
+        wait_for(|| async { sink.lock().len() == 1 }).await;
+        let spawns_before =
+            crate::kernel::TASK_SPAWNS.load(std::sync::atomic::Ordering::Relaxed);
+        let inline_before = crate::kernel::INLINE_SERVICE_DISPATCH
+            .load(std::sync::atomic::Ordering::Relaxed);
+
+        // When ten messages flow through the service step.
+        for n in 1..=10_i64 {
+            system
+                .send(system.envelope(Add::schema_id(), path.clone(), json!({ "n": n })))
+                .await
+                .expect("delivered");
+        }
+        wait_for(|| async { sink.lock().len() == 11 }).await;
+
+        // Then every dispatch ran INLINE on the loop task and the
+        // runtime spawned NOTHING for the ten steps.
+        let spawns_after =
+            crate::kernel::TASK_SPAWNS.load(std::sync::atomic::Ordering::Relaxed);
+        let inline_after = crate::kernel::INLINE_SERVICE_DISPATCH
+            .load(std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(
+            inline_after - inline_before, 10,
+            "each step dispatched inline"
+        );
+        assert_eq!(
+            spawns_after - spawns_before, 0,
+            "no task spawned per service message"
+        );
     }
 
     #[tokio::test]
