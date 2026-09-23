@@ -696,6 +696,38 @@ mod tests {
     }
 
     #[test]
+    fn trace_id_minting_pays_one_clock_read_and_no_getrandom() {
+        // Given the id-minting probes (each `next_uuid_shaped_id` bumps
+        // the clock-read counter once and the getrandom-skipped counter
+        // once; a real `Uuid::now_v7` call would skip the bump).
+        crate::kernel::ID_CLOCK_READS
+            .store(0, std::sync::atomic::Ordering::Relaxed);
+        crate::kernel::GETRANDOM_SKIPPED
+            .store(0, std::sync::atomic::Ordering::Relaxed);
+        const ROOTS: u64 = 1_000;
+
+        // When minting ROOTS trace contexts: root() pays 2 ids (trace +
+        // causality), each caused() hop renews causality and pays 1 more.
+        for _ in 0..ROOTS {
+            let parent = TraceCtx::root();
+            let _child = parent.caused();
+        }
+
+        // Then getrandom was never paid: every mint is counted as skipped.
+        assert_eq!(
+            crate::kernel::GETRANDOM_SKIPPED.load(std::sync::atomic::Ordering::Relaxed),
+            3 * ROOTS,
+            "every id mint must be getrandom-free"
+        );
+        // And exactly one clock read backed each id.
+        assert_eq!(
+            crate::kernel::ID_CLOCK_READS.load(std::sync::atomic::Ordering::Relaxed),
+            3 * ROOTS,
+            "each id costs exactly one vDSO clock read"
+        );
+    }
+
+    #[test]
     fn json_envelope_roundtrips_payload_and_metadata() {
         // Given a bytes-payload envelope (the erased boundary) with
         // sender and reply-to set.

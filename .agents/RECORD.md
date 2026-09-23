@@ -127,3 +127,7 @@ Entries are added or amended **only with human approval**.
 - (runtime) Journal stores install only at system construction, through SystemConfig's journal args (store plus an optional control-message closure); no post-construction setter exists.
 - (journal) The control-message closure receives synchronous store messages (currently errors only); with none installed store errors are only traced.
 - (bench) The journal bench (benches/journal.rs, requires the daow feature) measures the daow backend over in-memory and on-disk SQLite.
+- (schemas) A schema's SchemaDef and SchemaId are cached per-type in statics; repeated reads allocate nothing.
+- (runtime) Trace and causality ids are clock+counter generated (v7-layout, no getrandom); LeaseId shares the scheme.
+- (runtime) Service actor handlers dispatch inline on the actor loop task; no task is spawned per message.
+- (schemas) SchemaId holds a static string for derived schemas and allocates only for runtime-built names.

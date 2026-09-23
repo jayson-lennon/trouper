@@ -41,57 +41,57 @@ single-message by design (they price payload width, not batching).
 
 | Bench             | Case                       | Criterion time | Per message |               Rate |
 | ----------------- | -------------------------- | ------------: | ---------: | ----------------: |
-| tell_acked        | 64_messages                |      372.62 µs |      5.8 µs |      171,760 msg/s |
-|                   | 512_messages               |      11.710 ms |     22.9 µs |       43,724 msg/s |
-|                   | 2048_messages              |      47.936 ms |     23.4 µs |       42,723 msg/s |
-| fire_and_forget   | 64_messages                |      611.23 µs |      9.6 µs |      104,710 msg/s |
-|                   | 512_messages               |      8.4710 ms |     16.5 µs |       60,442 msg/s |
-|                   | 2048_messages              |      43.909 ms |     21.4 µs |       46,642 msg/s |
-| producer_scaling  | 64_messages/1              |      369.35 µs |      5.8 µs |      173,280 msg/s |
-|                   | 64_messages/2              |      681.24 µs |     10.6 µs |       93,946 msg/s |
-|                   | 64_messages/4              |      877.42 µs |     13.7 µs |       72,941 msg/s |
-|                   | 64_messages/8              |      1.0473 ms |     16.4 µs |       61,109 msg/s |
-|                   | 512_messages/1             |      12.912 ms |     25.2 µs |       39,652 msg/s |
-|                   | 512_messages/2             |      17.082 ms |     33.4 µs |       29,972 msg/s |
-|                   | 512_messages/4             |      19.247 ms |     37.6 µs |       26,602 msg/s |
-|                   | 512_messages/8             |      20.312 ms |     39.7 µs |       25,206 msg/s |
-|                   | 2048_messages/1            |      49.086 ms |     24.0 µs |       41,722 msg/s |
-|                   | 2048_messages/2            |      70.452 ms |     34.4 µs |       29,070 msg/s |
-|                   | 2048_messages/4            |      76.951 ms |     37.6 µs |       26,614 msg/s |
-|                   | 2048_messages/8            |      80.647 ms |     39.4 µs |       25,395 msg/s |
-| payload_size      | 500B                       |      871.15 µs |    871.2 µs |                  - |
-|                   | 2KB                        |      842.30 µs |    842.3 µs |                  - |
-|                   | 64KB                       |      421.56 µs |    421.6 µs |                  - |
-|                   | 1MB                        |      1.0454 ms |    1.045 ms |                  - |
-| wide_tree         | 100k_nodes                 |      809.56 µs |    809.6 µs |                  - |
-|                   | 1M_nodes                   |      1.4102 ms |    1.410 ms |                  - |
-| fanout            | handlers_1_1_asks          |      12.505 µs |     12.5 µs | 79,966 roundtrip/s |
-|                   | handlers_1_64_asks         |      800.96 µs |     12.5 µs | 79,904 roundtrip/s |
-|                   | handlers_1_512_asks        |      6.3559 ms |     12.4 µs | 80,556 roundtrip/s |
-|                   | handlers_8_1_asks          |      102.94 µs |    102.9 µs |  9,715 roundtrip/s |
-|                   | handlers_8_64_asks         |      6.4837 ms |    101.3 µs |  9,871 roundtrip/s |
-|                   | handlers_8_512_asks        |      52.058 ms |    101.7 µs |  9,835 roundtrip/s |
-|                   | handlers_64_1_asks         |      812.35 µs |    812.4 µs |  1,231 roundtrip/s |
-|                   | handlers_64_64_asks        |      52.203 ms |    815.7 µs |  1,226 roundtrip/s |
-|                   | handlers_64_512_asks       |      414.45 ms |    809.5 µs |  1,235 roundtrip/s |
-| overload_block    | producers_16_64_messages   |      601.85 µs |      9.4 µs |      106,340 msg/s |
-|                   | producers_16_512_messages  |      18.458 ms |     36.1 µs |       27,738 msg/s |
-|                   | producers_16_2048_messages |      78.663 ms |     38.4 µs |       26,035 msg/s |
-| idle_fleet        | 1k_idle_64_messages        |      207.17 µs |      3.2 µs |      308,920 msg/s |
-|                   | 1k_idle_512_messages       |      11.762 ms |     23.0 µs |       43,530 msg/s |
-|                   | 1k_idle_2048_messages      |      50.087 ms |     24.5 µs |       40,889 msg/s |
-|                   | 10k_idle_64_messages       |      200.61 µs |      3.1 µs |      319,020 msg/s |
-|                   | 10k_idle_512_messages      |      12.152 ms |     23.7 µs |       42,132 msg/s |
-|                   | 10k_idle_2048_messages     |      51.413 ms |     25.1 µs |       39,835 msg/s |
-| projection_read   | hot_typed_64_frames        |      7.4008 µs |    115.6 ns |   8,647,700 read/s |
-|                   | hot_json_64_frames         |      396.24 ms |    6.191 ms |         161 read/s |
-| swarm             | p32_r128                   |      4.5041 ms |      1.1 µs |      909,404 msg/s |
-|                   | p128_r512                  |      14.578 ms |      0.9 µs |    1,123,900 msg/s |
-|                   | p512_r2048                 |      75.192 ms |      1.1 µs |      871,590 msg/s |
-| observation_price | 64_messages_off            |      453.45 µs |      7.1 µs |      141,140 msg/s |
-|                   | 64_messages_on             |      826.82 µs |     12.9 µs |       77,405 msg/s |
-|                   | 512_messages_off           |      7.3965 ms |     14.4 µs |       69,222 msg/s |
-|                   | 512_messages_on            |      7.5446 ms |     14.7 µs |       67,863 msg/s |
+| tell_acked        | 64_messages                |      371.03 µs |     5.8 µs |      165,120 msg/s |
+|                   | 512_messages               |      13.325 ms |    26.0 µs |       38,099 msg/s |
+|                   | 2048_messages              |      55.081 ms |    26.9 µs |       36,754 msg/s |
+| fire_and_forget   | 64_messages                |      338.52 µs |     5.3 µs |      167,250 msg/s |
+|                   | 512_messages               |      10.875 ms |    21.2 µs |       46,612 msg/s |
+|                   | 2048_messages              |      51.818 ms |    25.3 µs |       38,901 msg/s |
+| producer_scaling  | 64_messages/1              |      334.30 µs |     5.2 µs |      171,420 msg/s |
+|                   | 64_messages/2              |      682.18 µs |    10.7 µs |       88,483 msg/s |
+|                   | 64_messages/4              |      1.0092 ms |    15.8 µs |       61,650 msg/s |
+|                   | 64_messages/8              |      1.2644 ms |    19.8 µs |       49,398 msg/s |
+|                   | 512_messages/1             |      13.173 ms |    25.7 µs |       38,591 msg/s |
+|                   | 512_messages/2             |      16.907 ms |    33.0 µs |       30,150 msg/s |
+|                   | 512_messages/4             |      19.497 ms |    38.1 µs |       26,007 msg/s |
+|                   | 512_messages/8             |      20.570 ms |    40.2 µs |       24,678 msg/s |
+|                   | 2048_messages/1            |      49.920 ms |    24.4 µs |       40,784 msg/s |
+|                   | 2048_messages/2            |      68.094 ms |    33.2 µs |       29,787 msg/s |
+|                   | 2048_messages/4            |      76.182 ms |    37.2 µs |       26,574 msg/s |
+|                   | 2048_messages/8            |      80.548 ms |    39.3 µs |       25,192 msg/s |
+| payload_size      | 500B                       |      845.48 µs |   845.5 µs |                  - |
+|                   | 2KB                        |      1.4123 ms |   1.412 ms |                  - |
+|                   | 64KB                       |      334.38 µs |   334.4 µs |                  - |
+|                   | 1MB                        |      960.53 µs |   960.5 µs |                  - |
+| wide_tree         | 100k_nodes                 |      941.64 µs |   941.6 µs |                  - |
+|                   | 1M_nodes                   |      1.6095 ms |   1.610 ms |                  - |
+| fanout            | handlers_1_1_asks          |      10.721 µs |    10.7 µs | 92,857 roundtrip/s |
+|                   | handlers_1_64_asks         |      677.79 µs |    10.6 µs | 94,076 roundtrip/s |
+|                   | handlers_1_512_asks        |      5.4277 ms |    10.6 µs | 93,881 roundtrip/s |
+|                   | handlers_8_1_asks          |      85.384 µs |    85.4 µs | 11,613 roundtrip/s |
+|                   | handlers_8_64_asks         |      5.4543 ms |    85.2 µs | 11,651 roundtrip/s |
+|                   | handlers_8_512_asks        |      43.952 ms |    85.8 µs | 11,602 roundtrip/s |
+|                   | handlers_64_1_asks         |      700.18 µs |   700.2 µs |  1,418 roundtrip/s |
+|                   | handlers_64_64_asks        |      43.670 ms |   682.3 µs |  1,450 roundtrip/s |
+|                   | handlers_64_512_asks       |      350.81 ms |   685.7 µs |  1,450 roundtrip/s |
+| overload_block    | producers_16_64_messages   |      504.02 µs |     7.9 µs |      120,000 msg/s |
+|                   | producers_16_512_messages  |      18.696 ms |    36.5 µs |       26,920 msg/s |
+|                   | producers_16_2048_messages |      78.556 ms |    38.4 µs |       25,806 msg/s |
+| idle_fleet        | 1k_idle_64_messages        |      230.65 µs |     3.6 µs |      258,160 msg/s |
+|                   | 1k_idle_512_messages       |      13.015 ms |    25.4 µs |       38,466 msg/s |
+|                   | 1k_idle_2048_messages      |      50.733 ms |    24.8 µs |       39,676 msg/s |
+|                   | 10k_idle_64_messages       |      201.65 µs |     3.1 µs |      300,780 msg/s |
+|                   | 10k_idle_512_messages      |      12.426 ms |    24.3 µs |       39,832 msg/s |
+|                   | 10k_idle_2048_messages     |      53.943 ms |    26.3 µs |       37,083 msg/s |
+| projection_read   | hot_typed_64_frames        |      7.5592 µs |   118.1 ns |   8,444,500 read/s |
+|                   | hot_json_64_frames         |      391.15 ms |   6.112 ms |         163 read/s |
+| swarm             | p32_r128                   |      3.2905 ms |     0.8 µs |    1,236,600 msg/s |
+|                   | p128_r512                  |      13.233 ms |     0.8 µs |    1,232,800 msg/s |
+|                   | p512_r2048                 |      62.710 ms |     1.2 µs |    1,031,900 msg/s |
+| observation_price | 64_messages_off            |      370.92 µs |     5.8 µs |      153,390 msg/s |
+|                   | 64_messages_on             |      651.19 µs |    10.2 µs |       92,899 msg/s |
+|                   | 512_messages_off           |      10.894 ms |    21.3 µs |       46,127 msg/s |
+|                   | 512_messages_on            |      10.763 ms |    21.0 µs |       46,729 msg/s |
 
 What the shapes mean:
 
@@ -134,12 +134,12 @@ What the shapes mean:
 
 | Bench                            | Case            |      Mean |
 | -------------------------------- | --------------- | -------: |
-| in_memory_journal_append         | batch_1         | 70.184 ns |
-|                                  | batch_8         | 246.98 ns |
-|                                  | batch_64        | 1.6731 µs |
-| in_memory_journal_replay_restart | journal_1000    | 50.536 µs |
-|                                  | journal_10000   | 573.91 µs |
-|                                  | repeat_load_10k | 744.56 µs |
+| in_memory_journal_append         | batch_1         | 71.79 ns |
+|                                  | batch_8         | 32.55 ns |
+|                                  | batch_64        | 27.79 ns |
+| in_memory_journal_replay_restart | journal_1000    | 54.080 µs |
+|                                  | journal_10000   | 566.30 µs |
+|                                  | repeat_load_10k | 765.40 µs |
 
 Also see `examples/idle_burn.rs`, a CPU-seconds probe for idle fleets
 (5,000 duty-armed idle actors burn ~0.003 CPU-seconds per second of
