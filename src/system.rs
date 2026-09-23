@@ -109,6 +109,13 @@ pub struct SystemConfig {
     /// Default mailbox capacity and overload policy for spawned actors
     /// (per-spawn [`SpawnOpts`] override these).
     pub default_mailbox: MailboxDefaults,
+    /// The journal store (plus its control wiring) installed at
+    /// construction — the only moment a store installs. `None` = the
+    /// in-memory default. Build one with
+    /// [`JournalArgs::new`](crate::journal::JournalArgs::new) (custom
+    /// stores) or, with the `daow` feature, that module's
+    /// `JournalArgs::daow` (see the `journal_daow` module).
+    pub journal_args: Option<crate::journal::JournalArgs>,
 }
 
 /// System-wide mailbox defaults.
@@ -136,6 +143,7 @@ impl SystemConfig {
             clock: ClockService::new(Arc::new(SystemClock::new())),
             observation: None,
             default_mailbox: MailboxDefaults::default(),
+            journal_args: None,
         }
     }
 
@@ -145,7 +153,16 @@ impl SystemConfig {
             clock,
             observation: None,
             default_mailbox: MailboxDefaults::default(),
+            journal_args: None,
         }
+    }
+
+    /// Installs the journal store (and its control handler) at
+    /// construction — the only moment a store installs. See
+    /// [`JournalArgs`](crate::journal::JournalArgs).
+    pub fn with_journal(mut self, args: crate::journal::JournalArgs) -> Self {
+        self.journal_args = Some(args);
+        self
     }
 }
 
@@ -213,6 +230,12 @@ pub struct ActorSystemCore {
     /// default; swapped per system at construction).
     pub(crate) journal_store_slot:
         parking_lot::RwLock<std::sync::Arc<dyn crate::journal::JournalStore>>,
+    /// The host's store-control handler installed with the store at
+    /// construction (`None` = store errors are only traced). The system's
+    /// surface for store failures that have no caller (writer-task ticks,
+    /// the sweep's flush). See
+    /// [`StoreControlMessage`](crate::journal::StoreControlMessage).
+    pub(crate) journal_control: Option<crate::journal::ControlHandler>,
     /// The test-build observation log the `test()` constructors install
     /// (the assertions' window on the observation flow). `None` for
     /// production systems — observation there is only the host's handler.
@@ -779,8 +802,18 @@ impl ActorSystemCore {
         });
         // ONE store instance per system: the core keeps a handle for the
         // sweep's flush; the kernel reads/writes through the same Arc.
-        let journal_store: std::sync::Arc<dyn crate::journal::JournalStore> =
-            std::sync::Arc::new(crate::journal::InMemoryJournalStore::new());
+        // Construction-time install only: config args carry the store
+        // (default: in-memory) plus its control handler.
+        let (journal_store, journal_control): (
+            std::sync::Arc<dyn crate::journal::JournalStore>,
+            Option<crate::journal::ControlHandler>,
+        ) = match config.journal_args {
+            Some(args) => (args.store, args.control),
+            None => (
+                std::sync::Arc::new(crate::journal::InMemoryJournalStore::new()),
+                None,
+            ),
+        };
         // ONE shutdown barrier, shared by the core and the kernel state:
         // the sweep stores through the core handle, the send path reads
         // through clones — never a lock in between.
@@ -800,6 +833,7 @@ impl ActorSystemCore {
             mailbox_defaults: config.default_mailbox,
             shutting_down,
             journal_store_slot: parking_lot::RwLock::new(journal_store),
+            journal_control,
             observation_log: None,
         }
     }
@@ -823,6 +857,7 @@ impl ActorSystemCore {
             mailbox_defaults: MailboxDefaults::default(),
             shutting_down,
             journal_store_slot: parking_lot::RwLock::new(store),
+            journal_control: None,
             observation_log: None,
         }
     }
@@ -838,6 +873,7 @@ impl ActorSystemCore {
             clock,
             observation: Some(log.handler()),
             default_mailbox: MailboxDefaults::default(),
+            journal_args: None,
         });
         system.observation_log = Some(log);
         (system, fake)
@@ -854,6 +890,7 @@ impl ActorSystemCore {
                 clock,
                 observation: Some(handler),
                 default_mailbox: MailboxDefaults::default(),
+                journal_args: None,
             }),
             fake,
         )
@@ -2572,6 +2609,17 @@ impl ActorSystem {
     #[cfg(test)]
     pub(crate) fn journal_store_trait(&self) -> std::sync::Arc<dyn crate::journal::JournalStore> {
         self.0.journal_store_slot.read().clone()
+    }
+
+    /// The host's store-control handler installed with the journal store
+    /// at construction (`None` = none installed). The system-level surface
+    /// for store messages — a persistent backend's writer task and the
+    /// shutdown flush report failures here because their results have no
+    /// caller (the sweep ignores `flush`'s result by design). See
+    /// [`JournalArgs`](crate::journal::JournalArgs) and
+    /// [`StoreControlMessage`](crate::journal::StoreControlMessage).
+    pub fn journal_control(&self) -> Option<crate::journal::ControlHandler> {
+        self.0.journal_control.clone()
     }
 
     /// Test seam: swaps the system's journal store.
@@ -9243,6 +9291,119 @@ mod tests {
         // Then the in-memory store flushed without error and the actor's
         // tables are gone (the sweep tore them down).
         assert!(!system.lookup_slot(&path), "sweep drained all");
+    }
+
+    /// A passthrough store that counts appends and loads — the probe for
+    /// construction-time install (`with_journal`).
+    struct InstalledStore {
+        inner: crate::journal::InMemoryJournalStore,
+        appends: std::sync::atomic::AtomicUsize,
+        loads: std::sync::atomic::AtomicUsize,
+    }
+
+    impl InstalledStore {
+        fn new() -> std::sync::Arc<Self> {
+            std::sync::Arc::new(Self {
+                inner: crate::journal::InMemoryJournalStore::new(),
+                appends: std::sync::atomic::AtomicUsize::new(0),
+                loads: std::sync::atomic::AtomicUsize::new(0),
+            })
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl crate::journal::JournalStore for InstalledStore {
+        async fn append(
+            &self,
+            path: &ActorPath,
+            events: &[crate::envelope::Event],
+        ) -> Result<Vec<crate::journal::SeqNo>, error_stack::Report<crate::journal::JournalError>>
+        {
+            self.appends.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.inner.append(path, events).await
+        }
+
+        async fn append_snapshot(
+            &self,
+            path: &ActorPath,
+            seq: crate::journal::SeqNo,
+            state: Json,
+            now_ms: u64,
+        ) -> Result<(), error_stack::Report<crate::journal::JournalError>> {
+            self.inner.append_snapshot(path, seq, state, now_ms).await
+        }
+
+        async fn load(
+            &self,
+            path: &ActorPath,
+        ) -> Result<Option<crate::journal::Replay>, error_stack::Report<crate::journal::JournalError>>
+        {
+            self.loads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.inner.load(path).await
+        }
+
+        async fn flush(&self) -> Result<(), error_stack::Report<crate::journal::JournalError>> {
+            self.inner.flush().await
+        }
+
+        fn name(&self) -> &'static str {
+            "installed"
+        }
+
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+    }
+
+    #[tokio::test]
+    async fn with_journal_installs_the_store_spawn_routes_through_it() {
+        // Given a system built with a counting store via `with_journal` —
+        // the construction-time install (no post-construction setter).
+        let store = InstalledStore::new();
+        let system = ActorSystem::new(SystemConfig::production().with_journal(
+            crate::journal::JournalArgs::new(store.clone()),
+        ));
+        system.register_schema::<Add>();
+        system.register_schema::<Added>();
+        let path = ActorPath::new("installed");
+        system.spawn_es::<Counter, _>(path.clone(), &json!({}), SpawnOpts::default(), || {
+            vec![Arc::new(TypedEsAdapter::<Counter, Add>::new::<Add>())]
+        });
+
+        // When a command is delivered (the journaled spawn must restore
+        // through the installed store, and the commit appends through it).
+        system
+            .send(system.envelope(Add::schema_id(), path.clone(), json!({ "n": 1 })))
+            .await
+            .expect("delivered");
+        wait_for_cursor(&system, &path, 1).await;
+
+        // Then the INSTALLED store saw the append and the restore load —
+        // the system routes journals through the construction-time store.
+        assert!(
+            store.appends.load(std::sync::atomic::Ordering::SeqCst) >= 1,
+            "spawn's append hit the installed store"
+        );
+        assert!(
+            store.loads.load(std::sync::atomic::Ordering::SeqCst) >= 1,
+            "spawn's restore load hit the installed store"
+        );
+    }
+
+    #[tokio::test]
+    async fn default_system_keeps_the_in_memory_store_and_no_control() {
+        // Given a system built without journal args.
+        let system = ActorSystem::new(SystemConfig::production());
+
+        // When probing the installed store and control handler.
+        let store = system.journal_store_trait();
+        let is_default_memory =
+            crate::journal::downcast_in_memory(&store).is_some();
+
+        // Then the in-memory default is intact and no control handler
+        // exists (behavior unchanged for consumers that never opt in).
+        assert!(is_default_memory, "default store is the in-memory one");
+        assert!(system.journal_control().is_none(), "no handler installed");
     }
 
     #[tokio::test]

@@ -36,6 +36,28 @@ derive_more = { version = "2.1", features = ["debug"] }
 tracing = "0.1"
 async-trait = "0.1"
 smallvec = "1"
+# The `daow` feature's SQLite journal backend. Optional: consumers who
+# never touch persistence pay nothing. `bundled-sqlite` (daow's default)
+# compiles the amalgamation so standalone trouper builds/benches need no
+# system libsqlite3; jinn's host-vs-target split is unaffected (trouper
+# is a runtime link there).
+daow = { version = "0.2", optional = true, default-features = false, features = [
+    "bundled-sqlite",
+] }
+# The backend's raw-SQL door rides daow's `with_conn(&mut rusqlite::Connection)`.
+# Same version/features as daow's own dep — one amalgamation, one connection
+# type; rusqlite does not version-gate its own re-exports so the two resolve
+# to one crate.
+rusqlite = { version = "0.40", optional = true, default-features = false, features = [
+    "cache",
+    "bundled",
+] }
+
+[features]
+default = []
+# The SQLite journal backend over a `daow::Pool` (see `journal_daow`).
+# Default features stay empty: the persistence tier is strictly opt-in.
+daow = ["dep:daow", "dep:rusqlite"]
 
 [dev-dependencies]
 # `fs` here (examples write real files) — deliberately NOT a library
@@ -46,6 +68,8 @@ futures = "0.3"
 tracing-subscriber = "0.3"
 trybuild = "1"
 criterion = { version = "0.7", features = ["html_reports"] }
+# On-disk SQLite databases for the daow journal tests and benches.
+tempfile = "3"
 
 [[bench]]
 name = "e2e"
@@ -54,6 +78,11 @@ harness = false
 [[bench]]
 name = "micro"
 harness = false
+
+[[bench]]
+name = "journal"
+harness = false
+required-features = ["daow"]
 
 [profile.release]
 lto = true

@@ -21,6 +21,8 @@ pub mod context;
 pub mod envelope;
 pub mod inbox;
 pub mod journal;
+#[cfg(feature = "daow")]
+pub mod journal_daow;
 pub mod json;
 pub mod kernel;
 pub mod observe;

@@ -484,6 +484,75 @@ pub trait JournalStore: Send + Sync {
     }
 }
 
+/// A synchronous store-control message the host may observe.
+///
+/// The store (or its install path) calls the installed
+/// [`ControlHandler`] in place of returning an error to the caller when
+/// a failure surfaces on a path that has no caller — the writer task's
+/// periodic flush and the shutdown sweep's `flush` (whose result the
+/// runtime ignores) are the two that matter. The host keeps the receiving
+/// end (a channel sender, a tracing hook, a metric bump) and decides what
+/// a store failure means for the deployment.
+#[derive(Debug, Clone)]
+pub enum StoreControlMessage {
+    /// A store operation failed after its result had no caller. `op`
+    /// names the failing operation (`"append"`, `"flush"`, `"tick"`,
+    /// `"load"`, `"scan"`, `"purge"`, `"passivated"`), `detail` carries
+    /// the error rendering.
+    Error {
+        /// The operation that failed.
+        op: &'static str,
+        /// The failure rendering.
+        detail: String,
+    },
+}
+
+/// The host's store-control closure. Called synchronously from store
+/// internals (the writer task, the sweep-adjacent paths) — keep it
+/// cheap and non-blocking (a channel send, a counter).
+pub type ControlHandler = std::sync::Arc<dyn Fn(StoreControlMessage) + Send + Sync>;
+
+/// A [`JournalStore`] plus its control wiring, handed to
+/// [`SystemConfig::with_journal`](crate::system::SystemConfig::with_journal)
+/// at construction — the only moment a system's store installs (no
+/// post-construction setter exists: a live swap would fork journals
+/// across two stores).
+///
+/// The default is the in-memory store with no control handler. Build a
+/// persistent system with the `daow` feature (see the `journal_daow`
+/// module's `JournalArgs::daow`).
+#[derive(Clone)]
+pub struct JournalArgs {
+    /// The store every ES actor's journal lives in.
+    pub store: std::sync::Arc<dyn JournalStore>,
+    /// The host's store-control handler (see
+    /// [`StoreControlMessage`]); `None` leaves store errors only traced.
+    pub control: Option<ControlHandler>,
+}
+
+impl std::fmt::Debug for JournalArgs {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("JournalArgs")
+            .field("store_name", &self.store.name())
+            .field("control", &self.control.is_some())
+            .finish()
+    }
+}
+
+impl JournalArgs {
+    /// Wraps a custom store (control: none — add one with
+    /// [`JournalArgs::with_control`]).
+    pub fn new(store: std::sync::Arc<dyn JournalStore>) -> Self {
+        Self { store, control: None }
+    }
+
+    /// Attaches the host's store-control handler.
+    pub fn with_control(mut self, handler: ControlHandler) -> Self {
+        self.control = Some(handler);
+        self
+    }
+}
+
 /// The default store: an in-memory [`Journal`] per actor path.
 #[derive(Debug, Default)]
 pub struct InMemoryJournalStore {

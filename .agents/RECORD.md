@@ -77,7 +77,7 @@ Entries are added or amended **only with human approval**.
 - (lifecycle) Passivation is declarative spawn config on the typed builders; the idle timer resets only on completed message steps.
 - (lifecycle) Passivation drains already-queued messages after closing the inbox; external stop and self-stop dead-letter undelivered mail instead.
 - (lifecycle) system.shutdown_graceful(deadline) runs a two-phase sweep: a barrier that refuses new sends and disables activation, restarts, and passivation, then a deadline-bounded parallel drain with on_stop hooks.
-- (journal) All event-sourced journal reads and writes route through the async JournalStore trait; the in-memory store is the default and only implementation.
+- (journal) All event-sourced journal reads and writes route through the async JournalStore trait; the in-memory store is the default.
 - (journal) The JournalStore append is awaited before the command's ack, backends may write through or buffer, and the runtime flushes the store once during the shutdown sweep.
 - (supervision) A supervised child's restart engine exits when the child's spec is removed and stays suspended during the shutdown sweep.
 - (supervision) Restart-budget exhaustion stops the child and delivers an Escalated message to its declared parent path; the parent is an ordinary actor whose handler owns the response.
@@ -121,3 +121,9 @@ Entries are added or amended **only with human approval**.
 - (schemas) The derive's schema name is the struct ident and descriptor field names are the Rust field idents; renames are serde's concern only, and the shard-key field must not be serde-renamed.
 - (runtime) An ES loop captures its state Arc at spawn and rebinds it at boot recovery, restart, and projector catch-up — the only moments the table's Arc is replaced; message steps read the cached state shell without the kernel tables lock (probe-counted: with observation off, a tell→fold→ack window acquires the tables zero times — the step's commit point reads cell state directly).
 - (runtime) Emit-declaration gating on the message path reads a cell-local declaration mirror, seeded from the manifest at spawn and re-synced with the registry at the single declaration-mutation point (ActorSystemCore::declare_emits); the registry lock is off the step path.
+- (journal) The optional daow feature enables a SQLite JournalStore backend over a daow Pool; building it runs a versioned, atomic journal-table migration chain and seeds the ingest counter from the stored maximum.
+- (journal) The daow backend acks appends against an in-memory buffer and a writer task flushes pending entries to SQLite on a configurable periodic tick (DaowConfig::flush_interval); failed flushes notify the control closure and retry with the buffer retained.
+- (journal) The daow backend's passivated hint flushes the path's buffer to SQLite and drops it; reactivation replays from SQLite and appends continue at the stored max seq.
+- (runtime) Journal stores install only at system construction, through SystemConfig's journal args (store plus an optional control-message closure); no post-construction setter exists.
+- (journal) The control-message closure receives synchronous store messages (currently errors only); with none installed store errors are only traced.
+- (bench) The journal bench (benches/journal.rs, requires the daow feature) measures the daow backend over in-memory and on-disk SQLite.
