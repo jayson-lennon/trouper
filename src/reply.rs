@@ -163,11 +163,19 @@ mod tests {
 pub struct LeaseId(Uuid);
 
 impl LeaseId {
-    /// Generates a fresh lease id.
+    /// Generates a fresh lease id (the shared counter-backed generator —
+    /// see `crate::envelope`'s id scheme; no `getrandom` on the ask path).
     pub fn new() -> Self {
-        Self(Uuid::now_v7())
+        Self(crate::envelope::next_lease_id())
     }
 }
+/// A lease id's uuid (the envelope-side uniqueness probe; test builds
+/// only).
+#[cfg(test)]
+pub(crate) fn lease_id_probe() -> uuid::Uuid {
+    LeaseId::new().0
+}
+
 impl Default for LeaseId {
     fn default() -> Self {
         Self::new()

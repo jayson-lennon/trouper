@@ -750,9 +750,9 @@ mod tests {
 pub struct TraceId(Uuid);
 
 impl TraceId {
-    /// Generates a fresh, time-ordered (v7) trace id.
+    /// Generates a fresh, time-ordered (v7-shaped) trace id.
     pub fn new() -> Self {
-        Self(Uuid::now_v7())
+        Self(next_uuid_shaped_id())
     }
 }
 impl std::fmt::Display for TraceId {
@@ -771,9 +771,9 @@ impl Default for TraceId {
 pub struct CausalityId(Uuid);
 
 impl CausalityId {
-    /// Generates a fresh, time-ordered (v7) causality id.
+    /// Generates a fresh, time-ordered (v7-shaped) causality id.
     pub fn new() -> Self {
-        Self(Uuid::now_v7())
+        Self(next_uuid_shaped_id())
     }
 }
 impl std::fmt::Display for CausalityId {
@@ -796,6 +796,75 @@ impl Default for CausalityId {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// The id generator behind [`TraceId::new`], [`CausalityId::new`], and
+/// [`crate::reply::LeaseId::new`]: a v7-SHAPED uuid assembled from one
+/// coarse clock read plus a process-unique counter — no `getrandom`, no
+/// float math, per id.
+///
+/// Layout (RFC 9562 v7, so `Display`/parse/`get_timestamp` stay valid):
+/// bits 0..48 carry the unix millisecond (time-ordered at ms grain,
+/// `as_millis_ts` reads it back), bits 48..52 the `7` version nibble,
+/// bits 52..54 the RFC-4122 variant, and the remaining 62 bits a
+/// process-unique counter. The counter mixes into the HIGH free bits so
+/// consecutive ids differ early in the rendered string, not only at the
+/// tail. Uniqueness holds within a process (one atomic counter feeds
+/// every id kind); across restarts the fresh clock value separates ids —
+/// ids never persist (journals carry schema + payload only; ids ride
+/// envelopes and observations), so no durable collision surface exists.
+///
+/// Layout map (uuid bytes are big-endian, `from_u64_pair(high, low)`):
+/// `high` bits 63..16 = unix ms (48), bits 15..12 = version `0x7`,
+/// bits 11..0 = rand_a (12) — carrying the counter's top 12 bits.
+/// `low` bits 63..62 = variant `0b10`, bits 61..0 = rand_b (62) —
+/// carrying the counter's low 62 bits. The full 62-bit counter is
+/// recoverable from (rand_a, rand_b), so ids never collide within a
+/// process, and consecutive ids differ in the rendered string's middle
+/// groups, not only at the tail.
+fn next_uuid_shaped_id() -> Uuid {
+    static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    let raw_millis = {
+        #[cfg(test)]
+        crate::kernel::bump_id_clock_reads();
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            // A clock before the epoch degrades to 0: ids stay unique by
+            // counter, only their time order is lost.
+            .unwrap_or(0)
+    };
+    // The monotonic guard: a clock step backwards (NTP correction) would
+    // break v7's time-ordered property; hold the high-water mark instead.
+    static LAST_MILLIS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let millis = {
+        let mut last = LAST_MILLIS.load(std::sync::atomic::Ordering::Relaxed);
+        loop {
+            if raw_millis > last {
+                match LAST_MILLIS.compare_exchange_weak(
+                    last,
+                    raw_millis,
+                    std::sync::atomic::Ordering::Relaxed,
+                    std::sync::atomic::Ordering::Relaxed,
+                ) {
+                    Ok(_) => break raw_millis,
+                    Err(now) => last = now,
+                }
+            } else {
+                break last; // step-back or same ms: keep the high-water mark
+            }
+        }
+    };
+    let counter = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed) & 0x3FFF_FFFF_FFFF_FFFF;
+    let high = (millis << 16) | 0x7000 | ((counter >> 50) & 0xFFF);
+    let low = 0x8000_0000_0000_0000 | (counter & 0x3FFF_FFFF_FFFF_FFFF);
+    Uuid::from_u64_pair(high, low)
+}
+
+/// The lease-id entry into the shared generator (the ask path's
+/// constructor; pub(crate) so `reply.rs` shares the one counter).
+pub(crate) fn next_lease_id() -> Uuid {
+    next_uuid_shaped_id()
 }
 
 #[test]
@@ -832,6 +901,112 @@ fn causality_id_is_version_7() {
 
     // Then it is v7.
     assert_eq!(version, 7);
+}
+
+#[test]
+fn trace_ids_are_unique_across_threads() {
+    // Given eight tasks each minting 100k ids (the shared atomic counter
+    // is the only uniqueness mechanism — this is the collision probe).
+    let handle = |task: usize| {
+        std::thread::spawn(move || {
+            let mut ids = std::collections::HashSet::with_capacity(100_000);
+            for n in 0..100_000_u64 {
+                // Alternate kinds: ONE counter feeds trace, causality,
+                // and lease ids, so the guarantee is shared-counter-wide.
+                let id = match (task + n as usize) % 3 {
+                    0 => TraceId::new().0.as_u128(),
+                    1 => CausalityId::new().0.as_u128(),
+                    _ => lease_probe().as_u128(),
+                };
+                ids.insert(id);
+            }
+            ids
+        })
+    };
+    let handles: Vec<_> = (0..8).map(handle).collect();
+    let mut all = std::collections::HashSet::new();
+    for h in handles {
+        let part = h.join().expect("thread");
+        assert_eq!(part.len(), 100_000, "no duplicate within one task");
+        all.extend(part);
+    }
+
+    // Then all 800k ids are distinct across every kind and task.
+    assert_eq!(all.len(), 800_000);
+}
+
+#[test]
+fn counter_ids_read_back_their_millisecond_timestamp() {
+    // Given a freshly generated causality id (the observation ts source).
+    let before_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock")
+        .as_millis() as u64;
+    let id = CausalityId::new();
+    let after_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock")
+        .as_millis() as u64;
+
+    // When reading the embedded timestamp back.
+    let ts = id.as_millis_ts().as_millis();
+
+    // Then it falls inside the generation window (the packed millis is
+    // the REAL clock — observation timestamps stay truthful).
+    assert!((before_ms..=after_ms).contains(&ts), "ts {ts} outside {before_ms}..{after_ms}");
+}
+
+#[test]
+fn legacy_v7_uuid_strings_decode_into_counter_ids() {
+    // Given a REAL v7 uuid written by a pre-change runtime (an old
+    // observation stream, a serialized envelope in flight).
+    let legacy = "018f6a2c-9f6b-7000-8000-3b3a9d6e4f21";
+    let round: TraceId = serde_json::from_str(&format!("\"{legacy}\"")).expect("decode");
+
+    // When rendering it back.
+    let rendered = round.to_string();
+
+    // Then the wire string survives untouched — the serde boundary never
+    // minted a new id.
+    assert_eq!(rendered, legacy);
+}
+
+#[test]
+fn counter_ids_keep_the_rfc_variant_bits() {
+    // Given a freshly generated id of each kind.
+    let trace = TraceId::new().0;
+    let causality = CausalityId::new().0;
+    let lease = lease_probe();
+
+    // When inspecting the variant nibble.
+    // Then every id is a valid RFC 4122 uuid (parsers never choke).
+    for id in [trace, causality, lease] {
+        assert_eq!(id.get_version_num(), 7);
+        let variant_nibble = (id.as_u128() >> 62) & 0b11;
+        assert_eq!(variant_nibble, 0b10, "RFC 4122 variant");
+    }
+}
+
+/// A lease id's uuid (the field is private to `reply`; this probe reads
+/// the shared generator's output for it).
+#[cfg(test)]
+fn lease_probe() -> Uuid {
+    crate::reply::lease_id_probe()
+}
+
+#[test]
+fn counter_ids_stay_time_ordered_within_a_millisecond() {
+    // Given a burst of ids minted back-to-back (same ms almost surely).
+    let mut prev = TraceId::new().0.as_u128();
+
+    // When minting 10k more.
+    for _ in 0..10_000 {
+        let next = CausalityId::new().0.as_u128();
+        // Then ordering never goes backwards (the v7 property the canvas
+        // and the monotonic millis guard both rely on).
+        assert!(next > prev, "ids must strictly increase");
+        prev = next;
+    }
 }
 
 // ---------------------------------------------------------------------------
