@@ -8,7 +8,7 @@ build:
     cargo build
 
 # Bump version (major/minor/patch), commit, and tag — git adaptation of the
-# fossil bump flow. Moves BOTH crates to the same number in one shot:
+# git bump flow. Moves BOTH crates to the same number in one shot:
 # trouper's `version`, trouper_macros' `version`, and the workspace
 # dependency requirement, so the two published crates never drift apart.
 bump LEVEL:
