@@ -749,7 +749,7 @@ async fn route_inner(
     registry: &crate::system::CountingRegistryLock,
     kernel: &CountingKernelLock,
     shutting_down: &std::sync::atomic::AtomicBool,
-    envelope: Envelope,
+    mut envelope: Envelope,
 ) -> Result<ActorPath, Envelope> {
     // SHUTDOWN BARRIER: once the sweep starts, nothing new is accepted —
     // every delivery dead-letters with `ShuttingDown` (observably, never
@@ -765,13 +765,12 @@ async fn route_inner(
         );
         return Err(envelope);
     }
-    let dest = envelope.dest.clone();
-    match dest {
-        Address::Path(ref path) => {
+    match &envelope.dest {
+        Address::Path(path) => {
             // RULES first: a matching rule places an observer relative to
             // the flow (Tee copies with a linked causality; Inline
             // interposes the observer in the primary's place).
-            let (delivery, primary_dest, tee_endpoint, set_specs, fast_endpoint) = {
+            let (tee, primary_dest, tee_endpoint, set_specs, fast_endpoint) = {
                 // ONE critical section for the send's whole registry read:
                 // the rules decision, the tee copy's endpoint resolve, and
                 // BOTH set-table probes (a plain path pays one lock to
@@ -782,51 +781,52 @@ async fn route_inner(
                 // path. (A set destination resolves after
                 // resolve_partition, which may mutate the path.)
                 let reg = registry.lock();
-                let (delivery, primary_dest) = apply_rules(&reg, &envelope, path.clone());
-                let tee_endpoint = delivery
-                    .as_ref()
-                    .and_then(|(_, tee_dest, _)| reg.resolve(tee_dest));
+                let (tee, primary_dest) = apply_rules(&reg, &envelope, path);
+                let tee_endpoint = tee.as_ref().and_then(|(tee_dest, _)| reg.resolve(tee_dest));
                 let set_specs = (
                     reg.partitions.get(path).cloned(),
                     reg.projector_sets
                         .get(path)
                         .cloned()
-                        .or_else(|| reg.projector_set_owning(path)),
+                        .or_else(|| reg.projector_set_owning_shared(path)),
                 );
                 let fast_endpoint = if set_specs.0.is_none() && set_specs.1.is_none() {
                     primary_dest
                         .as_ref()
                         .or(Some(path))
-                        .and_then(|p| reg.resolve(p))
+                        .and_then(|destination| reg.resolve(destination))
                 } else {
                     None
                 };
-                (
-                    delivery,
-                    primary_dest,
-                    tee_endpoint,
-                    set_specs,
-                    fast_endpoint,
-                )
+                (tee, primary_dest, tee_endpoint, set_specs, fast_endpoint)
             };
-            if let Some(tee) = delivery {
+            if let Some((tee_dest, origin_trace)) = tee {
                 // Tee: deliver the copy BEFORE the primary (same position
-                // in the flow, at-most-once). The copy carries a NEW
-                // causality id under the ORIGINAL's trace id — the Sent
-                // fact keeps the original trace so the two deliveries
-                // link observably without looking like a two-hop chain.
-                let (mut copy, tee_dest, origin_trace) = tee;
-                copy.trace.trace_id = origin_trace.trace_id;
-                copy.trace.causality_id = crate::envelope::CausalityId::new();
-                let endpoint = tee_endpoint;
-                if let Some(endpoint) = endpoint {
+                // in the flow, at-most-once). Promote the payload only now,
+                // when a matching tee actually duplicates it.
+                let mut trace = origin_trace;
+                trace.causality_id = crate::envelope::CausalityId::new();
+                envelope.payload.make_shared();
+                let copy = Envelope::shared_from(
+                    envelope.schema.clone(),
+                    Address::Path(tee_dest.clone()),
+                    &envelope,
+                    trace,
+                )
+                .from(
+                    envelope
+                        .from
+                        .clone()
+                        .unwrap_or_else(|| ActorPath::new("anonymous")),
+                );
+                if let Some(endpoint) = tee_endpoint {
                     let _ = deliver_with_retry(&endpoint, copy).await;
                     if kernel.observing() {
                         kernel.observe(crate::observe::Observation::new(
                             origin_trace.causality_id.as_millis_ts(),
                             crate::observe::ObservationKind::Sent {
                                 from: envelope.from.clone(),
-                                dest: Address::Path(tee_dest.clone()),
+                                dest: Address::Path(tee_dest),
                                 schema: envelope.schema.clone(),
                                 trace: origin_trace,
                             },
@@ -836,14 +836,7 @@ async fn route_inner(
                 // No tee endpoint → the copy is silently dropped: a tee is
                 // best-effort by contract (never blocks the primary flow).
             }
-            let path = match primary_dest {
-                Some(interposed) => {
-                    // Inline: the envelope's primary delivery goes to the
-                    // interposer, which owns forwarding.
-                    interposed
-                }
-                None => path.clone(),
-            };
+            let path = primary_dest.unwrap_or_else(|| path.clone());
             // PARTITION / PROJECTOR SETS: a public set path resolves to
             // ONE entity/projector, derived from the payload's shard key
             // (activated on demand); the specs were pre-read above (one
@@ -853,9 +846,9 @@ async fn route_inner(
                 kernel,
                 shutting_down,
                 &envelope,
-                path.clone(),
-                set_specs.0.clone(),
-                set_specs.1.clone(),
+                &path,
+                set_specs.0.as_deref(),
+                set_specs.1.as_deref(),
             )
             .await
             {
@@ -910,11 +903,10 @@ async fn route_inner(
             // consumes the envelope (the direct path moves it into the
             // inbox). TraceCtx is Copy; the from/schema clones are
             // shallow (schema id + option).
-            let (sent_from, sent_schema, sent_trace) = (
-                envelope.from.clone(),
-                envelope.schema.clone(),
-                envelope.trace,
-            );
+            let observation = kernel
+                .observing()
+                .then(|| (envelope.from.clone(), envelope.schema.clone()));
+            let sent_trace = envelope.trace;
             if let Err(refused) = direct_push(&endpoint, envelope, kernel, sent_trace).await {
                 envelope = refused;
                 if deliver_with_retry(&endpoint, envelope.clone())
@@ -926,9 +918,9 @@ async fn route_inner(
                         kernel,
                         shutting_down,
                         &envelope,
-                        path.clone(),
-                        set_specs.0,
-                        set_specs.1,
+                        &path,
+                        set_specs.0.as_deref(),
+                        set_specs.1.as_deref(),
                     )
                     .await
                     {
@@ -946,7 +938,7 @@ async fn route_inner(
                     return Ok(retry_path);
                 }
             }
-            if kernel.observing() {
+            if let Some((sent_from, sent_schema)) = observation {
                 kernel.observe(crate::observe::Observation::new(
                     sent_trace.causality_id.as_millis_ts(),
                     crate::observe::ObservationKind::Sent {
@@ -960,7 +952,7 @@ async fn route_inner(
             Ok(path)
         }
         Address::Slot(_) => Err(envelope), // reply routing: ctx only
-        Address::Schema(ref schema) => {
+        Address::Schema(schema) => {
             // Schema-addressed send: the route table picks the handler
             // (rotating when several actors handle the same schema).
             let (target, endpoint) = {
@@ -1005,9 +997,9 @@ async fn resolve_partition(
     kernel: &CountingKernelLock,
     shutting_down: &std::sync::atomic::AtomicBool,
     envelope: &Envelope,
-    dest: ActorPath,
-    spec: Option<crate::pool::PartitionSpec>,
-    projector_spec: Option<crate::pool::ProjectorSetSpec>,
+    dest: &ActorPath,
+    spec: Option<&crate::pool::PartitionSpec>,
+    projector_spec: Option<&crate::pool::ProjectorSetSpec>,
 ) -> Result<Option<ActorPath>, Envelope> {
     let Some(spec) = spec else {
         // Not an entity partition: fall through to the projector-set
@@ -1081,7 +1073,7 @@ async fn resolve_projector_set(
     kernel: &CountingKernelLock,
     shutting_down: &std::sync::atomic::AtomicBool,
     envelope: &Envelope,
-    spec: Option<crate::pool::ProjectorSetSpec>,
+    spec: Option<&crate::pool::ProjectorSetSpec>,
 ) -> Result<Option<ActorPath>, Envelope> {
     // The spec arrives pre-read by the caller (one lock for both set
     // tables). The set is addressed either by its public path (a direct
@@ -1133,9 +1125,9 @@ async fn resolve_projector_set(
 fn apply_rules(
     registry: &Registry,
     envelope: &Envelope,
-    dest: ActorPath,
+    dest: &ActorPath,
 ) -> (
-    Option<(Envelope, ActorPath, crate::envelope::TraceCtx)>,
+    Option<(ActorPath, crate::envelope::TraceCtx)>,
     Option<ActorPath>,
 ) {
     let mut tee = None;
@@ -1152,32 +1144,13 @@ fn apply_rules(
             continue;
         }
         if let Some(rule_dest) = &rule.dest
-            && *rule_dest != dest
+            && rule_dest != dest
         {
             continue;
         }
         match &rule.action {
             crate::pool::RuleAction::Tee(observer) => {
-                let origin_trace = envelope.trace;
-                let mut trace = origin_trace;
-                // New causality for the copy, same trace id: a fresh cause
-                // INSIDE the original's trace, never a chain of two hops.
-                trace.causality_id = crate::envelope::CausalityId::new();
-                // The copy SHARES the payload (Arc bump), never a copy
-                // of the value — every payload is shareable now.
-                let copy = Envelope::shared_from(
-                    envelope.schema.clone(),
-                    Address::Path(observer.clone()),
-                    envelope,
-                    trace,
-                )
-                .from(
-                    envelope
-                        .from
-                        .clone()
-                        .unwrap_or_else(|| ActorPath::new("anonymous")),
-                );
-                tee = Some((copy, observer.clone(), origin_trace));
+                tee = Some((observer.clone(), envelope.trace));
             }
             crate::pool::RuleAction::Inline(interposer) => {
                 inline = Some(interposer.clone());
@@ -1864,12 +1837,14 @@ async fn step_es(ctx: &EsLoop, batch: &mut Vec<(crate::inbox::InboxOffset, Envel
             "undeclared event dropped before journal append"
         );
         // The dropped EVENT is what died: it is dead-lettered as an
-        // envelope addressed back to the emitting actor. The envelope
-        // SHARES the event's payload (Arc bump).
+        // envelope addressed back to the emitting actor. The payload is
+        // promoted before the envelope retains it.
+        let mut payload = event.payload;
+        payload.make_shared();
         let dropped = Envelope::raw(
             event.schema.clone(),
             crate::envelope::Address::Path(ctx.path.clone()),
-            crate::envelope::Payload::shared(&event.payload),
+            payload,
             crate::envelope::TraceCtx::root(),
         )
         .from(ctx.path.clone());
@@ -1880,7 +1855,10 @@ async fn step_es(ctx: &EsLoop, batch: &mut Vec<(crate::inbox::InboxOffset, Envel
             "emitted undeclared schema (dropped before journal append)",
         );
     }
-    let events = declared_events;
+    let mut events = declared_events;
+    events
+        .iter_mut()
+        .for_each(|event| event.payload.make_shared());
 
     // 5. JOURNAL APPEND — ONE call for the whole batch (durable record
     // first). The store is awaited OUTSIDE the kernel sync guard — a
@@ -2323,6 +2301,8 @@ pub(crate) async fn broadcast(
     schema: SchemaId,
     envelope: Envelope,
 ) {
+    let mut envelope = envelope;
+    envelope.payload.make_shared();
     let targets: Vec<(ActorPath, Arc<Endpoint>)> = {
         let reg = registry.lock();
         let all: Vec<(ActorPath, Arc<Endpoint>)> = reg
@@ -2373,7 +2353,7 @@ pub(crate) async fn broadcast(
     // (never a double delivery).
     let sets = {
         let reg = registry.lock();
-        reg.projector_sets_consuming(&schema)
+        reg.projector_sets_consuming_shared(&schema)
     };
     for set in sets {
         let Some(key) = extract_key(registry, &envelope, &set.key_field) else {
@@ -2614,12 +2594,7 @@ fn dead_letter_schema(ctx: &EsLoop, intent: &crate::context::Intent, schema: &Sc
         }
         crate::context::Intent::Reply {
             to, payload, trace, ..
-        } => Envelope::raw(
-            schema.clone(),
-            to.clone(),
-            crate::envelope::Payload::shared(payload),
-            *trace,
-        ),
+        } => Envelope::raw(schema.clone(), to.clone(), payload.to_shared(), *trace),
         crate::context::Intent::StopSelf => return,
     };
     dead_letter(

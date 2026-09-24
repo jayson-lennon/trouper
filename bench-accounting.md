@@ -292,3 +292,80 @@ python3 tools/fold_accounting.py bench-accounting-trouper.folded \
 
 The committed folded stacks are the raw evidence; the script's output is
 deterministic (verified by running it twice and diffing).
+
+---
+
+## Unique-payload round (2026-09-24)
+
+This round combines the unique/shared payload representation, route clone
+removals, and the lazy memo side box. The figures below are a before/after
+measurement of the combined change; they do not isolate the individual
+contribution of each refactor.
+
+### Measurement
+
+| method | trouper bounded-64 | ractor unbounded |
+|---|---:|---:|
+| Criterion, 50,000 messages (median) | 589.7 ns/msg (29.483 ms) | 225.4 ns/msg (11.270 ms) |
+| Profile rig, single run | 634 ns/msg (5M in 3.172 s) | 252 ns/msg (10M in 2.517 s) |
+| Prior reference | 701 ns/msg | 228 ns/msg |
+
+The 589.7 ns/msg trouper median is approximately 15.9% below the 701 ns/msg
+prior reference. Criterion reports a 16.9% improvement against its own saved
+baseline (which is distinct from the rounded reference above); ractor is
+within the reported noise band (−1.4%). The single-run profile improves
+from the prior 800 ns/msg capture to 634 ns/msg. The independently sampled
+profile run and Criterion median differ, so use Criterion for the benchmark
+comparison and the profile only to attribute the combined change.
+
+### Re-profiled bucket comparison
+
+Same taxonomy and committed `fold_accounting.py`; the before columns are
+reduced from the previous committed folded stacks at their recorded 800 / 255
+ns/msg. New columns use the fresh capture at 634 / 252 ns/msg.
+
+| bucket | prior trouper self % (ns) | unique-payload trouper self % (ns) | Δ ns/msg |
+|---|---:|---:|---:|
+| trouper | 25.6% (205) | 25.6% (162) | −43 |
+| tokio-runtime | 5.7% (46) | 5.1% (32) | −14 |
+| sync-prims | 23.0% (184) | 28.5% (181) | −3 |
+| alloc | 33.6% (269) | 25.8% (163) | **−106** |
+| syscalls-clock | 2.3% (19) | 2.3% (15) | −4 |
+| unwound-libc | 9.7% (78) | 12.7% (81) | +3 |
+
+The allocation bucket falls by 7.8 percentage points and approximately
+106 ns/msg at the profile's measured rate. The new hot path allocates a
+`Box<PayloadCell>` for the unique cell instead of `Arc<PayloadCell>`; the
+profile still sees that allocation and deallocation. The baseline's sampled
+teardown included `Arc<PayloadCell>::drop_slow` (3.1% of samples) and
+`Arc<str>` drop (1.4%). In the new capture teardown shows the unique Box
+free (3.6%), and the route no longer constructs an owned destination before
+matching a plain path. These stacks support the combined decrease but do not
+separately quantify the effects of representation, path-clone removal, and
+memo slimming.
+
+Ractor's profile bucket table is effectively stable: 5.2% / 13 ns/msg
+allocation before, 5.1% / 13 ns/msg after; 255 → 252 ns/msg in the two
+profile runs. Unwound libc is 12.7% (trouper) and 15.0% (ractor) in this
+capture, so leaf-level attribution is indicative, not exact allocator-call
+accounting.
+
+### Artifacts and reproduction
+
+The committed `bench-accounting-trouper.folded` and
+`bench-accounting-ractor.folded` and `flame_competitors_*.svg` are regenerated
+from `/tmp/unique-trouper.data` and `/tmp/unique-ractor.data`. The host's
+`flamegraph` executable is a Rust wrapper with different arguments from the
+Perl script used for the previous artifacts; SVGs were rendered with
+`flamegraph.pl --colors=green|blue`.
+
+```text
+RUSTFLAGS="-C force-frame-pointers=yes" cargo build --profile release-debug --example profile_competitors
+PROFILE_TROUPER=1 MESSAGES=5000000 taskset -c 0-5 perf record -F 9999 --call-graph fp -o /tmp/unique-trouper.data -- target/release-debug/examples/profile_competitors
+PROFILE_RACTOR=1 MESSAGES=10000000 taskset -c 0-5 perf record -F 9999 --call-graph fp -o /tmp/unique-ractor.data -- target/release-debug/examples/profile_competitors
+perf script -i /tmp/unique-trouper.data | stackcollapse-perf.pl > bench-accounting-trouper.folded
+perf script -i /tmp/unique-ractor.data | stackcollapse-perf.pl > bench-accounting-ractor.folded
+flamegraph.pl --colors=green < bench-accounting-trouper.folded > flame_competitors_trouper.svg
+flamegraph.pl --colors=blue < bench-accounting-ractor.folded > flame_competitors_ractor.svg
+python3 tools/fold_accounting.py bench-accounting-trouper.folded bench-accounting-ractor.folded --trouper-ns 634 --ractor-ns 252
+```

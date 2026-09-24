@@ -36,7 +36,9 @@ Entries are added or amended **only with human approval**.
 - (runtime) Event-sourced actors are pure decision functions (sync `handle(&self)` returning events) with a single `apply` used for both live state application and replay; all other actors may perform side effects and use `ask`.
 - (runtime) The registry is kernel code, not an actor: path→endpoint slots, schema, schema→handler route, partition, projector-set, and router rule tables persist across actor restarts; actor identity is its registered path.
 - (runtime) Message schemas are runtime data: derived Rust types, hand-written impls, and external JSON descriptors register into the same schema table.
-- (payloads) Envelope payloads are live typed values behind Arc<dyn PayloadValue>; handlers downcast and no JSON tree exists anywhere on the message path.
+- (payloads) Envelope payloads are unique boxes on the send path, promoted to shared Arc storage only when tee, fan-out, or journal retention needs multiple owners; handlers downcast and no JSON tree is walked on the message path.
+- (payloads) Cloning a unique Payload deep-copies its erased value; cloning a shared Payload increments its Arc reference count.
+- (payloads) Payload JSON and wire-encoding memoization lives in a side box allocated on the first cold read.
 - (payloads) Service handlers borrow the live value (&M, zero copies) and replies/asks carry the payload end to end; serde exists only at the doors — the journal, erased ingress, and the public ask's lazy Json edge.
 - (payloads) Every declared message type generates field-by-name reads and a lazy memoized JSON-text encoding from its derive.
 - (payloads) Bytes exist only at two doors — erased ingress and the journal — wrapped in the PayloadBytes newtype.

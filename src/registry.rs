@@ -432,10 +432,10 @@ pub struct Registry {
     route_cursor: usize,
     /// Partition sets by PUBLIC path (entities own the real slots, derived
     /// from the set's path on demand).
-    pub(crate) partitions: HashMap<ActorPath, crate::pool::PartitionSpec>,
+    pub(crate) partitions: HashMap<ActorPath, std::sync::Arc<crate::pool::PartitionSpec>>,
     /// Projector sets by PUBLIC path (per-key projectors own the real
     /// slots, derived from the set's path on demand).
-    pub(crate) projector_sets: HashMap<ActorPath, crate::pool::ProjectorSetSpec>,
+    pub(crate) projector_sets: HashMap<ActorPath, std::sync::Arc<crate::pool::ProjectorSetSpec>>,
     /// Router rules in declaration (priority) order.
     pub(crate) rules: Vec<crate::pool::Rule>,
 }
@@ -683,7 +683,8 @@ impl Registry {
                 spec.public, spec.key_field
             )));
         }
-        self.partitions.insert(spec.public.clone(), spec);
+        self.partitions
+            .insert(spec.public.clone(), std::sync::Arc::new(spec));
         Ok(())
     }
 
@@ -737,7 +738,8 @@ impl Registry {
                 spec.public, spec.key_field
             )));
         }
-        self.projector_sets.insert(spec.public.clone(), spec);
+        self.projector_sets
+            .insert(spec.public.clone(), std::sync::Arc::new(spec));
         Ok(())
     }
 
@@ -747,6 +749,16 @@ impl Registry {
         &self,
         schema: &SchemaId,
     ) -> Vec<crate::pool::ProjectorSetSpec> {
+        self.projector_sets_consuming_shared(schema)
+            .into_iter()
+            .map(|spec| (*spec).clone())
+            .collect()
+    }
+
+    pub(crate) fn projector_sets_consuming_shared(
+        &self,
+        schema: &SchemaId,
+    ) -> Vec<std::sync::Arc<crate::pool::ProjectorSetSpec>> {
         self.projector_sets
             .values()
             .filter(|spec| spec.consumed.contains(schema))
@@ -757,6 +769,14 @@ impl Registry {
     /// The projector set owning `path` (a per-key projector derived from
     /// `public/key`), if any.
     pub fn projector_set_owning(&self, path: &ActorPath) -> Option<crate::pool::ProjectorSetSpec> {
+        self.projector_set_owning_shared(path)
+            .map(|spec| (*spec).clone())
+    }
+
+    pub(crate) fn projector_set_owning_shared(
+        &self,
+        path: &ActorPath,
+    ) -> Option<std::sync::Arc<crate::pool::ProjectorSetSpec>> {
         self.projector_sets
             .values()
             .find(|spec| {
