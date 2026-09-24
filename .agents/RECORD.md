@@ -142,3 +142,4 @@ Entries are added or amended **only with human approval**.
 - (runtime) A Block-refused tell parks on a space-available notify fired at inbox commit; there is no poll-retry loop on the hold path.
 - (runtime) An actor spawned with OverloadPolicy::Unbounded has no mailbox capacity: the inbox never refuses and the front door never engages; no pre-allocation occurs (the queue grows on demand).
 - (runtime) The front-door channel is a kanal channel; Endpoint wraps its sender with the destination's live cell and an atomic pending count incremented on accepted sends and decremented by the door on every drain.
+- (bench) The competitors profile rig (examples/profile_competitors.rs) mirrors the trouper and ractor competitors-bench legs under perf; folded stacks reduce to a sample-share accounting committed in bench-accounting.md.
