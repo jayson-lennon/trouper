@@ -150,8 +150,7 @@ impl Endpoint {
     /// check pairs it with the inbox depth read (which covers both
     /// paths), never on its own.
     pub fn pending(&self) -> usize {
-        self.pending
-            .load(std::sync::atomic::Ordering::Acquire)
+        self.pending.load(std::sync::atomic::Ordering::Acquire)
     }
 
     /// One accepted channel send (the door decrements on every drain).
@@ -195,7 +194,8 @@ impl Endpoint {
             }
             // Ok(false): the door is full — the value is still in `slot`.
             Ok(false) => Err(FrontDoorRefused::Full(
-                slot.take().expect("try_send_option leaves the value on full"),
+                slot.take()
+                    .expect("try_send_option leaves the value on full"),
             )),
             // Err: the channel is closed (senders-only or fully).
             Err(kanal::SendError::Closed | kanal::SendError::ReceiveClosed) => Err(
@@ -216,9 +216,7 @@ impl Endpoint {
                 self.note_channel_accept();
                 Ok(())
             }
-            Err(kanal::SendError::Closed | kanal::SendError::ReceiveClosed) => {
-                Err(FrontDoorClosed)
-            }
+            Err(kanal::SendError::Closed | kanal::SendError::ReceiveClosed) => Err(FrontDoorClosed),
         }
     }
 }
@@ -254,10 +252,8 @@ pub(crate) fn front_door_channel(
     match policy {
         crate::inbox::OverloadPolicy::Unbounded => kanal::unbounded_async(),
         _ => {
-            let (tx, rx) = kanal::bounded_async::<Envelope>(door_capacity(
-                mailbox_capacity,
-                policy,
-            ));
+            let (tx, rx) =
+                kanal::bounded_async::<Envelope>(door_capacity(mailbox_capacity, policy));
             (tx, rx)
         }
     }
@@ -1219,7 +1215,9 @@ mod tests {
         // and a fresh endpoint is swapped in under the same path.
         drop(rx1); // the actor task ended: its receiver is gone
         let (_rx2, ep2) = endpoint(4);
-        registry.swap_endpoint(&path, std::sync::Arc::new(ep2)).expect("swap");
+        registry
+            .swap_endpoint(&path, std::sync::Arc::new(ep2))
+            .expect("swap");
 
         // Then the stale handle no longer delivers (its receiver is gone),
         // but the path still resolves to a fresh live endpoint.

@@ -264,7 +264,10 @@ impl Inbox {
     /// gone — no claimants exist).
     pub fn drain(&mut self) -> impl Iterator<Item = (InboxOffset, Envelope)> + '_ {
         self.queue.drain(..).map(|(offset, slot)| {
-            (InboxOffset::new(offset), slot.expect("drain on a claim tombstone"))
+            (
+                InboxOffset::new(offset),
+                slot.expect("drain on a claim tombstone"),
+            )
         })
     }
 

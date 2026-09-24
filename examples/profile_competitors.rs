@@ -154,7 +154,14 @@ impl MsgHandler<Tick> for Sink {
 /// Builds the runtime + both actors on a fresh thread, primes the
 /// producer (Prime → ack), settles, then parks until the run ends.
 /// The bench leg's bounded variant: capacity 64, `OverloadPolicy::Block`.
-fn trouper_leg(n: u64) -> (kanal::Sender<()>, kanal::Receiver<()>, kanal::Sender<()>, std::thread::JoinHandle<()>) {
+fn trouper_leg(
+    n: u64,
+) -> (
+    kanal::Sender<()>,
+    kanal::Receiver<()>,
+    kanal::Sender<()>,
+    std::thread::JoinHandle<()>,
+) {
     let (start_tx, start_rx) = kanal::bounded::<()>(1);
     let (prime_tx, prime_rx) = kanal::bounded::<()>(1);
     let (done_tx, done_rx) = kanal::bounded::<()>(1);
@@ -450,9 +457,7 @@ fn main() {
     let elapsed = timed_run(&start_tx, &done_rx);
     let rate = n as f64 / elapsed.as_secs_f64();
     let ns_per_msg = elapsed.as_nanos() as f64 / n as f64;
-    println!(
-        "{n} msgs in {elapsed:.3?} → {rate:.0} msg/s ({ns_per_msg:.0} ns/msg)"
-    );
+    println!("{n} msgs in {elapsed:.3?} → {rate:.0} msg/s ({ns_per_msg:.0} ns/msg)");
 
     // Release the parked module thread; it drops its runtime.
     bench_done_tx.send(()).expect("release thread");

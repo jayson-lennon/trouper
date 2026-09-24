@@ -794,11 +794,20 @@ async fn route_inner(
                         .or_else(|| reg.projector_set_owning(path)),
                 );
                 let fast_endpoint = if set_specs.0.is_none() && set_specs.1.is_none() {
-                    primary_dest.as_ref().or(Some(path)).and_then(|p| reg.resolve(p))
+                    primary_dest
+                        .as_ref()
+                        .or(Some(path))
+                        .and_then(|p| reg.resolve(p))
                 } else {
                     None
                 };
-                (delivery, primary_dest, tee_endpoint, set_specs, fast_endpoint)
+                (
+                    delivery,
+                    primary_dest,
+                    tee_endpoint,
+                    set_specs,
+                    fast_endpoint,
+                )
             };
             if let Some(tee) = delivery {
                 // Tee: deliver the copy BEFORE the primary (same position
@@ -1228,10 +1237,7 @@ async fn deliver_with_retry(endpoint: &Endpoint, envelope: Envelope) -> Result<(
         Ok(()) => Ok(()),
         Err(FrontDoorRefused::Full(envelope)) => {
             let undeliverable = envelope.clone();
-            endpoint
-                .deliver(envelope)
-                .await
-                .map_err(|_| undeliverable)
+            endpoint.deliver(envelope).await.map_err(|_| undeliverable)
         }
         Err(FrontDoorRefused::Closed(envelope)) => Err(envelope), // the slot's endpoint died mid-restart
     }
@@ -1750,9 +1756,7 @@ async fn step_es(ctx: &EsLoop, batch: &mut Vec<(crate::inbox::InboxOffset, Envel
         for index in 0..claims.len() {
             let (_, envelope) = claims.at(index);
             // FIND the command entry for this schema by reference.
-            let entry = batch_entries
-                .iter()
-                .find(|e| e.schema() == envelope.schema);
+            let entry = batch_entries.iter().find(|e| e.schema() == envelope.schema);
             let Some(entry) = entry else {
                 // Unknown schema: dead-letter THIS message (it can never
                 // be handled; redelivering it would be futile) and let
@@ -1896,7 +1900,8 @@ async fn step_es(ctx: &EsLoop, batch: &mut Vec<(crate::inbox::InboxOffset, Envel
         if events.is_empty() {
             Vec::new()
         } else {
-            let mut origins = (0..claims.len()).filter_map(|index| claims.at(index).1.recorded_origin());
+            let mut origins =
+                (0..claims.len()).filter_map(|index| claims.at(index).1.recorded_origin());
             let first = origins.next();
             let all_same_origin = first.is_some()
                 && origins.all(|o| {
@@ -2608,10 +2613,7 @@ fn dead_letter_schema(ctx: &EsLoop, intent: &crate::context::Intent, schema: &Sc
             envelope.clone()
         }
         crate::context::Intent::Reply {
-            to,
-            payload,
-            trace,
-            ..
+            to, payload, trace, ..
         } => Envelope::raw(
             schema.clone(),
             to.clone(),
@@ -3144,9 +3146,7 @@ async fn step_service(
         }
 
         // FIND the message entry for this schema by reference.
-        let entry = batch_entries
-            .iter()
-            .find(|e| e.schema() == envelope.schema);
+        let entry = batch_entries.iter().find(|e| e.schema() == envelope.schema);
         let Some(entry) = entry else {
             dead_letter(
                 &ctx.es.kernel,
@@ -3339,10 +3339,8 @@ pub(crate) async fn restart_es(
     // clones never notice (identity = path; slots are swapped, not
     // dropped). The fresh door matches the spawn's capacity and policy
     // (the cell carries them), never a default.
-    let (tx, rx) = crate::registry::front_door_channel(
-        ctx.cell.mailbox_capacity,
-        ctx.cell.mailbox_policy,
-    );
+    let (tx, rx) =
+        crate::registry::front_door_channel(ctx.cell.mailbox_capacity, ctx.cell.mailbox_policy);
     // The fresh endpoint couples the fresh channel to the SAME cell (the
     // inbox is the identity that survives; only the door swaps).
     let endpoint = std::sync::Arc::new(Endpoint::new(

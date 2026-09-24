@@ -63,7 +63,9 @@ impl MsgHandler<Ship> for Fulfillment {
     async fn handle(&mut self, msg: &Ship, ctx: &mut MsgCtx<'_>) {
         log(format!("[fulfillment] shipped {}", msg.order));
         // The announcement: every handler of the EVENT gets a copy.
-        ctx.publish(Shipped { order: msg.order.clone() });
+        ctx.publish(Shipped {
+            order: msg.order.clone(),
+        });
     }
 }
 

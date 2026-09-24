@@ -292,7 +292,9 @@ impl ArmedEsActor {
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
         let path = self.path.clone();
         let kernel = self.loop_ctx.kernel.clone();
-        let task = self.loop_ctx.start_tracked(self.endpoint, self.rx, shutdown_rx);
+        let task = self
+            .loop_ctx
+            .start_tracked(self.endpoint, self.rx, shutdown_rx);
         let kernel = kernel.lock();
         if let Some(cell) = kernel.cells.get(&path)
             && let Ok(mut handle) = cell.handle.try_lock()
@@ -1012,10 +1014,8 @@ impl ActorSystemCore {
         args: &Json,
     ) -> ArmedEsActor {
         let opts = self.resolve_opts(opts);
-        let (tx, rx) = crate::registry::front_door_channel(
-            opts.mailbox_capacity,
-            opts.mailbox_policy,
-        );
+        let (tx, rx) =
+            crate::registry::front_door_channel(opts.mailbox_capacity, opts.mailbox_policy);
         // The manifest is the union of what the actor type declares and
         // what its command entries decode: every spawn flavor (positional,
         // builder, foreign) produces identical registry data this way.
@@ -1133,7 +1133,12 @@ impl ActorSystemCore {
             is_projector,
             state: Some(state),
         };
-        ArmedEsActor { path, loop_ctx, endpoint, rx }
+        ArmedEsActor {
+            path,
+            loop_ctx,
+            endpoint,
+            rx,
+        }
     }
 
     /// The projector spawn's arm phase: registers the read model as an
@@ -1208,10 +1213,8 @@ impl ActorSystemCore {
         // thread is not done — spawn the start inside the actor task and
         // register the slot immediately so senders never see a gap.
         let opts = self.resolve_opts(opts);
-        let (tx, rx) = crate::registry::front_door_channel(
-            opts.mailbox_capacity,
-            opts.mailbox_policy,
-        );
+        let (tx, rx) =
+            crate::registry::front_door_channel(opts.mailbox_capacity, opts.mailbox_policy);
         // The CELL is built first: the endpoint couples the front-door
         // channel to it (the direct-delivery target), and the kernel
         // tables register it below.
@@ -1997,11 +2000,10 @@ impl ActorSystemCore {
             // shell (a std Mutex must never span an await point).
             let (state, cursor) = {
                 let kernel = self.kernel.lock();
-                let cursor = kernel.cells.get(&path).and_then(|cell| {
-                    cell.inbox
-                        .try_lock()
-                        .map(|inbox| inbox.cursor().as_u64())
-                });
+                let cursor = kernel
+                    .cells
+                    .get(&path)
+                    .and_then(|cell| cell.inbox.try_lock().map(|inbox| inbox.cursor().as_u64()));
                 let has_state = kernel.es_state.contains_key(&path);
                 (has_state.then_some(()), cursor)
             };
@@ -4639,7 +4641,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unknown_schema_inside_a_batch_dead_letters_alone() {        // Given a service actor whose entry handles `Add` ONLY, and a sink
+    async fn unknown_schema_inside_a_batch_dead_letters_alone() {
+        // Given a service actor whose entry handles `Add` ONLY, and a sink
         // for the good work (the Mark fixture is unhandled here).
         let (system, _clock) = ActorSystem::test();
         let path = ActorPath::new("batch-unknown");
@@ -4828,7 +4831,10 @@ mod tests {
                     && l.envelope.payload_json()["n"].as_i64() == Some(2)
             }),
             "the un-dispatched tail flushed StoppedWithMail: {:?}",
-            drained.iter().map(|l| (l.reason.clone(), l.envelope.payload_json())).collect::<Vec<_>>()
+            drained
+                .iter()
+                .map(|l| (l.reason.clone(), l.envelope.payload_json()))
+                .collect::<Vec<_>>()
         );
     }
 
@@ -4846,12 +4852,13 @@ mod tests {
             mailbox_capacity: 2,
             ..SpawnOpts::default()
         };
-        static PARK_ONE: std::sync::atomic::AtomicBool =
-            std::sync::atomic::AtomicBool::new(false);
+        static PARK_ONE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
         struct Wedge;
         impl ServiceActor for Wedge {
             fn manifest() -> ActorManifest {
-                ActorManifest::new().handles::<Add>().kind(ActorKind::Service)
+                ActorManifest::new()
+                    .handles::<Add>()
+                    .kind(ActorKind::Service)
             }
             async fn start(
                 _args: &Json,
@@ -4867,12 +4874,9 @@ mod tests {
                 }
             }
         }
-        system.spawn_service::<Wedge, _>(
-            path.clone(),
-            &json!({}),
-            opts,
-            || vec![Arc::new(TypedServiceAdapter::<Wedge, Add>::new::<Add>())],
-        );
+        system.spawn_service::<Wedge, _>(path.clone(), &json!({}), opts, || {
+            vec![Arc::new(TypedServiceAdapter::<Wedge, Add>::new::<Add>())]
+        });
         wait_for(|| async {
             system.facts().iter().any(
                 |f| matches!(&f.kind, crate::observe::ObservationKind::Spawned { path: p, .. } if *p == path),
@@ -10578,11 +10582,7 @@ mod tests {
         impl MsgHandler<Add> for Bouncer {
             async fn handle(&mut self, msg: &Add, ctx: &mut crate::context::MsgCtx<'_>) {
                 if msg.n < 3 {
-                    ctx.send(
-                        Address::Path(self.peer.clone()),
-                        Add { n: msg.n + 1 },
-                        None,
-                    );
+                    ctx.send(Address::Path(self.peer.clone()), Add { n: msg.n + 1 }, None);
                 }
             }
         }
@@ -10736,7 +10736,9 @@ mod tests {
                 .push(format!("{}:pack:{}", self.tag, msg.order));
             // Announce the outcome as an event: every Shipped subscriber
             // gets a copy (the outbox-intent broadcast path).
-            ctx.publish(Shipped { order: msg.order.clone() });
+            ctx.publish(Shipped {
+                order: msg.order.clone(),
+            });
         }
     }
 
@@ -11341,18 +11343,19 @@ mod tests {
     fn tracing_error_capture() -> Arc<parking_lot::Mutex<Vec<u8>>> {
         static CAPTURE: std::sync::OnceLock<Arc<parking_lot::Mutex<Vec<u8>>>> =
             std::sync::OnceLock::new();
-        CAPTURE.get_or_init(|| {
-            let log: Arc<parking_lot::Mutex<Vec<u8>>> = Arc::default();
-            let subscriber = tracing_subscriber::fmt()
-                .with_max_level(tracing::Level::ERROR)
-                .with_writer(CaptureWriter(log.clone()))
-                .finish();
-            // A competing test binary or a prior init leaves this a no-op
-            // (Err) — the buffer still exists, the capture just best-effort.
-            let _ = tracing::subscriber::set_global_default(subscriber);
-            log
-        })
-        .clone()
+        CAPTURE
+            .get_or_init(|| {
+                let log: Arc<parking_lot::Mutex<Vec<u8>>> = Arc::default();
+                let subscriber = tracing_subscriber::fmt()
+                    .with_max_level(tracing::Level::ERROR)
+                    .with_writer(CaptureWriter(log.clone()))
+                    .finish();
+                // A competing test binary or a prior init leaves this a no-op
+                // (Err) — the buffer still exists, the capture just best-effort.
+                let _ = tracing::subscriber::set_global_default(subscriber);
+                log
+            })
+            .clone()
     }
 
     #[tokio::test]
@@ -11612,7 +11615,9 @@ mod tests {
             .handles::<Pack>()
             .start();
         wait_for(|| async {
-            system.inbox_cursor(&ActorPath::new("borrow-router")).is_some()
+            system
+                .inbox_cursor(&ActorPath::new("borrow-router"))
+                .is_some()
         })
         .await;
 
@@ -11623,7 +11628,9 @@ mod tests {
         system
             .tell(
                 ActorPath::new("borrow-router"),
-                Pack { order: "bd-1".into() },
+                Pack {
+                    order: "bd-1".into(),
+                },
             )
             .await
             .expect("delivered");
@@ -11862,7 +11869,12 @@ mod tests {
             .handles::<AskReq>()
             .emits::<AskRes>()
             .start();
-        wait_for(|| async { system.inbox_cursor(&ActorPath::new("echo-fabric")).is_some() }).await;
+        wait_for(|| async {
+            system
+                .inbox_cursor(&ActorPath::new("echo-fabric"))
+                .is_some()
+        })
+        .await;
 
         // When the typed ask round-trips with the serde probe open (the
         // request moves in as a live value; the reply leaves ctx.reply as
