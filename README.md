@@ -10,13 +10,13 @@ This crate is _not_ yet ready for general use. Built specifically for [`jinn`](h
 
 ## Benchmarks
 
-| runtime           | mailbox                                    |
-| ----------------- | ------------------------------------------ |
-| trouper           | bounded-64 (its default, Block policy)     |
-| trouper-unbounded | 2^20-capacity Block (no true unbounded)    |
-| kameo             | bounded-64 (its default)                   |
-| kameo-unbounded   | native unbounded                           |
-| ractor            | native unbounded (core has no bounded API) |
+| Runtime           | Send API | Mailbox                                    |
+| ----------------- | -------- | ------------------------------------------ |
+| trouper           | `tell`   | bounded-64 (its default, Block policy)     |
+| trouper-unbounded | `tell`   | 2^20-capacity Block (no true unbounded)    |
+| kameo             | `tell`   | bounded-64 (its default)                   |
+| kameo-unbounded   | `tell`   | native unbounded                           |
+| ractor            | `cast`   | native unbounded (core has no bounded API) |
 
 | Runtime           | messages | Criterion time | Per message |          Rate |
 | ----------------- | -------- | -------------: | ----------: | ------------: |
