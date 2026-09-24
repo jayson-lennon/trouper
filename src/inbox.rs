@@ -68,6 +68,16 @@ impl Refused {
 /// Offsets are never reused and survive restarts: acking is the runtime's
 /// record that a message was durably processed (journalled), so the offset
 /// cursor is what redelivery resumes from.
+///
+/// The step loops CLAIM batches: [`Inbox::claim_up_to`] MOVES envelopes out
+/// of their slots (dispatch needs owned envelopes — the handler future
+/// borrows from them across an await, so the inbox guard can never stay
+/// held) and leaves tombstones in place. A tombstone is an in-flight claim:
+/// it still counts toward capacity (the message is inside the actor until
+/// its commit point), it still holds its offset, and
+/// [`Inbox::restore_claims`] puts un-committed envelopes back into their
+/// exact slots on crash/stop. Nothing ever changes position — the old
+/// snapshot-clone and its per-message refcount traffic are gone.
 #[derive(Debug)]
 pub struct Inbox {
     capacity: usize,
@@ -76,8 +86,10 @@ pub struct Inbox {
     next_offset: u64,
     /// Offset of the next un-acked envelope (the peek cursor).
     cursor: u64,
-    /// Queue of (offset, envelope) waiting to be peeked/acked.
-    queue: VecDeque<(u64, Envelope)>,
+    /// Queue of (offset, envelope) waiting to be peeked/acked; `None` is
+    /// a claim tombstone (the envelope is out in a step batch until it is
+    /// committed or restored).
+    queue: VecDeque<(u64, Option<Envelope>)>,
     open: bool,
 }
 
@@ -125,6 +137,7 @@ impl Inbox {
                     // Evicting the front consumes its offset forever: advance
                     // the cursor so peek/ack stay aligned with the new front.
                     if let Some((_, evicted)) = self.queue.pop_front() {
+                        let evicted = evicted.expect("evicting a claim tombstone");
                         self.cursor += 1;
                         self.queue_next(envelope);
                         return Err(Refused::Evicted(evicted));
@@ -140,7 +153,7 @@ impl Inbox {
     fn queue_next(&mut self, envelope: Envelope) {
         let offset = self.next_offset;
         self.next_offset += 1;
-        self.queue.push_back((offset, envelope));
+        self.queue.push_back((offset, Some(envelope)));
     }
 
     /// Closes the inbox: no new deliveries, existing entries stay readable.
@@ -148,12 +161,25 @@ impl Inbox {
         self.open = false;
     }
 
-    /// Drains one queued entry for shutdown-flush purposes (the cursor
-    /// advances: the entry is leaving the system via the DLQ).
-    pub fn pop_discard(&mut self) -> Option<Envelope> {
-        let (_offset, envelope) = self.queue.pop_front()?;
-        self.cursor += 1;
-        Some(envelope)
+    /// Drains every LIVE entry for shutdown-flush purposes (the DLQ), skipping
+    /// claim tombstones — their envelopes are owned by live steps (possibly
+    /// parked mid-dispatch), and the step's claim guard disposes of each
+    /// (StoppedWithMail when the actor is stopping; restore otherwise).
+    ///
+    /// Tombstones stay queued in order; the cursor is untouched (the inbox
+    /// is closed for good at this point — only the guards' disposition of
+    /// their claims remains).
+    pub fn drain_live(&mut self) -> Vec<Envelope> {
+        let mut drained = Vec::new();
+        let mut keep = VecDeque::new();
+        while let Some((offset, slot)) = self.queue.pop_front() {
+            match slot {
+                Some(envelope) => drained.push(envelope),
+                None => keep.push_back((offset, None)),
+            }
+        }
+        self.queue = keep;
+        drained
     }
 
     /// Reopens a closed inbox (restart: redelivery resumes from the
@@ -173,12 +199,18 @@ impl Inbox {
     }
 
     /// Peeks the envelope at the cursor, if one is ready.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the cursor's slot is a claim tombstone — commit removes
+    /// tombstones synchronously with the cursor advance, so one at the
+    /// cursor is a runtime bug.
     pub fn peek(&mut self) -> Option<&Envelope> {
         let cursor = self.cursor;
         self.queue
             .front()
             .filter(|(offset, _)| *offset == cursor)
-            .map(|(_, envelope)| envelope)
+            .map(|(_, slot)| slot.as_ref().expect("peek on a claim tombstone"))
     }
 
     /// Acks the envelope at the cursor, advancing it.
@@ -206,75 +238,145 @@ impl Inbox {
     }
 
     /// Drains every un-acked entry (the runtime uses this on shutdown/DLQ flush).
+    ///
+    /// # Panics
+    ///
+    /// Panics if any slot is a claim tombstone (runs after the loop task is
+    /// gone — no claimants exist).
     pub fn drain(&mut self) -> impl Iterator<Item = (InboxOffset, Envelope)> + '_ {
-        self.queue
-            .drain(..)
-            .map(|(offset, envelope)| (InboxOffset::new(offset), envelope))
+        self.queue.drain(..).map(|(offset, slot)| {
+            (InboxOffset::new(offset), slot.expect("drain on a claim tombstone"))
+        })
     }
 
-    /// Snapshots up to `n` un-acked entries, oldest first, in FIFO order,
-    /// WITHOUT removing them and WITHOUT moving the cursor.
+    /// Claims up to `n` un-acked entries, oldest first, in FIFO order,
+    /// WITHOUT moving the cursor.
     ///
-    /// This is the batch step's read: the loop dispatches the snapshots in
-    /// order, committing each with [`Inbox::commit_through`] at the same
+    /// This is the batch step's read: each claimed envelope MOVES out of
+    /// its queue slot (leaving a tombstone) into the caller's reused batch
+    /// buffer — the loop dispatches from the owned batch (the handler
+    /// future borrows across an await, so the inbox guard cannot stay
+    /// held) and commits each with [`Inbox::commit_through`] at the same
     /// point the single-message step acked (service: before dispatch; ES:
-    /// after the journal append). Entries the step has not committed yet
-    /// stay fully queued — stop-time DLQ flushes, watermark depth reads,
-    /// and the restart cursor all see them exactly as the per-message step
-    /// would have. Nothing leaves the inbox before its commit point, so a
-    /// step killed mid-batch loses nothing the old step would have kept.
+    /// after the journal append). A claim is in flight, not consumed:
+    /// tombstones still count toward capacity, still hold their offsets,
+    /// and [`Inbox::restore_claims`] puts un-committed envelopes back into
+    /// their exact slots when the step ends without committing them.
+    /// Nothing ever changes position, so a step killed mid-batch loses
+    /// nothing and re-dispatches in original order.
     ///
     /// Fewer than `n` come back when the queue is shorter — a trickle load
-    /// snapshots exactly what is queued, and batch 1 costs one clone (the
-    /// old peek's clone).
-    pub fn peek_up_to(&mut self, n: usize) -> Vec<(InboxOffset, Envelope)> {
-        // The queue front is the cursor (the push/ack/evict paths keep
-        // them aligned; the filter is the same defensive gate peek has).
-        if !self
-            .queue
-            .front()
-            .is_some_and(|(offset, _)| *offset == self.cursor)
-        {
-            return Vec::new();
+    /// claims exactly what is queued.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the front slot is a claim tombstone — commit removes
+    /// tombstones synchronously with the cursor advance, so one at the
+    /// claim front is a runtime bug.
+    pub fn claim_up_to(&mut self, n: usize, batch: &mut Vec<(InboxOffset, Envelope)>) -> usize {
+        let mut claimed = 0usize;
+        for (offset, slot) in self.queue.iter_mut() {
+            if claimed == n {
+                break;
+            }
+            // Claims run from the cursor forward; a tombstone ahead of the
+            // committed prefix cannot exist (commit pops them), and the
+            // gate below keeps offsets contiguous from the cursor.
+            if *offset < self.cursor {
+                continue; // already-committed head (shouldn't linger, but skip)
+            }
+            if *offset != self.cursor + claimed as u64 {
+                break; // gap (evicted hole or empty) — claim only the run
+            }
+            let envelope = slot
+                .take()
+                .expect("claim on a claim tombstone ahead of the committed prefix");
+            batch.push((InboxOffset::new(*offset), envelope));
+            claimed += 1;
         }
-        self.queue
-            .iter()
-            .take(n)
-            .map(|(offset, envelope)| (InboxOffset::new(*offset), envelope.clone()))
-            .collect()
+        claimed
+    }
+
+    /// Restores previously-claimed envelopes into their original slots.
+    ///
+    /// The step's exit path for un-committed claims: every `(offset,
+    /// envelope)` moves back into the slot that claims vacated. Offsets
+    /// are slot addresses, so restoration is exact — FIFO order across a
+    /// crash is preserved even when a concurrent `push` landed during the
+    /// claim window (that push took a LATER offset and sits behind the
+    /// restored tail by construction).
+    ///
+    /// Returns whether any slot was restored — restoration returns
+    /// capacity to the queue (the space-available signal for a parked
+    /// Block hold).
+    ///
+    /// # Panics
+    ///
+    /// Panics if a slot is missing, is live (not a tombstone), or sits
+    /// before the cursor — restoring an already-committed claim is a
+    /// runtime bug.
+    pub fn restore_claims(&mut self, batch: Vec<(InboxOffset, Envelope)>) -> bool {
+        let restored_any = !batch.is_empty();
+        for (offset, envelope) in batch {
+            let offset = offset.as_u64();
+            let slot = self
+                .queue
+                .iter_mut()
+                .find(|(front, _)| *front == offset)
+                .map(|(_, slot)| slot)
+                .unwrap_or_else(|| {
+                    panic!("restore: offset {offset} is not queued (committed or evicted?)")
+                });
+            if offset < self.cursor {
+                panic!("restore: offset {offset} is behind the cursor (already committed)");
+            }
+            let prev = slot.replace(envelope);
+            if prev.is_some() {
+                panic!("restore: offset {offset} slot was live (double restore)");
+            }
+        }
+        restored_any
     }
 
     /// Atomically advances the cursor past `offset` — the batch commit.
     ///
     /// Pops every queued entry at or before `offset` (a batch step
     /// commits message-by-message with ever-larger offsets; the final
-    /// call pops the whole run) and sets the cursor to `offset + 1`.
-    /// One call is one commit point: there is no partially-advanced
-    /// state between the old cursor and the new one.
+    /// call pops the whole run), tombstones included, and sets the cursor
+    /// to `offset + 1`. One call is one commit point: there is no
+    /// partially-advanced state between the old cursor and the new one.
+    ///
+    /// Returns whether any entry was popped — the space-available signal
+    /// for a parked Block hold (a commit freed at least one slot).
     ///
     /// # Panics
     ///
     /// Panics under the same contract as [`Inbox::ack`]: `offset` past the
     /// write head is a runtime bug (only the runtime peeks and commits).
-    pub fn commit_through(&mut self, offset: InboxOffset) {
+    pub fn commit_through(&mut self, offset: InboxOffset) -> bool {
         let offset = offset.as_u64();
         if offset >= self.next_offset {
             panic!("inbox committed past the write head at {offset}");
         }
         // A batch commit never rewinds: `offset` is an entry the step has
         // fully processed, so it is at or after the cursor by construction
-        // (peek_up_to only hands out entries at/after the cursor).
+        // (claim_up_to only hands out entries at/after the cursor).
+        let mut popped = false;
         while self
             .queue
             .front()
             .is_some_and(|(front, _)| *front <= offset)
         {
             self.queue.pop_front();
+            popped = true;
         }
         self.cursor = offset + 1;
+        popped
     }
 
-    /// The number of entries waiting between the cursor and the write head.
+    /// The number of entries waiting between the cursor and the write
+    /// head, claims-in-flight included (a tombstone is an occupied slot
+    /// until its commit pops it).
     pub fn len(&self) -> usize {
         self.queue.len()
     }
@@ -461,18 +563,20 @@ mod tests {
     }
 
     #[test]
-    fn peek_up_to_returns_fifo_snapshots_without_moving_the_cursor() {
+    fn claim_up_to_returns_fifo_claims_without_moving_the_cursor() {
         // Given an inbox holding three envelopes.
         let mut inbox = Inbox::new(8, OverloadPolicy::Block);
         for n in 1..=3 {
             inbox.push(envelope(n)).expect("push");
         }
 
-        // When snapshotting two.
-        let batch = inbox.peek_up_to(2);
+        // When claiming two into a fresh batch buffer.
+        let mut batch = Vec::new();
+        inbox.claim_up_to(2, &mut batch);
 
-        // Then the snapshots are FIFO with their offsets, the queue still
-        // holds everything, and the cursor did NOT move.
+        // Then the claims are FIFO with their offsets, the cursor did NOT
+        // move, and the queue still counts all three slots (two are
+        // tombstones — claims are in flight, not consumed).
         assert_eq!(
             batch.iter().map(|(o, _)| o.as_u64()).collect::<Vec<_>>(),
             vec![0, 1]
@@ -480,61 +584,68 @@ mod tests {
         assert_eq!(batch[0].1.payload_json()["n"].as_u64(), Some(1));
         assert_eq!(batch[1].1.payload_json()["n"].as_u64(), Some(2));
         assert_eq!(inbox.cursor(), InboxOffset::new(0));
-        assert_eq!(inbox.len(), 3, "peek_up_to removes nothing");
+        assert_eq!(inbox.len(), 3, "tombstones count toward len");
     }
 
     #[test]
-    fn peek_up_to_takes_what_is_queued_when_shorter_than_n() {
+    fn claim_up_to_takes_what_is_queued_when_shorter_than_n() {
         // Given an inbox holding two envelopes and a batch budget of five.
         let mut inbox = Inbox::new(8, OverloadPolicy::Block);
         inbox.push(envelope(1)).expect("push");
         inbox.push(envelope(2)).expect("push");
 
-        // When snapshotting up to five.
-        let batch = inbox.peek_up_to(5);
+        // When claiming up to five.
+        let mut batch = Vec::new();
+        inbox.claim_up_to(5, &mut batch);
 
         // Then exactly the two queued entries come back (trickle behavior).
         assert_eq!(batch.len(), 2);
         assert_eq!(inbox.len(), 2);
 
-        // And a snapshot of a drained inbox yields nothing.
+        // And a claim on a drained inbox yields nothing.
         let mut empty = Inbox::new(4, OverloadPolicy::Block);
-        assert!(empty.peek_up_to(5).is_empty());
+        let mut none = Vec::new();
+        empty.claim_up_to(5, &mut none);
+        assert!(none.is_empty());
     }
 
     #[test]
     fn commit_through_advances_the_cursor_atomically() {
-        // Given an inbox whose first two entries are snapshotted.
+        // Given an inbox whose first two entries are claimed.
         let mut inbox = Inbox::new(8, OverloadPolicy::Block);
         for n in 1..=3 {
             inbox.push(envelope(n)).expect("push");
         }
-        let batch = inbox.peek_up_to(2);
+        let mut batch = Vec::new();
+        inbox.claim_up_to(2, &mut batch);
 
         // When committing through the last batch offset.
         let last = batch.last().expect("non-empty").0;
-        inbox.commit_through(last);
+        let popped = inbox.commit_through(last);
 
-        // Then the cursor sits exactly past the batch and the third
-        // envelope is what a peek returns.
+        // Then the cursor sits exactly past the batch (and the commit
+        // reports that it freed slots), and the third envelope is what a
+        // peek returns.
         assert_eq!(inbox.cursor(), InboxOffset::new(2));
         assert_eq!(inbox.len(), 1);
         let front = inbox.peek().expect("front");
         assert_eq!(front.payload_json()["n"].as_u64(), Some(3));
+        assert!(popped);
     }
 
     #[test]
     fn commit_through_pops_live_entries_it_jumps_over() {
-        // Given an inbox where entries were pushed AFTER a snapshot (new
+        // Given an inbox where entries were pushed AFTER a claim (new
         // mail queues behind a batch that is mid-flight).
         let mut inbox = Inbox::new(8, OverloadPolicy::Block);
         for n in 1..=2 {
             inbox.push(envelope(n)).expect("push");
         }
-        let batch = inbox.peek_up_to(1);
+        let mut batch = Vec::new();
+        inbox.claim_up_to(1, &mut batch);
         inbox.push(envelope(3)).expect("push");
 
-        // When committing through the single snapshotted entry.
+        // When committing through the single claimed entry.
         inbox.commit_through(batch[0].0);
 
         // Then the cursor moved past it and the queue still holds the
@@ -546,6 +657,106 @@ mod tests {
     }
 
     #[test]
+    fn tombstones_count_toward_capacity_until_commit() {
+        // Given a capacity-2 inbox.
+        let mut inbox = Inbox::new(2, OverloadPolicy::Block);
+        inbox.push(envelope(1)).expect("push");
+        inbox.push(envelope(2)).expect("push");
+
+        // When claiming one (its slot becomes a tombstone).
+        let mut batch = Vec::new();
+        inbox.claim_up_to(1, &mut batch);
+        assert_eq!(batch.len(), 1);
+
+        // Then the inbox is still at capacity — a claim is in flight, not
+        // consumed — so the next push is refused.
+        let refused = inbox.push(envelope(3)).expect_err("still full");
+        assert!(!refused.queued_anyway(), "Block refuses without queuing");
+
+        // And after the commit, the slot frees and the push succeeds.
+        inbox.commit_through(batch[0].0);
+        inbox.push(envelope(3)).expect("push after commit");
+    }
+
+    #[test]
+    fn dropped_claims_restore_to_their_original_slots() {
+        // Given an inbox whose first two entries are claimed.
+        let mut inbox = Inbox::new(8, OverloadPolicy::Block);
+        for n in 1..=3 {
+            inbox.push(envelope(n)).expect("push");
+        }
+        let mut batch = Vec::new();
+        inbox.claim_up_to(2, &mut batch);
+        assert_eq!(inbox.len(), 3, "tombstones in place");
+
+        // When restoring both claims (the step died before committing).
+        inbox.restore_claims(batch);
+
+        // Then every envelope is back in its original slot: peek sees
+        // envelope 1 at the cursor, len is unchanged, offsets intact.
+        assert_eq!(inbox.cursor(), InboxOffset::new(0));
+        assert_eq!(inbox.len(), 3);
+        let front = inbox.peek().expect("front");
+        assert_eq!(front.payload_json()["n"].as_u64(), Some(1));
+
+        // And a re-claim hands back the SAME envelopes in the SAME order.
+        let mut again = Vec::new();
+        inbox.claim_up_to(2, &mut again);
+        assert_eq!(
+            again.iter().map(|(o, _)| o.as_u64()).collect::<Vec<_>>(),
+            vec![0, 1]
+        );
+        assert_eq!(again[0].1.payload_json()["n"].as_u64(), Some(1));
+        assert_eq!(again[1].1.payload_json()["n"].as_u64(), Some(2));
+    }
+
+    #[test]
+    fn restored_claims_keep_fifo_order_across_a_concurrent_push() {
+        // Given an inbox whose first two entries are claimed, with a
+        // concurrent push landing at the tail during the claim window.
+        let mut inbox = Inbox::new(8, OverloadPolicy::Block);
+        for n in 1..=2 {
+            inbox.push(envelope(n)).expect("push");
+        }
+        let mut batch = Vec::new();
+        inbox.claim_up_to(2, &mut batch);
+        let late = inbox.push(envelope(9)).expect("push during claim window");
+        assert_eq!(late.as_u64(), 2, "the push took the next offset");
+
+        // When committing only the first claim and restoring the second
+        // (a mid-batch crash after message one).
+        inbox.commit_through(batch[0].0);
+        inbox.restore_claims(vec![batch.pop().expect("non-empty")]);
+
+        // Then the restored envelope sits at its ORIGINAL offset ahead of
+        // the late push — the drain+requeue reorder hole stays closed.
+        assert_eq!(inbox.cursor(), InboxOffset::new(1));
+        assert_eq!(inbox.len(), 2);
+        let front = inbox.peek().expect("front");
+        assert_eq!(front.payload_json()["n"].as_u64(), Some(2));
+    }
+
+    #[test]
+    fn commit_through_returns_false_when_nothing_pops() {
+        // Given an inbox holding one entry.
+        let mut inbox = Inbox::new(4, OverloadPolicy::Block);
+        inbox.push(envelope(1)).expect("push");
+
+        // When committing through the write head minus one (the entry's
+        // own offset): the pop happens, so this is true.
+        let mut batch = Vec::new();
+        inbox.claim_up_to(1, &mut batch);
+        assert!(inbox.commit_through(batch[0].0));
+
+        // And a second entry's commit pops exactly it.
+        inbox.push(envelope(2)).expect("push");
+        let mut batch = Vec::new();
+        inbox.claim_up_to(1, &mut batch);
+        assert!(inbox.commit_through(batch[0].0));
+        assert!(inbox.is_empty());
+    }
+
+    #[test]
     fn snapshot_commit_round_trip_leaves_no_residue() {
         // Given an inbox holding three entries.
         let mut inbox = Inbox::new(8, OverloadPolicy::Block);
@@ -553,9 +764,10 @@ mod tests {
             inbox.push(envelope(n)).expect("push");
         }
 
-        // When snapshotting all and committing message-by-message (the
+        // When claiming all and committing message-by-message (the
         // batch step's shape: the offset grows as the batch progresses).
-        let batch = inbox.peek_up_to(3);
+        let mut batch = Vec::new();
+        inbox.claim_up_to(3, &mut batch);
         for (offset, _) in &batch {
             inbox.commit_through(*offset);
         }
@@ -567,8 +779,9 @@ mod tests {
         let next = inbox.push(envelope(9)).expect("push");
         assert!(next.as_u64() >= 3);
 
-        // And a fresh snapshot sees only the new entry.
-        let again = inbox.peek_up_to(4);
+        // And a fresh claim sees only the new entry.
+        let mut again = Vec::new();
+        inbox.claim_up_to(4, &mut again);
         assert_eq!(again.len(), 1);
         assert_eq!(again[0].1.payload_json()["n"].as_u64(), Some(9));
     }
@@ -587,6 +800,40 @@ mod tests {
     }
 
     #[test]
+    #[should_panic(expected = "not queued")]
+    fn restoring_a_committed_claim_panics() {
+        // Given an inbox whose only entry was claimed AND committed.
+        let mut inbox = Inbox::new(4, OverloadPolicy::Block);
+        inbox.push(envelope(1)).expect("push");
+        let mut batch = Vec::new();
+        inbox.claim_up_to(1, &mut batch);
+        inbox.commit_through(batch[0].0);
+
+        // When restoring the committed claim.
+        inbox.restore_claims(batch);
+
+        // Then it panics: the slot is gone (commit popped it).
+    }
+
+    #[test]
+    #[should_panic(expected = "double restore")]
+    fn restoring_a_live_slot_panics() {
+        // Given an inbox with one claimed entry restored twice.
+        let mut inbox = Inbox::new(4, OverloadPolicy::Block);
+        inbox.push(envelope(1)).expect("push");
+        let mut batch = Vec::new();
+        inbox.claim_up_to(1, &mut batch);
+        let clone_batch = batch.clone();
+        inbox.restore_claims(batch);
+        let restored = clone_batch.into_iter().next().expect("non-empty");
+
+        // When restoring the same claim again (the slot is live now).
+        inbox.restore_claims(vec![restored]);
+
+        // Then it panics: double restore is a runtime bug.
+    }
+
+    #[test]
     fn drop_old_holes_stay_committed_through_a_batch() {
         // Given a capacity-2 DropOld inbox that evicted its first entry.
         let mut inbox = Inbox::new(2, OverloadPolicy::DropOld);
@@ -595,8 +842,9 @@ mod tests {
         let evicted = inbox.push(envelope(3)).expect_err("eviction");
         assert!(evicted.queued_anyway(), "envelope 1 was evicted");
 
-        // When snapshotting the live pair and committing through the last.
-        let batch = inbox.peek_up_to(4);
+        // When claiming the live pair and committing through the last.
+        let mut batch = Vec::new();
+        inbox.claim_up_to(4, &mut batch);
         assert_eq!(batch.len(), 2, "only envelopes 2 and 3 are live");
         assert_eq!(
             batch.iter().map(|(o, _)| o.as_u64()).collect::<Vec<_>>(),

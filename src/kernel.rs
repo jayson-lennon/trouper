@@ -500,6 +500,12 @@ pub(crate) struct ActorCell {
     /// construction). The async machinery (a semaphore wake per message)
     /// bought nothing here.
     pub(crate) inbox: parking_lot::Mutex<Inbox>,
+    /// Space-available signal: fired AFTER a commit guard drops when the
+    /// commit popped at least one entry. A Block-refused tell parked in
+    /// `push_holding_block` wakes on it (one park/unpark instead of the
+    /// old 2ms poll-sleep loop). Coalesced by Notify — a permit with no
+    /// waiter is one atomic store.
+    pub(crate) space_available: Arc<Notify>,
     /// The spawn-configured mailbox capacity. The front door and every
     /// restart derive their channel depth from it (D4: restarts keep the
     /// spawn's capacity, not a default).
@@ -527,6 +533,8 @@ pub(crate) struct ActorCell {
     /// passivation exit, or the external stop after joining the task) —
     /// the hook runs exactly once per actor lifetime, never twice.
     pub(crate) on_stop_done: std::sync::atomic::AtomicBool,
+    /// Teardown-begun flag (see [`ActorCell::mark_stopping`]).
+    stopping: std::sync::atomic::AtomicBool,
     // --- CELL-LOCAL BOOKKEEPING (single-writer: the actor's own loop) ---
     /// Whether this actor's loop died to a panic (or its service `start`
     /// failed) and it is awaiting supervision. Written by the loop's
@@ -605,6 +613,7 @@ impl ActorCell {
         Self {
             path,
             inbox: parking_lot::Mutex::new(inbox),
+            space_available: Arc::new(Notify::new()),
             mailbox_capacity,
             mailbox_policy,
             step_batch: batch.max(1),
@@ -612,6 +621,7 @@ impl ActorCell {
             handle: tokio::sync::Mutex::new(None),
             work: Arc::new(Notify::new()),
             on_stop_done: std::sync::atomic::AtomicBool::new(false),
+            stopping: std::sync::atomic::AtomicBool::new(false),
             crashed: std::sync::atomic::AtomicBool::new(false),
             crash_signal: Arc::new(Notify::new()),
             watermark_high: std::sync::atomic::AtomicU64::new(0),
@@ -655,6 +665,23 @@ impl ActorCell {
     /// `mark_crashed`'s Release).
     pub(crate) fn is_crashed(&self) -> bool {
         self.crashed.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Marks the actor as STOPPING (teardown begun; the inbox is closing
+    /// for good, not for restart). A step's claim guard reads this on
+    /// drop: an un-committed tail under a stopping actor dead-letters
+    /// (StoppedWithMail — the old snapshot drain flushed the in-flight
+    /// envelope too) instead of restoring it into a closed inbox where it
+    /// would be dropped with the cell silently.
+    pub(crate) fn mark_stopping(&self) {
+        self.stopping
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    /// Whether teardown has begun (lock-free read; Acquire pairs with
+    /// `mark_stopping`'s Release).
+    pub(crate) fn is_stopping(&self) -> bool {
+        self.stopping.load(std::sync::atomic::Ordering::Acquire)
     }
 }
 
@@ -1507,11 +1534,16 @@ pub(crate) async fn es_actor_loop(mut loop_ctx: EsLoop, mut shutdown: watch::Rec
     // genesis spawn has no journal; the store answers None. Recovery may
     // REPLACE the table's Arc — rebind the loop's cache here.
     recover_at_boot(&mut loop_ctx).await;
+    // The step batch buffer, allocated ONCE per loop task and reused every
+    // step (claims move in, commit/restore moves them out; the buffer
+    // empties but keeps its capacity).
+    let mut batch: Vec<(crate::inbox::InboxOffset, Envelope)> =
+        Vec::with_capacity(loop_ctx.cell.step_batch);
     loop {
         if *shutdown.borrow_and_update() {
             break;
         }
-        match step_es(&loop_ctx).await {
+        match step_es(&loop_ctx, &mut batch).await {
             Step::Work => {
                 stamp_work(&loop_ctx);
                 continue;
@@ -1630,15 +1662,21 @@ enum Step {
 ///   — append answers one seq per event, in order).
 /// - Unknown-schema and decode failures dead-letter THEIR message alone
 ///   (never entering the batch buffer) and the batch continues.
-async fn step_es(ctx: &EsLoop) -> Step {
-    // 1. SNAPSHOT up to the spawn's batch size (FIFO, nothing removed:
-    // the commit point is stage 6, after the append lands).
+async fn step_es(ctx: &EsLoop, batch: &mut Vec<(crate::inbox::InboxOffset, Envelope)>) -> Step {
+    // 1. CLAIM up to the spawn's batch size (FIFO; each envelope MOVES out
+    // of its inbox slot — tombstones hold the positions). The commit point
+    // is stage 6, after the append lands: every claim stays un-committed
+    // until then, and the claim guard restores the whole batch on any
+    // early exit (append failure, panic) exactly as the old snapshot kept
+    // it queued.
     let batch_n = ctx.cell.step_batch;
-    let batch: Vec<(crate::inbox::InboxOffset, Envelope)> = {
+    let mut claims = ClaimGuard::new(ctx, batch);
+    {
         let mut inbox = ctx.cell.inbox.lock();
-        inbox.peek_up_to(batch_n)
-    };
-    if batch.is_empty() {
+        inbox.claim_up_to(batch_n, claims.batch_mut());
+    }
+    if claims.is_empty() {
+        claims.discharge();
         return Step::Idle;
     }
 
@@ -1647,7 +1685,8 @@ async fn step_es(ctx: &EsLoop) -> Step {
     // nothing when observation is off.
     let observing = ctx.kernel.observing();
     if observing {
-        for (_, envelope) in &batch {
+        for index in 0..claims.len() {
+            let (_, envelope) = claims.at(index);
             ctx.kernel.observe(crate::observe::Observation::new(
                 envelope.trace.causality_id.as_millis_ts(),
                 crate::observe::ObservationKind::Delivered {
@@ -1664,7 +1703,7 @@ async fn step_es(ctx: &EsLoop) -> Step {
     // commit inside the handler. Events collect into ONE ordered buffer;
     // each message's outbox is kept for its own flush. The state lock is
     // taken ONCE for the whole decide pass.
-    let mut decisions: Vec<Outbox> = Vec::with_capacity(batch.len());
+    let mut decisions: Vec<Outbox> = Vec::with_capacity(claims.len());
     let mut batch_events = crate::envelope::Events::new();
     // PER-BATCH entry resolution (cell-local spawn-static config): ONE
     // read-guard clone of the table per batch — the per-message find
@@ -1677,7 +1716,8 @@ async fn step_es(ctx: &EsLoop) -> Step {
     {
         let state = ctx.state();
         let mut state = state.lock().await;
-        for (_, envelope) in &batch {
+        for index in 0..claims.len() {
+            let (_, envelope) = claims.at(index);
             // FIND the command entry for this schema by reference.
             let entry = batch_entries
                 .iter()
@@ -1731,10 +1771,13 @@ async fn step_es(ctx: &EsLoop) -> Step {
                 }
                 Err(poison) => {
                     // PANIC: nothing appended, nothing committed, outboxes
-                    // discarded. The whole batch stays queued (snapshots
-                    // never removed anything) and the state may be
-                    // poisoned — mark crashed and stop; the supervisor
-                    // rebuilds from the journal (never reuses `state`).
+                    // discarded. The whole batch is UN-committed claims —
+                    // the guard restores every envelope to its original
+                    // slot on the way out (same observable contract as the
+                    // old snapshot: nothing was removed) — and the state
+                    // may be poisoned: mark crashed and stop; the
+                    // supervisor rebuilds from the journal (never reuses
+                    // `state`).
                     ctx.cell.mark_crashed();
                     if observing {
                         ctx.kernel.observe(crate::observe::Observation::new(
@@ -1822,19 +1865,16 @@ async fn step_es(ctx: &EsLoop) -> Step {
         if events.is_empty() {
             Vec::new()
         } else {
-            let mut origins = batch
-                .iter()
-                .filter_map(|(_, envelope)| envelope.recorded_origin());
+            let mut origins = (0..claims.len()).filter_map(|index| claims.at(index).1.recorded_origin());
             let first = origins.next();
             let all_same_origin = first.is_some()
                 && origins.all(|o| {
                     let f = first.expect("checked");
                     o.journal == f.journal && o.seq == f.seq
                 })
-                && batch.len()
-                    == batch
-                        .iter()
-                        .filter(|(_, e)| e.recorded_origin().is_some())
+                && claims.len()
+                    == (0..claims.len())
+                        .filter(|index| claims.at(*index).1.recorded_origin().is_some())
                         .count();
             if all_same_origin {
                 let origin = first.expect("checked").clone();
@@ -1852,11 +1892,22 @@ async fn step_es(ctx: &EsLoop) -> Step {
                         if !results.iter().all(|slot| slot.is_some()) {
                             // Already checkpointed by the seeding path:
                             // commit (durably held) and move on — replay
-                            // restores this fact from the journal.
-                            let mut inbox = ctx.cell.inbox.lock();
-                            for (offset, _) in &batch {
-                                inbox.commit_through(*offset);
+                            // restores this fact from the journal. The
+                            // commit fires the space-available wake after
+                            // its guard drops.
+                            let freed = {
+                                let mut inbox = ctx.cell.inbox.lock();
+                                let mut freed = false;
+                                for index in 0..claims.len() {
+                                    let (offset, _) = claims.at(index);
+                                    freed |= inbox.commit_through(offset);
+                                }
+                                freed
+                            };
+                            if freed {
+                                ctx.cell.space_available.notify_one();
                             }
+                            claims.discharge();
                             return Step::Work;
                         }
                         events
@@ -1885,23 +1936,34 @@ async fn step_es(ctx: &EsLoop) -> Step {
 
     // 6. COMMIT the whole batch (the commit point: none of these messages
     // will ever redeliver). One inbox acquisition moves the cursor past
-    // every offset. The commit-point bookkeeping is cell-local: the last
-    // committed seq and the inbox cursor land without the kernel lock (the
-    // seq and the cursor are single-writer — this loop is the only
-    // appender for the path). Acked observations ride the handler slot.
+    // every offset; the space-available wake fires after the guard drops.
+    // The commit-point bookkeeping is cell-local: the last committed seq
+    // and the inbox cursor land without the kernel lock (the seq and the
+    // cursor are single-writer — this loop is the only appender for the
+    // path). Acked observations ride the handler slot.
     {
-        let mut inbox = ctx.cell.inbox.lock();
-        for (offset, _) in &batch {
-            inbox.commit_through(*offset);
+        let freed = {
+            let mut inbox = ctx.cell.inbox.lock();
+            let mut freed = false;
+            for index in 0..claims.len() {
+                let (offset, _) = claims.at(index);
+                freed |= inbox.commit_through(offset);
+            }
+            freed
+        };
+        if freed {
+            ctx.cell.space_available.notify_one();
         }
     }
+    claims.discharge();
     if let Some(last) = seqs.last() {
         ctx.cell
             .last_event_seq
             .store(last.as_u64(), std::sync::atomic::Ordering::Release);
     }
     if observing {
-        for (_, envelope) in &batch {
+        for index in 0..claims.len() {
+            let (_, envelope) = claims.at(index);
             ctx.kernel.observe(crate::observe::Observation::new(
                 envelope.trace.causality_id.as_millis_ts(),
                 crate::observe::ObservationKind::Acked {
@@ -2708,11 +2770,14 @@ async fn maybe_passivate(ctx: &EsLoop) -> bool {
     // CLOSE THE DOOR first: pushes now refuse to the DLQ, but entries
     // already inside stay processable (peek/ack still work on a closed
     // inbox). Then drain: process what's queued — the ES step is sync,
-    // so this is bounded by capacity.
+    // so this is bounded by capacity. (A local buffer: passivation is a
+    // terminal one-shot — the loop's reused buffer isn't reachable here.)
     {
         let mut inbox = ctx.cell.inbox.lock();
         inbox.close();
     }
+    let mut batch: Vec<(crate::inbox::InboxOffset, Envelope)> =
+        Vec::with_capacity(ctx.cell.step_batch);
     loop {
         let has_mail = {
             let mut inbox = ctx.cell.inbox.lock();
@@ -2721,7 +2786,7 @@ async fn maybe_passivate(ctx: &EsLoop) -> bool {
         if !has_mail {
             break;
         }
-        match step_es(ctx).await {
+        match step_es(ctx, &mut batch).await {
             Step::Work => continue,
             // A poison message mid-drain: leave the crash for supervision
             // (which restarts; the next idle re-passivates — converges).
@@ -2749,11 +2814,16 @@ async fn maybe_passivate(ctx: &EsLoop) -> bool {
 /// drop the message. No journal, no cursor — service actors are at-most-once
 /// by design (supervision wraps this loop).
 pub(crate) async fn service_actor_loop(loop_ctx: ServiceLoop, mut shutdown: watch::Receiver<bool>) {
+    // The step batch buffer, allocated ONCE per loop task and reused every
+    // step (claims move in, commit/restore moves them out; the buffer
+    // empties but keeps its capacity).
+    let mut batch: Vec<(crate::inbox::InboxOffset, Envelope)> =
+        Vec::with_capacity(loop_ctx.es.cell.step_batch);
     loop {
         if *shutdown.borrow_and_update() {
             break;
         }
-        match step_service(&loop_ctx).await {
+        match step_service(&loop_ctx, &mut batch).await {
             Step::Work => {
                 stamp_work(&loop_ctx.es);
                 continue;
@@ -2812,6 +2882,117 @@ enum DispatchFailure {
     Panic,
 }
 
+/// A step batch's claim ownership: the guard BORROWS the loop task's
+/// reused batch buffer and owns the claimed envelopes inside it (dispatch
+/// borrows through the guard), tracks the committed prefix, and on any
+/// early exit RESTORES the un-committed tail to its original inbox slots
+/// (offset-addressed, so restoration is exact — FIFO order survives a
+/// crash even when a concurrent push landed during the claim window: that
+/// push took a later offset and sits behind the restored tail).
+///
+/// The restore runs in Drop, so every early-return path (Crashed, Stop,
+/// `?`) is covered without per-site surgery; a fully-committed batch calls
+/// [`ClaimGuard::discharge`] to skip the restore, leaving the buffer
+/// empty for the loop's next step (Vec reuse: one allocation per task,
+/// zero per step). Restoration frees inbox slots, so the drop fires
+/// `space_available` after its own guard drops (the same wake-after-drop
+/// discipline as commit).
+struct ClaimGuard<'a> {
+    cell: std::sync::Arc<ActorCell>,
+    /// The kernel lock (for the stopping path's StoppedWithMail DLQ).
+    kernel: Arc<CountingKernelLock>,
+    /// The loop task's reused batch buffer (emptied on step exit).
+    batch: &'a mut Vec<(crate::inbox::InboxOffset, Envelope)>,
+    /// Claims `[0..committed)` are dispatched-and-committed; the tail is
+    /// un-committed and is what a Drop restores.
+    committed: usize,
+}
+
+impl<'a> ClaimGuard<'a> {
+    /// A guard over the loop's reused buffer (claim via
+    /// [`Inbox::claim_up_to`] into [`ClaimGuard::batch_mut`]).
+    fn new(es: &EsLoop, batch: &'a mut Vec<(crate::inbox::InboxOffset, Envelope)>) -> Self {
+        Self {
+            cell: es.cell.clone(),
+            kernel: es.kernel.clone(),
+            batch,
+            committed: 0,
+        }
+    }
+
+    /// The claim destination for [`Inbox::claim_up_to`]. The buffer is
+    /// expected EMPTY here (the previous step discharged or restored it).
+    fn batch_mut(&mut self) -> &mut Vec<(crate::inbox::InboxOffset, Envelope)> {
+        debug_assert!(self.batch.is_empty(), "batch buffer not drained");
+        self.batch
+    }
+
+    fn is_empty(&self) -> bool {
+        self.batch.is_empty()
+    }
+
+    fn len(&self) -> usize {
+        self.batch.len()
+    }
+
+    /// Shared access to claim `index` (dispatch borrows the envelope).
+    fn at(&self, index: usize) -> (crate::inbox::InboxOffset, &Envelope) {
+        let (offset, envelope) = &self.batch[index];
+        (*offset, envelope)
+    }
+
+    /// Records that claim `index` committed (advances the prefix).
+    fn commit(&mut self, index: usize) {
+        debug_assert_eq!(index, self.committed, "claims commit front-to-back");
+        self.committed = index + 1;
+    }
+
+    /// A fully-committed (or fully-restored) batch: Drop restores nothing
+    /// and the buffer stays with the loop, empty, for reuse.
+    fn discharge(&mut self) {
+        self.committed = self.batch.len();
+    }
+}
+
+impl Drop for ClaimGuard<'_> {
+    fn drop(&mut self) {
+        if self.committed >= self.batch.len() {
+            self.batch.clear();
+            return;
+        }
+        let uncommitted: Vec<_> = self.batch.drain(self.committed..).collect();
+        self.batch.clear();
+        // A STOPPING actor's tail cannot restore: the inbox is closing for
+        // good (teardown), and an envelope restored there would drop with
+        // the cell silently. The old snapshot drain flushed the IN-FLIGHT
+        // envelope too (its original lived in the queue) — dead-letter the
+        // tail with the same StoppedWithMail type to keep the observable.
+        if self.cell.is_stopping() {
+            let letters: Vec<crate::kernel::DeadLetter> = uncommitted
+                .into_iter()
+                .map(|(_, envelope)| crate::kernel::DeadLetter {
+                    schema: envelope.schema.clone(),
+                    dest: envelope.dest.clone(),
+                    reason: crate::kernel::DeadLetterReason::StoppedWithMail,
+                    detail: "stopped with an in-flight claim (un-committed)".to_owned(),
+                    trace: envelope.trace,
+                    envelope,
+                })
+                .collect();
+            let count = letters.len();
+            self.kernel.lock().dead_letters.extend(letters);
+            tracing::debug!(path = %self.cell.path, count, "stop flushed in-flight claims to the DLQ");
+            return;
+        }
+        let freed = self.cell.inbox.lock().restore_claims(uncommitted);
+        // Restoration returned slots to the queue — a parked Block hold
+        // may proceed. Notify after the guard drops (wake-after-drop).
+        if freed {
+            self.cell.space_available.notify_one();
+        }
+    }
+}
+
 impl<F: Future> Future for PanicIsolated<F> {
     type Output = Result<F::Output, Box<dyn std::any::Any + Send>>;
 
@@ -2850,19 +3031,26 @@ impl<F: Future> Future for PanicIsolated<F> {
 /// time. Per-message outbox flushes stay INSIDE the batch loop, so message
 /// k's sends still land before message k+1's (cross-message ordering
 /// preserved; batching amortizes the wake/lock, never the intent order).
-async fn step_service(ctx: &ServiceLoop) -> Step {
-    // 1. SNAPSHOT up to the spawn's batch size (FIFO, nothing removed).
+async fn step_service(
+    ctx: &ServiceLoop,
+    batch: &mut Vec<(crate::inbox::InboxOffset, Envelope)>,
+) -> Step {
+    // 1. CLAIM up to the spawn's batch size (FIFO; each envelope MOVES out
+    // of its inbox slot — tombstones hold the positions — into the loop's
+    // reused batch buffer). The claim guard restores any un-committed
+    // claims to their exact slots when the step exits early.
     let batch_n = ctx.es.cell.step_batch;
-    let batch: Vec<(crate::inbox::InboxOffset, Envelope)> = {
+    let mut claims = ClaimGuard::new(&ctx.es, batch);
+    {
         let mut inbox = ctx.es.cell.inbox.lock();
-        inbox.peek_up_to(batch_n)
-    };
-    let Some((_, first)) = batch.first() else {
+        inbox.claim_up_to(batch_n, claims.batch_mut());
+    }
+    if claims.is_empty() {
+        claims.discharge();
         return Step::Idle;
-    };
-    let _ = first;
+    }
 
-    // 2. DISPATCH each snapshot inline, in order. Delivered observations
+    // 2. DISPATCH each claim inline, in order. Delivered observations
     // ride the handler slot (no kernel lock, nothing constructed when
     // observation is off). Unknown-schema and decode failures dead-letter
     // THEIR message alone and continue the batch (one bad envelope never
@@ -2899,10 +3087,20 @@ async fn step_service(ctx: &ServiceLoop) -> Step {
         .read()
         .expect("msg entries lock")
         .clone();
-    for (offset, envelope) in batch {
+    for index in 0..claims.len() {
         // COMMIT (the at-most-once handoff, at the same point the
         // single-message step acked: before this message's dispatch).
-        ctx.es.cell.inbox.lock().commit_through(offset);
+        // The claim's slot tombstone pops here; a freed slot fires the
+        // space-available wake AFTER the guard drops.
+        let freed = {
+            let (offset, _) = claims.at(index);
+            ctx.es.cell.inbox.lock().commit_through(offset)
+        };
+        if freed {
+            ctx.es.cell.space_available.notify_one();
+        }
+        claims.commit(index);
+        let (_, envelope) = claims.at(index);
         if observing {
             ctx.es.kernel.observe(crate::observe::Observation::new(
                 envelope.trace.causality_id.as_millis_ts(),
@@ -2921,7 +3119,7 @@ async fn step_service(ctx: &ServiceLoop) -> Step {
         let Some(entry) = entry else {
             dead_letter(
                 &ctx.es.kernel,
-                &envelope,
+                envelope,
                 crate::kernel::DeadLetterReason::UnknownSchema,
                 "no entry for this schema",
             );
@@ -2963,9 +3161,11 @@ async fn step_service(ctx: &ServiceLoop) -> Step {
                 // Handler panicked: mark crashed (supervision restarts via
                 // `start`). This message was already consumed at handoff (the
                 // same at-most-once window as the single-message step); every
-                // LATER snapshot is still fully queued (nothing was removed),
-                // so no tail surgery is needed. The outbox dies with the
-                // dispatch — nothing recorded, the standing contract.
+                // LATER claim is still un-committed, so the guard restores
+                // them to their original slots on the way out (nothing was
+                // removed, same contract — by restoration instead of
+                // never-having-left). The outbox dies with the dispatch —
+                // nothing recorded, the standing contract.
                 ctx.es.cell.mark_crashed();
                 return Step::Crashed;
             }
@@ -2976,7 +3176,7 @@ async fn step_service(ctx: &ServiceLoop) -> Step {
                 let reason = format!("{report}");
                 dead_letter(
                     &ctx.es.kernel,
-                    &envelope,
+                    envelope,
                     crate::kernel::DeadLetterReason::Decode,
                     &reason,
                 );
@@ -2998,6 +3198,9 @@ async fn step_service(ctx: &ServiceLoop) -> Step {
         }
     }
 
+    // Every claim committed and dispatched; the guard discharges without
+    // restoration and the buffer goes back to the loop for reuse.
+    claims.discharge();
     Step::Work
 }
 

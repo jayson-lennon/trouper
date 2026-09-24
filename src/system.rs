@@ -1779,8 +1779,24 @@ impl ActorSystemCore {
         // 3. AWAIT the loop's exit (current message completes). The loop
         // drains/flushes on stop, and its graceful exit claims + runs the
         // on_stop hook itself.
-        if let Some(jh) = join_slot.take() {
-            let joined = tokio::time::timeout(remaining, jh).await;
+        if let Some(mut jh) = join_slot.take() {
+            let joined = match tokio::time::timeout(remaining, &mut jh).await {
+                Ok(joined) => Ok(joined),
+                Err(_elapsed) => {
+                    // BUDGET EXPIRED: the handler never finished. Abort the
+                    // loop task — a bounded stop gives up on the in-flight
+                    // message, and leaving the task parked forever on a
+                    // dead actor leaks it. The abort unwinds the step
+                    // frame, whose claim guard disposes of the
+                    // un-committed batch: the cell is already marked
+                    // stopping, so the tail (and the wedged claim)
+                    // dead-letters StoppedWithMail — the same observable
+                    // the old snapshot queue gave the stop-drain.
+                    jh.abort();
+                    let _ = jh.await;
+                    Err(())
+                }
+            };
             // 3.5 HOOK ONLY IF THE LOOP FINISHED: when the join times out,
             // the loop is wedged inside a handler that may hold the
             // instance mutex — running on_stop there would block forever
@@ -1837,7 +1853,13 @@ impl ActorSystemCore {
             let kernel = self.kernel.lock();
             kernel.cells.contains_key(path) || kernel.specs.contains_key(path)
         };
-        // UNDELIVERED → DLQ; then close the inbox.
+        // UNDELIVERED → DLQ; then close the inbox. Mark the cell stopping
+        // FIRST: a step parked mid-dispatch reads this in its claim
+        // guard's drop and dead-letters its in-flight claim (StoppedWithMail)
+        // instead of restoring it into the closing inbox.
+        if let Some(cell) = self.kernel.lock().cells.get(path).cloned() {
+            cell.mark_stopping();
+        }
         let undelivered: Vec<Envelope> = {
             let kernel = self.kernel.lock();
             let mut drained = Vec::new();
@@ -1845,9 +1867,7 @@ impl ActorSystemCore {
                 && let Some(mut inbox) = cell.inbox.try_lock()
             {
                 inbox.close();
-                while let Some(envelope) = inbox.pop_discard() {
-                    drained.push(envelope);
-                }
+                drained = inbox.drain_live();
             }
             drained
         };
@@ -3167,6 +3187,69 @@ mod tests {
         assert_eq!(system.inbox_cursor(&path).map(|c| c.as_u64()), Some(0));
         let state = system.es_state(&path).await.expect("shell present");
         assert_eq!(state["total"], 0);
+    }
+
+    #[tokio::test]
+    async fn mid_batch_decide_panic_restores_the_whole_claimed_batch() {
+        // Given an ES counter (default batch 64) that will receive one good
+        // Add, a poison Boom, and a second good Add — all one claimed batch.
+        let (system, _clock) = ActorSystem::test();
+        let path = ActorPath::new("mid-batch-restore");
+        system.spawn_es::<Counter, _>(path.clone(), &json!({}), SpawnOpts::default(), || {
+            vec![
+                Arc::new(TypedEsAdapter::<Counter, Add>::new::<Add>()),
+                Arc::new(TypedEsAdapter::<Counter, Boom>::new::<Boom>()),
+            ]
+        });
+        system
+            .send(system.envelope(Add::schema_id(), path.clone(), json!({ "n": 1 })))
+            .await
+            .expect("delivered");
+        system
+            .send(system.envelope(Boom::schema_id(), path.clone(), json!({ "why": "boom" })))
+            .await
+            .expect("delivered");
+        system
+            .send(system.envelope(Add::schema_id(), path.clone(), json!({ "n": 2 })))
+            .await
+            .expect("delivered");
+        wait_for_crash(&system, &path).await;
+
+        // Then the decide-panic aborted the batch BEFORE any commit: no
+        // events appended, cursor still at zero, and all THREE claimed
+        // envelopes were restored to their original slots (tombstones
+        // refilled — the queue holds the whole batch for redelivery).
+        {
+            assert!(
+                system.journal_entries(&path).is_empty(),
+                "nothing appended on a decide panic"
+            );
+            let kernel = system.kernel.lock();
+            let cell = kernel.cells.get(&path).expect("cell kept for redelivery");
+            assert_eq!(
+                cell.inbox.lock().len(),
+                3,
+                "the claimed batch was restored to the queue"
+            );
+        }
+        assert_eq!(system.inbox_cursor(&path).map(|c| c.as_u64()), Some(0));
+
+        // And after a supervised restart the restored batch redelivers
+        // whole (decide is batch-atomic: the restored Boom aborts the
+        // batch again before anything appends — the crash re-records and
+        // the inbox STILL holds all three in order for the next restart).
+        system.restart_es(&path, &json!({})).await.expect("restart");
+        wait_for_crash(&system, &path).await;
+        assert!(
+            system.journal_entries(&path).is_empty(),
+            "the restored Boom aborts the batch before any append"
+        );
+        {
+            let kernel = system.kernel.lock();
+            let cell = kernel.cells.get(&path).expect("cell");
+            assert_eq!(cell.inbox.lock().len(), 3, "re-restored whole batch");
+        }
+        assert_eq!(system.inbox_cursor(&path).map(|c| c.as_u64()), Some(0));
     }
 
     #[tokio::test]
@@ -4659,6 +4742,18 @@ mod tests {
                 .any(|f| matches!(&f.kind, crate::observe::ObservationKind::Sent { schema, .. } if *schema == Note::schema_id()))
         })
         .await;
+
+        // And the UN-dispatched tail (n=2, claimed but never reached) went
+        // to the DLQ at teardown: only the dispatched prefix committed.
+        let drained = system.drain_dead_letters();
+        assert!(
+            drained.iter().any(|l| {
+                l.reason == crate::kernel::DeadLetterReason::StoppedWithMail
+                    && l.envelope.payload_json()["n"].as_i64() == Some(2)
+            }),
+            "the un-dispatched tail flushed StoppedWithMail: {:?}",
+            drained.iter().map(|l| (l.reason.clone(), l.envelope.payload_json())).collect::<Vec<_>>()
+        );
     }
 
     #[tokio::test]
