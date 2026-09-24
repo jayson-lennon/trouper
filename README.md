@@ -1,6 +1,6 @@
 # trouper
 
-[![Crates.io](https://img.shields.io/crates/v/trouper.svg)](https://crates.io/crates/trouper)
+[![Crates.io](https://img.shields.io/crates/v/trouper.svg)](https://img.shields.io/crates/v/trouper.svg)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](https://opensource.org/license/mit)
 [![Repository](https://img.shields.io/badge/repository-GitHub-black)](https://github.com/jayson-lennon/trouper)
 
@@ -34,7 +34,7 @@ actor spawn, priming, and settle sit in `iter_batched`'s untimed setup;
 one element = one fully processed message. Mailboxes follow each
 framework's supported set:
 
-| leg               | mailbox                                    |
+| runtime           | mailbox                                    |
 | ----------------- | ------------------------------------------ |
 | trouper           | bounded-64 (its default, Block policy)     |
 | trouper-unbounded | 2^20-capacity Block (no true unbounded)    |
@@ -46,38 +46,38 @@ trouper's producer declares `.emits::<Tick>()` at spawn — the flush
 gate dead-letters undeclared outbound schemas, so that declaration is
 part of its send path.
 
-| Leg               | n    | Criterion time | Per message | Rate          |
-| ----------------- | ---- | -------------: | ----------: | ------------: |
-| trouper           | 64   |      223.44 µs |    3,491 ns |   286,435 msg/s |
-|                   | 512  |      545.59 µs |    1,066 ns |   938,429 msg/s |
-|                   | 2048 |        1.74 ms |      849 ns | 1,177,673 msg/s |
-| trouper-unbounded | 64   |      210.64 µs |    3,291 ns |   303,833 msg/s |
-|                   | 512  |      603.77 µs |    1,179 ns |   848,012 msg/s |
-|                   | 2048 |        1.85 ms |      901 ns | 1,109,500 msg/s |
-| kameo             | 64   |      178.78 µs |    2,794 ns |   357,973 msg/s |
-|                   | 512  |      331.66 µs |      648 ns | 1,543,735 msg/s |
-|                   | 2048 |      821.85 µs |      401 ns | 2,491,929 msg/s |
-| kameo-unbounded   | 64   |      181.90 µs |    2,842 ns |   351,846 msg/s |
-|                   | 512  |      293.68 µs |      574 ns | 1,743,416 msg/s |
-|                   | 2048 |      724.92 µs |      354 ns | 2,825,142 msg/s |
-| ractor            | 64   |      178.36 µs |    2,787 ns |   358,833 msg/s |
-|                   | 512  |      265.03 µs |      518 ns | 1,931,886 msg/s |
-|                   | 2048 |      567.48 µs |      277 ns | 3,608,950 msg/s |
+| Runtime           | tells | Criterion time | Per tell | Rate          |
+| ----------------- | ----- | -------------: | -------: | ------------: |
+| trouper           | 64    |      223.44 µs | 3,491 ns |   286,435 t/s |
+|                   | 512   |      545.59 µs | 1,066 ns |   938,429 t/s |
+|                   | 2048  |        1.74 ms |   849 ns | 1,177,673 t/s |
+| trouper-unbounded | 64    |      210.64 µs | 3,291 ns |   303,833 t/s |
+|                   | 512   |      603.77 µs | 1,179 ns |   848,012 t/s |
+|                   | 2048  |        1.85 ms |   901 ns | 1,109,500 t/s |
+| kameo             | 64    |      178.78 µs | 2,794 ns |   357,973 c/s |
+|                   | 512   |      331.66 µs |   648 ns | 1,543,735 c/s |
+|                   | 2048  |      821.85 µs |   401 ns | 2,491,929 c/s |
+| kameo-unbounded   | 64    |      181.90 µs | 2,842 ns |   351,846 c/s |
+|                   | 512   |      293.68 µs |   574 ns | 1,743,416 c/s |
+|                   | 2048  |      724.92 µs |   354 ns | 2,825,142 c/s |
+| ractor            | 64    |      178.36 µs | 2,787 ns |   358,833 c/s |
+|                   | 512   |      265.03 µs |   518 ns | 1,931,886 c/s |
+|                   | 2048  |      567.48 µs |   277 ns | 3,608,950 c/s |
 
 Shape read: at small batches every framework is parked near the same
 wake-up floor (~170-220 µs covers the producer's resume, the whole
 in-flight batch, and the done signal). As the batch grows, per-message
 cost separates: the unbounded kameo/ractor mailboxes climb toward
-~2.5-3.6M msg/s while trouper's journaled-style path — every tell is
+~2.5-3.6M c/s while trouper's journaled-style path — every tell is
 schema-routed, outbox-recorded, and flush-gated, with the payload as a
 live value end to end (zero serde on the message path; serde exists
-only at the journal door) — holds ~850K-1.18M msg/s at 2048. The
+only at the journal door) — holds ~850K-1.18M t/s at 2048. The
 bounded leg is trouper's FASTEST at scale: each step claims the batch
 by MOVING envelopes out of their inbox slots (tombstones hold the
 positions — zero per-message clones, the old snapshot's refcount
 traffic is gone), and a Block-refused tell parks on a space-available
 notify instead of polling (the commit wakes it). Those two changes took
-the bounded leg from ~476K to ~1.18M msg/s at 2048 (~2.2-2.8× its
+the bounded leg from ~476K to ~1.18M t/s at 2048 (~2.2-2.8× its
 pre-claim median) while the unbounded leg and the kameo/ractor
 controls sat flat (±7%). That is the architectural trade trouper makes
 for its registry/journal guarantees, priced honestly against the plain
