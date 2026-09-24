@@ -4,7 +4,8 @@
 //! completion wait) but the measured loop is the whole profile.
 //!
 //! ```text
-//! cargo build --profile release-debug --example flame_tells
+//! RUSTFLAGS="-C force-frame-pointers=yes" \
+//!   cargo build --profile release-debug --example flame_tells
 //! perf record -F 9999 --call-graph fp -o /tmp/tells.data \
 //!   -- target/release-debug/examples/flame_tells
 //! perf script -i /tmp/tells.data | flamegraph --flamechart > tells.svg

@@ -96,16 +96,16 @@ required-features = ["daow"]
 lto = true
 codegen-units = 1
 
-# Profiling build: full symbols + frame pointers so `perf record --call-graph fp`
-# can unwind through tokio's inlined runtime internals (the default release
-# profile unwinds to "[unknown]" and collapses ~a third of samples into one
-# runtime/libc bucket). Build with:
-#   RUSTFLAGS="-C force-frame-pointers=yes" CARGO_PROFILE_RELEASE_DEBUG=true \
-#     cargo build --release --example flame_tells
+# Profiling build: full symbols (the frame pointers come from the build
+# command's RUSTFLAGS, below — cargo has no profile key for them) so
+# `perf record --call-graph fp` can unwind through tokio's inlined runtime
+# internals (the default release profile unwinds to "[unknown]" and
+# collapses ~a third of samples into one runtime/libc bucket). Build with:
+#   RUSTFLAGS="-C force-frame-pointers=yes" cargo build \
+#     --profile release-debug --example flame_tells
 [profile.release-debug]
 inherits = "release"
 debug = true
-force-frame-pointers = true
 
 [lints.clippy]
 # The envelope rides `Result::Err` back to senders on failed delivery and
