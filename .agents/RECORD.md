@@ -146,3 +146,4 @@ Entries are added or amended **only with human approval**.
 - (runtime) An actor spawned with OverloadPolicy::Unbounded has no mailbox capacity: the inbox never refuses and the front door never engages; no pre-allocation occurs (the queue grows on demand).
 - (runtime) The front-door channel is a kanal channel; Endpoint wraps its sender with the destination's live cell and an atomic pending count incremented on accepted sends and decremented by the door on every drain.
 - (bench) The competitors profile rig (examples/profile_competitors.rs) mirrors the trouper and ractor competitors-bench legs under perf; folded stacks reduce to a sample-share accounting committed in bench-accounting.md.
+- (bench) The competitors bench creates a fresh runtime and actors for every iteration, times only the interval from the start signal to sink completion, and excludes runtime construction, priming, settlement, release, and thread joins from that interval.

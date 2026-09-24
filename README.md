@@ -10,32 +10,34 @@ This crate is _not_ yet ready for general use. Built specifically for [`jinn`](h
 
 ## Benchmarks
 
-Notes:
+The competitor benchmark hot-loops a burst of actor-to-actor messages from one producer to one sink. Every iteration uses a fresh runtime and actor pair; only the start signal through sink completion leaks into the bench timing. Construction, priming, the 50 ms settlement, runtime release, and thread joining are excluded. Values are Criterion point estimates (2026-09-24, Intel Core i5-10400, cores 0–5).
 
-- `ractor` does not have a bounded API.
+`ractor` does not have a bounded API.
 
 | Runtime                 | msg burst | Criterion time | Per message |             Rate |
 | ----------------------- | --------- | -------------: | ----------: | ---------------: |
-| trouper-tell-bounded-64 | 64        |      228.31 µs |    3,567 ns |   280,323 tell/s |
-|                         | 512       |      545.17 µs |    1,065 ns |   939,155 tell/s |
-|                         | 2048      |        1.58 ms |      770 ns | 1,298,889 tell/s |
-|                         | 50000     |       35.04 ms |      701 ns | 1,426,790 tell/s |
-| trouper-unbounded-tell  | 64        |      230.67 µs |    3,604 ns |   277,447 tell/s |
-|                         | 512       |      573.17 µs |    1,119 ns |   893,273 tell/s |
-|                         | 2048      |        1.65 ms |      808 ns | 1,238,208 tell/s |
-|                         | 50000     |       39.07 ms |      781 ns | 1,279,704 tell/s |
-| kameo-tell-bounded-64   | 64        |      204.39 µs |    3,194 ns |   313,120 tell/s |
-|                         | 512       |      361.41 µs |      706 ns | 1,416,662 tell/s |
-|                         | 2048      |      835.59 µs |      408 ns | 2,450,951 tell/s |
-|                         | 50000     |       16.31 ms |      326 ns | 3,066,180 tell/s |
-| kameo-unbounded-tell    | 64        |      191.05 µs |    2,985 ns |   334,985 tell/s |
-|                         | 512       |      329.79 µs |      644 ns | 1,552,487 tell/s |
-|                         | 2048      |      732.55 µs |      358 ns | 2,795,728 tell/s |
-|                         | 50000     |       13.94 ms |      279 ns | 3,585,603 tell/s |
-| ractor-unbounded-cast   | 64        |      179.11 µs |    2,799 ns |   357,318 cast/s |
-|                         | 512       |      310.81 µs |      607 ns | 1,647,301 cast/s |
-|                         | 2048      |      597.61 µs |      292 ns | 3,426,966 cast/s |
-|                         | 50000     |       11.38 ms |      228 ns | 4,395,039 cast/s |
+| trouper-tell-bounded-64 | 64        |       76.83 µs |    1,201 ns |   832,976 tell/s |
+|                         | 512       |      334.65 µs |      654 ns | 1,529,940 tell/s |
+|                         | 2048      |        1.16 ms |      565 ns | 1,770,563 tell/s |
+|                         | 50000     |       28.77 ms |      575 ns | 1,737,825 tell/s |
+| trouper-unbounded-tell  | 64        |       78.93 µs |    1,233 ns |   810,846 tell/s |
+|                         | 512       |      354.76 µs |      693 ns | 1,443,227 tell/s |
+|                         | 2048      |        1.29 ms |      628 ns | 1,592,438 tell/s |
+|                         | 50000     |       32.61 ms |      652 ns | 1,533,196 tell/s |
+| kameo-tell-bounded-64   | 64        |       53.93 µs |      843 ns | 1,186,792 tell/s |
+|                         | 512       |      207.26 µs |      405 ns | 2,470,285 tell/s |
+|                         | 2048      |      695.27 µs |      339 ns | 2,945,612 tell/s |
+|                         | 50000     |       15.78 ms |      316 ns | 3,167,968 tell/s |
+| kameo-unbounded-tell    | 64        |       48.54 µs |      758 ns | 1,318,410 tell/s |
+|                         | 512       |      172.31 µs |      337 ns | 2,971,423 tell/s |
+|                         | 2048      |      573.94 µs |      280 ns | 3,568,290 tell/s |
+|                         | 50000     |       13.50 ms |      270 ns | 3,702,659 tell/s |
+| ractor-unbounded-cast   | 64        |       43.14 µs |      674 ns | 1,483,386 cast/s |
+|                         | 512       |      141.30 µs |      276 ns | 3,623,388 cast/s |
+|                         | 2048      |      466.25 µs |      228 ns | 4,392,536 cast/s |
+|                         | 50000     |       11.21 ms |      224 ns | 4,462,186 cast/s |
+
+Reproduce with `taskset -c 0-5 cargo bench --bench competitors`.
 
 Daow SQLite journal benches using the default 64-message mailbox with `:memory:` and on-disk
 SQLite media, reported as Criterion point estimates (2026-09-24, Intel Core i5-10400, cores 0–5).

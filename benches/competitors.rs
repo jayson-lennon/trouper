@@ -6,22 +6,27 @@
 //!
 //! Mechanics (identical in every leg):
 //!
-//! 1. SETUP (untimed, `iter_batched`'s setup closure): the leg's module
-//!    thread builds the framework's runtime and spawns producer + sink
-//!    actors. (trouper-specific: the producer declares
-//!    `.emits::<Tick>()` — its flush gate dead-letters undeclared
-//!    outbound schemas, so the declaration IS part of the send path.) One real actor message (`Prime`) wakes the producer's
+//! 1. SETUP (untimed): the leg's module thread builds the framework's
+//!    runtime and spawns producer + sink actors. (trouper-specific: the
+//!    producer declares `.emits::<Tick>()` — its flush gate dead-letters
+//!    undeclared outbound schemas, so the declaration IS part of the send
+//!    path.) One real actor message (`Prime`) wakes the producer's
 //!    handler, which acknowledges on the `prime` kanal channel, then
 //!    parks awaiting the `start` kanal channel — the producer enters its
 //!    handler exactly once and never receives another message. The bench
 //!    waits for the prime ack, settles 50 ms (runtime catches up), and
 //!    only then opens the timed window.
-//! 2. TIMED (the entire criterion body — see `run`): `start_tx.send(())`
-//!    wakes the parked handler, which hot-loops all `n` tells; the sink
-//!    counts receives and fires `done_tx` at the target;
-//!    `done_rx.recv()` returns.
-//! 3. TEARDOWN: `bench_done_tx` releases the parked module thread, which
-//!    drops the runtime; the leg is discarded (fresh leg per iteration).
+//! 2. TIMED: `start_tx.send(())` wakes the parked handler, which hot-loops
+//!    all `n` tells; the sink counts receives and fires `done_tx` at the
+//!    target; `done_rx.recv()` returns. The harness captures elapsed time
+//!    immediately, before any runtime release or thread join.
+//! 3. TEARDOWN (untimed): `bench_done_tx` releases the parked module
+//!    thread, the thread drops the runtime, and the harness joins it. A
+//!    fresh leg is built for the next iteration.
+//!
+//! `iter_custom` receives only the sum of those captured delivery intervals,
+//! so setup, prime, settle, release, and join are outside the reported
+//! duration.
 //!
 //! One throughput element = one fully processed message (send → handler
 //! → sink count), per `Throughput::Elements(n)`.
@@ -42,11 +47,10 @@
 //! cargo bench --bench competitors -- --warm-up-time 1 --measurement-time 2 --sample-size 10 "competitors/trouper/64"
 //! ```
 //!
-//! Adding a framework: copy one leg module (~70 lines, same two-function
-//! shape: `start(bounded, n) -> Pair`, `run(pair, n)`) and add one
-//! `bench_function`.
+//! Adding a framework: copy one leg module (~70 lines, same
+//! `start(bounded, n) -> Pair` shape) and add one `bench_function`.
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 
@@ -60,9 +64,9 @@ const SIZES: [u64; 4] = [64, 512, 2_048, 50_000];
 /// bookkeeping so the timed window opens on a hot, quiet system.
 const SETTLE: Duration = Duration::from_millis(50);
 
-/// What a leg's `start` hands to `run`. `n` is baked into the actors at
-/// start time (the sink's done target), so `run` is a pure signal
-/// round-trip.
+/// What a leg's `start` hands to `iter_delivery`. `n` is baked into the
+/// actors at start time (the sink's done target), so iteration is a pure
+/// signal round-trip.
 pub struct Pair {
     /// Harness → producer: "spam n tells now".
     pub start_tx: kanal::Sender<()>,
@@ -70,19 +74,32 @@ pub struct Pair {
     pub done_rx: kanal::Receiver<()>,
     /// Harness → module thread: "release the runtime".
     pub bench_done_tx: kanal::Sender<()>,
-    /// The module thread parking its runtime; joined by `run`.
+    /// The module thread parking its runtime; joined by `iter_delivery`.
     pub thread: std::thread::JoinHandle<()>,
 }
 
-/// The timed body — byte-identical for every framework. `n` was recorded
-/// at `start` (the actors carry the target); the routine is the start
-/// signal, the done signal, and the release.
-fn run(pair: Pair, n: u64) {
-    let _ = n;
-    pair.start_tx.send(()).expect("start signal");
-    pair.done_rx.recv().expect("done signal");
-    pair.bench_done_tx.send(()).expect("release thread");
-    pair.thread.join().expect("module thread");
+/// Runs Criterion's requested number of fresh legs while reporting only
+/// delivery time. Each setup, prime, and settle is untimed; each release
+/// and join occurs after its delivery interval has been captured.
+fn iter_delivery<F>(iters: u64, mut start_leg: F) -> Duration
+where
+    F: FnMut() -> Pair,
+{
+    let mut measured = Duration::ZERO;
+    for _ in 0..iters {
+        let pair = start_leg();
+
+        let started = Instant::now();
+        pair.start_tx.send(()).expect("start signal");
+        pair.done_rx.recv().expect("done signal");
+        let elapsed = started.elapsed();
+
+        pair.bench_done_tx.send(()).expect("release thread");
+        pair.thread.join().expect("module thread");
+
+        measured += elapsed;
+    }
+    measured
 }
 
 /// Waits (sync, on the bench thread) for a leg's prime ack — the sync
@@ -643,39 +660,19 @@ fn competitors(c: &mut Criterion) {
     for n in SIZES {
         group.throughput(criterion::Throughput::Elements(n));
         group.bench_function(BenchmarkId::new("trouper", n), |b| {
-            b.iter_batched(
-                || trouper_leg::start(true, n),
-                |pair| run(pair, n),
-                criterion::BatchSize::PerIteration,
-            );
+            b.iter_custom(|iters| iter_delivery(iters, || trouper_leg::start(true, n)));
         });
         group.bench_function(BenchmarkId::new("trouper-unbounded", n), |b| {
-            b.iter_batched(
-                || trouper_leg::start(false, n),
-                |pair| run(pair, n),
-                criterion::BatchSize::PerIteration,
-            );
+            b.iter_custom(|iters| iter_delivery(iters, || trouper_leg::start(false, n)));
         });
         group.bench_function(BenchmarkId::new("kameo", n), |b| {
-            b.iter_batched(
-                || kameo_leg::start(true, n),
-                |pair| run(pair, n),
-                criterion::BatchSize::PerIteration,
-            );
+            b.iter_custom(|iters| iter_delivery(iters, || kameo_leg::start(true, n)));
         });
         group.bench_function(BenchmarkId::new("kameo-unbounded", n), |b| {
-            b.iter_batched(
-                || kameo_leg::start(false, n),
-                |pair| run(pair, n),
-                criterion::BatchSize::PerIteration,
-            );
+            b.iter_custom(|iters| iter_delivery(iters, || kameo_leg::start(false, n)));
         });
         group.bench_function(BenchmarkId::new("ractor", n), |b| {
-            b.iter_batched(
-                || ractor_leg::start(false, n),
-                |pair| run(pair, n),
-                criterion::BatchSize::PerIteration,
-            );
+            b.iter_custom(|iters| iter_delivery(iters, || ractor_leg::start(false, n)));
         });
     }
     group.finish();
