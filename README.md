@@ -12,11 +12,13 @@ This crate is _not_ yet ready for general use. Built specifically for [`jinn`](h
 
 Three criterion suites (`cargo bench --bench competitors`, `--bench
 micro`, `--bench journal`) on the development machine (Intel i5-10400,
-12 threads, Linux, release profile). Numbers are criterion means from a
-quiet-machine run; treat them as shape and scale, not absolute
-promises — rerun `cargo bench` locally for your hardware. An element is
-always one fully processed message, one flush, or one frame read —
-never a spawn or a harness step.
+12 threads, Linux, release profile). Competitors numbers are criterion
+means, median-of-5 taskset-pinned alternating runs (each framework's
+leg re-measured in the same round — machine noise hits every leg); the
+other suites are single quiet-machine runs. Treat them as shape and
+scale, not absolute promises — rerun `cargo bench` locally for your
+hardware. An element is always one fully processed message, one flush,
+or one frame read — never a spawn or a harness step.
 
 ### competitors
 
@@ -46,32 +48,35 @@ part of its send path.
 
 | Leg               | n    | Criterion time | Per message | Rate          |
 | ----------------- | ---- | -------------: | ----------: | ------------: |
-| trouper           | 64   |       316.6 µs |    4.90 µs |   202,163 msg/s |
-|                   | 512  |        3.79 ms |    7.40 µs |   135,088 msg/s |
-|                   | 2048 |        4.89 ms |    2.40 µs |   419,187 msg/s |
-| trouper-unbounded | 64   |       338.5 µs |    5.30 µs |   189,069 msg/s |
-|                   | 512  |       949.4 µs |    1.90 µs |   539,277 msg/s |
-|                   | 2048 |        3.46 ms |    1.70 µs |   591,461 msg/s |
-| kameo             | 64   |       267.0 µs |    4.20 µs |   239,696 msg/s |
-|                   | 512  |       435.1 µs |     850 ns | 1,176,618 msg/s |
-|                   | 2048 |       913.2 µs |     446 ns | 2,242,673 msg/s |
-| kameo-unbounded   | 64   |       282.4 µs |    4.40 µs |   226,661 msg/s |
-|                   | 512  |       395.0 µs |     772 ns | 1,296,045 msg/s |
-|                   | 2048 |       791.4 µs |     386 ns | 2,587,901 msg/s |
-| ractor            | 64   |       263.8 µs |    4.10 µs |   242,566 msg/s |
-|                   | 512  |       376.4 µs |     735 ns | 1,360,147 msg/s |
-|                   | 2048 |       677.4 µs |     331 ns | 3,023,506 msg/s |
+| trouper           | 64   |       220.0 µs |    3,438 ns |   290,856 msg/s |
+|                   | 512  |        1.44 ms |    2,808 ns |   356,149 msg/s |
+|                   | 2048 |        3.83 ms |    1,872 ns |   534,126 msg/s |
+| trouper-unbounded | 64   |       216.3 µs |    3,380 ns |   295,872 msg/s |
+|                   | 512  |       592.6 µs |    1,158 ns |   863,916 msg/s |
+|                   | 2048 |        1.89 ms |      925 ns | 1,081,595 msg/s |
+| kameo             | 64   |       186.0 µs |    2,907 ns |   344,012 msg/s |
+|                   | 512  |       330.4 µs |      645 ns | 1,549,871 msg/s |
+|                   | 2048 |       834.1 µs |      407 ns | 2,455,429 msg/s |
+| kameo-unbounded   | 64   |       179.2 µs |    2,800 ns |   357,083 msg/s |
+|                   | 512  |       293.2 µs |      573 ns | 1,746,487 msg/s |
+|                   | 2048 |       722.1 µs |      353 ns | 2,836,251 msg/s |
+| ractor            | 64   |       174.5 µs |    2,727 ns |   366,699 msg/s |
+|                   | 512  |       268.7 µs |      525 ns | 1,905,329 msg/s |
+|                   | 2048 |       572.4 µs |      279 ns | 3,578,230 msg/s |
 
 Shape read: at small batches every framework is parked near the same
-wake-up floor (~260-340 µs covers the producer's resume, the whole
+wake-up floor (~170-220 µs covers the producer's resume, the whole
 in-flight batch, and the done signal). As the batch grows, per-message
 cost separates: the unbounded kameo/ractor mailboxes climb toward
-~2.6-3.0M msg/s while trouper's journaled-style path — every tell is
+~2.5-3.6M msg/s while trouper's journaled-style path — every tell is
 schema-routed, outbox-recorded, and flush-gated, with the payload as a
 live value end to end (zero serde on the message path; serde exists
-only at the journal door) — holds ~420-590K msg/s at 2048. That is the
-architectural trade trouper makes for its registry/journal guarantees,
-priced honestly against the plain tell machines.
+only at the journal door) — holds ~530K-1.08M msg/s at 2048 (the
+bounded leg ~1.6× and the unbounded leg ~1.8× its pre-hot-path medians:
+the inbox is a sync parking_lot lock, entry tables resolve once per
+batch, and a plain-path send takes one registry critical section).
+That is the architectural trade trouper makes for its registry/journal
+guarantees, priced honestly against the plain tell machines.
 
 ### micro
 
@@ -80,12 +85,12 @@ Component costs without a running system: in-memory journal append
 
 | Bench                            | Case            |      Mean |
 | -------------------------------- | --------------- | -------: |
-| in_memory_journal_append         | batch_1         | 72.02 ns |
-|                                  | batch_8         | 32.04 ns |
-|                                  | batch_64        | 27.58 ns |
-| in_memory_journal_replay_restart | journal_1000    | 53.62 µs |
-|                                  | journal_10000   | 561.07 µs |
-|                                  | repeat_load_10k | 743.88 µs |
+| in_memory_journal_append         | batch_1         | 70.75 ns |
+|                                  | batch_8         | 253.26 ns |
+|                                  | batch_64        | 1.72 µs |
+| in_memory_journal_replay_restart | journal_1000    | 54.04 µs |
+|                                  | journal_10000   | 569.80 µs |
+|                                  | repeat_load_10k | 756.43 µs |
 
 ### journal
 
