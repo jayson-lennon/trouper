@@ -48,21 +48,21 @@ part of its send path.
 
 | Leg               | n    | Criterion time | Per message | Rate          |
 | ----------------- | ---- | -------------: | ----------: | ------------: |
-| trouper           | 64   |       220.0 µs |    3,438 ns |   290,856 msg/s |
-|                   | 512  |        1.44 ms |    2,808 ns |   356,149 msg/s |
-|                   | 2048 |        3.83 ms |    1,872 ns |   534,126 msg/s |
-| trouper-unbounded | 64   |       216.3 µs |    3,380 ns |   295,872 msg/s |
-|                   | 512  |       592.6 µs |    1,158 ns |   863,916 msg/s |
-|                   | 2048 |        1.89 ms |      925 ns | 1,081,595 msg/s |
-| kameo             | 64   |       186.0 µs |    2,907 ns |   344,012 msg/s |
-|                   | 512  |       330.4 µs |      645 ns | 1,549,871 msg/s |
-|                   | 2048 |       834.1 µs |      407 ns | 2,455,429 msg/s |
-| kameo-unbounded   | 64   |       179.2 µs |    2,800 ns |   357,083 msg/s |
-|                   | 512  |       293.2 µs |      573 ns | 1,746,487 msg/s |
-|                   | 2048 |       722.1 µs |      353 ns | 2,836,251 msg/s |
-| ractor            | 64   |       174.5 µs |    2,727 ns |   366,699 msg/s |
-|                   | 512  |       268.7 µs |      525 ns | 1,905,329 msg/s |
-|                   | 2048 |       572.4 µs |      279 ns | 3,578,230 msg/s |
+| trouper           | 64   |      223.44 µs |    3,491 ns |   286,435 msg/s |
+|                   | 512  |      545.59 µs |    1,066 ns |   938,429 msg/s |
+|                   | 2048 |        1.74 ms |      849 ns | 1,177,673 msg/s |
+| trouper-unbounded | 64   |      210.64 µs |    3,291 ns |   303,833 msg/s |
+|                   | 512  |      603.77 µs |    1,179 ns |   848,012 msg/s |
+|                   | 2048 |        1.85 ms |      901 ns | 1,109,500 msg/s |
+| kameo             | 64   |      178.78 µs |    2,794 ns |   357,973 msg/s |
+|                   | 512  |      331.66 µs |      648 ns | 1,543,735 msg/s |
+|                   | 2048 |      821.85 µs |      401 ns | 2,491,929 msg/s |
+| kameo-unbounded   | 64   |      181.90 µs |    2,842 ns |   351,846 msg/s |
+|                   | 512  |      293.68 µs |      574 ns | 1,743,416 msg/s |
+|                   | 2048 |      724.92 µs |      354 ns | 2,825,142 msg/s |
+| ractor            | 64   |      178.36 µs |    2,787 ns |   358,833 msg/s |
+|                   | 512  |      265.03 µs |      518 ns | 1,931,886 msg/s |
+|                   | 2048 |      567.48 µs |      277 ns | 3,608,950 msg/s |
 
 Shape read: at small batches every framework is parked near the same
 wake-up floor (~170-220 µs covers the producer's resume, the whole
@@ -71,12 +71,17 @@ cost separates: the unbounded kameo/ractor mailboxes climb toward
 ~2.5-3.6M msg/s while trouper's journaled-style path — every tell is
 schema-routed, outbox-recorded, and flush-gated, with the payload as a
 live value end to end (zero serde on the message path; serde exists
-only at the journal door) — holds ~530K-1.08M msg/s at 2048 (the
-bounded leg ~1.6× and the unbounded leg ~1.8× its pre-hot-path medians:
-the inbox is a sync parking_lot lock, entry tables resolve once per
-batch, and a plain-path send takes one registry critical section).
-That is the architectural trade trouper makes for its registry/journal
-guarantees, priced honestly against the plain tell machines.
+only at the journal door) — holds ~850K-1.18M msg/s at 2048. The
+bounded leg is trouper's FASTEST at scale: each step claims the batch
+by MOVING envelopes out of their inbox slots (tombstones hold the
+positions — zero per-message clones, the old snapshot's refcount
+traffic is gone), and a Block-refused tell parks on a space-available
+notify instead of polling (the commit wakes it). Those two changes took
+the bounded leg from ~476K to ~1.18M msg/s at 2048 (~2.2-2.8× its
+pre-claim median) while the unbounded leg and the kameo/ractor
+controls sat flat (±7%). That is the architectural trade trouper makes
+for its registry/journal guarantees, priced honestly against the plain
+tell machines.
 
 ### micro
 
@@ -85,12 +90,12 @@ Component costs without a running system: in-memory journal append
 
 | Bench                            | Case            |      Mean |
 | -------------------------------- | --------------- | -------: |
-| in_memory_journal_append         | batch_1         | 70.75 ns |
-|                                  | batch_8         | 253.26 ns |
-|                                  | batch_64        | 1.72 µs |
-| in_memory_journal_replay_restart | journal_1000    | 54.04 µs |
-|                                  | journal_10000   | 569.80 µs |
-|                                  | repeat_load_10k | 756.43 µs |
+| in_memory_journal_append         | batch_1         | 71.40 ns |
+|                                  | batch_8         | 263.50 ns |
+|                                  | batch_64        | 1.76 µs |
+| in_memory_journal_replay_restart | journal_1000    | 56.06 µs |
+|                                  | journal_10000   | 569.14 µs |
+|                                  | repeat_load_10k | 779.12 µs |
 
 ### journal
 
