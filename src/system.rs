@@ -4757,6 +4757,134 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn block_hold_parks_on_space_available_and_lands_on_commit() {
+        // Given a capacity-2 Block actor whose handler parks forever on the
+        // FIRST message (the loop is wedged inside dispatch): msg1 commits
+        // at handoff (at-most-once), msg2 queues into the freed slot, and
+        // msg3 finds a FULL inbox — the front door HELD it on the
+        // space-available notify (the old design would poll-retry it in).
+        let (system, _clock) = ActorSystem::test();
+        system.register_schema::<Add>();
+        let path = ActorPath::new("hold-notify");
+        let opts = SpawnOpts {
+            mailbox_capacity: 2,
+            ..SpawnOpts::default()
+        };
+        static PARK_ONE: std::sync::atomic::AtomicBool =
+            std::sync::atomic::AtomicBool::new(false);
+        struct Wedge;
+        impl ServiceActor for Wedge {
+            fn manifest() -> ActorManifest {
+                ActorManifest::new().handles::<Add>().kind(ActorKind::Service)
+            }
+            async fn start(
+                _args: &Json,
+            ) -> Result<Self, error_stack::Report<crate::registry::RegistryError>> {
+                Ok(Self)
+            }
+        }
+        impl MsgHandler<Add> for Wedge {
+            async fn handle(&mut self, _msg: &Add, _ctx: &mut crate::context::MsgCtx<'_>) {
+                if !PARK_ONE.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                    let (_tx, rx) = tokio::sync::oneshot::channel::<()>();
+                    let _ = rx.await;
+                }
+            }
+        }
+        system.spawn_service::<Wedge, _>(
+            path.clone(),
+            &json!({}),
+            opts,
+            || vec![Arc::new(TypedServiceAdapter::<Wedge, Add>::new::<Add>())],
+        );
+        wait_for(|| async {
+            system.facts().iter().any(
+                |f| matches!(&f.kind, crate::observe::ObservationKind::Spawned { path: p, .. } if *p == path),
+            )
+        })
+        .await;
+
+        // Msg1 first, and wait until the loop has CLAIMED it (the
+        // Delivered fact fires right after the handoff commit) — only then
+        // are msg2/msg3 sent, so their routing sees the post-commit state
+        // deterministically.
+        system
+            .send(system.envelope(Add::schema_id(), path.clone(), json!({ "n": 1 })))
+            .await
+            .expect("msg1 delivered");
+        eprintln!("[test] waiting Delivered(msg1)");
+        wait_for(|| async {
+            system.facts().iter().any(
+                |f| matches!(&f.kind, crate::observe::ObservationKind::Delivered { to, .. } if *to == path),
+            )
+        })
+        .await;
+        eprintln!("[test] Delivered(msg1) seen");
+        // Msgs 2+3 fill both slots (msg1's commit freed one); msg4 is the
+        // held tell (the inbox is FULL — the front door holds it).
+        for n in 2..=3_i64 {
+            system
+                .send(system.envelope(Add::schema_id(), path.clone(), json!({ "n": n })))
+                .await
+                .expect("delivered");
+        }
+        wait_for(|| async { system.inbox_debug_len(&path).await == 2 }).await;
+        system
+            .send(system.envelope(Add::schema_id(), path.clone(), json!({ "n": 4 })))
+            .await
+            .expect("msg4 accepted by the door channel");
+        // The hold is notify-driven: nothing commits on its own (the loop
+        // is wedged), so msg4 can NEVER land — under the old 2ms poll
+        // design it would have within milliseconds.
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        {
+            let kernel = system.kernel.lock();
+            let cell = kernel.cells.get(&path).expect("cell");
+            let inbox = cell.inbox.lock();
+            assert_eq!(
+                inbox.len(),
+                2,
+                "the held msg4 never entered the inbox while full"
+            );
+            assert_eq!(
+                inbox.cursor().as_u64(),
+                1,
+                "cursor still at msg2 (nothing new committed)"
+            );
+        }
+
+        // When the consumer side commits msg2 DIRECTLY (the commit fires
+        // space_available after its guard drops — same shape as a step's
+        // commit), the held msg4 wakes and takes the freed slot.
+        {
+            let kernel = system.kernel.lock();
+            let cell = kernel.cells.get(&path).expect("cell");
+            let mut inbox = cell.inbox.lock();
+            let offset = inbox.cursor();
+            inbox.commit_through(offset);
+            drop(inbox);
+            cell.space_available.notify_one();
+        }
+
+        wait_for(|| async { system.inbox_debug_len(&path).await == 2 }).await;
+        {
+            let kernel = system.kernel.lock();
+            let cell = kernel.cells.get(&path).expect("cell");
+            let inbox = cell.inbox.lock();
+            assert_eq!(
+                inbox.len(),
+                2,
+                "msg2 committed out, held msg4 landed (msgs 3+4 remain)"
+            );
+            assert_eq!(
+                inbox.cursor().as_u64(),
+                2,
+                "cursor advanced past the manually-committed msg2"
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn block_producer_unblocks_when_a_batch_commits() {
         // Given a Block mailbox of FOUR on a batched service actor.
         let (system, _clock) = ActorSystem::test();

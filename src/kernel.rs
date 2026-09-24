@@ -1359,20 +1359,23 @@ pub(crate) async fn front_door_loop(
     }
 }
 
-/// How long the front door holds a Block-refused envelope between retry
-/// pushes, and how many retries before dead-lettering as a last resort.
-const BLOCK_HOLD_RETRY_MS: u64 = 2;
-const BLOCK_HOLD_RETRIES: usize = 1_000;
+/// Belt-and-suspenders cap on the space-notify hold: a wake that finds no
+/// space re-parks (spurious/coalesced wakes are normal), but a pathological
+/// notify storm must not spin forever — exhaustion dead-letters.
+const BLOCK_HOLD_MAX_PARKS: usize = 10_000;
 
 /// Pushes one envelope into the actor's inbox, honoring the Block policy.
 ///
-/// A `Refused::Full` under Block is HELD and retried — the sender was
-/// already paced by the channel await, so a refusal here is the in-flight
-/// race between the channel accept and the inbox filling (or a restart
-/// swap), and dead-lettering it would make Block lossy. The hold ends
-/// when a push succeeds (an ack freed room), or — after the retry budget —
-/// dead-letters as a last resort. Closed inboxes and DropNew/DropOld
-/// refusals dead-letter immediately, exactly as before.
+/// A `Refused::Full` under Block is HELD — the sender was already paced by
+/// the channel await, so a refusal here is the in-flight race between the
+/// channel accept and the inbox filling (or a restart swap), and
+/// dead-lettering it would make Block lossy. The hold PARKS on the cell's
+/// space-available notify: the next commit (or claim-guard restore) fires
+/// it after its inbox guard drops, the push re-attempts with the SAME
+/// owned envelope (no per-retry clone), and a spurious or coalesced wake
+/// just re-checks capacity. After the park cap (a pathological notify
+/// storm) it dead-letters as a last resort. Closed inboxes and
+/// DropNew/DropOld refusals dead-letter immediately, exactly as before.
 ///
 /// ORDERING CAVEAT (direct delivery): a Block-refused message held HERE
 /// can be overtaken by the SAME sender's next message — after the hold
@@ -1384,19 +1387,22 @@ async fn push_holding_block(
     kernel: &CountingKernelLock,
     envelope: Envelope,
 ) -> bool {
-    let mut attempt = 0usize;
+    let mut parks = 0usize;
+    let mut envelope = envelope;
     loop {
         let refusal = {
             let mut inbox = cell.inbox.lock();
-            match inbox.push(envelope.clone()) {
+            match inbox.push(envelope) {
                 Ok(_) => return true,
                 Err(refused) => refused,
             }
         };
         let holds = matches!(refusal, crate::inbox::Refused::Full(_))
             && cell.mailbox_policy == crate::inbox::OverloadPolicy::Block;
-        if !holds || attempt >= BLOCK_HOLD_RETRIES {
-            let detail = if refusal.queued_anyway() {
+        if !holds || parks >= BLOCK_HOLD_MAX_PARKS {
+            let detail = if parks >= BLOCK_HOLD_MAX_PARKS {
+                "inbox still full after the space-notify hold cap"
+            } else if refusal.queued_anyway() {
                 "inbox evicted oldest (DropOld)"
             } else {
                 "inbox refused (overload/closed)"
@@ -1410,8 +1416,9 @@ async fn push_holding_block(
             );
             return false;
         }
-        attempt += 1;
-        tokio::time::sleep(std::time::Duration::from_millis(BLOCK_HOLD_RETRY_MS)).await;
+        parks += 1;
+        envelope = refusal.into_envelope();
+        cell.space_available.notified().await;
     }
 }
 
