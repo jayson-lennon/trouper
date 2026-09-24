@@ -36,6 +36,12 @@ derive_more = { version = "2.1", features = ["debug"] }
 tracing = "0.1"
 async-trait = "0.1"
 smallvec = "1"
+# The front-door channel (registry::Endpoint): sync `try_send_option` for
+# the lossless refusal probe, async `send` for the Block hold, async
+# `recv` in the door loop. A regular dependency: the runtime's front door
+# IS a kanal channel now (the bench's control channels use the same
+# crate).
+kanal = "0.1"
 # The `daow` feature's SQLite journal backend. Optional: consumers who
 # never touch persistence pay nothing. `bundled-sqlite` (daow's default)
 # compiles the amalgamation so standalone trouper builds/benches need no
@@ -75,9 +81,7 @@ tempfile = "3"
 # published crate never links them.
 kameo = "0.22"
 ractor = "0.16"
-# The harness control channels: created sync in the bench, awaited async
-# inside the actors (one dependency serving both sides of the harness).
-kanal = "0.1"
+# (kanal moved to [dependencies]: the runtime's front door uses it.)
 
 [[bench]]
 name = "micro"

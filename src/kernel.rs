@@ -76,7 +76,7 @@ use std::collections::{HashMap, HashSet};
 use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
 
-use tokio::sync::{Notify, mpsc, watch};
+use tokio::sync::{Notify, watch};
 
 use serde::{Deserialize, Serialize};
 
@@ -720,12 +720,13 @@ impl EsLoop {
     /// join it: a bounded wait for the current message, then teardown).
     pub fn start_tracked(
         self,
-        rx: mpsc::Receiver<Envelope>,
+        endpoint: std::sync::Arc<Endpoint>,
+        rx: kanal::AsyncReceiver<Envelope>,
         shutdown: watch::Receiver<bool>,
     ) -> tokio::task::JoinHandle<()> {
         let front_cell = self.cell.clone();
         let front_kernel = self.kernel.clone();
-        tokio::spawn(front_door_loop(front_cell, front_kernel, rx));
+        tokio::spawn(front_door_loop(front_cell, front_kernel, endpoint, rx));
         tokio::spawn(es_actor_loop(self, shutdown))
     }
 }
@@ -1212,15 +1213,27 @@ pub(crate) fn dead_letter(
 }
 
 /// Delivers to an endpoint, honoring Block by awaiting capacity.
+///
+/// `try_deliver` first: the direct-path fast probe (an empty roomy door
+/// accepts without an await). A full door then waits on the channel —
+/// the channel-wait-shaped Block — and only a dead door refuses. On that
+/// refusal
+/// the envelope is CLONED back for the dead-letter: kanal's async `send`
+/// drops the value on a closed channel (no payload in its error), and a
+/// lost tell would break the lossless-delivery contract, so the caller's
+/// copy dead-letters instead.
 async fn deliver_with_retry(endpoint: &Endpoint, envelope: Envelope) -> Result<(), Envelope> {
-    use tokio::sync::mpsc::error::TrySendError::*;
+    use crate::registry::FrontDoorRefused;
     match endpoint.try_deliver(envelope.clone()) {
         Ok(()) => Ok(()),
-        Err(Full(envelope)) => endpoint
-            .deliver(envelope)
-            .await
-            .map_err(|send_err| send_err.0),
-        Err(Closed(envelope)) => Err(envelope), // the slot's endpoint died mid-restart
+        Err(FrontDoorRefused::Full(envelope)) => {
+            let undeliverable = envelope.clone();
+            endpoint
+                .deliver(envelope)
+                .await
+                .map_err(|_| undeliverable)
+        }
+        Err(FrontDoorRefused::Closed(envelope)) => Err(envelope), // the slot's endpoint died mid-restart
     }
 }
 
@@ -1305,7 +1318,8 @@ async fn direct_push(
     Ok(())
 }
 
-/// The front-door task: drains the mpsc into the runtime-owned inbox.
+/// The front-door task: drains the kanal channel into the runtime-owned
+/// inbox.
 ///
 /// The REFUSAL path only: accepted deliveries push the destination's
 /// inbox directly from the sender (`direct_push`) and never enter the
@@ -1317,9 +1331,16 @@ async fn direct_push(
 pub(crate) async fn front_door_loop(
     cell: Arc<ActorCell>,
     kernel: Arc<CountingKernelLock>,
-    mut rx: mpsc::Receiver<Envelope>,
+    endpoint: std::sync::Arc<Endpoint>,
+    rx: kanal::AsyncReceiver<Envelope>,
 ) {
-    while let Some(envelope) = rx.recv().await {
+    // `Err` is the channel closing (restart swap or shutdown): the same
+    // exit the old mpsc `None` was. Every drained envelope decrements the
+    // pending count on the SHARED endpoint handle — the same Arc the
+    // registry stored (senders' increments and the door's decrements
+    // land on one counter).
+    while let Ok(envelope) = rx.recv().await {
+        endpoint.note_channel_drain();
         let accepted = push_holding_block(&cell, &kernel, envelope.clone()).await;
         // WATERMARK CHECK (rate-limited): fires on the UP-crossing only;
         // the latch re-arms when the depth falls back to/below the mark.
@@ -3318,17 +3339,21 @@ pub(crate) async fn restart_es(
     // clones never notice (identity = path; slots are swapped, not
     // dropped). The fresh door matches the spawn's capacity and policy
     // (the cell carries them), never a default.
-    let (tx, rx) = mpsc::channel(door_capacity(
+    let (tx, rx) = crate::registry::front_door_channel(
         ctx.cell.mailbox_capacity,
         ctx.cell.mailbox_policy,
-    ));
+    );
     // The fresh endpoint couples the fresh channel to the SAME cell (the
     // inbox is the identity that survives; only the door swaps).
-    let endpoint = Endpoint::new(tx, ctx.cell.clone());
+    let endpoint = std::sync::Arc::new(Endpoint::new(
+        tx,
+        door_capacity(ctx.cell.mailbox_capacity, ctx.cell.mailbox_policy),
+        ctx.cell.clone(),
+    ));
     {
         let mut registry = ctx.registry.lock();
         registry
-            .swap_endpoint(&ctx.path, endpoint)
+            .swap_endpoint(&ctx.path, endpoint.clone())
             .expect("slot exists at restart");
     }
 
@@ -3339,7 +3364,12 @@ pub(crate) async fn restart_es(
         inbox.reopen();
     }
     let (_shutdown_tx, shutdown_rx) = watch::channel(false);
-    spawn_tracked(front_door_loop(ctx.cell.clone(), ctx.kernel.clone(), rx));
+    spawn_tracked(front_door_loop(
+        ctx.cell.clone(),
+        ctx.kernel.clone(),
+        endpoint,
+        rx,
+    ));
     spawn_tracked(es_actor_loop(ctx.clone(), shutdown_rx));
     Ok(())
 }

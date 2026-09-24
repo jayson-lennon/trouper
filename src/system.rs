@@ -282,7 +282,8 @@ impl std::fmt::Debug for ActorSystem {
 pub(crate) struct ArmedEsActor {
     path: ActorPath,
     loop_ctx: crate::kernel::EsLoop,
-    rx: tokio::sync::mpsc::Receiver<Envelope>,
+    endpoint: Arc<Endpoint>,
+    rx: kanal::AsyncReceiver<Envelope>,
 }
 
 impl ArmedEsActor {
@@ -291,7 +292,7 @@ impl ArmedEsActor {
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
         let path = self.path.clone();
         let kernel = self.loop_ctx.kernel.clone();
-        let task = self.loop_ctx.start_tracked(self.rx, shutdown_rx);
+        let task = self.loop_ctx.start_tracked(self.endpoint, self.rx, shutdown_rx);
         let kernel = kernel.lock();
         if let Some(cell) = kernel.cells.get(&path)
             && let Ok(mut handle) = cell.handle.try_lock()
@@ -1011,10 +1012,10 @@ impl ActorSystemCore {
         args: &Json,
     ) -> ArmedEsActor {
         let opts = self.resolve_opts(opts);
-        let (tx, rx) = tokio::sync::mpsc::channel::<Envelope>(crate::kernel::door_capacity(
+        let (tx, rx) = crate::registry::front_door_channel(
             opts.mailbox_capacity,
             opts.mailbox_policy,
-        ));
+        );
         // The manifest is the union of what the actor type declares and
         // what its command entries decode: every spawn flavor (positional,
         // builder, foreign) produces identical registry data this way.
@@ -1035,12 +1036,17 @@ impl ActorSystemCore {
             opts.mailbox_policy,
             opts.batch,
         ));
+        let endpoint = Arc::new(Endpoint::new(
+            tx,
+            crate::kernel::door_capacity(opts.mailbox_capacity, opts.mailbox_policy),
+            cell.clone(),
+        ));
         let mut registry = self.registry.lock();
         registry
             .insert_slot(
                 path.clone(),
                 manifest.clone(),
-                Endpoint::new(tx, cell.clone()),
+                endpoint.clone(),
                 opts.mailbox_policy,
             )
             .expect("path free at spawn");
@@ -1127,7 +1133,7 @@ impl ActorSystemCore {
             is_projector,
             state: Some(state),
         };
-        ArmedEsActor { path, loop_ctx, rx }
+        ArmedEsActor { path, loop_ctx, endpoint, rx }
     }
 
     /// The projector spawn's arm phase: registers the read model as an
@@ -1202,10 +1208,10 @@ impl ActorSystemCore {
         // thread is not done — spawn the start inside the actor task and
         // register the slot immediately so senders never see a gap.
         let opts = self.resolve_opts(opts);
-        let (tx, rx) = tokio::sync::mpsc::channel::<Envelope>(crate::kernel::door_capacity(
+        let (tx, rx) = crate::registry::front_door_channel(
             opts.mailbox_capacity,
             opts.mailbox_policy,
-        ));
+        );
         // The CELL is built first: the endpoint couples the front-door
         // channel to it (the direct-delivery target), and the kernel
         // tables register it below.
@@ -1216,13 +1222,18 @@ impl ActorSystemCore {
             opts.mailbox_policy,
             opts.batch,
         ));
+        let endpoint = Arc::new(Endpoint::new(
+            tx,
+            crate::kernel::door_capacity(opts.mailbox_capacity, opts.mailbox_policy),
+            cell.clone(),
+        ));
         {
             let mut registry = self.registry.lock();
             registry
                 .insert_slot(
                     path.clone(),
                     manifest.clone(),
-                    Endpoint::new(tx, cell.clone()),
+                    endpoint.clone(),
                     opts.mailbox_policy,
                 )
                 .expect("path free at spawn");
@@ -1289,6 +1300,7 @@ impl ActorSystemCore {
         let kernel_table = self.kernel.clone();
         let front_cell = cell.clone();
         let front_kernel = self.kernel.clone();
+        let front_endpoint = endpoint.clone();
         crate::kernel::spawn_tracked(async move {
             // Start the instance inside the task; a start failure leaves
             // the slot present (senders get a closed door) and the crash
@@ -1315,6 +1327,7 @@ impl ActorSystemCore {
             crate::kernel::spawn_tracked(crate::kernel::front_door_loop(
                 front_cell,
                 front_kernel,
+                front_endpoint,
                 rx,
             ));
             let task = crate::kernel::spawn_tracked(crate::kernel::service_actor_loop(
@@ -3151,6 +3164,69 @@ mod tests {
                     && l.envelope.schema == Add::schema_id()
             ),
             "DLQ retains the refused envelope"
+        );
+    }
+
+    #[tokio::test]
+    async fn front_door_kanal_roundtrips_refused_envelopes() {
+        // Given a Block actor with a mailbox of ONE (door = 1): the direct
+        // path takes the first message, the second falls back through the
+        // kanal door and HELDS (Block), and the pending count reflects it.
+        let (system, _clock) = ActorSystem::test();
+        let path = ActorPath::new("held");
+        system.spawn_es::<Counter, _>(
+            path.clone(),
+            &json!({}),
+            SpawnOpts {
+                snapshot: SnapshotCadence::Off,
+                mailbox_capacity: 1,
+                mailbox_policy: OverloadPolicy::Block,
+                high_watermark: None,
+                passivation: None,
+                ..SpawnOpts::default()
+            },
+            || vec![Arc::new(TypedEsAdapter::<Counter, Add>::new::<Add>())],
+        );
+        wait_for(|| async {
+            system
+                .facts()
+                .iter()
+                .any(|f| matches!(&f.kind, crate::observe::ObservationKind::Spawned { path, .. } if *path == path.clone()))
+        })
+        .await;
+        system
+            .send(system.envelope(Add::schema_id(), path.clone(), json!({ "n": 1 })))
+            .await
+            .expect("first delivered");
+        system
+            .send(system.envelope(Add::schema_id(), path.clone(), json!({ "n": 2 })))
+            .await
+            .expect("second held by the door (Block backpressure)");
+
+        // When both messages process to commit (two Acked facts).
+        wait_for(|| async {
+            system
+                .facts()
+                .iter()
+                .filter(|f| {
+                    matches!(
+                        &f.kind,
+                        crate::observe::ObservationKind::Acked { to, .. } if *to == path
+                    )
+                })
+                .count()
+                >= 2
+        })
+        .await;
+
+        // Then nothing was lost: the held envelope delivered after the
+        // direct one (FIFO), and the door drained to zero pending.
+        let endpoint = system.registry.lock().resolve(&path).expect("live");
+        wait_for(|| async { endpoint.pending() == 0 }).await;
+        assert!(
+            system.dead_letter_reasons().await.is_empty(),
+            "Block holds are lossless; got {:?}",
+            system.dead_letter_reasons().await
         );
     }
 
@@ -5480,7 +5556,7 @@ mod tests {
         let (system, _clock) = ActorSystem::test();
         system.register_schema::<PingAsk>();
         let path = ActorPath::new("ghost");
-        let (tx, rx) = tokio::sync::mpsc::channel::<Envelope>(8);
+        let (tx, rx) = kanal::bounded_async::<Envelope>(8);
         // The synthetic dead slot: closed inbox + dropped receiver — under
         // the direct-delivery path a fresh OPEN inbox would accept the ask
         // silently, changing what this test asserts.
@@ -5503,7 +5579,7 @@ mod tests {
                 crate::schema::ActorManifest::new()
                     .handles::<PingAsk>()
                     .kind(ActorKind::Service),
-                Endpoint::new(tx, dead_cell),
+                std::sync::Arc::new(Endpoint::new(tx, 8, dead_cell)),
                 OverloadPolicy::Block,
             )
             .expect("insert dead slot");
@@ -12422,8 +12498,9 @@ mod tests {
             registry
                 .swap_endpoint(
                     &ActorPath::new("resurr"),
-                    Endpoint::new(
-                        tokio::sync::mpsc::channel(1).0,
+                    std::sync::Arc::new(Endpoint::new(
+                        kanal::bounded_async::<Envelope>(1).0,
+                        1,
                         // The mid-restart pretend cell: closed inbox, so the
                         // direct-delivery fast path refuses exactly like the
                         // closed channel does (the test asserts the skip).
@@ -12438,7 +12515,7 @@ mod tests {
                             OverloadPolicy::Block,
                             1,
                         )),
-                    ),
+                    )),
                 )
                 .expect("slot exists");
         }

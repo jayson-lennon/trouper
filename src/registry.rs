@@ -8,8 +8,6 @@
 
 use std::collections::HashMap;
 
-use tokio::sync::mpsc;
-
 use crate::actor::{ActorKind, ActorPath};
 use crate::envelope::{Envelope, PayloadBytes};
 use crate::json::Json;
@@ -85,9 +83,11 @@ pub fn decode_latest<T: Schema + serde::de::DeserializeOwned>(
 ///
 /// Senders clone this handle; a restart swaps in a fresh endpoint under the
 /// same path, so pre-crash handles die quietly while the path keeps working.
-/// The mpsc is the inbox's "Block" overload made concrete: its depth is the
-/// spawn-configured capacity, so a full mailbox backpressures senders via
-/// `.send().await` at exactly the configured bound.
+/// The kanal channel is the inbox's "Block" overload made concrete: its
+/// depth is the spawn-configured capacity, so a full mailbox backpressures
+/// senders via `.send().await` at exactly the configured bound (unbounded
+/// actors get an unbounded channel, but their inbox never refuses, so the
+/// door never engages).
 ///
 /// The handle also carries the destination's LIVE CELL: a sender may push
 /// straight into the cell's inbox and fire its wake itself (the direct
@@ -101,9 +101,15 @@ pub fn decode_latest<T: Schema + serde::de::DeserializeOwned>(
 /// deadlock: every member is blocked sending while blocked flushes wait on
 /// blocked peers. Size mailboxes so hot cycles cannot saturate every hop.
 pub struct Endpoint {
-    tx: mpsc::Sender<Envelope>,
-    /// The channel's total capacity (`pending` derives from it).
+    tx: kanal::AsyncSender<Envelope>,
+    /// The channel's declared depth (tests: the D4 restart-capacity seam).
     capacity: usize,
+    /// Envelopes accepted into the channel but not yet moved into the
+    /// inbox by the front door: incremented by every accepted channel
+    /// send, decremented by the door on EVERY drain (delivered or
+    /// dead-lettered). kanal exposes no in-flight reflection, so the
+    /// count is ours (quiescence detection reads it).
+    pending: std::sync::atomic::AtomicUsize,
     /// The destination's live cell (its inbox is the direct-delivery
     /// target; its `work` notify is the direct wake).
     pub(crate) cell: std::sync::Arc<crate::kernel::ActorCell>,
@@ -122,14 +128,16 @@ impl std::fmt::Debug for Endpoint {
 }
 
 impl Endpoint {
-    /// Wraps the front-door sender and its destination's live cell.
+    /// Wraps the front-door channel and its destination's live cell.
     pub(crate) fn new(
-        tx: mpsc::Sender<Envelope>,
+        tx: kanal::AsyncSender<Envelope>,
+        capacity: usize,
         cell: std::sync::Arc<crate::kernel::ActorCell>,
     ) -> Self {
         Self {
-            capacity: tx.max_capacity(),
             tx,
+            capacity,
+            pending: std::sync::atomic::AtomicUsize::new(0),
             cell,
         }
     }
@@ -142,41 +150,116 @@ impl Endpoint {
     /// check pairs it with the inbox depth read (which covers both
     /// paths), never on its own.
     pub fn pending(&self) -> usize {
-        self.capacity.saturating_sub(self.tx.capacity())
+        self.pending
+            .load(std::sync::atomic::Ordering::Acquire)
     }
 
-    /// The channel's total capacity (tests: the D4 restart-capacity seam).
+    /// One accepted channel send (the door decrements on every drain).
+    pub(crate) fn note_channel_accept(&self) {
+        self.pending
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+    }
+
+    /// One envelope drained out of the channel by the front door (both
+    /// outcomes: moved into the inbox or dead-lettered).
+    pub(crate) fn note_channel_drain(&self) {
+        self.pending
+            .fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+    }
+
+    /// The channel's declared depth (tests: the D4 restart-capacity seam).
     #[cfg(test)]
     pub fn max_capacity(&self) -> usize {
         self.capacity
     }
 
-    /// Attempts delivery without waiting: fails immediately when the inbox
-    /// is full.
+    /// Attempts delivery without waiting: fails immediately when the door
+    /// is full. The envelope comes back by value on failure — kanal's
+    /// `try_send` DROPS the value on a full channel, so the fallback
+    /// writes into the caller's `Option` to keep refused mail lossless.
     ///
     /// # Errors
     ///
-    /// Fails when the front door is full (`try_send`) or the endpoint is
-    /// gone (receiver dropped mid-restart).
+    /// Fails when the front door is full (`Err(Full(envelope))`) or the
+    /// endpoint is gone (`Err(Closed(envelope))`, receiver dropped
+    /// mid-restart).
     // Large Err is deliberate: the caller recovers the undeliverable
     // envelope for dead-lettering (allowed workspace-wide in Cargo.toml).
-    pub fn try_deliver(
-        &self,
-        envelope: Envelope,
-    ) -> Result<(), mpsc::error::TrySendError<Envelope>> {
-        self.tx.try_send(envelope)
+    pub fn try_deliver(&self, envelope: Envelope) -> Result<(), FrontDoorRefused> {
+        let mut slot = Some(envelope);
+        match self.tx.try_send_option(&mut slot) {
+            // Ok(true): queued (direct handoff or room in the queue).
+            Ok(true) => {
+                self.note_channel_accept();
+                Ok(())
+            }
+            // Ok(false): the door is full — the value is still in `slot`.
+            Ok(false) => Err(FrontDoorRefused::Full(
+                slot.take().expect("try_send_option leaves the value on full"),
+            )),
+            // Err: the channel is closed (senders-only or fully).
+            Err(kanal::SendError::Closed | kanal::SendError::ReceiveClosed) => Err(
+                FrontDoorRefused::Closed(slot.take().expect("closed send keeps the value")),
+            ),
+        }
     }
 
     /// Delivers an envelope, waiting for capacity (backpressure = Block).
     ///
     /// # Errors
     ///
-    /// Fails when the endpoint is gone (receiver dropped mid-restart).
-    pub async fn deliver(
-        &self,
-        envelope: Envelope,
-    ) -> Result<(), mpsc::error::SendError<Envelope>> {
-        self.tx.send(envelope).await
+    /// Fails with the envelope back when the endpoint is gone (receiver
+    /// dropped mid-restart).
+    pub async fn deliver(&self, envelope: Envelope) -> Result<(), FrontDoorClosed> {
+        match self.tx.send(envelope).await {
+            Ok(()) => {
+                self.note_channel_accept();
+                Ok(())
+            }
+            Err(kanal::SendError::Closed | kanal::SendError::ReceiveClosed) => {
+                Err(FrontDoorClosed)
+            }
+        }
+    }
+}
+
+/// A refused front-door `try_deliver`, carrying the envelope back to the
+/// caller (kanal's try_send cannot: it drops the value on a full channel,
+/// so the value round-trips through the caller's `Option` instead).
+#[derive(Debug, wherror::Error)]
+#[error(debug)]
+pub enum FrontDoorRefused {
+    /// The door is at capacity; retry (the Block hold path).
+    Full(Envelope),
+    /// The endpoint is gone (receiver dropped mid-restart).
+    Closed(Envelope),
+}
+
+/// A failed front-door `deliver` — the channel is gone, so kanal has
+/// already dropped the envelope (no value to carry back; the ask/tee
+/// callers treat every failure as best-effort or settle-failed).
+#[derive(Debug, wherror::Error)]
+#[error(debug)]
+pub struct FrontDoorClosed;
+
+/// The front-door channel for a spawn: bounded at `door_capacity`, or
+/// unbounded when the mailbox policy is `Unbounded` (honesty: the door is
+/// cold for those actors — the inbox never refuses — but a restart-gap
+/// backlog must never refuse either).
+pub(crate) fn front_door_channel(
+    mailbox_capacity: usize,
+    policy: crate::inbox::OverloadPolicy,
+) -> (kanal::AsyncSender<Envelope>, kanal::AsyncReceiver<Envelope>) {
+    use crate::kernel::door_capacity;
+    match policy {
+        crate::inbox::OverloadPolicy::Unbounded => kanal::unbounded_async(),
+        _ => {
+            let (tx, rx) = kanal::bounded_async::<Envelope>(door_capacity(
+                mailbox_capacity,
+                policy,
+            ));
+            (tx, rx)
+        }
     }
 }
 
@@ -480,7 +563,7 @@ impl Registry {
         &mut self,
         path: ActorPath,
         manifest: ActorManifest,
-        endpoint: Endpoint,
+        endpoint: std::sync::Arc<Endpoint>,
         inbox_policy: crate::inbox::OverloadPolicy,
     ) -> Result<(), error_stack::Report<RegistryError>> {
         use error_stack::IntoReport;
@@ -493,7 +576,7 @@ impl Registry {
             path,
             Slot {
                 manifest,
-                endpoint: arc_swap::ArcSwapOption::from_pointee(endpoint),
+                endpoint: arc_swap::ArcSwapOption::new(Some(endpoint)),
                 inbox_policy,
             },
         );
@@ -509,7 +592,7 @@ impl Registry {
     pub fn swap_endpoint(
         &mut self,
         path: &ActorPath,
-        endpoint: Endpoint,
+        endpoint: std::sync::Arc<Endpoint>,
     ) -> Result<(), error_stack::Report<RegistryError>> {
         use error_stack::ResultExt;
         let slot = self
@@ -517,7 +600,7 @@ impl Registry {
             .get_mut(path)
             .ok_or_else(|| RegistryError::UnknownPath(path.clone()))
             .attach(format!("restarting unknown path {path}"))?;
-        slot.endpoint.store(Some(std::sync::Arc::new(endpoint)));
+        slot.endpoint.store(Some(endpoint));
         Ok(())
     }
 
@@ -831,8 +914,8 @@ mod tests {
         ActorManifest::new().kind(kind)
     }
 
-    fn endpoint(capacity: usize) -> (mpsc::Receiver<Envelope>, Endpoint) {
-        let (tx, rx) = mpsc::channel(capacity);
+    fn endpoint(capacity: usize) -> (kanal::AsyncReceiver<Envelope>, Endpoint) {
+        let (tx, rx) = kanal::bounded_async::<Envelope>(capacity);
         let path = ActorPath::new("test.cell");
         let cell = std::sync::Arc::new(crate::kernel::ActorCell::new(
             path,
@@ -841,7 +924,7 @@ mod tests {
             crate::inbox::OverloadPolicy::DropNew,
             1,
         ));
-        (rx, Endpoint::new(tx, cell))
+        (rx, Endpoint::new(tx, capacity, cell))
     }
 
     fn envelope(n: u32) -> Envelope {
@@ -851,6 +934,71 @@ mod tests {
             PayloadBytes::from(json!({ "n": n })),
             TraceCtx::root(),
         )
+    }
+
+    #[test]
+    fn try_deliver_full_door_returns_the_envelope_not_a_drop() {
+        // Given an endpoint whose door is capacity-1 and full.
+        let (_rx, ep) = endpoint(1);
+        ep.try_deliver(envelope(1)).expect("first fits");
+
+        // When trying a second delivery while the door is full.
+        let result = ep.try_deliver(envelope(2));
+
+        // Then the refusal comes back Full WITH the envelope (kanal's
+        // try_send drops the value; the Option round-trip preserves it).
+        match result {
+            Err(crate::registry::FrontDoorRefused::Full(envelope)) => {
+                assert_eq!(envelope.payload_json()["n"].as_u64(), Some(2));
+            }
+            other => panic!("expected Full, got {other:?}"),
+        }
+        // And the pending count counted only the accepted send.
+        assert_eq!(ep.pending(), 1);
+    }
+
+    #[test]
+    fn closed_endpoint_refusal_carries_the_envelope_back() {
+        // Given an endpoint whose receiver is gone (restart in flight).
+        let (rx, ep) = endpoint(1);
+        drop(rx);
+
+        // When delivering through the dead door.
+        let result = ep.try_deliver(envelope(7));
+
+        // Then the refusal is Closed and the envelope survives for the
+        // dead-letter (never silently dropped by the channel).
+        match result {
+            Err(crate::registry::FrontDoorRefused::Closed(envelope)) => {
+                assert_eq!(envelope.payload_json()["n"].as_u64(), Some(7));
+            }
+            other => panic!("expected Closed, got {other:?}"),
+        }
+        // And pending stays 0 (a closed send was never accepted).
+        assert_eq!(ep.pending(), 0);
+    }
+
+    #[tokio::test]
+    async fn pending_counts_accepted_sends_until_the_door_drains() {
+        // Given an endpoint with a live door.
+        let (rx, ep) = endpoint(8);
+
+        // When two envelopes are accepted into the channel.
+        ep.try_deliver(envelope(1)).expect("1");
+        ep.try_deliver(envelope(2)).expect("2");
+        assert_eq!(ep.pending(), 2);
+
+        // Then each door drain decrements the same counter (the door
+        // calls note_channel_drain — simulated here via recv).
+        rx.recv().await.expect("recv 1");
+        ep.note_channel_drain();
+        assert_eq!(ep.pending(), 1);
+
+        // And a refused send never inflated it.
+        let (_rx2, full) = endpoint(1);
+        full.try_deliver(envelope(9)).expect("fits");
+        assert!(full.try_deliver(envelope(10)).is_err());
+        assert_eq!(full.pending(), 1);
     }
 
     #[test]
@@ -1005,7 +1153,7 @@ mod tests {
             .insert_slot(
                 path.clone(),
                 manifest(ActorKind::EventSourced),
-                ep,
+                std::sync::Arc::new(ep),
                 crate::inbox::OverloadPolicy::DropNew,
             )
             .expect("insert");
@@ -1030,7 +1178,7 @@ mod tests {
             .insert_slot(
                 path.clone(),
                 manifest(ActorKind::Service),
-                ep,
+                std::sync::Arc::new(ep),
                 crate::inbox::OverloadPolicy::DropNew,
             )
             .expect("insert");
@@ -1040,7 +1188,7 @@ mod tests {
         let result = registry.insert_slot(
             path,
             manifest(ActorKind::Service),
-            ep2,
+            std::sync::Arc::new(ep2),
             crate::inbox::OverloadPolicy::DropNew,
         );
 
@@ -1061,7 +1209,7 @@ mod tests {
             .insert_slot(
                 path.clone(),
                 manifest(ActorKind::EventSourced),
-                ep1,
+                std::sync::Arc::new(ep1),
                 crate::inbox::OverloadPolicy::DropNew,
             )
             .expect("insert");
@@ -1071,7 +1219,7 @@ mod tests {
         // and a fresh endpoint is swapped in under the same path.
         drop(rx1); // the actor task ended: its receiver is gone
         let (_rx2, ep2) = endpoint(4);
-        registry.swap_endpoint(&path, ep2).expect("swap");
+        registry.swap_endpoint(&path, std::sync::Arc::new(ep2)).expect("swap");
 
         // Then the stale handle no longer delivers (its receiver is gone),
         // but the path still resolves to a fresh live endpoint.
@@ -1090,7 +1238,7 @@ mod tests {
             .insert_slot(
                 path.clone(),
                 manifest(ActorKind::Service),
-                ep,
+                std::sync::Arc::new(ep),
                 crate::inbox::OverloadPolicy::DropNew,
             )
             .expect("insert");
@@ -1118,7 +1266,7 @@ mod tests {
             .insert_slot(
                 path.clone(),
                 ep_manifest,
-                ep,
+                std::sync::Arc::new(ep),
                 crate::inbox::OverloadPolicy::DropNew,
             )
             .expect("insert");
