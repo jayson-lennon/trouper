@@ -109,9 +109,9 @@ Entries are added or amended **only with human approval**.
 - (journal) A due-time snapshot check reads kernel-side anchors and loads the journal only when a snapshot is due.
 - (runtime) Ask reply leases are bounded: failed request deliveries cancel the lease and expired slots are pruned.
 - (bench) Criterion benches live in benches/competitors.rs (framework tell comparison), benches/micro.rs, and benches/journal.rs, run via cargo bench.
-- (bench) The competitors bench times one producer actor hot-looping n tells at one sink actor per framework (trouper, kameo, ractor) at n of 64, 512, and 2048; setup (runtime, actors, priming) is excluded from timing via iter_batched, and the timed body is only a kanal start signal and done signal.
+- (bench) The competitors bench times one producer actor hot-looping n tells at one sink actor per framework (trouper, kameo, ractor) at n of 64, 512, 2048, and 50000; setup (runtime, actors, priming) is excluded from timing via iter_batched, and the timed body is only a kanal start signal and done signal.
 - (bench) Competitor completion is harness-owned: the producer parks awaiting a kanal start channel inside its handler, and the sink fires a kanal done channel at the target count — the bench thread never touches actor handles.
-- (bench) Mailbox shapes in the competitors bench follow each framework's supported set: kameo runs bounded-64 and unbounded, trouper runs bounded-64 and a large-capacity Block inbox as its unbounded leg, and ractor runs unbounded.
+- (bench) Mailbox shapes in the competitors bench follow each framework's supported set: kameo runs bounded-64 and unbounded, trouper runs bounded-64 and OverloadPolicy::Unbounded, and ractor runs unbounded.
 - (bench) The journal bench times SQLite-backed tell commits at :memory: and on-disk media plus a direct store flush, with system and journal setup outside the timed body.
 - (runtime) Message delivery wakes the actor's loop through a Notify signal fired by the sender on the direct-delivery path and by the front door on its fallback path; no fixed-interval polling exists on the message path.
 - (runtime) Per-actor mutable bookkeeping lives on the actor cell as lock-free state; the kernel tables lock guards cross-actor state only (with observation disabled an ES message's happy path acquires the tables zero times end to end).
@@ -140,3 +140,5 @@ Entries are added or amended **only with human approval**.
 - (runtime) A plain-path send acquires the registry once (rules, set probes, and endpoint resolve share one critical section); partition/projector destinations resolve after resolve_partition and may acquire again.
 - (runtime) Step loops claim batches by moving envelopes out of claimed inbox slots (tombstones) and restore un-committed claims to their original offsets on crash or stop; no snapshot clones exist on the step path.
 - (runtime) A Block-refused tell parks on a space-available notify fired at inbox commit; there is no poll-retry loop on the hold path.
+- (runtime) An actor spawned with OverloadPolicy::Unbounded has no mailbox capacity: the inbox never refuses and the front door never engages; no pre-allocation occurs (the queue grows on demand).
+- (runtime) The front-door channel is a kanal channel; Endpoint wraps its sender with the destination's live cell and an atomic pending count incremented on accepted sends and decremented by the door on every drain.
