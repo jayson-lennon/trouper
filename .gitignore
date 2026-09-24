@@ -3,3 +3,6 @@
 .plans/
 Cargo.lock
 perf.data
+*.folded
+/fire_and_forget*.svg
+/flame*.svg
