@@ -14,8 +14,8 @@ Notes:
 
 - `ractor` does not have a bounded API.
 
-| Runtime                 | msg burst | Criterion time | Per message |            Rate |
-| ----------------------- | --------- | -------------: | ----------: | --------------: |
+| Runtime                 | msg burst | Criterion time | Per message |             Rate |
+| ----------------------- | --------- | -------------: | ----------: | ---------------: |
 | trouper-tell-bounded-64 | 64        |      228.31 µs |    3,567 ns |   280,323 tell/s |
 |                         | 512       |      545.17 µs |    1,065 ns |   939,155 tell/s |
 |                         | 2048      |        1.58 ms |      770 ns | 1,298,889 tell/s |
@@ -36,6 +36,26 @@ Notes:
 |                         | 512       |      310.81 µs |      607 ns | 1,647,301 cast/s |
 |                         | 2048      |      597.61 µs |      292 ns | 3,426,966 cast/s |
 |                         | 50000     |       11.38 ms |      228 ns | 4,395,039 cast/s |
+
+Daow SQLite journal benches @ default (64 messages) mailbox size.
+
+- `tell-acked` measures the complete flow of receiving a command, emitting an event, and then the journal receiving the event.
+- `flush` measures the journal committing buffered events
+
+Note: Journal implementations that ship with `trouper` buffer events in memory, so some data loss is possible between flushes. Committing to disk happens on a separate thread.
+
+| Runtime                | msg burst   | Criterion time | Per message |           Rate |
+| ---------------------- | ----------- | -------------: | ----------: | -------------: |
+| daow-tell-acked-memory | 64          |       96.74 µs |    1,512 ns |  661,570 msg/s |
+|                        | 512         |       11.75 ms |   22,947 ns |   43,579 msg/s |
+|                        | 2048        |       47.68 ms |   23,283 ns |   42,950 msg/s |
+| daow-tell-acked-disk   | 64          |      130.76 µs |    2,043 ns |  489,432 msg/s |
+|                        | 512         |       11.10 ms |   21,680 ns |   46,125 msg/s |
+|                        | 2048        |       42.84 ms |   20,919 ns |   47,803 msg/s |
+| daow-flush-memory      | 512 events  |       50.29 ms |   98,226 ns | 10,181 event/s |
+|                        | 2048 events |       98.37 ms |   48,032 ns | 20,819 event/s |
+| daow-flush-disk        | 512 events  |       37.61 ms |   73,453 ns | 13,614 event/s |
+|                        | 2048 events |      133.65 ms |   65,257 ns | 15,324 event/s |
 
 Overhead of journal, per message:
 

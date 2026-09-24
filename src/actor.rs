@@ -508,7 +508,7 @@ impl CommandEntry for ConsumeEntry {
         let mut events = crate::envelope::Events::new();
         events.push(crate::envelope::Event::with_shared_payload(
             self.schema.clone(),
-            crate::envelope::Payload::shared(payload),
+            payload.to_shared(),
         ));
         Ok(events)
     }

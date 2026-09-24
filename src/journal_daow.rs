@@ -28,6 +28,7 @@
 //!
 //! ```no_run
 //! # async fn demo(pool: daow::Pool) -> Result<(), error_stack::Report<trouper::journal::JournalError>> {
+//! use trouper::journal_daow::DaowConfig;
 //! let control = trouper::journal::JournalArgs::daow(pool, DaowConfig::default())
 //!     .with_control(std::sync::Arc::new(|msg| {
 //!         tracing::error!(?msg, "journal store");

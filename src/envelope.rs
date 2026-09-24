@@ -3,11 +3,12 @@
 //! Users never construct envelopes: the runtime assembles the metadata at the
 //! send boundary. Handlers see typed payloads plus a context.
 //!
-//! The fabric invariant: a payload is a LIVE TYPED VALUE behind a shared,
-//! memoizing cell (`Arc<dyn PayloadValue>`). Handlers downcast; nothing on
-//! the message path walks a JSON tree. Serde exists at exactly two doors —
+//! The fabric invariant: a payload is a live typed value in unique or shared
+//! storage (`Box<PayloadCell>` or `Arc<PayloadCell>`). Handlers downcast;
+//! nothing on the message path walks a JSON tree. Cold JSON and wire memoization
+//! lives in a lazily allocated side box. Serde exists at exactly two doors —
 //! erased ingress ([`PayloadBytes`] from outside the system) and the journal
-//! (the payload's memoized compact encoding) — and every payload value
+//! (the payload's memoized compact encoding) — and every shared payload value
 //! serializes at most once, however many readers ask.
 
 use std::ops::Deref;
@@ -63,36 +64,67 @@ impl TraceCtx {
     }
 }
 
-/// What an envelope carries: one erased, shared payload.
+/// What an envelope carries: a live payload that is unique until a runtime
+/// path actually needs to retain or fan it out.
 ///
-/// Clonable by refcount — a clone of an envelope bumps the payload's
-/// `Arc`, never a copy of the value. The many simultaneous owners (the
-/// channel copy and the inbox cursor; the fan-out copies; the journal
-/// entry and the outbox intent) all read ONE value.
+/// Typed sends start in a box with no refcount. Cloning a unique payload
+/// deep-copies its value; runtime fan-out sites promote it to shared storage
+/// first, after which clones bump the `Arc` and every reader sees one value.
+/// The many simultaneous owners (the channel copy and inbox cursor; fan-out
+/// copies; the journal entry and outbox intent) all read ONE shared value.
 ///
-/// The fabric holds live typed values (downcast via [`AnyPayload`]) OR
-/// wire bytes that arrived erased (decoded on demand); serde exists only
-/// at the doors — the journal and erased ingress. There is no `Bytes`
-/// fabric arm: a message that is not in memory is not a message.
-#[derive(Clone)]
-pub struct Payload(Arc<PayloadCell>);
+/// The fabric holds live typed values (downcast via [`AnyPayload`]) OR wire
+/// bytes that arrived erased (decoded on demand); serde exists only at the
+/// doors — the journal and erased ingress. There is no `Bytes` fabric arm: a
+/// message that is not in memory is not a message.
+pub struct Payload(PayloadRepr);
 
-/// The payload and its memoized JSON view. The view is interior-mutable
-/// through the shared `Arc`: the FIRST reader of a `Bytes` payload pays
-/// the decode (a debug-render path, never the typed hot path), every
-/// later reader — including readers on other threads — shares it.
+enum PayloadRepr {
+    Unique(Box<PayloadCell>),
+    Shared(Arc<PayloadCell>),
+    /// A temporary replacement while `make_shared` moves the unique cell.
+    Transition,
+}
+
+/// The payload cell. Typed sends keep this in a unique box; runtime paths
+/// that duplicate a payload promote it into an `Arc`. Cold JSON and wire
+/// caches live in a side box allocated only on first use, so messages that
+/// are neither rendered nor journaled carry no memoization allocation.
 struct PayloadCell {
     inner: AnyPayload,
+    memo: std::sync::OnceLock<Box<Memo>>,
+}
+
+#[derive(Default)]
+struct Memo {
     json_view: std::sync::OnceLock<Json>,
-    /// The memoized wire encoding (the journal door's input). Live
-    /// values serialize at most once no matter how many readers ask;
-    /// `Bytes` payloads pass their bytes through and never populate it.
     wire: std::sync::OnceLock<Arc<[u8]>>,
+}
+
+impl Clone for Payload {
+    fn clone(&self) -> Self {
+        match &self.0 {
+            PayloadRepr::Unique(cell) => Self(PayloadRepr::Unique(Box::new(PayloadCell {
+                inner: clone_payload_value(&cell.inner),
+                memo: std::sync::OnceLock::new(),
+            }))),
+            PayloadRepr::Shared(cell) => Self(PayloadRepr::Shared(Arc::clone(cell))),
+            PayloadRepr::Transition => unreachable!("payload transition is never observable"),
+        }
+    }
+}
+
+fn clone_payload_value(payload: &AnyPayload) -> AnyPayload {
+    match payload {
+        AnyPayload::Value(value) => AnyPayload::Value(Arc::from(value.clone_value())),
+        AnyPayload::Bytes(bytes) => AnyPayload::Bytes(bytes.clone()),
+        AnyPayload::Json(view) => AnyPayload::Json(view.clone()),
+    }
 }
 
 impl std::fmt::Debug for Payload {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match &self.0.inner {
+        match &self.cell().inner {
             AnyPayload::Value(value) => f
                 .debug_tuple("Payload::Value")
                 .field(&value.as_any().type_id())
@@ -115,20 +147,18 @@ impl Default for Payload {
 impl Payload {
     /// Wraps a live value (the typed send edge's constructor).
     pub(crate) fn value<T: PayloadValue>(value: T) -> Self {
-        Self(Arc::new(PayloadCell {
+        Self(PayloadRepr::Unique(Box::new(PayloadCell {
             inner: AnyPayload::Value(Arc::new(value)),
-            json_view: std::sync::OnceLock::new(),
-            wire: std::sync::OnceLock::new(),
-        }))
+            memo: std::sync::OnceLock::new(),
+        })))
     }
 
     /// Wraps wire bytes (the erased-ingress constructor).
     pub(crate) fn bytes(bytes: PayloadBytes) -> Self {
-        Self(Arc::new(PayloadCell {
+        Self(PayloadRepr::Unique(Box::new(PayloadCell {
             inner: AnyPayload::Bytes(bytes),
-            json_view: std::sync::OnceLock::new(),
-            wire: std::sync::OnceLock::new(),
-        }))
+            memo: std::sync::OnceLock::new(),
+        })))
     }
 
     /// Wraps a JSON tree as a payload (the internal Json-flavored seams:
@@ -136,31 +166,71 @@ impl Payload {
     /// normal shape; this is the escape hatch for payloads that already
     /// exist as trees.
     pub(crate) fn json_view(view: Json) -> Self {
-        Self(Arc::new(PayloadCell {
+        Self(PayloadRepr::Unique(Box::new(PayloadCell {
             inner: AnyPayload::Json(view),
-            json_view: std::sync::OnceLock::new(),
-            wire: std::sync::OnceLock::new(),
-        }))
+            memo: std::sync::OnceLock::new(),
+        })))
     }
 
-    /// Wraps a shared payload — a refcount bump (the fan-out's
-    /// constructor: one value across N handlers).
-    pub(crate) fn shared(source: &Payload) -> Self {
-        Self(Arc::clone(&source.0))
+    /// Promotes a unique payload to shared storage. Promotion is idempotent;
+    /// it is performed only at runtime paths that actually duplicate a
+    /// payload (fan-out, tee, or journal retention).
+    pub(crate) fn make_shared(&mut self) {
+        if self.is_shared() {
+            return;
+        }
+        let repr = std::mem::replace(&mut self.0, PayloadRepr::Transition);
+        self.0 = match repr {
+            PayloadRepr::Unique(cell) => PayloadRepr::Shared(Arc::new(*cell)),
+            shared @ PayloadRepr::Shared(_) => shared,
+            PayloadRepr::Transition => unreachable!("payload transition is never observable"),
+        };
+    }
+
+    /// Returns whether this payload has been promoted to shared storage.
+    pub(crate) fn is_shared(&self) -> bool {
+        matches!(self.0, PayloadRepr::Shared(_))
+    }
+
+    /// Makes an owned shared payload for an API that receives `&Payload`.
+    /// A unique source is deep-copied; a shared source only bumps its count.
+    pub(crate) fn to_shared(&self) -> Self {
+        match &self.0 {
+            PayloadRepr::Shared(cell) => Self(PayloadRepr::Shared(Arc::clone(cell))),
+            PayloadRepr::Unique(_) => {
+                let mut copy = self.clone();
+                copy.make_shared();
+                copy
+            }
+            PayloadRepr::Transition => unreachable!("payload transition is never observable"),
+        }
+    }
+
+    /// The cell regardless of whether this payload is unique or shared.
+    fn cell(&self) -> &PayloadCell {
+        match &self.0 {
+            PayloadRepr::Unique(cell) => cell,
+            PayloadRepr::Shared(cell) => cell,
+            PayloadRepr::Transition => unreachable!("payload transition is never observable"),
+        }
     }
 
     /// The payload union erased for downcast dispatch.
     pub(crate) fn inner(&self) -> &AnyPayload {
-        &self.0.inner
+        &self.cell().inner
     }
 
     /// The JSON view, materializing (and memoizing) through the bytes
     /// when needed. DLQ rendering and foreign-fold surfaces read here;
     /// the typed hot path never does.
     pub(crate) fn json(&self) -> &Json {
-        self.0.json_view.get_or_init(|| match &self.0.inner {
-            AnyPayload::Json(view) => view.clone(),
-            other => Json(serde_json::from_slice(&other.json_text()).unwrap_or_default()),
+        let cell = self.cell();
+        if let AnyPayload::Json(view) = &cell.inner {
+            return view;
+        }
+        let memo = cell.memo.get_or_init(Box::default);
+        memo.json_view.get_or_init(|| {
+            Json(serde_json::from_slice(&cell.inner.json_text()).unwrap_or_default())
         })
     }
 
@@ -168,10 +238,12 @@ impl Payload {
     /// memoization lives in the shared cell: one serialize, every later
     /// reader shares the bytes). The journal door's input.
     pub(crate) fn json_text(&self) -> Arc<[u8]> {
-        if let AnyPayload::Bytes(bytes) = &self.0.inner {
+        let cell = self.cell();
+        if let AnyPayload::Bytes(bytes) = &cell.inner {
             return Arc::clone(&bytes.0); // bytes ARE the wire encoding
         }
-        self.0.wire.get_or_init(|| self.0.inner.json_text()).clone()
+        let memo = cell.memo.get_or_init(Box::default);
+        memo.wire.get_or_init(|| cell.inner.json_text()).clone()
     }
 
     /// The wire encoding as [`PayloadBytes`] (the journal entry's shape).
@@ -181,7 +253,7 @@ impl Payload {
 
     /// A field's value as a string (the shard-key read).
     pub(crate) fn field(&self, name: &str) -> Option<String> {
-        self.0.inner.field(name)
+        self.cell().inner.field(name)
     }
 }
 
@@ -286,13 +358,11 @@ fn json_string_of(value: &serde_json::Value) -> Option<String> {
 /// answer them: shard-key reads and journal encoding need the schema's
 /// field names, which only the type knows.
 ///
-/// The `Clone` supertrait serves handler-side retention: the fabric
-/// itself never copies (a payload is an `Arc`), but a handler that
-/// stashes or re-sends a message clones its value explicitly — the
-/// bound guarantees every declared message type can. It sits behind
-/// `CloneablePayloadValue` (`Clone` requires `Self: Sized`) so the
-/// erased cell keeps its vtable shape and every public signature is
-/// unchanged.
+/// The `Clone` supertrait serves payload retention: a handler that stashes
+/// or re-sends a message clones its value explicitly — the bound guarantees
+/// every declared message type can. It sits behind `CloneablePayloadValue`
+/// (`Clone` requires `Self: Sized`) so the erased cell keeps its vtable shape
+/// and every public signature is unchanged.
 pub trait PayloadValue: Send + Sync + 'static {
     /// The value as `Any` — the downcast dispatch core.
     fn as_any(&self) -> &dyn std::any::Any;
@@ -489,10 +559,9 @@ impl Event {
         }
     }
 
-    /// Creates an event that ADOPTS an existing payload (an `Arc` bump,
-    /// never a copy) — the consume-entry seam: a projector's consumed
-    /// command re-enters its journal as a fact without a single payload
-    /// copy.
+    /// Creates an event that adopts an existing payload. Shared payloads
+    /// retain their common value; unique payloads are cloned into an owned
+    /// event payload.
     pub fn with_shared_payload(schema: SchemaId, payload: Payload) -> Self {
         Self { schema, payload }
     }
@@ -503,8 +572,8 @@ impl Event {
     /// [`crate::actor::Projector::apply`]: an event whose schema is not
     /// `T`'s (another fact type) yields `None` without touching the
     /// payload; a matching event downcasts (a live value: a TypeId
-    /// recognition and an `Arc` read, no decode) — or decodes from bytes
-    /// (a replayed event), the system's only shape-changing transition.
+    /// recognition, no decode) — or decodes from bytes (a replayed event),
+    /// the system's only shape-changing transition.
     ///
     /// Unmatched schemas are simply ignored — one fold can consume several
     /// fact types by stacking `as_fact` calls.
@@ -581,16 +650,16 @@ impl Envelope {
         Self::raw(schema, dest, value.into(), trace)
     }
 
-    /// Assembles a payload-SHARING envelope (a `Payload` Arc bump, never a
-    /// copy of the value) — the kernel's constructor for tee/fan-out copies
-    /// of an existing message.
+    /// Assembles a payload-sharing envelope for a tee or fan-out copy.
+    /// The source must already be promoted when multiple envelopes need to
+    /// observe the same payload; shared sources are cloned by refcount.
     pub(crate) fn shared_from(
         schema: SchemaId,
         dest: Address,
         source: &Envelope,
         trace: TraceCtx,
     ) -> Self {
-        let mut copy = Self::raw(schema, dest, Payload::shared(&source.payload), trace);
+        let mut copy = Self::raw(schema, dest, source.payload.to_shared(), trace);
         copy.recorded_origin = source.recorded_origin.clone();
         copy
     }
@@ -1150,6 +1219,11 @@ impl Events {
     pub fn as_slice(&self) -> &[Event] {
         &self.0
     }
+
+    /// The events as a mutable iterator.
+    pub fn iter_mut(&mut self) -> impl Iterator<Item = &mut Event> {
+        self.0.iter_mut()
+    }
 }
 
 impl Deref for Events {
@@ -1224,6 +1298,63 @@ mod events_tests {
     #[derive(crate::schema::Event, Serialize, Deserialize, Clone)]
     struct Deposited {
         n: i64,
+    }
+
+    #[test]
+    fn cloning_a_unique_payload_copies_the_live_value() {
+        // Given a unique payload wrapping a live value.
+        let payload = Payload::value(Deposited { n: 5 });
+
+        // When cloning the payload.
+        let copy = payload.clone();
+        let original_value = payload.inner().value_ref::<Deposited>().expect("original");
+        let copied_value = copy.inner().value_ref::<Deposited>().expect("copy");
+
+        // Then each payload owns a distinct value with equal content.
+        assert_ne!(
+            original_value as *const Deposited,
+            copied_value as *const Deposited
+        );
+        assert_eq!(original_value.n, copied_value.n);
+        assert!(!payload.is_shared());
+        assert!(!copy.is_shared());
+    }
+
+    #[test]
+    fn cloning_a_shared_payload_aliases_the_live_value() {
+        // Given a payload promoted to shared storage.
+        let mut payload = Payload::value(Deposited { n: 5 });
+        payload.make_shared();
+
+        // When cloning the shared payload.
+        let copy = payload.clone();
+
+        // Then both payloads refer to the same live value.
+        let original_value = payload.inner().value_ref::<Deposited>().expect("original");
+        let copied_value = copy.inner().value_ref::<Deposited>().expect("copy");
+        assert_eq!(
+            original_value as *const Deposited,
+            copied_value as *const Deposited
+        );
+        assert!(payload.is_shared());
+        assert!(copy.is_shared());
+    }
+
+    #[test]
+    fn promoting_a_payload_is_idempotent() {
+        // Given a payload promoted to shared storage.
+        let mut payload = Payload::value(Deposited { n: 5 });
+        payload.make_shared();
+
+        // When promoting it again.
+        payload.make_shared();
+
+        // Then it remains shared and retains its value.
+        assert!(payload.is_shared());
+        assert_eq!(
+            payload.inner().value_ref::<Deposited>().expect("value").n,
+            5
+        );
     }
 
     #[test]
