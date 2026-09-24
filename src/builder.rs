@@ -162,6 +162,14 @@ impl<A: crate::actor::EventSourcedActor> SpawnBuilder<A> {
         self
     }
 
+    /// An unbounded mailbox: the inbox never refuses and grows without
+    /// bound (no backpressure — a fast sender can grow memory
+    /// indefinitely). The `mailbox` capacity is ignored.
+    pub fn mailbox_unbounded(mut self) -> Self {
+        self.opts.mailbox_policy = crate::inbox::OverloadPolicy::Unbounded;
+        self
+    }
+
     /// How many queued messages one wake's step may drain and commit as a
     /// batch (default 64). A trickle load behaves per-message; a loaded run
     /// amortizes the wake/lock/commit across up to `n` messages.
@@ -326,6 +334,14 @@ impl<A: ServiceActor> ServiceBuilder<A> {
         self
     }
 
+    /// An unbounded mailbox: the inbox never refuses and grows without
+    /// bound (no backpressure — a fast sender can grow memory
+    /// indefinitely). The `mailbox` capacity is ignored.
+    pub fn mailbox_unbounded(mut self) -> Self {
+        self.opts.mailbox_policy = crate::inbox::OverloadPolicy::Unbounded;
+        self
+    }
+
     /// How many queued messages one wake's step may drain and commit as a
     /// batch (default 64). A trickle load behaves per-message; a loaded run
     /// amortizes the wake/lock/commit across up to `n` messages.
@@ -456,6 +472,14 @@ impl ForeignBuilder {
     pub fn mailbox(mut self, capacity: usize, policy: crate::inbox::OverloadPolicy) -> Self {
         self.opts.mailbox_capacity = capacity;
         self.opts.mailbox_policy = policy;
+        self
+    }
+
+    /// An unbounded mailbox: the inbox never refuses and grows without
+    /// bound (no backpressure — a fast sender can grow memory
+    /// indefinitely). The `mailbox` capacity is ignored.
+    pub fn mailbox_unbounded(mut self) -> Self {
+        self.opts.mailbox_policy = crate::inbox::OverloadPolicy::Unbounded;
         self
     }
 
@@ -595,6 +619,14 @@ impl<P: crate::actor::Projector> ProjectorBuilder<P> {
     pub fn mailbox(mut self, capacity: usize, policy: crate::inbox::OverloadPolicy) -> Self {
         self.opts.mailbox_capacity = capacity;
         self.opts.mailbox_policy = policy;
+        self
+    }
+
+    /// An unbounded mailbox: the inbox never refuses and grows without
+    /// bound (no backpressure — a fast sender can grow memory
+    /// indefinitely). The `mailbox` capacity is ignored.
+    pub fn mailbox_unbounded(mut self) -> Self {
+        self.opts.mailbox_policy = crate::inbox::OverloadPolicy::Unbounded;
         self
     }
 

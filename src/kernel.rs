@@ -1399,6 +1399,9 @@ async fn push_holding_block(
         };
         let holds = matches!(refusal, crate::inbox::Refused::Full(_))
             && cell.mailbox_policy == crate::inbox::OverloadPolicy::Block;
+        // NOTE: `Unbounded` cannot reach the hold path — its inbox never
+        // returns `Refused::Full` (the capacity check is skipped), so the
+        // only refusals here are `Closed` (shutdown drain) → dead-letter.
         if !holds || parks >= BLOCK_HOLD_MAX_PARKS {
             let detail = if parks >= BLOCK_HOLD_MAX_PARKS {
                 "inbox still full after the space-notify hold cap"
@@ -3345,6 +3348,12 @@ pub(crate) async fn restart_es(
 /// is exactly the inbox's capacity (the channel `.send().await` is the
 /// block, so senders pace at the configured depth); the lossy policies
 /// keep 2× headroom so bursts actually reach the inbox's own policy.
+/// `Unbounded` gets [`DOOR_CAPACITY_UNBOUNDED`]: the door never engages
+/// for these actors (the inbox never refuses, so direct delivery always
+/// succeeds and nothing falls back) — the number only satisfies the
+/// channel constructor and any queued mail during brief restart gaps.
+pub(crate) const DOOR_CAPACITY_UNBOUNDED: usize = 65_536;
+
 pub(crate) fn door_capacity(
     mailbox_capacity: usize,
     policy: crate::inbox::OverloadPolicy,
@@ -3355,6 +3364,7 @@ pub(crate) fn door_capacity(
         crate::inbox::OverloadPolicy::DropNew | crate::inbox::OverloadPolicy::DropOld => {
             capacity * 2
         }
+        crate::inbox::OverloadPolicy::Unbounded => DOOR_CAPACITY_UNBOUNDED,
     }
 }
 

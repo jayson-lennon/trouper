@@ -21,6 +21,16 @@ pub enum OverloadPolicy {
     DropNew,
     /// The oldest queued message is dropped to make room.
     DropOld,
+    /// No capacity: the inbox never refuses and grows without bound.
+    ///
+    /// There is no backpressure — a fast sender can grow the mailbox
+    /// until memory runs out (Erlang's trade, made explicit). Nothing
+    /// else changes: offsets, claims/restore, restart redelivery, and
+    /// at-most-once commits are all capacity-blind. The queue grows on
+    /// demand; nothing is pre-allocated. A declared high watermark still
+    /// works as an observe-only signal (it fires `Backpressured`, never
+    /// a hold).
+    Unbounded,
 }
 
 /// Errors surfaced by an inbox.
@@ -114,6 +124,8 @@ impl Inbox {
     /// * `DropNew` → the envelope is returned refused.
     /// * `DropOld` → the oldest queued envelope is evicted and returned
     ///   (the runtime dead-letters it), and the new envelope is queued.
+    /// * `Unbounded` → the capacity check never runs; the envelope is
+    ///   always queued.
     ///
     /// # Errors
     ///
@@ -127,6 +139,12 @@ impl Inbox {
     pub fn push(&mut self, envelope: Envelope) -> Result<InboxOffset, Refused> {
         if !self.open {
             return Err(Refused::Closed(envelope));
+        }
+        // Under Unbounded the capacity is meaningless: the refusal check
+        // (and every eviction arm behind it) is skipped entirely.
+        if self.policy == OverloadPolicy::Unbounded {
+            self.queue_next(envelope);
+            return Ok(InboxOffset::new(self.next_offset - 1));
         }
         if self.queue.len() >= self.capacity {
             match self.policy {
@@ -143,6 +161,7 @@ impl Inbox {
                         return Err(Refused::Evicted(evicted));
                     }
                 }
+                OverloadPolicy::Unbounded => unreachable!("early-returned above"),
             }
         }
         self.queue_next(envelope);
@@ -529,6 +548,85 @@ mod tests {
         inbox.ack();
         let next_n = inbox.peek().map(|e| e.payload_json()["n"].as_u64());
         assert_eq!(next_n, Some(Some(3)));
+    }
+
+    #[test]
+    fn unbounded_inbox_never_refuses_at_any_depth() {
+        // Given an Unbounded inbox whose capacity field is irrelevant.
+        let mut inbox = Inbox::new(1, OverloadPolicy::Unbounded);
+
+        // When pushing far past any sane capacity.
+        for n in 0..100_000u32 {
+            inbox.push(envelope(n)).expect("push");
+        }
+
+        // Then every envelope queued (len == pushes) and the offsets
+        // stayed monotonic — nothing was refused, nothing pre-allocated.
+        assert_eq!(inbox.len(), 100_000);
+        assert_eq!(inbox.cursor(), InboxOffset::zero());
+
+        // And a drain hands back all of them FIFO.
+        let drained: Vec<_> = inbox.drain().collect();
+        assert_eq!(drained.len(), 100_000);
+        assert_eq!(
+            drained[0].1.payload_json()["n"].as_u64(),
+            Some(0),
+            "FIFO order intact"
+        );
+    }
+
+    #[test]
+    fn unbounded_push_never_refuses_even_with_a_full_capacity_field() {
+        // Given an Unbounded inbox already holding capacity-many entries.
+        let mut inbox = Inbox::new(2, OverloadPolicy::Unbounded);
+        inbox.push(envelope(1)).expect("push");
+        inbox.push(envelope(2)).expect("push");
+
+        // When pushing a third envelope (a bounded inbox would refuse).
+        let result = inbox.push(envelope(3));
+
+        // Then it queues anyway and the queue holds all three.
+        assert!(result.is_ok());
+        assert_eq!(inbox.len(), 3);
+        assert_eq!(inbox.cursor(), InboxOffset::zero());
+    }
+
+    #[test]
+    fn unbounded_inbox_still_refuses_when_closed() {
+        // Given a closed Unbounded inbox.
+        let mut inbox = Inbox::new(4, OverloadPolicy::Unbounded);
+        inbox.push(envelope(1)).expect("push");
+        inbox.close();
+
+        // When pushing another envelope.
+        let push = inbox.push(envelope(2));
+
+        // Then the shutdown-drain refusal still applies (Unbounded only
+        // lifts the CAPACITY refusal, never the closed one).
+        assert!(matches!(push, Err(Refused::Closed(_))));
+    }
+
+    #[test]
+    fn unbounded_claims_commits_and_restores_still_work() {
+        // Given an Unbounded inbox holding three entries.
+        let mut inbox = Inbox::new(1, OverloadPolicy::Unbounded);
+        for n in 1..=3 {
+            inbox.push(envelope(n)).expect("push");
+        }
+
+        // When claiming two and committing through the first.
+        let mut batch = Vec::new();
+        inbox.claim_up_to(2, &mut batch);
+        inbox.commit_through(batch[0].0);
+        inbox.restore_claims(vec![batch[1].clone()]);
+
+        // Then the claim machinery behaves exactly as under a bounded
+        // policy: the cursor sits past offset 0 and envelope 2 is at the
+        // front (restored into its slot).
+        assert_eq!(inbox.cursor(), InboxOffset::new(1));
+        assert_eq!(inbox.len(), 2);
+        let front = inbox.peek().expect("front");
+        assert_eq!(front.payload_json()["n"].as_u64(), Some(2));
     }
 
     #[test]
