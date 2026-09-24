@@ -1320,7 +1320,8 @@ pub(crate) async fn front_door_loop(
     // land on one counter).
     while let Ok(envelope) = rx.recv().await {
         endpoint.note_channel_drain();
-        let accepted = push_holding_block(&cell, &kernel, envelope.clone()).await;
+        let trace = envelope.trace;
+        let accepted = push_holding_block(&cell, &kernel, envelope).await;
         // WATERMARK CHECK (rate-limited): fires on the UP-crossing only;
         // the latch re-arms when the depth falls back to/below the mark.
         // Actors with no declared watermark (the common case) skip the
@@ -1341,7 +1342,7 @@ pub(crate) async fn front_door_loop(
             {
                 if kernel.observing() {
                     kernel.observe(crate::observe::Observation::new(
-                        envelope.trace.causality_id.as_millis_ts(),
+                        trace.causality_id.as_millis_ts(),
                         crate::observe::ObservationKind::Backpressured {
                             path: cell.path.clone(),
                             depth,
@@ -2340,10 +2341,19 @@ pub(crate) async fn broadcast(
         ));
     }
     for (_path, endpoint) in &targets {
-        // Block backpressure: a full inbox stalls the publisher (loss is
-        // unrepresentable; sizing mailboxes is the spawner's call). A
-        // closed endpoint (restart in flight) skips this one delivery.
-        let _ = deliver_with_retry(endpoint, envelope.clone()).await;
+        // DIRECT first: an accepted roomy inbox is pushed from this
+        // publisher task, so a plain fan-out does not cross the
+        // subscriber's front-door channel or wake its door task. A refusal
+        // keeps the existing door semantics: deliver_with_retry retains the
+        // copy in the channel and lets the door hold a full Block inbox or
+        // apply the configured refusal/dead-letter behavior. DropOld is
+        // already accepted by direct_push after queueing the new envelope;
+        // falling back for that result would duplicate it.
+        let copy = envelope.clone();
+        let trace = copy.trace;
+        if let Err(refused) = direct_push(endpoint, copy, kernel, trace).await {
+            let _ = deliver_with_retry(endpoint, refused).await;
+        }
     }
     // PROJECTOR SETS: a declared consumption with a shard key is a
     // delivery obligation — a per-set copy resolves `public/key` and

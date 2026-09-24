@@ -12219,33 +12219,193 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn publish_backpressures_a_full_inbox_instead_of_dropping() {
-        // Given a subscriber with a capacity-1 Block inbox whose handler
-        // parks on the first delivery.
-        let (system, _clock) = ActorSystem::test();
-        spawn_edged(&system, "parked-sub", "parked", false, true).await;
-        // (Edged never parks; for the Block proof we publish twice in a
-        // row and assert both arrive IN ORDER once the inbox drains.)
+    async fn refused_broadcast_copy_falls_back_until_block_capacity_returns() {
+        // Given a capacity-1 Block subscriber whose first handler waits for
+        // a test-controlled release.
+        struct BlockedSubscriber {
+            entered: Option<tokio::sync::mpsc::Sender<()>>,
+            release: Option<tokio::sync::oneshot::Receiver<()>>,
+            seen: Arc<Mutex<Vec<String>>>,
+        }
+        impl ServiceActor for BlockedSubscriber {
+            fn manifest() -> ActorManifest {
+                ActorManifest::new()
+                    .handles::<Shipped>()
+                    .kind(ActorKind::Service)
+            }
+            async fn start(
+                _args: &Json,
+            ) -> Result<Self, error_stack::Report<crate::registry::RegistryError>> {
+                unreachable!("subscriber starts with test channels")
+            }
+        }
+        impl MsgHandler<Shipped> for BlockedSubscriber {
+            async fn handle(&mut self, event: &Shipped, _ctx: &mut crate::context::MsgCtx<'_>) {
+                self.seen.lock().push(format!("shipped:{}", event.order));
+                if let Some(entered) = self.entered.take() {
+                    let _ = entered.send(()).await;
+                }
+                if let Some(release) = self.release.take() {
+                    let _ = release.await;
+                }
+            }
+        }
 
-        // When two events are published back to back.
+        let (system, _clock) = ActorSystem::test();
+        let path = ActorPath::new("blocked-sub");
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let (entered_tx, mut entered_rx) = tokio::sync::mpsc::channel(1);
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        crate::builder::spawn_service_builder::<BlockedSubscriber>(&system)
+            .at(path.clone())
+            .handles::<Shipped>()
+            .mailbox(1, OverloadPolicy::Block)
+            .start_with({
+                let seen = seen.clone();
+                move || {
+                    Box::pin(async move {
+                        Ok(BlockedSubscriber {
+                            entered: Some(entered_tx),
+                            release: Some(release_rx),
+                            seen,
+                        })
+                    })
+                }
+            })
+            .start();
+        wait_for(|| async { system.lookup_slot(&path) }).await;
+
+        // When the first event is claimed and the handler parks, a second
+        // event directly fills the inbox, and a third is refused by the
+        // direct push and handed to the front-door fallback.
         system
             .publish(Shipped {
                 order: "first".into(),
             })
             .await;
+        entered_rx.recv().await.expect("first handler entered");
         system
             .publish(Shipped {
                 order: "second".into(),
             })
             .await;
+        wait_for(|| async { system.inbox_debug_len(&path).await == 1 }).await;
+        system
+            .publish(Shipped {
+                order: "third".into(),
+            })
+            .await;
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
 
-        // Then BOTH deliveries landed, in publish order — Block
-        // backpressure makes loss unrepresentable.
-        wait_for(|| async { sink_read(&ActorPath::new("parked-sub")).len() == 2 }).await;
+        // Then the refused third copy waits without loss or duplication
+        // while the first handler still holds the consumer.
+        assert_eq!(seen.lock().as_slice(), ["shipped:first"]);
+        assert_eq!(system.inbox_debug_len(&path).await, 1);
+        assert_eq!(system.dead_letter_count().await, 0);
+
+        // When capacity returns, the front door lands all three copies.
+        release_tx.send(()).expect("release handler");
+        wait_for(|| async { system.inbox_cursor(&path).map(|cursor| cursor.as_u64()) == Some(3) })
+            .await;
         assert_eq!(
-            sink_read(&ActorPath::new("parked-sub")),
-            ["parked:shipped:first", "parked:shipped:second"]
+            seen.lock().as_slice(),
+            ["shipped:first", "shipped:second", "shipped:third"]
         );
+    }
+
+    #[tokio::test]
+    async fn drop_old_broadcast_evicts_without_duplicate_delivery() {
+        // Given a capacity-1 DropOld subscriber whose first handler waits
+        // for a test-controlled release.
+        struct BlockedSubscriber {
+            entered: Option<tokio::sync::mpsc::Sender<()>>,
+            release: Option<tokio::sync::oneshot::Receiver<()>>,
+            seen: Arc<Mutex<Vec<String>>>,
+        }
+        impl ServiceActor for BlockedSubscriber {
+            fn manifest() -> ActorManifest {
+                ActorManifest::new()
+                    .handles::<Shipped>()
+                    .kind(ActorKind::Service)
+            }
+            async fn start(
+                _args: &Json,
+            ) -> Result<Self, error_stack::Report<crate::registry::RegistryError>> {
+                unreachable!("subscriber starts with test channels")
+            }
+        }
+        impl MsgHandler<Shipped> for BlockedSubscriber {
+            async fn handle(&mut self, event: &Shipped, _ctx: &mut crate::context::MsgCtx<'_>) {
+                self.seen.lock().push(format!("shipped:{}", event.order));
+                if let Some(entered) = self.entered.take() {
+                    let _ = entered.send(()).await;
+                }
+                if let Some(release) = self.release.take() {
+                    let _ = release.await;
+                }
+            }
+        }
+
+        let (system, _clock) = ActorSystem::test();
+        let path = ActorPath::new("drop-old-sub");
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let (entered_tx, mut entered_rx) = tokio::sync::mpsc::channel(1);
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        crate::builder::spawn_service_builder::<BlockedSubscriber>(&system)
+            .at(path.clone())
+            .handles::<Shipped>()
+            .mailbox(1, OverloadPolicy::DropOld)
+            .start_with({
+                let seen = seen.clone();
+                move || {
+                    Box::pin(async move {
+                        Ok(BlockedSubscriber {
+                            entered: Some(entered_tx),
+                            release: Some(release_rx),
+                            seen,
+                        })
+                    })
+                }
+            })
+            .start();
+        wait_for(|| async { system.lookup_slot(&path) }).await;
+
+        // When the first event is claimed, the second fills the inbox,
+        // and the third accepted push evicts that queued victim.
+        system
+            .publish(Shipped {
+                order: "first".into(),
+            })
+            .await;
+        entered_rx.recv().await.expect("first handler entered");
+        system
+            .publish(Shipped {
+                order: "second".into(),
+            })
+            .await;
+        wait_for(|| async { system.inbox_debug_len(&path).await == 1 }).await;
+        system
+            .publish(Shipped {
+                order: "third".into(),
+            })
+            .await;
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+
+        // Then the accepted third copy is not also sent through fallback:
+        // only the oldest queued copy is dead-lettered.
+        let letters = system.drain_dead_letters();
+        assert_eq!(letters.len(), 1, "only the evicted copy is dead-lettered");
+        assert_eq!(
+            letters[0].reason,
+            crate::kernel::DeadLetterReason::InboxRefused
+        );
+        assert_eq!(letters[0].envelope.payload_json()["order"], json!("second"));
+
+        // When the first handler returns, events one and three commit once
+        // each; the accepted third copy did not traverse the front door.
+        release_tx.send(()).expect("release handler");
+        wait_for(|| async { seen.lock().len() == 2 }).await;
+        assert_eq!(seen.lock().as_slice(), ["shipped:first", "shipped:third"]);
     }
 
     #[tokio::test]

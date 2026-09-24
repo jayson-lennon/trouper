@@ -146,3 +146,49 @@ per-message work.
 Combined realistic floor for this shape: 1,147 → roughly 650–750
 ns/msg without touching the store or the fold, matching the service
 actor's 800 ns plus the now-cheap journal steps.
+
+## Full-completion ES fan-out before/after
+
+The direct-path change makes an accepted plain-subscriber broadcast copy
+push straight into the destination inbox from the publishing ES task. A
+refused copy still enters the existing front-door channel and retains
+Block/DropNew/DropOld behavior. The front-door loop also moves its owned
+envelope into the inbox after copying the `Copy` trace instead of cloning
+the envelope to retain that trace.
+
+`examples/profile_es_fanout.rs` measures one typed `Ticked` event per ES
+command with the in-memory journal. Its timed window opens before the N
+commands and closes only after the emitter and every subscriber have
+committed N messages, so these are full producer-plus-consumer rates—not
+enqueue-only timings.
+
+| plain subscribers | before ns/cmd | after ns/cmd | delta | before cmd/s | after cmd/s |
+|---:|---:|---:|---:|---:|---:|
+| 0 | 932 | 909 | −2.5% | 1,073,342 | 1,100,701 |
+| 1 | 1,621 | 1,240 | **−23.5%** | 616,889 | 806,454 |
+| 4 | 2,665 | 2,101 | **−21.2%** | 375,182 | 476,033 |
+
+The profiles corroborate the path change. With one subscriber,
+`front_door_loop` fell from 28.1% to 9.4% of all samples; with four, from
+24.9% to 3.3%. Within `broadcast` stacks specifically, kanal was 6.9% of
+the before samples at four subscribers and 0.0% after; `direct_push` was
+0.0% before and 32.5% after. All six captures had 0.00% `[unknown]`
+frames. Folded evidence is committed as
+`bench-accounting-es-fanout-{before,after}-{0,1,4}.folded`.
+
+Reproduction (one leg per process, six pinned CPUs, 64,000 warmup commands,
+and 1,000,000 measured commands):
+
+```sh
+RUSTFLAGS="-C force-frame-pointers=yes" \
+  cargo build --profile release-debug --example profile_es_fanout
+for subscribers in 0 1 4; do
+  SUBSCRIBERS="$subscribers" MESSAGES=1000000 WARMUP=64000 \
+    taskset -c 0-5 perf record -F 9999 --call-graph fp \
+    -o "/tmp/es-fanout-${subscribers}.data" -- \
+    target/release-debug/examples/profile_es_fanout
+  perf script -i "/tmp/es-fanout-${subscribers}.data" \
+    | stackcollapse-perf.pl \
+    > "bench-accounting-es-fanout-${subscribers}.folded"
+done
+```
