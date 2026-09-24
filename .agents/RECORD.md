@@ -138,3 +138,5 @@ Entries are added or amended **only with human approval**.
 - (runtime) The actor inbox is a parking_lot mutex guarding a sync queue; senders and loops take it only for synchronous push/peek/commit bodies, never across an await.
 - (runtime) Step loops resolve the cell's entry tables once per batch and dispatch by reference; the per-message entry lookup takes no lock and bumps no Arc.
 - (runtime) A plain-path send acquires the registry once (rules, set probes, and endpoint resolve share one critical section); partition/projector destinations resolve after resolve_partition and may acquire again.
+- (runtime) Step loops claim batches by moving envelopes out of claimed inbox slots (tombstones) and restore un-committed claims to their original offsets on crash or stop; no snapshot clones exist on the step path.
+- (runtime) A Block-refused tell parks on a space-available notify fired at inbox commit; there is no poll-retry loop on the hold path.
