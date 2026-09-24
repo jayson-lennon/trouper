@@ -135,3 +135,6 @@ Entries are added or amended **only with human approval**.
 - (runtime) Trace and causality ids are clock+counter generated (v7-layout, no getrandom); LeaseId shares the scheme.
 - (runtime) Service actor handlers dispatch inline on the actor loop task; no task is spawned per message.
 - (schemas) SchemaId holds a static string for derived schemas and allocates only for runtime-built names.
+- (runtime) The actor inbox is a parking_lot mutex guarding a sync queue; senders and loops take it only for synchronous push/peek/commit bodies, never across an await.
+- (runtime) Step loops resolve the cell's entry tables once per batch and dispatch by reference; the per-message entry lookup takes no lock and bumps no Arc.
+- (runtime) A plain-path send acquires the registry once (rules, set probes, and endpoint resolve share one critical section); partition/projector destinations resolve after resolve_partition and may acquire again.
