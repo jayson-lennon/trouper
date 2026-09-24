@@ -37,7 +37,8 @@ Notes:
 |                         | 2048      |      597.61 µs |      292 ns | 3,426,966 cast/s |
 |                         | 50000     |       11.38 ms |      228 ns | 4,395,039 cast/s |
 
-Daow SQLite journal benches @ default (64 messages) mailbox size.
+Daow SQLite journal benches using the default 64-message mailbox with `:memory:` and on-disk
+SQLite media, reported as Criterion point estimates (2026-09-24, Intel Core i5-10400, cores 0–5).
 
 - `tell-acked` measures the complete flow of receiving a command, emitting an event, and then the journal receiving the event.
 - `flush` measures the journal committing buffered events
@@ -46,16 +47,18 @@ Note: Journal implementations that ship with `trouper` buffer events in memory, 
 
 | Runtime                | msg burst   | Criterion time | Per message |           Rate |
 | ---------------------- | ----------- | -------------: | ----------: | -------------: |
-| daow-tell-acked-memory | 64          |       96.74 µs |    1,512 ns |  661,570 msg/s |
-|                        | 512         |       11.75 ms |   22,947 ns |   43,579 msg/s |
-|                        | 2048        |       47.68 ms |   23,283 ns |   42,950 msg/s |
-| daow-tell-acked-disk   | 64          |      130.76 µs |    2,043 ns |  489,432 msg/s |
-|                        | 512         |       11.10 ms |   21,680 ns |   46,125 msg/s |
-|                        | 2048        |       42.84 ms |   20,919 ns |   47,803 msg/s |
-| daow-flush-memory      | 512 events  |       50.29 ms |   98,226 ns | 10,181 event/s |
-|                        | 2048 events |       98.37 ms |   48,032 ns | 20,819 event/s |
-| daow-flush-disk        | 512 events  |       37.61 ms |   73,453 ns | 13,614 event/s |
-|                        | 2048 events |      133.65 ms |   65,257 ns | 15,324 event/s |
+| daow-tell-acked-memory | 64          |       92.70 µs |    1,449 ns |  690,366 msg/s |
+|                        | 512         |      568.69 µs |    1,111 ns |  900,307 msg/s |
+|                        | 2048        |        2.14 ms |    1,043 ns |  958,436 msg/s |
+| daow-tell-acked-disk   | 64          |       78.93 µs |    1,233 ns |  810,856 msg/s |
+|                        | 512         |      575.35 µs |    1,124 ns |  889,901 msg/s |
+|                        | 2048        |        2.13 ms |    1,040 ns |  961,222 msg/s |
+| daow-flush-memory      | 512 events  |       26.71 ms |   52,166 ns | 19,169 event/s |
+|                        | 2048 events |       71.43 ms |   34,878 ns | 28,671 event/s |
+| daow-flush-disk        | 512 events  |       26.09 ms |   50,954 ns | 19,626 event/s |
+|                        | 2048 events |       72.30 ms |   35,301 ns | 28,327 event/s |
+
+Reproduce with `taskset -c 0-5 cargo bench --bench journal --features daow`.
 
 Overhead of journal, per message:
 
