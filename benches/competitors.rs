@@ -50,9 +50,11 @@ use std::time::Duration;
 
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 
-/// Message counts: small (mailbox-scale), medium, and large enough that
-/// amortized per-send cost dominates.
-const SIZES: [u64; 3] = [64, 512, 2_048];
+/// Message counts: small (mailbox-scale), medium, large enough that
+/// amortized per-send cost dominates, and a sustained burst (25
+/// mailbox-cycles through the bounded-64 mailboxes) for true
+/// steady-state per-message throughput.
+const SIZES: [u64; 4] = [64, 512, 2_048, 50_000];
 
 /// Settle time after the prime ack: the runtime finishes spawn
 /// bookkeeping so the timed window opens on a hot, quiet system.
@@ -188,9 +190,9 @@ mod trouper_leg {
 
     /// Builds the runtime + both actors on a fresh thread, primes the
     /// producer (Prime → ack), settles, then parks. `bounded` picks the
-    /// mailbox: `true` = the default bounded-64; `false` = the
-    /// large-capacity Block stand-in for unbounded (capacity 2^20 is
-    /// unbounded at these message counts).
+    /// mailbox: `true` = the default bounded-64 Block; `false` =
+    /// `OverloadPolicy::Unbounded` (the inbox never refuses; the capacity
+    /// value is ignored).
     pub fn start(bounded: bool, n: u64) -> Pair {
         let (start_tx, start_rx) = kanal::bounded::<()>(1);
         let (prime_tx, prime_rx) = kanal::bounded::<()>(1);
@@ -198,7 +200,12 @@ mod trouper_leg {
         let (release_tx, bench_done_rx) = kanal::bounded_async::<()>(1);
         let bench_done_tx = release_tx.clone_sync();
 
-        let capacity = if bounded { 64 } else { 1 << 20 };
+        let capacity = 64;
+        let policy = if bounded {
+            OverloadPolicy::Block
+        } else {
+            OverloadPolicy::Unbounded
+        };
         let thread = std::thread::Builder::new()
             .name("trouper-leg".into())
             .spawn(move || {
@@ -214,7 +221,7 @@ mod trouper_leg {
                     trouper::builder::spawn_service_builder::<Sink>(&system)
                         .at(sink_path.clone())
                         .handles::<Tick>()
-                        .mailbox(capacity, OverloadPolicy::Block)
+                        .mailbox(capacity, policy)
                         .start_with({
                             let done = done_tx.clone().to_async();
                             move || {
@@ -234,7 +241,7 @@ mod trouper_leg {
                         .at(producer_path.clone())
                         .handles::<Prime>()
                         .emits::<Tick>()
-                        .mailbox(capacity, OverloadPolicy::Block)
+                        .mailbox(capacity, policy)
                         .start_with({
                             let ack = prime_tx.clone().to_async();
                             let go = start_rx.clone().to_async();
