@@ -4,8 +4,9 @@
 //! completion wait) but the measured loop is the whole profile.
 //!
 //! ```text
-//! CARGO_PROFILE_BENCH_DEBUG=true cargo build --release --example flame_tells
-//! perf record -F 9999 -g -o /tmp/tells.data -- target/release/examples/flame_tells
+//! cargo build --profile release-debug --example flame_tells
+//! perf record -F 9999 --call-graph fp -o /tmp/tells.data \
+//!   -- target/release-debug/examples/flame_tells
 //! perf script -i /tmp/tells.data | flamegraph --flamechart > tells.svg
 //! PROFILE_SERVICE=1 runs the service-actor leg instead of ES.
 //! ```
