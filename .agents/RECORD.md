@@ -115,6 +115,7 @@ Entries are added or amended **only with human approval**.
 - (bench) Competitor completion is harness-owned: the producer parks awaiting a kanal start channel inside its handler, and the sink fires a kanal done channel at the target count — the bench thread never touches actor handles.
 - (bench) Mailbox shapes in the competitors bench follow each framework's supported set: kameo runs bounded-64 and unbounded, trouper runs bounded-64 and OverloadPolicy::Unbounded, and ractor runs unbounded.
 - (bench) The journal bench times SQLite-backed tell commits at :memory: and on-disk media plus a direct store flush, with system and journal setup outside the timed body.
+- (runtime) Broadcast fan-out to plain subscribers first attempts direct inbox delivery on the publisher's task and sends refused copies through the front-door channel.
 - (runtime) Message delivery wakes the actor's loop through a Notify signal fired by the sender on the direct-delivery path and by the front door on its fallback path; no fixed-interval polling exists on the message path.
 - (runtime) Per-actor mutable bookkeeping lives on the actor cell as lock-free state; the kernel tables lock guards cross-actor state only (with observation disabled an ES message's happy path acquires the tables zero times end to end).
 - (runtime) An idle actor's loop sleeps until its next due duty (snapshot cadence or passivation) or the next message, whichever comes first; an actor with no duties armed does not wake at all.
