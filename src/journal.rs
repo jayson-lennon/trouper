@@ -451,10 +451,11 @@ pub trait JournalStore: Send + Sync {
         Err(error_stack::Report::new(JournalError::Scan))
     }
 
-    /// Lifecycle hint: the actor at `path` just passivated (left memory
-    /// with its journal durable). A backend may use this to switch it to
-    /// cold storage. A failing hint never blocks passivation — the runtime
-    /// logs and continues.
+    /// Lifecycle hint: the actor at `path` just passivated. A buffering
+    /// backend may flush it and release retained state once that flush is
+    /// durable, but must retain acknowledged unflushed entries on
+    /// failure for a later retry. A failing hint never blocks passivation —
+    /// the runtime logs and continues.
     ///
     /// # Errors
     ///

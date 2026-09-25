@@ -7,19 +7,20 @@
 //! writer task flushes pending buffer entries to SQLite on a periodic
 //! tick ([`DaowConfig::flush_interval`]), and the runtime's one
 //! shutdown-sweep `flush` drains everything, so a graceful shutdown
-//! leaves zero unflushed entries. Between flushes, reads answer from the
-//! union of buffer and database — `load` and `scan` see buffered state
-//! exactly as the trait contract requires.
+//! leaves zero unflushed entries. Each active path's in-memory [`Journal`]
+//! remains authoritative between flushes: `load` answers from it directly,
+//! while `scan` unions it with SQLite to include passivated paths and
+//! retained failed-passivation buffers.
 //!
 //! Durability and failure shape:
-//! - A failed flush keeps the buffer and its watermark untouched; the
-//!   next cycle retries the same entries. Failures with no caller (the
+//! - A failed flush keeps the buffer and its durable frontier unchanged;
+//!   the next cycle retries the same entries. Failures with no caller (the
 //!   writer tick, the sweep's flush whose result the runtime ignores)
 //!   report through the installed control handler — see
 //!   [`JournalArgs::control`](crate::journal::JournalArgs::control).
 //! - [`JournalStore::passivated`] flushes that path and drops its buffer
-//!   entry: passivated journals live only in SQLite (cold storage), and
-//!   reactivation replays from the database.
+//!   only after commit. A failed flush retains the acknowledged tail for
+//!   a later retry; reactivation clears its release marker.
 //! - Dropping the store aborts the writer task; a graceful shutdown is
 //!   the durability path (an un-graceful drop loses the unflushed tail).
 //!
@@ -282,15 +283,63 @@ fn record_version(
 
 // ── Shared state ─────────────────────────────────────────────────────────
 
-/// One path's buffered journal plus the flush watermark: entries with
-/// `ingest_seq > watermark` are pending (buffer-only); the watermark
-/// advances only when their rows commit to SQLite. The buffer's seq
-/// anchor (`event_count`) is the seq source of truth — never drained,
-/// never reset by flush; only `passivated` drops the whole entry.
+/// Number of leading entries in a path's in-memory journal that are durable
+/// in SQLite.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct FlushedEntryCount(usize);
+
+impl FlushedEntryCount {
+    fn start() -> Self {
+        Self(0)
+    }
+
+    fn through(end: usize) -> Self {
+        Self(end)
+    }
+
+    fn as_usize(self) -> usize {
+        self.0
+    }
+}
+
+/// One path's authoritative in-memory journal plus its durable prefix.
 struct PathBuffer {
     journal: Journal,
-    /// Max `ingest_seq` committed to SQLite for this path.
-    watermark: u64,
+    /// `journal.entries()[..flushed_entry_count]` is durable in SQLite.
+    flushed_entry_count: FlushedEntryCount,
+    /// A passivation flush failed: remove this buffer after a later flush
+    /// commits the same captured end without a concurrent append/reactivation.
+    drop_when_durable: bool,
+    /// A cold read is building this path's authoritative journal. Appends
+    /// reject the placeholder rather than racing the seed.
+    activation_in_progress: bool,
+}
+
+impl PathBuffer {
+    fn new() -> Self {
+        Self {
+            journal: Journal::new(),
+            flushed_entry_count: FlushedEntryCount::start(),
+            drop_when_durable: false,
+            activation_in_progress: false,
+        }
+    }
+
+    fn activating() -> Self {
+        Self {
+            activation_in_progress: true,
+            ..Self::new()
+        }
+    }
+
+    fn durable(journal: Journal) -> Self {
+        Self {
+            flushed_entry_count: FlushedEntryCount::through(journal.len()),
+            journal,
+            drop_when_durable: false,
+            activation_in_progress: false,
+        }
+    }
 }
 
 /// The state every store method shares: the per-path buffers (appends
@@ -309,6 +358,9 @@ pub struct Shared {
     /// Globally monotonic arrival order, seeded from
     /// `MAX(ingest_seq)` at build; never reset by purge.
     ingest_seq: AtomicU64,
+    /// Test-only synchronization point after suffix capture and before SQLite.
+    #[cfg(test)]
+    pending_capture_hook: parking_lot::Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
 }
 
 impl Shared {
@@ -363,7 +415,33 @@ impl Shared {
             // Seeded ABOVE the stored max: the next ingest hands out
             // max+1 (a fresh store over an empty DB starts at 0).
             ingest_seq: AtomicU64::new(max_ingest.map(|m| m as u64).unwrap_or(0) + 1),
+            #[cfg(test)]
+            pending_capture_hook: parking_lot::Mutex::new(None),
         })
+    }
+
+    #[cfg(test)]
+    fn run_pending_capture_hook(&self) {
+        let hook = self.pending_capture_hook.lock().take();
+        if let Some(hook) = hook {
+            hook();
+        }
+    }
+
+    #[cfg(test)]
+    fn set_pending_capture_hook(&self, hook: Arc<dyn Fn() + Send + Sync>) {
+        *self.pending_capture_hook.lock() = Some(hook);
+    }
+
+    /// Test seam: marks `path` as cold-activating so integration tests
+    /// can verify every mutation boundary without racing the SQLite read.
+    #[cfg(any(test, feature = "daow"))]
+    #[doc(hidden)]
+    pub fn mark_activation_for_test(&self, path: &ActorPath) {
+        self.journals
+            .lock()
+            .entry(path.clone())
+            .or_insert_with(PathBuffer::activating);
     }
 
     /// Reports a failure with no caller to the control handler (and
@@ -440,6 +518,14 @@ impl DaowJournalStore {
             writer: parking_lot::Mutex::new(None),
         }
     }
+
+    /// Test seam: installs the same cold-activation placeholder used by
+    /// `load`, without racing the SQLite read.
+    #[cfg(any(test, feature = "daow"))]
+    #[doc(hidden)]
+    pub fn mark_activation_for_test(&self, path: &ActorPath) {
+        self.shared.mark_activation_for_test(path);
+    }
 }
 
 impl Drop for DaowJournalStore {
@@ -455,16 +541,29 @@ impl Drop for DaowJournalStore {
 
 // ── Ack paths (buffer only; never SQLite, never the drain lock) ──────────
 
+fn activation_error(context: JournalError) -> Report<JournalError> {
+    Report::new(context).attach("cannot append while the journal is activating")
+}
+
+fn mutable_buffer<'a>(
+    journals: &'a mut HashMap<ActorPath, PathBuffer>,
+    path: &ActorPath,
+    context: JournalError,
+) -> Result<&'a mut PathBuffer, Report<JournalError>> {
+    let buffer = journals.entry(path.clone()).or_insert_with(PathBuffer::new);
+    if buffer.activation_in_progress {
+        return Err(activation_error(context));
+    }
+    Ok(buffer)
+}
+
 fn buffer_append(
     shared: &Shared,
     path: &ActorPath,
     events: &[Event],
 ) -> Result<Vec<SeqNo>, Report<JournalError>> {
     let mut journals = shared.journals.lock();
-    let buffer = journals.entry(path.clone()).or_insert_with(|| PathBuffer {
-        journal: Journal::new(),
-        watermark: 0,
-    });
+    let buffer = mutable_buffer(&mut journals, path, JournalError::Append)?;
     let journal = &mut buffer.journal;
     Ok(events
         .iter()
@@ -481,27 +580,29 @@ fn buffer_append_snapshot(
     seq: SeqNo,
     state: crate::json::Json,
     now_ms: u64,
-) {
+) -> Result<(), Report<JournalError>> {
     let mut journals = shared.journals.lock();
-    let buffer = journals.entry(path.clone()).or_insert_with(|| PathBuffer {
-        journal: Journal::new(),
-        watermark: 0,
-    });
+    let buffer = mutable_buffer(&mut journals, path, JournalError::Snapshot)?;
     buffer.journal.append_snapshot(seq, state, now_ms);
+    Ok(())
 }
 
 // ── Flush machinery ──────────────────────────────────────────────────────
 
-/// One path's pending rows, snapshot under the journals lock: the events
-/// still above the watermark and (when the buffer holds a snapshot the
-/// DB does not) the snapshot row. `new_watermark` is the max pending
-/// ingest; committed only after the transaction succeeds.
-#[derive(Clone)]
+/// One path's captured suffix and the frontier value to install after commit.
 struct PendingFlush {
     path: ActorPath,
     events: Vec<PendingEventRow>,
     snapshot: Option<PendingSnapshotRow>,
-    new_watermark: u64,
+    captured_end: FlushedEntryCount,
+    drop_when_durable: bool,
+}
+
+/// Post-transaction metadata that does not own the rows sent to SQLite.
+struct FlushCompletion {
+    path: ActorPath,
+    captured_end: FlushedEntryCount,
+    drop_when_durable: bool,
 }
 
 /// One event row as it travels buffer → SQLite.
@@ -570,49 +671,51 @@ fn serialize_event(row: &JournalEntry) -> Option<PendingEventRow> {
     })
 }
 
-/// Snapshots every path's pending rows (buffer entries above the
-/// watermark) and releases the journals lock BEFORE any DB work.
-fn collect_pending(shared: &Shared) -> Vec<PendingFlush> {
+/// Materializes every requested path's unflushed journal suffix and releases
+/// the journals lock before any DB work. Old durable entries are never visited.
+fn collect_pending(shared: &Shared, target: Option<&ActorPath>) -> Vec<PendingFlush> {
     let journals = shared.journals.lock();
     journals
         .iter()
+        .filter(|(path, _)| target.is_none_or(|target| *path == target))
         .filter_map(|(path, buffer)| {
-            let mut events = Vec::new();
-            let mut max_ingest = buffer.watermark;
-            for entry in buffer.journal.entries() {
-                if let Some(row) = serialize_event(entry)
-                    && row.ingest_seq > buffer.watermark
-                {
-                    max_ingest = max_ingest.max(row.ingest_seq);
-                    events.push(row);
-                }
-            }
-            if events.is_empty() {
+            let start = buffer.flushed_entry_count.as_usize();
+            let end = buffer.journal.len();
+            if start == end {
                 return None;
             }
-            // The DB-side snapshot check happens inside the cycle (only
-            // the highest buffer snapshot matters); carry the latest one.
-            let snapshot = buffer.journal.last_snapshot().map(|entry| match entry {
-                JournalEntry::Snapshot { seq, state } => PendingSnapshotRow {
-                    seq: *seq,
-                    state: state.to_string(),
-                },
-                _ => unreachable!("last_snapshot returns a snapshot"),
-            });
+            let mut events = Vec::new();
+            let mut snapshot = None;
+            for entry in &buffer.journal.entries()[start..end] {
+                match entry {
+                    JournalEntry::Event { .. } => {
+                        if let Some(row) = serialize_event(entry) {
+                            events.push(row);
+                        }
+                    }
+                    JournalEntry::Snapshot { seq, state } => {
+                        snapshot = Some(PendingSnapshotRow {
+                            seq: *seq,
+                            state: state.to_string(),
+                        });
+                    }
+                }
+            }
             Some(PendingFlush {
                 path: path.clone(),
                 events,
                 snapshot,
-                new_watermark: max_ingest,
+                captured_end: FlushedEntryCount::through(end),
+                drop_when_durable: buffer.drop_when_durable,
             })
         })
         .collect()
 }
 
 /// Writes one cycle's pending rows in a single transaction (all paths or
-/// one path — the caller's `pending` decides), advancing watermarks only
-/// on success. On failure watermarks stay put, so the next cycle retries
-/// exactly the same entries.
+/// one path — the caller's `pending` decides), advancing durable frontiers
+/// only on success. On failure frontiers stay put, so the next cycle
+/// retries exactly the same entries.
 async fn write_pending(
     shared: &Shared,
     pending: Vec<PendingFlush>,
@@ -621,65 +724,147 @@ async fn write_pending(
     if pending.is_empty() {
         return Ok(());
     }
-    write_pending_tx(&shared.pool, &pending)
+    #[cfg(test)]
+    shared.run_pending_capture_hook();
+    let completions = pending
+        .iter()
+        .map(|batch| FlushCompletion {
+            path: batch.path.clone(),
+            captured_end: batch.captured_end,
+            drop_when_durable: batch.drop_when_durable,
+        })
+        .collect();
+    write_pending_tx(&shared.pool, pending)
         .await
         .change_context(JournalError::Append)
         .attach(format!("{op}: journal flush failed; entries stay buffered"))?;
 
-    // Commit the watermarks (the rows are durable now).
-    let mut journals = shared.journals.lock();
-    for batch in &pending {
-        if let Some(buffer) = journals.get_mut(&batch.path) {
-            buffer.watermark = batch.new_watermark;
-        }
-        // A buffer removed mid-cycle (passivated dropped it after this
-        // snapshot) simply has nothing to advance — its rows are in.
-    }
+    commit_flush(shared, completions);
     Ok(())
+}
+
+fn commit_flush(shared: &Shared, completions: Vec<FlushCompletion>) {
+    let mut journals = shared.journals.lock();
+    for completion in completions {
+        let Some(buffer) = journals.get_mut(&completion.path) else {
+            continue;
+        };
+        buffer.flushed_entry_count = completion.captured_end;
+        if buffer.drop_when_durable && completion.drop_when_durable {
+            if buffer.journal.len() == completion.captured_end.as_usize() {
+                journals.remove(&completion.path);
+            } else {
+                buffer.drop_when_durable = false;
+            }
+        }
+    }
 }
 
 /// The transaction: events (multi-row) + snapshots (upsert) in one
 /// `BEGIN IMMEDIATE … COMMIT` on a single pooled connection.
-async fn write_pending_tx(pool: &daow::Pool, pending: &[PendingFlush]) -> Result<(), daow::Error> {
-    let pending = pending.to_vec();
+async fn write_pending_tx(
+    pool: &daow::Pool,
+    pending: Vec<PendingFlush>,
+) -> Result<(), daow::Error> {
     pool.with_conn(move |conn| {
         conn.execute_batch("BEGIN IMMEDIATE")?;
-        let result = write_pending_statements(conn, &pending);
-        match result {
-            Ok(()) => conn.execute_batch("COMMIT")?,
+        let write_result = write_pending_statements(conn, &pending);
+        let result = match write_result {
+            Ok(()) => conn.execute_batch("COMMIT"),
             Err(err) => {
                 let _ = conn.execute_batch("ROLLBACK");
                 return Err(daow::Error::from(err));
             }
+        };
+        if let Err(err) = result {
+            let _ = conn.execute_batch("ROLLBACK");
+            return Err(daow::Error::from(err));
         }
         Ok(())
     })
     .await
 }
 
-/// The cycle's INSERT statements on one open transaction.
+fn insert_event(
+    conn: &mut rusqlite::Connection,
+    batch: &PendingFlush,
+    row: &PendingEventRow,
+) -> Result<(), rusqlite::Error> {
+    let mut stmt = conn.prepare_cached(
+        "INSERT INTO trouper_journal_events \
+         (journal, seq, kind, schema, payload, origin, catchup_source, catchup_seq, ingest_seq) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+    )?;
+    stmt.execute(rusqlite::params![
+        batch.path.to_string(),
+        row.seq.as_u64() as i64,
+        row.kind,
+        row.schema,
+        row.payload,
+        row.origin_json,
+        row.catchup_source,
+        row.catchup_seq,
+        row.ingest_seq as i64,
+    ])?;
+    Ok(())
+}
+
+fn verify_existing_event(
+    conn: &mut rusqlite::Connection,
+    batch: &PendingFlush,
+    row: &PendingEventRow,
+) -> Result<(), rusqlite::Error> {
+    let stored = conn.query_row(
+        "SELECT kind, schema, payload, origin, catchup_source, catchup_seq, ingest_seq \
+         FROM trouper_journal_events WHERE journal = ?1 AND seq = ?2",
+        rusqlite::params![batch.path.to_string(), row.seq.as_u64() as i64],
+        |stored| {
+            Ok((
+                stored.get::<_, i64>(0)?,
+                stored.get::<_, String>(1)?,
+                stored.get::<_, String>(2)?,
+                stored.get::<_, String>(3)?,
+                stored.get::<_, Option<String>>(4)?,
+                stored.get::<_, Option<i64>>(5)?,
+                stored.get::<_, i64>(6)?,
+            ))
+        },
+    )?;
+    let matches = stored
+        == (
+            row.kind,
+            row.schema.clone(),
+            row.payload.clone(),
+            row.origin_json.clone(),
+            row.catchup_source.clone(),
+            row.catchup_seq,
+            row.ingest_seq as i64,
+        );
+    if matches {
+        Ok(())
+    } else {
+        Err(rusqlite::Error::InvalidParameterName(
+            "event row conflicts at an existing journal sequence".to_owned(),
+        ))
+    }
+}
+
 fn write_pending_statements(
     conn: &mut rusqlite::Connection,
     pending: &[PendingFlush],
 ) -> Result<(), rusqlite::Error> {
     for batch in pending {
-        let mut stmt = conn.prepare_cached(
-            "INSERT INTO trouper_journal_events \
-             (journal, seq, kind, schema, payload, origin, catchup_source, catchup_seq, ingest_seq) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
-        )?;
         for row in &batch.events {
-            stmt.execute(rusqlite::params![
-                batch.path.to_string(),
-                row.seq.as_u64() as i64,
-                row.kind,
-                row.schema,
-                row.payload,
-                row.origin_json,
-                row.catchup_source,
-                row.catchup_seq,
-                row.ingest_seq as i64,
-            ])?;
+            match insert_event(conn, batch, row) {
+                Ok(()) => {}
+                Err(err)
+                    if err.sqlite_error_code()
+                        == Some(rusqlite::ErrorCode::ConstraintViolation) =>
+                {
+                    verify_existing_event(conn, batch, row)?;
+                }
+                Err(err) => return Err(err),
+            }
         }
         if let Some(snapshot) = &batch.snapshot {
             let mut stmt = conn.prepare_cached(
@@ -697,10 +882,10 @@ fn write_pending_statements(
 }
 
 /// One flush cycle: drain lock → snapshot pending → one transaction →
-/// advance watermarks. Shared by the writer tick and `flush`.
+/// advance durable frontiers. Shared by the writer tick and `flush`.
 async fn flush_cycle(shared: &Shared) -> Result<(), Report<JournalError>> {
     let _guard = shared.drain.lock().await;
-    let pending = collect_pending(shared);
+    let pending = collect_pending(shared, None);
     write_pending(shared, pending, "tick").await
 }
 
@@ -823,27 +1008,40 @@ async fn db_holds_origin(
 /// Rebuilds one path's buffer from its stored rows (the passivated →
 /// reactivated transition): entries re-append with their stored origins
 /// and ingest seqs (seq anchoring and CatchUp checkpoints survive), the
-/// latest snapshot rides along as an entry, and the watermark marks every
-/// stored row committed. `Ok(false)` = nothing stored.
+/// latest snapshot rides along as an entry, and the durable frontier marks
+/// every stored row committed. `Ok(false)` = nothing stored.
 ///
 /// The drain lock must be held: this reads the DB and inserts into the
 /// journals map as one step.
 async fn seed_buffer(shared: &Shared, path: &ActorPath) -> Result<bool, Report<JournalError>> {
+    {
+        let mut journals = shared.journals.lock();
+        match journals.entry(path.clone()) {
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                entry.insert(PathBuffer::activating());
+            }
+            std::collections::hash_map::Entry::Occupied(entry) => {
+                if !entry.get().activation_in_progress {
+                    return Ok(true);
+                }
+            }
+        }
+    }
     let (rows, snapshot) = read_path_rows(&shared.pool, path)
         .await
         .change_context(JournalError::Load)
         .attach("journal seed read failed")?;
     if rows.is_empty() && snapshot.is_none() {
+        shared.journals.lock().remove(path);
         return Ok(false);
     }
     let journal = rebuild_journal(rows, snapshot)?;
     let mut journals = shared.journals.lock();
-    // Another task may have seeded while we read — first writer wins;
-    // both read the same DB so either result is identical.
-    journals.entry(path.clone()).or_insert(PathBuffer {
-        journal,
-        watermark: u64::MAX,
-    });
+    if let Some(buffer) = journals.get_mut(path)
+        && buffer.activation_in_progress
+    {
+        *buffer = PathBuffer::durable(journal);
+    }
     Ok(true)
 }
 
@@ -864,87 +1062,42 @@ fn rebuild_journal(
     Ok(journal)
 }
 
-/// Decodes stored rows into the replay's event list.
-fn decode_events(rows: Vec<StoredEventRow>) -> Result<Vec<JournaledEvent>, Report<JournalError>> {
-    rows.into_iter()
-        .map(StoredEventRow::into_journaled)
-        .collect()
-}
-
-/// Decodes the stored latest-snapshot row, if any.
-fn decode_snapshot(
-    snapshot: Option<(i64, String)>,
-) -> Result<Option<JournalEntry>, Report<JournalError>> {
-    snapshot
-        .map(|(seq, state)| {
-            Ok(JournalEntry::Snapshot {
-                seq: SeqNo::new(seq as u64),
-                state: json_from_text(&state)?,
-            })
-        })
-        .transpose()
-}
-
-/// The load answer: DB rows ∪ buffer entries, deduped by seq (the buffer
-/// wins — it is the later write), highest snapshot wins, tail strictly
-/// after the snapshot.
-fn build_replay(
-    buffer: &Journal,
-    db_events: Vec<JournaledEvent>,
-    db_snapshot: Option<JournalEntry>,
-) -> Result<Option<Replay>, Report<JournalError>> {
-    let mut events = db_events;
-    let mut snapshot = db_snapshot;
-    let mut seen: HashSet<u64> = events.iter().map(|e| e.seq.as_u64()).collect();
-    for entry in buffer.entries() {
-        match entry {
-            JournalEntry::Event {
+/// Builds replay from one authoritative [`Journal`]. Full event history is
+/// retained for projector checkpoints; the tail is strictly after the
+/// journal's latest snapshot.
+fn build_replay(journal: &Journal) -> Result<Option<Replay>, Report<JournalError>> {
+    let snapshot = journal.last_snapshot().cloned();
+    let events: Vec<JournaledEvent> = journal
+        .entries()
+        .iter()
+        .filter_map(|entry| {
+            let JournalEntry::Event {
                 seq,
                 event,
                 origin,
                 ingest_seq,
-            } => {
-                if seen.insert(seq.as_u64()) {
-                    events.push(JournaledEvent {
-                        seq: *seq,
-                        event: event.clone(),
-                        origin: origin.clone(),
-                        ingest_seq: *ingest_seq,
-                    });
-                }
-            }
-            JournalEntry::Snapshot { seq, state } => {
-                let buffer_is_newer = snapshot.as_ref().map(|db| seq > &db.seq()).unwrap_or(true);
-                if buffer_is_newer {
-                    snapshot = Some(JournalEntry::Snapshot {
-                        seq: *seq,
-                        state: state.clone(),
-                    });
-                }
-            }
-        }
+            } = entry
+            else {
+                return None;
+            };
+            Some(JournaledEvent {
+                seq: *seq,
+                event: event.clone(),
+                origin: origin.clone(),
+                ingest_seq: *ingest_seq,
+            })
+        })
+        .collect();
+    if events.is_empty() && snapshot.is_none() {
+        return Ok(None);
     }
-    if events.is_empty() {
-        return match snapshot {
-            Some(snapshot) => Ok(Some(Replay {
-                snapshot: Some(snapshot),
-                tail: Vec::new(),
-                events,
-            })),
-            None => Ok(None),
-        };
-    }
-    events.sort_by_key(|e| e.seq);
     let tail = match &snapshot {
-        Some(snapshot) => {
-            let snap_seq = snapshot.seq();
-            events
-                .iter()
-                .filter(|e| e.seq > snap_seq)
-                .map(|e| e.event.clone())
-                .collect()
-        }
-        None => events.iter().map(|e| e.event.clone()).collect(),
+        Some(snapshot) => events
+            .iter()
+            .filter(|event| event.seq > snapshot.seq())
+            .map(|event| event.event.clone())
+            .collect(),
+        None => events.iter().map(|event| event.event.clone()).collect(),
     };
     Ok(Some(Replay {
         snapshot,
@@ -979,6 +1132,10 @@ impl JournalStore for DaowJournalStore {
         // the phases.
         let mut results = Vec::with_capacity(events.len());
         for scanned in events {
+            {
+                let mut journals = self.shared.journals.lock();
+                mutable_buffer(&mut journals, path, JournalError::Append)?;
+            }
             let buffer_known = {
                 let journals = self.shared.journals.lock();
                 journals
@@ -1005,10 +1162,7 @@ impl JournalStore for DaowJournalStore {
                 source_seq: scanned.seq,
             };
             let mut journals = self.shared.journals.lock();
-            let buffer = journals.entry(path.clone()).or_insert_with(|| PathBuffer {
-                journal: Journal::new(),
-                watermark: 0,
-            });
+            let buffer = mutable_buffer(&mut journals, path, JournalError::Append)?;
             let ingest = self.shared.ingest_seq.fetch_add(1, Ordering::SeqCst);
             let seq =
                 buffer
@@ -1068,8 +1222,9 @@ impl JournalStore for DaowJournalStore {
             }
         }
 
-        // Buffer union: pending entries the DB has not seen yet, plus the
-        // dedup key so a row already collected cannot double-appear.
+        // Scan union: SQLite rows plus authoritative in-memory journals.
+        // Retained failed-passivation buffers contribute their unflushed
+        // suffix here; dedup by `(journal, seq)` keeps the set exact.
         let mut seen: HashSet<(ActorPath, u64)> = found
             .iter()
             .map(|s| (s.journal.clone(), s.seq.as_u64()))
@@ -1110,47 +1265,33 @@ impl JournalStore for DaowJournalStore {
         state: crate::json::Json,
         now_ms: u64,
     ) -> Result<(), Report<JournalError>> {
-        buffer_append_snapshot(&self.shared, path, seq, state, now_ms);
-        Ok(())
+        buffer_append_snapshot(&self.shared, path, seq, state, now_ms)
     }
 
     async fn load(&self, path: &ActorPath) -> Result<Option<Replay>, Report<JournalError>> {
-        // Drain lock: DB rows and the buffer are read as one view.
+        // The drain lock serializes cold seeding, flush, passivation, and
+        // replay so activation observes one authoritative view.
         let _guard = self.shared.drain.lock().await;
 
-        // Seed the buffer from the DB when this path has none (the
-        // post-passivation reactivation case): the buffer restores seq
-        // anchoring and CatchUp origins so appends continue at the
-        // stored max seq and seed idempotence survives restarts. Every
-        // stored row is committed — the seed's watermark is u64::MAX.
-        let already = self.shared.journals.lock().contains_key(path);
-        if !already {
-            seed_buffer(&self.shared, path).await?;
+        // A retained path is already the complete authoritative view. Loading
+        // it means reactivation: cancel any pending failed-passivation
+        // release marker without querying SQLite again.
+        if let Some(buffer) = self.shared.journals.lock().get_mut(path)
+            && !buffer.activation_in_progress
+        {
+            buffer.drop_when_durable = false;
+            return build_replay(&buffer.journal);
         }
 
-        let (rows, snapshot) = read_path_rows(&self.shared.pool, path)
-            .await
-            .change_context(JournalError::Load)
-            .attach("journal load failed")?;
-        if rows.is_empty() && snapshot.is_none() {
-            // No DB journal. The buffer (if any) decides — an empty
-            // buffer path reports None exactly like the in-memory store.
-            let journals = self.shared.journals.lock();
-            return match journals.get(path) {
-                Some(buffer) if !buffer.journal.is_empty() => {
-                    build_replay(&buffer.journal, Vec::new(), None)
-                }
-                _ => Ok(None),
-            };
-        }
-
-        let db_events = decode_events(rows)?;
-        let db_snapshot = decode_snapshot(snapshot)?;
+        // Cold or failed-previous seed: one SQLite read becomes the
+        // authoritative buffer, whose frontier starts at its full length
+        // because every entry is durable.
+        seed_buffer(&self.shared, path).await?;
         let journals = self.shared.journals.lock();
-        let Some(buffer) = journals.get(path) else {
-            return build_replay(&Journal::new(), db_events, db_snapshot);
-        };
-        build_replay(&buffer.journal, db_events, db_snapshot)
+        journals
+            .get(path)
+            .map(|buffer| build_replay(&buffer.journal))
+            .unwrap_or(Ok(None))
     }
 
     async fn flush(&self) -> Result<(), Report<JournalError>> {
@@ -1159,7 +1300,7 @@ impl JournalStore for DaowJournalStore {
         // control handler here so the host observes them after the
         // sweep returns.
         let _guard = self.shared.drain.lock().await;
-        let pending = collect_pending(&self.shared);
+        let pending = collect_pending(&self.shared, None);
         if let Err(report) = write_pending(&self.shared, pending, "flush").await {
             self.shared.report("flush", &report);
             return Err(report);
@@ -1168,19 +1309,25 @@ impl JournalStore for DaowJournalStore {
     }
 
     async fn passivated(&self, path: &ActorPath) -> Result<(), Report<JournalError>> {
-        // Cold storage: flush this path best-effort (a failure is
-        // reported and the rows stay buffered — the hint never blocks
-        // passivation), then drop the buffer entry entirely. The next
-        // `load` re-seeds from SQLite.
+        // Cold storage: flush this path, but never discard acknowledged
+        // entries on failure. The actor loop treats this as a non-blocking
+        // hint and passivates either way.
         let _guard = self.shared.drain.lock().await;
-        let pending: Vec<PendingFlush> = collect_pending(&self.shared)
-            .into_iter()
-            .filter(|batch| &batch.path == path)
-            .collect();
+        let pending = collect_pending(&self.shared, Some(path));
+        if pending.is_empty() {
+            self.shared.journals.lock().remove(path);
+            return Ok(());
+        }
+        {
+            let mut journals = self.shared.journals.lock();
+            if let Some(buffer) = journals.get_mut(path) {
+                buffer.drop_when_durable = true;
+            }
+        }
         if let Err(report) = write_pending(&self.shared, pending, "passivated").await {
             self.shared.report("passivated", &report);
+            return Err(report);
         }
-        self.shared.journals.lock().remove(path);
         Ok(())
     }
 
@@ -1213,5 +1360,88 @@ impl JournalStore for DaowJournalStore {
 
     fn as_any(&self) -> &dyn std::any::Any {
         self
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::envelope::PayloadBytes;
+    use crate::json;
+    use crate::schema::SchemaId;
+
+    fn event(n: i64) -> Event {
+        Event::from_bytes(
+            SchemaId::new("ConcurrentFlush"),
+            PayloadBytes::from(json!({ "n": n })),
+        )
+    }
+
+    fn event_count(runtime: &tokio::runtime::Runtime, pool: &daow::Pool, path: &str) -> i64 {
+        let path = path.to_owned();
+        runtime
+            .block_on(pool.with_conn(move |conn| {
+                conn.query_row(
+                    "SELECT COUNT(*) FROM trouper_journal_events WHERE journal = ?1",
+                    rusqlite::params![path],
+                    |row| row.get(0),
+                )
+                .map_err(daow::Error::from)
+            }))
+            .expect("count events")
+    }
+
+    #[test]
+    fn append_after_pending_capture_remains_pending_for_next_flush() {
+        // Given one event captured by a flush that pauses before SQLite.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let pool = daow::Pool::builder()
+            .path(dir.path().join("journal.db").display().to_string())
+            .max_size(2)
+            .build()
+            .expect("pool");
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let shared = runtime
+            .block_on(Shared::test_build(pool.clone(), DaowConfig::default()))
+            .expect("shared");
+        let store = Arc::new(DaowJournalStore::no_writer(Arc::clone(&shared)));
+        let path = ActorPath::new("concurrent-flush");
+        runtime
+            .block_on(store.append(&path, &[event(1)]))
+            .expect("initial append");
+        let captured = Arc::new(std::sync::Barrier::new(2));
+        let release = Arc::clone(&captured);
+        shared.set_pending_capture_hook(Arc::new(move || {
+            release.wait();
+        }));
+        let flush_store = Arc::clone(&store);
+        let flush = std::thread::spawn(move || {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("flush runtime")
+                .block_on(flush_store.flush())
+        });
+
+        // When another append lands after capture but before commit.
+        captured.wait();
+        runtime
+            .block_on(store.append(&path, &[event(2)]))
+            .expect("concurrent append");
+        flush.join().expect("flush thread").expect("first flush");
+
+        // Then only the captured event is durable, while replay contains both;
+        // the next flush persists the newly pending suffix.
+        assert_eq!(event_count(&runtime, &pool, "concurrent-flush"), 1);
+        let replay = runtime
+            .block_on(store.load(&path))
+            .expect("load")
+            .expect("replay");
+        assert_eq!(replay.events.len(), 2, "both buffered events replay");
+        runtime.block_on(store.flush()).expect("second flush");
+        assert_eq!(event_count(&runtime, &pool, "concurrent-flush"), 2);
     }
 }

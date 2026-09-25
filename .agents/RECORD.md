@@ -129,8 +129,10 @@ Entries are added or amended **only with human approval**.
 - (runtime) An ES loop captures its state Arc at spawn and rebinds it at boot recovery, restart, and projector catch-up — the only moments the table's Arc is replaced; message steps read the cached state shell without the kernel tables lock (probe-counted: with observation off, a tell→fold→ack window acquires the tables zero times — the step's commit point reads cell state directly).
 - (runtime) Emit-declaration gating on the message path reads a cell-local declaration mirror, seeded from the manifest at spawn and re-synced with the registry at the single declaration-mutation point (ActorSystemCore::declare_emits); the registry lock is off the step path.
 - (journal) The optional daow feature enables a SQLite JournalStore backend over a daow Pool; building it runs a versioned, atomic journal-table migration chain and seeds the ingest counter from the stored maximum.
-- (journal) The daow backend acks appends against an in-memory buffer and a writer task flushes pending entries to SQLite on a configurable periodic tick (DaowConfig::flush_interval); failed flushes notify the control closure and retry with the buffer retained.
-- (journal) The daow backend's passivated hint flushes the path's buffer to SQLite and drops it; reactivation replays from SQLite and appends continue at the stored max seq.
+- (journal) The daow backend treats each active path's in-memory journal as authoritative and persists only the journal suffix beyond its last successful flush.
+- (journal) The daow backend seeds a cold path from the append-only SQLite event table when it has no in-memory journal.
+- (journal) Normal daow event persistence appends SQLite rows, with explicit host-requested purge as the only deletion path.
+- (journal) The daow backend removes a passivated path buffer only after its entries commit to SQLite, and any retained buffer contributes to replay.
 - (runtime) Journal stores install only at system construction, through SystemConfig's journal args (store plus an optional control-message closure); no post-construction setter exists.
 - (journal) The control-message closure receives synchronous store messages (currently errors only); with none installed store errors are only traced.
 - (bench) The journal bench (benches/journal.rs, requires the daow feature) measures the daow backend over in-memory and on-disk SQLite; tell_acked spawns a fresh entity per iteration in untimed setup, so the timed body is only tells plus the commit-cursor wait.

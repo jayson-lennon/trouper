@@ -16,7 +16,7 @@ use trouper::actor::{ActorKind, ActorPath as Path, EventSourcedActor};
 use trouper::builder::spawn_es_builder;
 use trouper::context::CmdCtx;
 use trouper::envelope::Events;
-use trouper::journal::{JournalArgs, SeqNo, StoreControlMessage};
+use trouper::journal::{JournalArgs, JournalStore, SeqNo, StoreControlMessage};
 use trouper::journal_daow::DaowConfig;
 use trouper::schema::{ActorManifest, Command, Schema};
 use trouper::system::{ActorSystem, SystemConfig};
@@ -109,6 +109,16 @@ async fn memory_store(config: DaowConfig) -> Arc<dyn trouper::journal::JournalSt
         .store
 }
 
+async fn activation_store(
+    pool: daow::Pool,
+    config: DaowConfig,
+) -> Arc<trouper::journal_daow::DaowJournalStore> {
+    let shared = trouper::journal_daow::Shared::test_build(pool, config)
+        .await
+        .expect("test shared");
+    Arc::new(trouper::journal_daow::DaowJournalStore::no_writer(shared))
+}
+
 /// Builds the concrete daow store directly and hands back its writer
 /// handle (the writer-exit test's seam — the concrete Arc is reachable
 /// before anything clones it).
@@ -126,8 +136,7 @@ async fn test_store_with_writer(
     // `no_writer` and the test owns the join handle directly (sync Drop
     // aborts only the store-owned handle; here the test joins it).
     let writer = shared.spawn_writer();
-    let store: Arc<dyn trouper::journal::JournalStore> =
-        Arc::new(trouper::journal_daow::DaowJournalStore::no_writer(shared));
+    let store = Arc::new(trouper::journal_daow::DaowJournalStore::no_writer(shared));
     (store, writer)
 }
 
@@ -419,6 +428,217 @@ async fn fresh_store_continues_the_global_ingest_order() {
 }
 
 #[tokio::test]
+async fn cold_activation_replays_complete_snapshot_and_event_history() {
+    // Given durable events and a snapshot in SQLite.
+    let db = TestDb::new();
+    let path = Path::new("cold-replay");
+    {
+        let args = JournalArgs::daow(db.pool(), DaowConfig::default())
+            .build()
+            .await
+            .expect("seed store");
+        args.store
+            .append(&path, &[event(1), event(2), event(3)])
+            .await
+            .expect("append events");
+        args.store
+            .append_snapshot(&path, SeqNo::new(1), json!({ "v": 1 }), 0)
+            .await
+            .expect("append snapshot");
+        args.store.flush().await.expect("flush seed");
+    }
+
+    // When a fresh store cold-loads the path.
+    let store = activation_store(db.pool(), DaowConfig::default()).await;
+    let replay = store.load(&path).await.expect("load").expect("replay");
+
+    // Then full projector history and ingest metadata survive, and the
+    // snapshot tail is strictly after its anchor.
+    assert_eq!(replay.events.len(), 3, "full event history retained");
+    assert_eq!(
+        replay
+            .events
+            .iter()
+            .map(|event| event.seq)
+            .collect::<Vec<_>>(),
+        [SeqNo::new(0), SeqNo::new(1), SeqNo::new(2)]
+    );
+    assert!(replay.events[0].ingest_seq < replay.events[1].ingest_seq);
+    assert!(replay.events[1].ingest_seq < replay.events[2].ingest_seq);
+    assert_eq!(replay.snapshot.expect("snapshot").seq(), SeqNo::new(1));
+    assert_eq!(replay.tail.len(), 1, "one event strictly after snapshot");
+    assert_eq!(replay.tail[0].payload_json()["qty"], 3);
+}
+
+#[tokio::test]
+async fn warmed_activation_replays_without_reading_sqlite() {
+    // Given a store that activated a durable path into memory.
+    let db = TestDb::new();
+    let path = Path::new("warm-replay");
+    {
+        let args = JournalArgs::daow(db.pool(), DaowConfig::default())
+            .build()
+            .await
+            .expect("seed store");
+        args.store.append(&path, &[event(1)]).await.expect("append");
+        args.store.flush().await.expect("flush");
+    }
+    let store = activation_store(db.pool(), DaowConfig::default()).await;
+    let first = store
+        .load(&path)
+        .await
+        .expect("first load")
+        .expect("replay");
+    assert_eq!(first.events.len(), 1);
+
+    // When SQLite is made unreadable after the authoritative buffer exists.
+    db.pool()
+        .with_conn(|conn| {
+            conn.execute_batch("DROP TABLE trouper_journal_events")
+                .map_err(daow::Error::from)
+        })
+        .await
+        .expect("drop event table");
+
+    // Then replay still comes entirely from memory.
+    let replay = store.load(&path).await.expect("warm load").expect("replay");
+    assert_eq!(replay.events.len(), 1, "warmed replay used the buffer");
+}
+
+#[tokio::test]
+async fn event_append_rejected_while_journal_is_activating() {
+    // Given the cold-activation placeholder.
+    let store = activation_store(memory_pool(), DaowConfig::default()).await;
+    store.mark_activation_for_test(&Path::new("activating"));
+
+    // When an event append races the seed.
+    let result = store.append(&Path::new("activating"), &[event(1)]).await;
+
+    // Then the append is refused instead of losing the seed's sequence.
+    assert!(result.is_err());
+}
+
+#[tokio::test]
+async fn snapshot_append_rejected_while_journal_is_activating() {
+    // Given the cold-activation placeholder.
+    let store = activation_store(memory_pool(), DaowConfig::default()).await;
+    let path = Path::new("activating-snapshot");
+    store.mark_activation_for_test(&path);
+
+    // When a snapshot append races the seed.
+    let result = store
+        .append_snapshot(&path, SeqNo::genesis(), json!({ "v": 1 }), 0)
+        .await;
+
+    // Then the append is refused with the snapshot error instead of
+    // racing buffer installation.
+    assert!(matches!(
+        result
+            .expect_err("activation refuses snapshots")
+            .current_context(),
+        trouper::journal::JournalError::Snapshot
+    ));
+}
+
+#[tokio::test]
+async fn catchup_append_rejected_while_journal_is_activating() {
+    // Given the cold-activation placeholder.
+    let store = activation_store(memory_pool(), DaowConfig::default()).await;
+    let path = Path::new("activating-catchup");
+    store.mark_activation_for_test(&path);
+    let scanned = [trouper::journal::ScannedEvent {
+        journal: Path::new("source"),
+        seq: SeqNo::new(0),
+        ingest_seq: 10,
+        event: event(1),
+    }];
+
+    // When a catch-up seed races the seed.
+    let result = store.append_catchup(&path, &scanned).await;
+
+    // Then the append is refused before any event can be assigned.
+    assert!(result.is_err());
+}
+
+#[tokio::test]
+async fn exact_committed_row_retry_advances_frontier_without_duplication() {
+    // Given an acknowledged buffered event whose exact SQLite row is
+    // present as if a prior transaction committed but reported failure.
+    let db = TestDb::new();
+    let pool = db.pool();
+    let args = JournalArgs::daow(pool.clone(), DaowConfig::default())
+        .build()
+        .await
+        .expect("build");
+    let path = Path::new("ambiguous-commit");
+    args.store.append(&path, &[event(1)]).await.expect("append");
+    let path_name = path.to_string();
+    pool.with_conn(move |conn| {
+        conn.execute(
+            "INSERT INTO trouper_journal_events \
+             (journal, seq, kind, schema, payload, origin, catchup_source, catchup_seq, ingest_seq) \
+             VALUES (?1, 0, 0, 'StockReserved', '{\"qty\":1}', '\"Recorded\"', NULL, NULL, 1)",
+            rusqlite::params![path_name],
+        )
+        .map(|_| ())
+        .map_err(daow::Error::from)
+    })
+    .await
+    .expect("simulate committed row");
+
+    // When the unchanged in-memory suffix retries its flush.
+    args.store.flush().await.expect("exact retry succeeds");
+
+    // Then the exact row is accepted once, the frontier advances, and
+    // passivation can release the now-durable buffer.
+    assert_eq!(db_event_count(&pool, "ambiguous-commit").await, 1);
+    args.store.passivated(&path).await.expect("passivate");
+    let replay = args
+        .store
+        .load(&path)
+        .await
+        .expect("cold load")
+        .expect("replay");
+    assert_eq!(replay.events.len(), 1, "reactivation sees one exact row");
+}
+
+#[tokio::test]
+async fn conflicting_committed_row_retry_keeps_frontier_unchanged() {
+    // Given an acknowledged buffered event whose sequence already has a
+    // different durable payload.
+    let db = TestDb::new();
+    let pool = db.pool();
+    let args = JournalArgs::daow(pool.clone(), DaowConfig::default())
+        .build()
+        .await
+        .expect("build");
+    let path = Path::new("conflicting-retry");
+    args.store.append(&path, &[event(1)]).await.expect("append");
+    let path_name = path.to_string();
+    pool.with_conn(move |conn| {
+        conn.execute(
+            "INSERT INTO trouper_journal_events \
+             (journal, seq, kind, schema, payload, origin, catchup_source, catchup_seq, ingest_seq) \
+             VALUES (?1, 0, 0, 'StockReserved', '{\"qty\":99}', '\"Recorded\"', NULL, NULL, 1)",
+            rusqlite::params![path_name],
+        )
+        .map(|_| ())
+        .map_err(daow::Error::from)
+    })
+    .await
+    .expect("insert conflicting row");
+
+    // When the store retries.
+    let result = args.store.flush().await;
+
+    // Then the conflict fails and the unchanged in-memory replay remains
+    // authoritative; a second retry does not overwrite the durable row.
+    assert!(result.is_err());
+    let replay = args.store.load(&path).await.expect("load").expect("replay");
+    assert_eq!(replay.events[0].event.payload_json()["qty"], 1);
+}
+
+#[tokio::test]
 async fn buffered_append_fails_the_write_and_the_tick_reports_and_recovers() {
     // Given a store whose writer will fail (a RAISE(ABORT) trigger) with
     // the control closure installed.
@@ -524,6 +744,66 @@ async fn scan_unions_buffer_and_db_excluding_catchup_entries() {
     assert!(found[0].ingest_seq < found[1].ingest_seq, "ingest order");
     assert_eq!(found[0].journal, source, "the DB row comes first");
     assert_eq!(found[1].journal, projector, "the buffered row comes second");
+}
+
+#[tokio::test]
+async fn failed_passivation_flush_retains_events_for_retry() {
+    // Given a store with one acknowledged buffered event and a database
+    // that refuses event inserts.
+    let db = TestDb::new();
+    let pool = db.pool();
+    let args = JournalArgs::daow(pool.clone(), DaowConfig::default())
+        .build()
+        .await
+        .expect("build");
+    let path = Path::new("failed-passivation");
+    args.store.append(&path, &[event(1)]).await.expect("append");
+    install_fault(&pool).await;
+
+    // When passivation attempts the durable transition.
+    let result = args.store.passivated(&path).await;
+
+    // Then the hint reports failure and replay still contains the event.
+    assert!(result.is_err(), "failed durable transition reports failure");
+    let replay = args
+        .store
+        .load(&path)
+        .await
+        .expect("load")
+        .expect("retained journal");
+    assert_eq!(
+        replay.events.len(),
+        1,
+        "failed passivation retained the event"
+    );
+
+    // And a later background flush retries and commits the retained event
+    // without releasing it, because `load` above reactivated the path.
+    clear_fault(&pool).await;
+    args.store.flush().await.expect("retry flush");
+    assert_eq!(db_event_count(&pool, "failed-passivation").await, 1);
+    let next = args
+        .store
+        .append(&path, &[event(2)])
+        .await
+        .expect("append after retry");
+    assert_eq!(
+        next,
+        vec![SeqNo::new(1)],
+        "retained path continued sequence"
+    );
+    args.store.passivated(&path).await.expect("passivate again");
+    let replay = args
+        .store
+        .load(&path)
+        .await
+        .expect("cold load")
+        .expect("replay");
+    assert_eq!(
+        replay.events.len(),
+        2,
+        "second passivation released the buffer"
+    );
 }
 
 #[tokio::test]

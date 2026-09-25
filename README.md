@@ -39,26 +39,41 @@ The competitor benchmark hot-loops a burst of actor-to-actor messages from one p
 
 Reproduce with `taskset -c 0-5 cargo bench --bench competitors`.
 
-Daow SQLite journal benches using the default 64-message mailbox with `:memory:` and on-disk
-SQLite media, reported as Criterion point estimates (2026-09-24, Intel Core i5-10400, cores 0–5).
+Daow SQLite journal benchmarks use `:memory:` and on-disk SQLite media. Values are Criterion point estimates (2026-09-25, Intel Core i5-10400, cores 0–5).
 
-- `tell-acked` measures the complete flow of receiving a command, emitting an event, and then the journal receiving the event.
-- `flush` measures the journal committing buffered events
+- `tell_acked` times command delivery, fold, journal append, and acknowledgement. SQLite is not on this path: daow acknowledges the buffered append.
+- `pending` times one direct store flush of a fresh 512- or 2,048-event backlog. Fixture reset and appends are outside the timed body.
+- `accumulated_backlog` times one direct flush of 2,048 events buffered since the previous reset.
+- `retained_history` recreates and durably flushes 2,048 retained events, then times only the 64-event suffix flush.
+- `noop_flush` times a second flush after the path is already durable.
+- `replay` times `JournalStore::load()` for 2,048 events plus a snapshot. This is replay reconstruction, not a complete actor load: actor acquisition, state folding, and liveness are excluded. `cold` constructs a fresh on-disk store in setup and reads SQLite; `warmed` loads the authoritative in-memory journal.
+- `accumulated_shutdown` accumulates 2,048 acknowledged actor messages in setup, then times graceful actor shutdown plus the final journal flush.
 
-Note: Journal implementations that ship with `trouper` buffer events in memory, so some data loss is possible between flushes. Committing to disk happens on a separate thread.
+Because appends are buffered, a successful command acknowledgement does not yet imply SQLite durability. The periodic writer task and graceful-shutdown sweep provide the durable commit boundary.
 
-| Runtime                | msg burst   | Criterion time | Per message |           Rate |
-| ---------------------- | ----------- | -------------: | ----------: | -------------: |
-| daow-tell-acked-memory | 64          |       92.70 µs |    1,449 ns |  690,366 msg/s |
-|                        | 512         |      568.69 µs |    1,111 ns |  900,307 msg/s |
-|                        | 2048        |        2.14 ms |    1,043 ns |  958,436 msg/s |
-| daow-tell-acked-disk   | 64          |       78.93 µs |    1,233 ns |  810,856 msg/s |
-|                        | 512         |      575.35 µs |    1,124 ns |  889,901 msg/s |
-|                        | 2048        |        2.13 ms |    1,040 ns |  961,222 msg/s |
-| daow-flush-memory      | 512 events  |       26.71 ms |   52,166 ns | 19,169 event/s |
-|                        | 2048 events |       71.43 ms |   34,878 ns | 28,671 event/s |
-| daow-flush-disk        | 512 events  |       26.09 ms |   50,954 ns | 19,626 event/s |
-|                        | 2048 events |       72.30 ms |   35,301 ns | 28,327 event/s |
+| Bench                  | Media  | Size                 | Criterion time | Per event / message |            Rate |
+| ---------------------- | ------ | -------------------- | -------------: | ------------------: | -------------: |
+| tell_acked             | memory | 64 messages          |       78.02 µs |           1,219 ns |  820,270 msg/s |
+|                       |        | 512 messages         |      477.24 µs |             932 ns | 1,072,800 msg/s |
+|                       |        | 2,048 messages       |        1.94 ms |             946 ns | 1,057,000 msg/s |
+| tell_acked             | disk   | 64 messages          |       84.33 µs |           1,318 ns |  758,960 msg/s |
+|                       |        | 512 messages         |      503.32 µs |             983 ns | 1,017,200 msg/s |
+|                       |        | 2,048 messages       |        1.93 ms |             944 ns | 1,059,700 msg/s |
+| pending flush          | memory | 512 pending events   |      974.23 µs |           1,901 ns |  525,540 event/s |
+|                       |        | 2,048 pending events |        4.15 ms |           2,025 ns |  493,720 event/s |
+| pending flush          | disk   | 512 pending events   |      998.17 µs |           1,949 ns |  512,940 event/s |
+|                       |        | 2,048 pending events |        4.40 ms |           2,149 ns |  465,310 event/s |
+| accumulated backlog    | memory | 2,048 pending events |        4.77 ms |           2,327 ns |  429,720 event/s |
+| accumulated backlog    | disk   | 2,048 pending events |        4.89 ms |           2,388 ns |  418,590 event/s |
+| retained-history flush | memory | 2,048 retained + 64 |      226.32 µs |           3,537 ns |  282,790 event/s |
+| retained-history flush | disk   | 2,048 retained + 64 |      260.23 µs |           4,066 ns |  245,940 event/s |
+| no-op flush            | memory | 0 pending events     |      283.78 ns |                — |               — |
+| no-op flush            | disk   | 0 pending events     |      300.13 ns |                — |               — |
+| warmed replay          | memory | 2,048 + snapshot     |      403.95 µs |             197 ns |  2,475 replay/s |
+| cold replay            | disk   | 2,048 + snapshot     |        2.01 ms |             984 ns |    496 replay/s |
+| warmed replay          | disk   | 2,048 + snapshot     |      410.47 µs |             200 ns |  2,436 replay/s |
+| accumulated shutdown   | memory | 2,048 messages       |        4.79 ms |           2,337 ns |  427,860 msg/s |
+| accumulated shutdown   | disk   | 2,048 messages       |        5.08 ms |           2,479 ns |  403,310 msg/s |
 
 Reproduce with `taskset -c 0-5 cargo bench --bench journal --features daow`.
 
