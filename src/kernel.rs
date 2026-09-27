@@ -1532,6 +1532,20 @@ impl Idler {
     }
 }
 
+/// Announces `Running` for a loop's actor on the fabric census channel.
+///
+/// The loop carries no [`crate::system::ActorSystem`] handle, so the
+/// announcement goes out through the same system facade the loop's
+/// teardown builds ([`crate::system::ActorSystemCore::loop_facade`]).
+/// System-level by construction: no `MsgCtx`, no outbox, so no actor's
+/// `.emits` gate is consulted.
+async fn announce_running(ctx: &EsLoop, kind: crate::actor::ActorKind) {
+    let system = crate::system::ActorSystemCore::loop_facade(ctx);
+    system
+        .announce_lifecycle(&ctx.path, crate::actor::LifecycleState::Running, kind)
+        .await;
+}
+
 /// The ES actor loop: the atomic step, forever, until shutdown or crash.
 ///
 /// PUSH-DRIVEN: a message wakes the loop through the front door's notify;
@@ -1545,6 +1559,15 @@ pub(crate) async fn es_actor_loop(mut loop_ctx: EsLoop, mut shutdown: watch::Rec
     // genesis spawn has no journal; the store answers None. Recovery may
     // REPLACE the table's Arc — rebind the loop's cache here.
     recover_at_boot(&mut loop_ctx).await;
+    // The fabric census announcement, at LOOP TOP rather than at the
+    // spawn call: the loop is the one place that runs for a fresh spawn
+    // AND for a supervised restart's fresh loop, so `Running` is
+    // re-announced on restart with no second site — and a restart is
+    // indistinguishable from a fresh spawn, by design (see
+    // `LifecycleState`). Loop-top also keeps the announcement ordered
+    // with the loop's own lifecycle: a stop can only be announced by the
+    // teardown, which runs after this.
+    announce_running(&loop_ctx, crate::actor::ActorKind::EventSourced).await;
     // The step batch buffer, allocated ONCE per loop task and reused every
     // step (claims move in, commit/restore moves them out; the buffer
     // empties but keeps its capacity).
@@ -2832,6 +2855,11 @@ async fn maybe_passivate(ctx: &EsLoop) -> bool {
 /// drop the message. No journal, no cursor — service actors are at-most-once
 /// by design (supervision wraps this loop).
 pub(crate) async fn service_actor_loop(loop_ctx: ServiceLoop, mut shutdown: watch::Receiver<bool>) {
+    // The census announcement, for the same reason and with the same
+    // shape as the ES loop's (see `announce_running`): loop-top covers
+    // both a fresh spawn and a supervised service restart, which re-runs
+    // this closure through the spec's spawn.
+    announce_running(&loop_ctx.es, crate::actor::ActorKind::Service).await;
     // The step batch buffer, allocated ONCE per loop task and reused every
     // step (claims move in, commit/restore moves them out; the buffer
     // empties but keeps its capacity).
@@ -3584,6 +3612,24 @@ async fn escalate(
     reason: &str,
     stop_reason: crate::actor::StopReason,
 ) {
+    // The census stop announcement, BEFORE the child's table entries are
+    // dropped: this path (a terminal crash or an exhausted restart
+    // budget) does NOT route through `teardown_tables`, so this is the
+    // only place `Crashed`/`Escalated` reach the fabric. The ES state
+    // entry that identifies the tier is still present here (removed just
+    // below), so the tier read is accurate. Not gated on observation —
+    // a census is not an opt-in observability feature.
+    system
+        .announce_lifecycle(
+            &spec.path,
+            crate::actor::LifecycleState::from(&stop_reason),
+            if system.kernel.lock().es_state.contains_key(&spec.path) {
+                crate::actor::ActorKind::EventSourced
+            } else {
+                crate::actor::ActorKind::Service
+            },
+        )
+        .await;
     {
         let kernel = system.kernel.lock();
         // The child is gone: clear its crash flag (cell-local now) and

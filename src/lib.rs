@@ -42,9 +42,18 @@ pub use crate::json::Json;
 // through the module or the prelude.
 pub use crate::schema::{Command, Event};
 
+// The fabric's own lifecycle announcement, re-exported at the root beside
+// the derive macros: a consumer that wants a census of the fabric reaches
+// for `trouper::ActorLifecycle` and `trouper::LifecycleState` without
+// naming the module they live in.
+pub use crate::actor::{ActorLifecycle, LifecycleState};
+
 /// Everything a typical actor author needs.
 pub mod prelude {
-    pub use crate::actor::{ActorKind, ActorPath, Projector, SnapshotCadence, StopReason};
+    pub use crate::actor::{
+        ActorKind, ActorLifecycle, ActorPath, LifecycleState, Projector, SnapshotCadence,
+        StopReason,
+    };
     pub use crate::builder::{
         spawn_es_builder, spawn_foreign, spawn_projector_builder, spawn_service_builder,
     };

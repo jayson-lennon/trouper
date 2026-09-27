@@ -1206,6 +1206,67 @@ pub enum StopReason {
     Shutdown,
 }
 
+/// The state an actor is in, as announced on the fabric.
+///
+/// Describes states an actor PERSISTS IN, not transitions it passes
+/// through: every variant here is something a subscriber can rely on
+/// holding until the next announcement for the same path. A supervised
+/// restart re-announces [`LifecycleState::Running`] and is
+/// indistinguishable from a fresh spawn — a restart is a transition,
+/// and no transition earns a variant. See [`ActorLifecycle`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum LifecycleState {
+    /// The actor is live and accepting messages.
+    Running,
+    /// The actor finished on its own or was stopped gracefully.
+    Normal,
+    /// A handler panicked and the supervisor declined to restart it.
+    Crashed,
+    /// The restart budget was exhausted; escalated to the parent.
+    Escalated,
+    /// Idled past its passivation window and was evicted from its slot.
+    /// NOT a failure: the actor re-spawns on the next send.
+    Passivated,
+    /// Torn down by the graceful shutdown sweep.
+    Shutdown,
+}
+
+impl From<&crate::actor::StopReason> for LifecycleState {
+    fn from(reason: &crate::actor::StopReason) -> Self {
+        match reason {
+            crate::actor::StopReason::Normal => LifecycleState::Normal,
+            crate::actor::StopReason::Crashed => LifecycleState::Crashed,
+            crate::actor::StopReason::Escalated => LifecycleState::Escalated,
+            crate::actor::StopReason::Passivated => LifecycleState::Passivated,
+            crate::actor::StopReason::Shutdown => LifecycleState::Shutdown,
+        }
+    }
+}
+
+/// An actor's lifecycle, announced on the fabric at every spawn and stop.
+///
+/// A system-level broadcast: the runtime announces it, not the actor, so
+/// a subscriber learns about an actor that publishes nothing of its
+/// own. A consumer that wants a census of the fabric — a status view, a
+/// registry mirror — declares `.handles::<ActorLifecycle>()` and folds
+/// these into whatever shape it displays. Announcing from the system is
+/// also why this is never gated by an actor's `.emits`: no actor ever
+/// emits it.
+///
+/// Two announcements bracket an actor's live window: [`LifecycleState::Running`]
+/// on spawn, and a [`StopReason`]-named state on stop. A supervised
+/// restart re-announces `Running` for the same path.
+#[derive(Debug, Clone, Serialize, Deserialize, crate::schema::Event)]
+#[schema(description = "An actor spawned or stopped.")]
+pub struct ActorLifecycle {
+    /// The actor's path — its identity across restarts.
+    pub path: ActorPath,
+    /// The state the actor is now in.
+    pub state: LifecycleState,
+    /// Which of the two actor contracts it implements.
+    pub kind: ActorKind,
+}
+
 /// How often an event-sourced actor takes journal snapshots. Default: off.
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub enum SnapshotCadence {

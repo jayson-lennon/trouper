@@ -910,6 +910,37 @@ impl ActorSystemCore {
         self.clock.backend_fake()
     }
 
+    /// Announces an actor's lifecycle to every `.handles::<ActorLifecycle>()`
+    /// declarant on the fabric.
+    ///
+    /// SYSTEM-LEVEL by construction: the announcement is issued by the
+    /// runtime, not recorded into an actor's outbox, so it never passes
+    /// through [`crate::kernel::flush_outbox`] and is therefore not
+    /// subject to any actor's `.emits` declaration gate. That is the
+    /// whole point — a census must cover actors that announce nothing
+    /// themselves, and no actor here has declared (or could declare)
+    /// this schema.
+    ///
+    /// Broadcast semantics apply (see [`Self::publish`]): zero handlers
+    /// is a silent no-op, so this is safe to call unconditionally on the
+    /// spawn and stop paths. The stop paths pass through
+    /// [`Self::teardown_tables`], which re-runs for already-dead paths
+    /// but is idempotent — the `was_live` guard there keeps a repeat
+    /// teardown from re-announcing a stop.
+    pub(crate) async fn announce_lifecycle(
+        &self,
+        path: &ActorPath,
+        state: crate::actor::LifecycleState,
+        kind: crate::actor::ActorKind,
+    ) {
+        self.publish(crate::actor::ActorLifecycle {
+            path: path.clone(),
+            state,
+            kind,
+        })
+        .await;
+    }
+
     /// Fills unset mailbox fields from the system defaults.
     fn resolve_opts(&self, opts: SpawnOpts) -> SpawnOpts {
         SpawnOpts {
@@ -1869,6 +1900,18 @@ impl ActorSystemCore {
             let kernel = self.kernel.lock();
             kernel.cells.contains_key(path) || kernel.specs.contains_key(path)
         };
+        // The census stop announcement needs the tier, and the ES state
+        // entry that identifies it is dropped below — so read the tier
+        // here, while the table still holds the answer. Journaled actors
+        // are exactly the ones holding an `es_state` entry.
+        let kind = {
+            let kernel = self.kernel.lock();
+            if kernel.es_state.contains_key(path) {
+                crate::actor::ActorKind::EventSourced
+            } else {
+                crate::actor::ActorKind::Service
+            }
+        };
         // UNDELIVERED → DLQ; then close the inbox. Mark the cell stopping
         // FIRST: a step parked mid-dispatch reads this in its claim
         // guard's drop and dead-letters its in-flight claim (StoppedWithMail)
@@ -1933,7 +1976,7 @@ impl ActorSystemCore {
                     now,
                     crate::observe::ObservationKind::Stopped {
                         path: path.clone(),
-                        reason,
+                        reason: reason.clone(),
                     },
                 ));
                 if let Some(parent) = notified_parent {
@@ -1946,6 +1989,15 @@ impl ActorSystemCore {
                     ));
                 }
             }
+        }
+        // The census stop announcement, OUTSIDE the observation gate: the
+        // census is not an opt-in observability feature, so an actor's
+        // life is announced whether or not a host installed an
+        // observation handler. Gated on `was_live` alone — a repeat
+        // teardown of an already-gone path must not re-announce a stop.
+        if was_live {
+            self.announce_lifecycle(path, crate::actor::LifecycleState::from(&reason), kind)
+                .await;
         }
         let _ = was_live;
     }
@@ -13847,5 +13899,192 @@ mod tests {
 
         // Then delivery completed intact — no panic, all four handled.
         wait_for(|| async { sink_read(&plain).len() == 4 }).await;
+    }
+}
+
+/// The fabric census: `ActorLifecycle` announcements at every spawn and
+/// stop.
+///
+/// These tests pin the contract the message exists to serve — a
+/// subscriber learns about actors that announce nothing themselves, the
+/// announcement is not gated by any actor's `.emits`, and a supervised
+/// restart is indistinguishable from a fresh spawn.
+#[cfg(test)]
+mod lifecycle_census_tests {
+    use super::*;
+    use crate::actor::{ActorLifecycle, LifecycleState, MsgHandler, ServiceActor};
+    use crate::schema::{ActorManifest, Schema};
+
+    /// A subscriber that records every census announcement it receives.
+    ///
+    /// It publishes NOTHING of its own and declares no `.emits` — the
+    /// census must reach it anyway, which is the whole point.
+    struct Census {
+        seen: std::sync::Arc<std::sync::Mutex<Vec<ActorLifecycle>>>,
+    }
+
+    impl ServiceActor for Census {
+        fn manifest() -> ActorManifest {
+            ActorManifest::new()
+        }
+        async fn start(
+            _args: &Json,
+        ) -> Result<Self, error_stack::Report<crate::registry::RegistryError>> {
+            Ok(Self {
+                seen: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+            })
+        }
+    }
+
+    impl MsgHandler<ActorLifecycle> for Census {
+        async fn handle(&mut self, msg: &ActorLifecycle, _ctx: &mut crate::context::MsgCtx<'_>) {
+            self.seen
+                .lock()
+                .expect("census lock")
+                .push(msg.clone());
+        }
+    }
+
+    /// A service actor that emits nothing and handles nothing — the
+    /// actor a per-feature status event would never learn about.
+    struct Quiet;
+
+    impl ServiceActor for Quiet {
+        fn manifest() -> ActorManifest {
+            ActorManifest::new()
+        }
+        async fn start(
+            _args: &Json,
+        ) -> Result<Self, error_stack::Report<crate::registry::RegistryError>> {
+            Ok(Self)
+        }
+    }
+
+    /// Spawns the census subscriber and returns its recording handle.
+    fn subscribe(system: &ActorSystem) -> std::sync::Arc<std::sync::Mutex<Vec<ActorLifecycle>>> {
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        // The actor's own instance is constructed by `start`; hand the
+        // test the SAME Arc by seeding it through the start override.
+        let for_start = seen.clone();
+        crate::builder::spawn_service_builder::<Census>(system)
+            .at(ActorPath::new("census"))
+            .start_with(move || {
+                Box::pin(async move {
+                    Ok(Census {
+                        seen: for_start.clone(),
+                    })
+                })
+            })
+            .handles::<ActorLifecycle>()
+            .start();
+        seen
+    }
+
+    /// Polls until `cond` holds, or fails the test.
+    async fn eventually<F, Fut>(what: &str, cond: F)
+    where
+        F: Fn() -> Fut,
+        Fut: std::future::Future<Output = bool>,
+    {
+        for _ in 0..1_000 {
+            if cond().await {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+        }
+        panic!("condition never became true: {what}");
+    }
+
+    #[tokio::test]
+    async fn a_spawn_announces_running_to_the_census() {
+        // Given a census subscriber on the fabric.
+        let system = ActorSystem::new(SystemConfig::production());
+        let seen = subscribe(&system);
+
+        // When an actor that publishes nothing is spawned.
+        crate::builder::spawn_service_builder::<Quiet>(&system)
+            .at(ActorPath::new("quiet"))
+            .start();
+
+        // Then the subscriber hears `Running` for it, with the service tier.
+        eventually("the Running announcement", || async {
+            seen.lock().expect("census lock").iter().any(|a| {
+                a.path == ActorPath::new("quiet")
+                    && a.state == LifecycleState::Running
+                    && a.kind == crate::actor::ActorKind::Service
+            })
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn the_census_reaches_a_subscriber_that_declared_no_emits() {
+        // Given a census subscriber whose manifest declares no `.emits`.
+        let system = ActorSystem::new(SystemConfig::production());
+        let seen = subscribe(&system);
+
+        // When another actor spawns.
+        crate::builder::spawn_service_builder::<Quiet>(&system)
+            .at(ActorPath::new("emits-free"))
+            .start();
+
+        // Then the announcement lands — the emits gate never saw it,
+        // because a system-level publish does not pass through it. A
+        // regression to an actor-level publish would dead-letter this
+        // as `UndeclaredEmit` instead of delivering it.
+        eventually("the ungated announcement", || async {
+            seen.lock()
+                .expect("census lock")
+                .iter()
+                .any(|a| a.path == ActorPath::new("emits-free"))
+        })
+        .await;
+        let letters = system.drain_dead_letters();
+        assert!(
+            letters.is_empty(),
+            "an ungated census announcement dead-lettered: {letters:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_stop_announces_the_stop_reason() {
+        // Given a census subscriber and a live actor.
+        let system = ActorSystem::new(SystemConfig::production());
+        let seen = subscribe(&system);
+        let path = ActorPath::new("stoppable");
+        crate::builder::spawn_service_builder::<Quiet>(&system)
+            .at(path.clone())
+            .start();
+        eventually("the spawn announcement", || async {
+            seen.lock()
+                .expect("census lock")
+                .iter()
+                .any(|a| a.path == path)
+        })
+        .await;
+
+        // When it is stopped.
+        system.stop(&path).await;
+
+        // Then the stop reason is announced as itself, not as a generic
+        // "dead" — `Normal` here.
+        eventually("the stop announcement", || async {
+            seen.lock()
+                .expect("census lock")
+                .iter()
+                .any(|a| a.path == path && a.state == LifecycleState::Normal)
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn the_lifecycle_schema_registers_under_the_bare_type_name() {
+        // Given the census message type itself.
+        // When reading its schema id.
+        let id = ActorLifecycle::schema_id().to_string();
+
+        // Then it is the bare type name (no version component), so a
+        // consumer naming the type is guaranteed to share the schema.
+        assert_eq!(id, "ActorLifecycle", "schema id was {id}");
     }
 }
