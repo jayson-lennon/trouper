@@ -51,7 +51,7 @@ Entries are added or amended **only with human approval**.
 - (runtime) Actor `manifest()` defaults to an empty manifest; builders supply the contract kind and edges, making builder declarations the single source of an actor's declared surface.
 - (runtime) The ActorSystem exposes typed `tell` and `ask` entry points; ask is lease-backed with a mandatory timeout and settles with the same Replied/Timeout/Failed observations as in-actor asks.
 - (runtime) Event emission is declaration-filtered: the kernel drops events whose schema the actor has not declared, before journal append, with a dead-letter and a tracing error; journals therefore contain only declared schemas.
-- (runtime) Outbound actor messages are declaration-enforced: every intent an actor records (send, publish, send_to_any, reply) is gated at flush against the actor's .emits, and undeclared messages drop with an UndeclaredEmit dead letter plus a tracing error.
+- (runtime) Outbound actor messages are declaration-enforced: every intent an actor records (send, publish, send_to_any, reply) is gated at flush against the actor's .emits, except a send whose destination is the actor's own path, and undeclared messages drop with an UndeclaredEmit dead letter plus a tracing error.
 - (runtime) Partition sets are declarative specs resolved by the kernel at route time: senders keep addressing the public path; per-entity paths derive from a schema-declared shard key and entities activate on demand.
 - (runtime) Service-actor asks are lease-backed: every ask carries a mandatory timeout, the reply slot is a runtime lease that dies with the ask, and outcomes (Replied/Timeout/Failed) are observations.
 - (observability) Runtime observation is opt-in: a single user-installed handler closure (`ObservationHandler`); with no handler installed no observation messages are constructed. JSON projection exists only at the observation boundary (`Observation::to_json`).
@@ -62,7 +62,7 @@ Entries are added or amended **only with human approval**.
 - (runtime) A ReportState command makes a StateReporter actor emit a journaled StateReported event whose payload is the JSON SystemExport document.
 - (runtime) Domain outcomes are events journaled like any other event; technical failures are handler panics, which supervision converts into restarts and `Failed`/`Escalated` observations.
 - (runtime) All synchronous mutexes are parking_lot: lock() cannot fail, there is no poisoning, and a panic under a lock never wedges later lockers.
-- (runtime) Replies are point-to-point: a reply with no reply_to is dropped silently, never broadcast; every outbound actor message requires a declared .emits and is dropped with an UndeclaredEmit dead letter otherwise.
+- (runtime) Replies are point-to-point: a reply with no reply_to is dropped silently, never broadcast; every outbound actor message requires a declared .emits — except a send addressed to the actor's own path — and is dropped with an UndeclaredEmit dead letter otherwise.
 - (runtime) Handler contexts (CmdCtx/MsgCtx) expose only tier-curated methods; the outbox, trace, and ask port are crate-private plumbing.
 - (runtime) Handler effects are typed: ctx reply/publish/send take Message values by value (Schema + PayloadValue), derive the schema id from the type, and wrap the live value into the fabric at intent time (zero serde); raw value escape hatches remain (\*\_json methods, Event::new, into_inner).
 - (values) The runtime's public value type is trouper::Json, a newtype over the internal JSON tree; serde_json types do not appear in public signatures.
@@ -73,7 +73,9 @@ Entries are added or amended **only with human approval**.
 - (routing) A declared edge accepts any payload under its schema name, delivered as the registered type.
 - (queries) Typed asks deliver typed replies through lease slots; a reply type mismatch surfaces as a named ask error.
 - (runtime) Spawn arguments are provided as typed Serialize values on builders and decoded in restore via Json; partition entities receive the shard key merged as a "key" field.
-- (contexts) MsgCtx exposes typed send/publish/send_to_any/ask/reply/stop_self, all emits-gated at flush; CmdCtx is pure introspection — an event-sourced entity announces only by returning facts from its decision.
+- (contexts) MsgCtx exposes typed send/publish/send_to_any/ask/reply/stop_self/schedule_self, all emits-gated at flush except a send addressed to the actor's own path; CmdCtx is pure introspection — an event-sourced entity announces only by returning facts from its decision.
+- (scheduling) MsgCtx::schedule_self delivers a message to the calling actor after a caller-supplied std::time::Duration counted from the call; the delayed delivery is a system-root send riding the ordinary tell path, and cadence is the caller's placement (top of handler = fixed interval, end = gap between work).
+- (scheduling) ServiceBuilder::kickoff arms one delayed self-delivery when the spawned actor goes live, and a supervised restart re-arms it (the spawn closure re-runs the whole builder chain).
 - (lifecycle) A trouper actor's on_stop hook runs on graceful stop, self-stop, passivation, and the shutdown sweep; never on crash or hard shutdown.
 - (lifecycle) Service actors receive an async on_stop(&mut self); event-sourced actors receive a sync on_stop(&self).
 - (lifecycle) stop_self() records a deferred intent; the actor stops after the current message commits, flushing pending sends in order.
