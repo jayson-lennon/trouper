@@ -8,9 +8,11 @@
 //! observation nobody captures is gone. The dead-letter queue is the
 //! only after-the-fact artifact the runtime keeps on its own.
 //!
-//! Install a handler with [`crate::ActorSystem::set_observation`] (or at
-//! config time); remove it with
-//! [`crate::ActorSystem::clear_observation`]. The handler is invoked
+//! Install a handler with
+//! [`ActorSystem::set_observation`](crate::system::ActorSystemCore::set_observation)
+//! (or at config time); remove it with
+//! [`ActorSystem::clear_observation`](crate::system::ActorSystemCore::clear_observation).
+//! The handler is invoked
 //! synchronously at the emission site.
 //!
 //! # Handler rules

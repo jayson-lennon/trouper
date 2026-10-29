@@ -19,6 +19,7 @@ use crate::actor::{
     CommandEntry, ForeignCommandEntry, ForeignDecision, ForeignEsState, ForeignFold, MsgEntry,
     ServiceActor, TypedEsAdapter, TypedServiceAdapter,
 };
+use crate::envelope::{Address, Envelope};
 use crate::json::Json;
 use crate::schema::Schema;
 use crate::schema::SchemaId;
@@ -61,6 +62,7 @@ pub fn spawn_service_builder<A: ServiceActor>(
         entries: Vec::new(),
         emits: Vec::new(),
         opts: SpawnOpts::default(),
+        kickoff: None,
         _actor: std::marker::PhantomData,
     }
 }
@@ -238,6 +240,7 @@ pub struct ServiceBuilder<A: ServiceActor> {
     entries: Vec<Arc<dyn MsgEntry>>,
     emits: Vec<SchemaId>,
     opts: SpawnOpts,
+    kickoff: Option<(SchemaId, crate::envelope::Payload, std::time::Duration)>,
     _actor: std::marker::PhantomData<fn(&A)>,
 }
 
@@ -315,7 +318,11 @@ impl<A: ServiceActor> ServiceBuilder<A> {
     /// declared here, as an `UndeclaredEmit` dead letter — a service actor
     /// publishing undeclared schemas never silently delivers. Declared
     /// edges are published in the manifest so the export/GUI shows the
-    /// actor's outputs.
+    /// actor's outputs. One exemption: a send addressed to the actor's
+    /// own path is always allowed — self-messages are self-contained,
+    /// not system edges (see
+    /// [`MsgCtx::schedule_self`](crate::context::MsgCtx::schedule_self)
+    /// and [`Self::kickoff`]).
     ///
     /// `E`'s schema descriptor is registered into the schema table here,
     /// at the declaration site.
@@ -324,6 +331,33 @@ impl<A: ServiceActor> ServiceBuilder<A> {
         if !self.emits.contains(&E::schema_id()) {
             self.emits.push(E::schema_id());
         }
+        self
+    }
+
+    /// Arms one self-delivery of `msg` at `delay` after the actor goes
+    /// live: the first tick of a self-driven loop, declared once at the
+    /// spawn site. The delivery is a system-root send addressed to the
+    /// actor's own path — not subject to `.emits` — and requires a
+    /// `.handles::<M>()` declaration like any inbound message. The delay
+    /// counts from when the timer task arms (immediately after
+    /// registration, which `start` completes synchronously).
+    ///
+    /// Self-perpetuating ticks call
+    /// [`MsgCtx::schedule_self`](crate::context::MsgCtx::schedule_self)
+    /// from the handler to rearm; a supervised restart needs nothing
+    /// extra — the
+    /// spawn closure (this whole builder chain) re-runs, rearming the
+    /// kick. Fire-and-forget: a kick aimed at an actor that has already
+    /// stopped merely dead-letters.
+    ///
+    /// Service builders only — an event-sourced actor's timeline is its
+    /// journal, not the wall clock.
+    pub fn kickoff<M>(mut self, msg: M, delay: std::time::Duration) -> Self
+    where
+        M: crate::schema::Message + crate::envelope::PayloadValue,
+    {
+        self.system.register_schema::<M>();
+        self.kickoff = Some((M::schema_id(), crate::envelope::Payload::value(msg), delay));
         self
     }
 
@@ -403,6 +437,29 @@ impl<A: ServiceActor> ServiceBuilder<A> {
             self.opts,
             start,
         );
+        // Arm the kickoff AFTER the spawn call returns: registration is
+        // synchronous (slot + routes + inbox exist by here), so a timer
+        // firing at any delay — even zero — resolves its destination. The
+        // delivery queues behind whatever the actor is already doing, as
+        // an ordinary tell. A supervised restart re-runs this whole
+        // builder chain (the spawn closure IS the caller's builder run),
+        // rearming the kick for free.
+        if let Some((schema, payload, delay)) = self.kickoff {
+            let system = self.system.clone();
+            let kick_dest = path.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(delay).await;
+                let envelope = Envelope::raw(
+                    schema,
+                    Address::Path(kick_dest.clone()),
+                    payload,
+                    crate::envelope::TraceCtx::root(),
+                )
+                .from(kick_dest);
+                // A failed send only means the actor is already stopping.
+                let _ = system.send(envelope).await;
+            });
+        }
         path
     }
 }

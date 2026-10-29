@@ -109,8 +109,8 @@ pub struct SystemConfig {
     /// The observation handler installed at startup (opt-in; `None` = off,
     /// the default — with no handler installed no observation is ever
     /// constructed). Install or remove later via
-    /// [`ActorSystem::set_observation`](ActorSystem::set_observation) /
-    /// [`ActorSystem::clear_observation`](ActorSystem::clear_observation).
+    /// [`ActorSystemCore::set_observation`] /
+    /// [`ActorSystemCore::clear_observation`].
     pub observation: Option<crate::observe::ObservationHandler>,
     /// Default mailbox capacity and overload policy for spawned actors
     /// (per-spawn [`SpawnOpts`] override these).
@@ -331,7 +331,7 @@ impl ActorSystem {
     }
 
     /// Fires every supervised child's shutdown watcher: each
-    /// [`crate::kernel::supervise_child`] loop exits instead of restarting
+    /// `crate::kernel::supervise_child` loop exits instead of restarting
     /// its child. Idempotent; children spawned after the call are not
     /// covered until the next call.
     pub fn shutdown(&self) {
@@ -531,7 +531,7 @@ pub enum EdgeDirection {
 
 /// One observed edge: aggregated send traffic.
 ///
-/// Under opt-in observation there is no send history: [`ActorSystem::export`]
+/// Under opt-in observation there is no send history: [`ActorSystemCore::export`]
 /// counts `Sent` observations that flow during the export's own await
 /// points (its temporary counting handler replaces whatever handler was
 /// installed and leaves observation off afterwards), so a quiet system
@@ -13938,10 +13938,7 @@ mod lifecycle_census_tests {
 
     impl MsgHandler<ActorLifecycle> for Census {
         async fn handle(&mut self, msg: &ActorLifecycle, _ctx: &mut crate::context::MsgCtx<'_>) {
-            self.seen
-                .lock()
-                .expect("census lock")
-                .push(msg.clone());
+            self.seen.lock().expect("census lock").push(msg.clone());
         }
     }
 
@@ -14086,5 +14083,682 @@ mod lifecycle_census_tests {
         // Then it is the bare type name (no version component), so a
         // consumer naming the type is guaranteed to share the schema.
         assert_eq!(id, "ActorLifecycle", "schema id was {id}");
+    }
+}
+
+/// Self-messaging: the emit gate's self-address exemption,
+/// [`crate::context::MsgCtx::schedule_self`], and
+/// [`crate::builder::ServiceBuilder::kickoff`].
+///
+/// Timing note: these tests use REAL timers (10–60ms) — the system's
+/// `FakeClock` drives trouper's internal duties, never the test actors'
+/// `tokio::time::sleep`. Deadlines carry wide margins against CI jitter.
+#[cfg(test)]
+mod self_messaging_tests {
+    use std::sync::Arc;
+
+    use parking_lot::Mutex;
+    use serde::{Deserialize, Serialize};
+
+    use crate::actor::{ActorKind, ActorPath, MsgHandler, ServiceActor};
+    use crate::builder::spawn_service_builder;
+    use crate::context::MsgCtx;
+    use crate::envelope::Address;
+    use crate::json;
+    use crate::json::Json;
+    use crate::schema::{ActorManifest, Command, Event, Schema};
+    use crate::supervision::{ActorSpec, Backoff, RestartBudget, RestartPolicy};
+    use crate::system::ActorSystem;
+
+    /// The self-scheduled tick marker.
+    #[derive(Command, Serialize, Deserialize, Clone)]
+    struct Tick;
+
+    /// The kick command (schedule_self's trigger in the handler tests).
+    #[derive(Command, Serialize, Deserialize, Clone)]
+    struct Kick;
+
+    /// A plain work command carrying a tag.
+    #[derive(Command, Serialize, Deserialize, Clone)]
+    struct Work {
+        tag: String,
+    }
+
+    /// An undeclared published schema (the gate's contraband).
+    #[derive(Event, Serialize, Deserialize, Clone)]
+    struct Smuggled {
+        n: i64,
+    }
+
+    /// Shared recording sink (per-test Arc, seeded through `start_with`).
+    type Sink = Arc<Mutex<Vec<String>>>;
+
+    /// Polls until `cond` holds (≈2s budget), or fails the test.
+    async fn eventually<F, Fut>(what: &str, cond: F)
+    where
+        F: Fn() -> Fut,
+        Fut: std::future::Future<Output = bool>,
+    {
+        for _ in 0..1_000 {
+            if cond().await {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+        }
+        panic!("condition never became true: {what}");
+    }
+
+    // ------------------------------------------------------------------
+    // Gate exemption actors.
+    // ------------------------------------------------------------------
+
+    /// The outbound effect a `GateProbe` runs before recording its tag.
+    type Effect = fn(&mut Sink, &mut MsgCtx<'_>);
+
+    /// A gate test actor: handles `Work`, runs the configured outbound
+    /// effect, then records the tag. Declares NO `.emits` — anything
+    /// that delivers survived the gate without a declaration.
+    struct GateProbe {
+        sink: Sink,
+        effect: Effect,
+    }
+    impl ServiceActor for GateProbe {
+        fn manifest() -> ActorManifest {
+            ActorManifest::new().kind(ActorKind::Service)
+        }
+        async fn start(
+            _args: &Json,
+        ) -> Result<Self, error_stack::Report<crate::registry::RegistryError>> {
+            panic!("built through start_with only")
+        }
+    }
+    impl MsgHandler<Work> for GateProbe {
+        async fn handle(&mut self, msg: &Work, ctx: &mut MsgCtx<'_>) {
+            (self.effect)(&mut self.sink, ctx);
+            self.sink.lock().push(msg.tag.clone());
+        }
+    }
+    impl MsgHandler<Tick> for GateProbe {
+        async fn handle(&mut self, _msg: &Tick, ctx: &mut MsgCtx<'_>) {
+            self.sink.lock().push("tick".to_owned());
+            let _ = ctx;
+        }
+    }
+
+    /// Spawns a `GateProbe` at `path` (opts tweakable); returns the sink.
+    fn probe(
+        system: &ActorSystem,
+        path: &ActorPath,
+        effect: Effect,
+        opts: impl FnOnce(
+            crate::builder::ServiceBuilder<GateProbe>,
+        ) -> crate::builder::ServiceBuilder<GateProbe>,
+    ) -> Sink {
+        let sink: Sink = Arc::new(Mutex::new(Vec::new()));
+        let for_start = sink.clone();
+        let builder = spawn_service_builder::<GateProbe>(system)
+            .at(path.clone())
+            .start_with(move || {
+                Box::pin(async move {
+                    Ok(GateProbe {
+                        sink: for_start.clone(),
+                        effect,
+                    })
+                })
+            })
+            .handles::<Work>()
+            .handles::<Tick>();
+        opts(builder).start();
+        sink
+    }
+
+    #[tokio::test]
+    async fn a_self_addressed_send_is_ungated_without_declared_emits() {
+        // Given a service actor with NO `.emits`, whose handler sends a
+        // Tick to its OWN path.
+        let (system, _clock) = ActorSystem::test();
+        let path = ActorPath::new("self-sender");
+        fn self_send(_sink: &mut Sink, ctx: &mut MsgCtx<'_>) {
+            ctx.send(Address::Path(ctx.self_path().clone()), Tick, None);
+        }
+        let sink = probe(&system, &path, self_send, |b| b);
+
+        // When it receives one command.
+        system
+            .tell(path.clone(), Work { tag: "go".into() })
+            .await
+            .expect("delivered");
+
+        // Then the self-send comes back around and is handled — the
+        // gate exempted it despite zero declared emits.
+        eventually("the self-delivered tick", || async {
+            sink.lock().as_slice() == ["go", "tick"]
+        })
+        .await;
+        assert!(
+            system.drain_dead_letters().is_empty(),
+            "a self-send must never dead-letter as UndeclaredEmit"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_publish_stays_gated_even_from_the_actor_to_itself() {
+        // Given the same emits-free actor, publishing a schema (a
+        // broadcast — never a point-to-point self-send).
+        let (system, _clock) = ActorSystem::test();
+        let path = ActorPath::new("self-publisher");
+        system.register_schema::<Smuggled>();
+        fn publish_smuggled(_sink: &mut Sink, ctx: &mut MsgCtx<'_>) {
+            ctx.publish(Smuggled { n: 1 });
+        }
+        let sink = probe(&system, &path, publish_smuggled, |b| b);
+
+        // When it receives one command.
+        system
+            .tell(path.clone(), Work { tag: "go".into() })
+            .await
+            .expect("delivered");
+
+        // Then the publish is STILL gated — the exemption is Send + own
+        // path only, so broadcasts keep their declaration requirement.
+        eventually("the UndeclaredEmit drop", || async {
+            system
+                .dead_letter_schemas()
+                .contains(&Smuggled::schema_id())
+        })
+        .await;
+        let letters = system.drain_dead_letters();
+        assert_eq!(letters.len(), 1);
+        assert_eq!(
+            letters[0].reason,
+            crate::kernel::DeadLetterReason::UndeclaredEmit
+        );
+        assert_eq!(letters[0].schema, Smuggled::schema_id());
+        assert_eq!(sink.lock().as_slice(), ["go"], "the actor kept running");
+    }
+
+    // ------------------------------------------------------------------
+    // schedule_self.
+    // ------------------------------------------------------------------
+
+    /// A self-ticking probe: on `Kick` it schedules ONE Tick at `delay`
+    /// (the `delay` also serves as the kickoff test's zero-delay knob).
+    struct OneShotTicker {
+        sink: Sink,
+        delay: std::time::Duration,
+    }
+    impl ServiceActor for OneShotTicker {
+        fn manifest() -> ActorManifest {
+            ActorManifest::new().kind(ActorKind::Service)
+        }
+        async fn start(
+            _args: &Json,
+        ) -> Result<Self, error_stack::Report<crate::registry::RegistryError>> {
+            panic!("built through start_with only")
+        }
+    }
+    impl MsgHandler<Kick> for OneShotTicker {
+        async fn handle(&mut self, _msg: &Kick, ctx: &mut MsgCtx<'_>) {
+            ctx.schedule_self(Tick, self.delay);
+        }
+    }
+    impl MsgHandler<Tick> for OneShotTicker {
+        async fn handle(&mut self, _msg: &Tick, _ctx: &mut MsgCtx<'_>) {
+            self.sink.lock().push("tick".to_owned());
+        }
+    }
+
+    #[tokio::test]
+    async fn schedule_self_delivers_to_self_after_the_delay() {
+        // Given a ticker whose Kick schedules one Tick 40ms out.
+        let (system, _clock) = ActorSystem::test();
+        let path = ActorPath::new("one-shot");
+        let sink = Arc::new(Mutex::new(Vec::new()));
+        let for_start = sink.clone();
+        spawn_service_builder::<OneShotTicker>(&system)
+            .at(path.clone())
+            .start_with(move || {
+                Box::pin(async move {
+                    Ok(OneShotTicker {
+                        sink: for_start.clone(),
+                        delay: std::time::Duration::from_millis(40),
+                    })
+                })
+            })
+            .handles::<Kick>()
+            .handles::<Tick>()
+            .start();
+
+        // When it is kicked.
+        system
+            .tell(path.clone(), Kick)
+            .await
+            .expect("kick delivered");
+
+        // Then exactly one tick lands (a one-shot, not a recurrence).
+        eventually("the scheduled tick", || async {
+            sink.lock().as_slice() == ["tick"]
+        })
+        .await;
+        tokio::time::sleep(std::time::Duration::from_millis(120)).await;
+        assert_eq!(sink.lock().len(), 1, "schedule_self must not recur");
+        assert!(system.drain_dead_letters().is_empty());
+    }
+
+    /// A metronome: reschedules itself from either the TOP of the tick
+    /// handler (fixed cadence) or the END (gap between work), with real
+    /// handler work between. Five ticks, then it stops.
+    struct Metronome {
+        stamps: Arc<Mutex<Vec<std::time::Instant>>>,
+        delay: std::time::Duration,
+        work: std::time::Duration,
+        top: bool,
+    }
+    impl ServiceActor for Metronome {
+        fn manifest() -> ActorManifest {
+            ActorManifest::new().kind(ActorKind::Service)
+        }
+        async fn start(
+            _args: &Json,
+        ) -> Result<Self, error_stack::Report<crate::registry::RegistryError>> {
+            panic!("built through start_with only")
+        }
+    }
+    impl MsgHandler<Tick> for Metronome {
+        async fn handle(&mut self, _msg: &Tick, ctx: &mut MsgCtx<'_>) {
+            if self.stamps.lock().len() < 5 {
+                if self.top {
+                    ctx.schedule_self(Tick, self.delay);
+                }
+                tokio::time::sleep(self.work).await;
+                if !self.top {
+                    ctx.schedule_self(Tick, self.delay);
+                }
+            }
+            self.stamps.lock().push(std::time::Instant::now());
+        }
+    }
+
+    #[tokio::test]
+    async fn schedule_self_cadence_follows_the_call_placement() {
+        // Given two metronomes: 60ms delay, 30ms of handler work, one
+        // scheduling at the TOP of the handler, one at the END. A single
+        // initial Tick starts each loop; the rest is self-scheduled.
+        let (system, _clock) = ActorSystem::test();
+        let spawn = |path: &ActorPath, top: bool| {
+            let stamps = Arc::new(Mutex::new(Vec::new()));
+            let for_start = stamps.clone();
+            spawn_service_builder::<Metronome>(&system)
+                .at(path.clone())
+                .start_with(move || {
+                    Box::pin(async move {
+                        Ok(Metronome {
+                            stamps: for_start.clone(),
+                            delay: std::time::Duration::from_millis(60),
+                            work: std::time::Duration::from_millis(30),
+                            top,
+                        })
+                    })
+                })
+                .handles::<Tick>()
+                .start();
+            stamps
+        };
+        let top_path = ActorPath::new("metro-top");
+        let end_path = ActorPath::new("metro-end");
+        let top_stamps = spawn(&top_path, true);
+        let end_stamps = spawn(&end_path, false);
+        system.tell(top_path, Tick).await.expect("top started");
+        system.tell(end_path, Tick).await.expect("end started");
+
+        // When both run their five ticks.
+        eventually("the top metronome finishes", || async {
+            top_stamps.lock().len() >= 6
+        })
+        .await;
+        eventually("the end metronome finishes", || async {
+            end_stamps.lock().len() >= 6
+        })
+        .await;
+
+        // Then the intervals show the placement: top-of-handler ticks
+        // come back at the bare delay (fixed cadence — the next schedule
+        // is armed before the work); end-of-handler ticks at delay +
+        // work (a gap between completing one unit and the next).
+        let mean_ms = |stamps: &Arc<Mutex<Vec<std::time::Instant>>>| -> f64 {
+            let stamps = stamps.lock();
+            let deltas: Vec<u128> = stamps
+                .windows(2)
+                .map(|w| w[1].duration_since(w[0]).as_millis())
+                .collect();
+            deltas.iter().sum::<u128>() as f64 / deltas.len() as f64
+        };
+        let top_mean = mean_ms(&top_stamps);
+        let end_mean = mean_ms(&end_stamps);
+        assert!(
+            top_mean + 15.0 < end_mean,
+            "top-of-handler cadence ({top_mean}ms) must be tighter than end-of-handler ({end_mean}ms)"
+        );
+        for mean in [top_mean, end_mean] {
+            assert!(
+                (40.0..150.0).contains(&mean),
+                "interval {mean}ms left the plausible band"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_scheduled_self_type_without_a_handler_dead_letters() {
+        // Given an actor that schedules a Tick 20ms out, but declares no
+        // Tick handler.
+        let (system, _clock) = ActorSystem::test();
+        let path = ActorPath::new("self-deadletter");
+        struct Deaf;
+        impl ServiceActor for Deaf {
+            fn manifest() -> ActorManifest {
+                ActorManifest::new().kind(ActorKind::Service)
+            }
+            async fn start(
+                _args: &Json,
+            ) -> Result<Self, error_stack::Report<crate::registry::RegistryError>> {
+                Ok(Self)
+            }
+        }
+        impl MsgHandler<Kick> for Deaf {
+            async fn handle(&mut self, _msg: &Kick, ctx: &mut MsgCtx<'_>) {
+                ctx.schedule_self(Tick, std::time::Duration::from_millis(20));
+            }
+        }
+        spawn_service_builder::<Deaf>(&system)
+            .at(path.clone())
+            .handles::<Kick>()
+            .start();
+
+        // When the tick fires.
+        system.tell(path.clone(), Kick).await.expect("kicked");
+        eventually("the dead letter", || async {
+            system.dead_letter_schemas().contains(&Tick::schema_id())
+        })
+        .await;
+
+        // Then the self-delivery died at dispatch — no handler for the
+        // schema — loudly, as `UnknownSchema`.
+        let letters = system.drain_dead_letters();
+        assert_eq!(letters.len(), 1);
+        assert_eq!(
+            letters[0].reason,
+            crate::kernel::DeadLetterReason::UnknownSchema
+        );
+
+        // And the actor survived the failed self-delivery.
+        system
+            .tell(path.clone(), Kick)
+            .await
+            .expect("the actor is still there");
+    }
+
+    #[tokio::test]
+    async fn a_pending_timer_firing_after_a_stop_fails_harmlessly() {
+        // Given an actor whose handler schedules one Tick 40ms out.
+        let (system, _clock) = ActorSystem::test();
+        let path = ActorPath::new("stops-soon");
+        fn schedule_tick(_sink: &mut Sink, ctx: &mut MsgCtx<'_>) {
+            ctx.schedule_self(Tick, std::time::Duration::from_millis(40));
+        }
+        let sink = probe(&system, &path, schedule_tick, |b| b);
+
+        // When the actor is stopped before the delay elapses.
+        system
+            .tell(path.clone(), Work { tag: "go".into() })
+            .await
+            .expect("delivered");
+        eventually("the command ran", || async {
+            sink.lock().as_slice() == ["go"]
+        })
+        .await;
+        system.stop(&path).await;
+        tokio::time::sleep(std::time::Duration::from_millis(120)).await;
+
+        // Then the timer fired into a dead path: no panic, no delivery,
+        // a dead letter for the late tick.
+        assert_eq!(
+            sink.lock().as_slice(),
+            ["go"],
+            "the stopped actor must not process the late tick"
+        );
+        let letters = system.drain_dead_letters();
+        assert!(
+            letters.iter().any(|l| l.schema == Tick::schema_id()
+                && l.reason == crate::kernel::DeadLetterReason::Unresolvable),
+            "the late tick should dead-letter as Unresolvable: {letters:?}"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // kickoff.
+    // ------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn kickoff_delivers_one_tick_after_the_delay() {
+        // Given a builder spawning with a 40ms kickoff.
+        let (system, _clock) = ActorSystem::test();
+        let path = ActorPath::new("kicked");
+        let sink: Sink = Arc::new(Mutex::new(Vec::new()));
+        let for_start = sink.clone();
+        spawn_service_builder::<OneShotTicker>(&system)
+            .at(path.clone())
+            .start_with(move || {
+                Box::pin(async move {
+                    Ok(OneShotTicker {
+                        sink: for_start.clone(),
+                        delay: std::time::Duration::ZERO,
+                    })
+                })
+            })
+            .handles::<Tick>()
+            .kickoff(Tick, std::time::Duration::from_millis(40))
+            .start();
+
+        // Then the tick arrives once, without anyone kicking the actor.
+        eventually("the kickoff tick", || async {
+            sink.lock().as_slice() == ["tick"]
+        })
+        .await;
+        tokio::time::sleep(std::time::Duration::from_millis(120)).await;
+        assert_eq!(sink.lock().len(), 1, "kickoff is one-shot");
+        assert!(system.drain_dead_letters().is_empty());
+    }
+
+    /// A seeder: relays `Work` to the target on `Kick` (a declared
+    /// edge — the seeder's cross-actor send must be gated-clean too).
+    struct Seeder {
+        target: ActorPath,
+    }
+    impl ServiceActor for Seeder {
+        fn manifest() -> ActorManifest {
+            ActorManifest::new()
+                .emits::<Work>()
+                .kind(ActorKind::Service)
+        }
+        async fn start(
+            _args: &Json,
+        ) -> Result<Self, error_stack::Report<crate::registry::RegistryError>> {
+            panic!("built through start_with only")
+        }
+    }
+    impl MsgHandler<Kick> for Seeder {
+        async fn handle(&mut self, _msg: &Kick, ctx: &mut MsgCtx<'_>) {
+            ctx.send(
+                Address::Path(self.target.clone()),
+                Work {
+                    tag: "seeded".into(),
+                },
+                None,
+            );
+        }
+    }
+
+    /// A work-and-tick recorder for the kickoff ordering test.
+    struct Recorder {
+        sink: Sink,
+    }
+    impl ServiceActor for Recorder {
+        fn manifest() -> ActorManifest {
+            ActorManifest::new().kind(ActorKind::Service)
+        }
+        async fn start(
+            _args: &Json,
+        ) -> Result<Self, error_stack::Report<crate::registry::RegistryError>> {
+            panic!("built through start_with only")
+        }
+    }
+    impl MsgHandler<Work> for Recorder {
+        async fn handle(&mut self, msg: &Work, _ctx: &mut MsgCtx<'_>) {
+            self.sink.lock().push(msg.tag.clone());
+        }
+    }
+    impl MsgHandler<Tick> for Recorder {
+        async fn handle(&mut self, _msg: &Tick, _ctx: &mut MsgCtx<'_>) {
+            self.sink.lock().push("tick".to_owned());
+        }
+    }
+
+    #[tokio::test]
+    async fn a_zero_delay_kickoff_queues_behind_earlier_mail() {
+        // Given a target with a 60ms kickoff, and a seeder that relays
+        // work to it on kick (long before the 60ms elapses).
+        let (system, _clock) = ActorSystem::test();
+        let target = ActorPath::new("zero-kick");
+        let seeder_path = ActorPath::new("seeder");
+        let sink: Sink = Arc::new(Mutex::new(Vec::new()));
+        let for_start = sink.clone();
+        spawn_service_builder::<Recorder>(&system)
+            .at(target.clone())
+            .start_with(move || {
+                Box::pin(async move {
+                    Ok(Recorder {
+                        sink: for_start.clone(),
+                    })
+                })
+            })
+            .handles::<Work>()
+            .handles::<Tick>()
+            .kickoff(Tick, std::time::Duration::from_millis(60))
+            .start();
+        let for_start = target.clone();
+        spawn_service_builder::<Seeder>(&system)
+            .at(seeder_path.clone())
+            .start_with(move || {
+                Box::pin(async move {
+                    Ok(Seeder {
+                        target: for_start.clone(),
+                    })
+                })
+            })
+            .handles::<Kick>()
+            .start();
+
+        // When the seed lands long before the kickoff fires.
+        system.tell(seeder_path, Kick).await.expect("seeded");
+
+        // Then the earlier mail is processed first: FIFO holds, and the
+        // kick never jumps the queue.
+        eventually("both messages", || async {
+            sink.lock().as_slice() == ["seeded", "tick"]
+        })
+        .await;
+    }
+
+    /// A supervised probe that crashes on `Work{tag: "poison"}` and
+    /// records ticks and work tags.
+    struct Phoenix {
+        sink: Sink,
+    }
+    impl ServiceActor for Phoenix {
+        fn manifest() -> ActorManifest {
+            ActorManifest::new().kind(ActorKind::Service)
+        }
+        async fn start(
+            _args: &Json,
+        ) -> Result<Self, error_stack::Report<crate::registry::RegistryError>> {
+            panic!("built through start_with only")
+        }
+    }
+    impl MsgHandler<Work> for Phoenix {
+        async fn handle(&mut self, msg: &Work, _ctx: &mut MsgCtx<'_>) {
+            if msg.tag == "poison" {
+                panic!("injected crash for the kickoff restart test");
+            }
+            self.sink.lock().push(msg.tag.clone());
+        }
+    }
+    impl MsgHandler<Tick> for Phoenix {
+        async fn handle(&mut self, _msg: &Tick, _ctx: &mut MsgCtx<'_>) {
+            self.sink.lock().push("tick".to_owned());
+        }
+    }
+
+    #[tokio::test]
+    async fn a_supervised_restart_rearms_the_kickoff() {
+        // Given a supervised Phoenix whose spawn closure is a builder
+        // chain ending in `.kickoff(Tick, 40ms)`.
+        let (system, _clock) = ActorSystem::test();
+        let child = ActorPath::new("kick-phoenix");
+        let sink: Sink = Arc::new(Mutex::new(Vec::new()));
+        let spec = ActorSpec {
+            path: child.clone(),
+            parent: None,
+            restart: RestartPolicy::Permanent,
+            budget: RestartBudget::per(5, std::time::Duration::from_secs(10)),
+            backoff: Backoff {
+                base: std::time::Duration::from_millis(5),
+                max: std::time::Duration::from_millis(20),
+                factor: 2.0,
+            },
+            args: json!({}),
+            spawn: {
+                let sink = sink.clone();
+                let child = child.clone();
+                Arc::new(move |sys: &ActorSystem, _path: &ActorPath, _args: &Json| {
+                    let sink = sink.clone();
+                    let child = child.clone();
+                    spawn_service_builder::<Phoenix>(sys)
+                        .at(child.clone())
+                        .start_with(move || {
+                            let sink = sink.clone();
+                            Box::pin(async move { Ok(Phoenix { sink }) })
+                        })
+                        .handles::<Work>()
+                        .handles::<Tick>()
+                        .kickoff(Tick, std::time::Duration::from_millis(40))
+                        .start();
+                })
+            },
+        };
+        system.spawn(spec);
+        eventually("the first spawn's tick", || async {
+            sink.lock().as_slice() == ["tick"]
+        })
+        .await;
+
+        // When the actor crashes (a poison message) and supervision
+        // restarts it by re-running the spawn closure.
+        system
+            .tell(
+                child.clone(),
+                Work {
+                    tag: "poison".into(),
+                },
+            )
+            .await
+            .expect("poison delivered");
+        eventually("the restart re-kick", || async {
+            sink.lock().as_slice() == ["tick", "tick"]
+        })
+        .await;
+
+        // Then the fresh instance received its own kick: the builder
+        // chain re-ran, rearming the kickoff with no extra code.
+        assert!(system.drain_dead_letters().is_empty());
     }
 }

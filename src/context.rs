@@ -7,6 +7,8 @@
 //! Lookups from inside a handler take a read-only snapshot of the registry,
 //! so user code never blocks the runtime.
 
+use std::sync::Arc;
+
 use crate::actor::ActorPath;
 use crate::clock::Timestamp;
 use crate::envelope::{Address, Envelope, TraceCtx};
@@ -166,6 +168,36 @@ pub(crate) struct CtxCore<'a> {
     /// The deferred effects of the message being handled, performed after
     /// the ack.
     outbox: &'a mut Outbox,
+    /// The scheduling surface (`None` in pure tests that never schedule).
+    scheduler: Option<Scheduler>,
+}
+
+/// The Arc bundle a delayed self-send needs: the same shared handles the
+/// send path routes through, captured at context construction so the
+/// detached timer task stays `'static`.
+#[derive(Clone)]
+pub(crate) struct Scheduler {
+    /// The shared routing table.
+    registry: Arc<crate::system::CountingRegistryLock>,
+    /// The shared actor tables (dead letters live here).
+    kernel: Arc<crate::kernel::CountingKernelLock>,
+    /// The lock-free clone of the shutdown barrier.
+    shutting_down: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl Scheduler {
+    /// Captures the scheduling surface from a loop's shared Arcs.
+    pub(crate) fn new(
+        registry: Arc<crate::system::CountingRegistryLock>,
+        kernel: Arc<crate::kernel::CountingKernelLock>,
+        shutting_down: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    ) -> Self {
+        Self {
+            registry,
+            kernel,
+            shutting_down,
+        }
+    }
 }
 
 impl CtxCore<'_> {
@@ -227,6 +259,7 @@ impl<'a> CmdCtx<'a> {
                 reply_to: None,
                 view,
                 outbox,
+                scheduler: None,
             },
         }
     }
@@ -390,6 +423,58 @@ impl<'a> MsgCtx<'a> {
         self.core.outbox.push_stop_self();
     }
 
+    /// Delivers `msg` to this actor after `delay`, counted from this
+    /// call. The delayed delivery is a system-root send addressed to
+    /// this actor's own path — it is NOT subject to the `.emits` gate
+    /// (self-messages are self-contained, not system edges), rides the
+    /// ordinary tell path (mailbox capacity, ordering, and overload
+    /// policy all apply as usual), and requires a `.handles::<M>()`
+    /// declaration like any inbound message.
+    ///
+    /// The schedule is fire-and-forget: a plain timer task, armed now.
+    /// Cadence is the caller's placement — calling at the top of a
+    /// handler yields a fixed interval, calling at the end yields the
+    /// delay between completing one unit of work and the next. There is
+    /// no cancellation handle: a pending timer outlives its actor, and
+    /// firing after a stop merely dead-letters (the same tolerance as
+    /// any send to a dead path).
+    ///
+    /// Service actors only ([`CmdCtx`] is pure by design). No-op in pure
+    /// test contexts built without a scheduler.
+    pub fn schedule_self<M: Message + crate::envelope::PayloadValue>(
+        &self,
+        msg: M,
+        delay: std::time::Duration,
+    ) {
+        let Some(scheduler) = &self.core.scheduler else {
+            return;
+        };
+        let path = self.core.self_path.clone();
+        // Causality links the tick to the message that scheduled it.
+        let trace = self.core.child_trace();
+        let scheduler = scheduler.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(delay).await;
+            let envelope =
+                Envelope::json(M::schema_id(), Address::Path(path.clone()), msg, trace).from(path);
+            if let Err(undeliverable) = crate::kernel::route(
+                &scheduler.registry,
+                &scheduler.kernel,
+                &scheduler.shutting_down,
+                envelope,
+            )
+            .await
+            {
+                crate::kernel::dead_letter(
+                    &scheduler.kernel,
+                    &undeliverable,
+                    crate::kernel::DeadLetterReason::Unresolvable,
+                    "scheduled self-send to a dead destination",
+                );
+            }
+        });
+    }
+
     /// Records a send to `dest` with an explicit schema id and hand-built
     /// JSON payload. (Erased-surface seam: exercised by the context tests;
     /// the typed send is the production path — live values ride the
@@ -499,6 +584,7 @@ impl<'a> MsgCtx<'a> {
         view: &'a dyn RuntimeView,
         outbox: &'a mut Outbox,
         port: Option<&'a dyn AskPort>,
+        scheduler: Option<Scheduler>,
     ) -> MsgCtx<'a> {
         MsgCtx {
             core: CtxCore {
@@ -507,6 +593,7 @@ impl<'a> MsgCtx<'a> {
                 reply_to,
                 view,
                 outbox,
+                scheduler,
             },
             port,
         }
@@ -771,7 +858,7 @@ mod tests {
         let parent = TraceCtx::root();
         let mut outbox = Outbox::new();
         let path = ActorPath::new("storefront");
-        let mut ctx = MsgCtx::new(&path, &parent, None, &view, &mut outbox, None);
+        let mut ctx = MsgCtx::new(&path, &parent, None, &view, &mut outbox, None, None);
 
         // When sending a command.
         ctx.send(
@@ -808,7 +895,15 @@ mod tests {
         let mut outbox = Outbox::new();
         let path = ActorPath::new("server");
         let reply_to = Address::Path(ActorPath::new("client"));
-        let mut ctx = MsgCtx::new(&path, &trace, Some(&reply_to), view, &mut outbox, None);
+        let mut ctx = MsgCtx::new(
+            &path,
+            &trace,
+            Some(&reply_to),
+            view,
+            &mut outbox,
+            None,
+            None,
+        );
 
         // When replying.
         ctx.reply(Reserved { ok: true });
@@ -825,7 +920,7 @@ mod tests {
 
         // When a context without reply-to replies.
         let mut silent_outbox = Outbox::new();
-        let mut silent = MsgCtx::new(&path, &trace, None, view, &mut silent_outbox, None);
+        let mut silent = MsgCtx::new(&path, &trace, None, view, &mut silent_outbox, None, None);
         silent.reply(Reserved { ok: false });
 
         // Then nothing is recorded.
@@ -839,7 +934,7 @@ mod tests {
         let trace = TraceCtx::root();
         let mut outbox = Outbox::new();
         let path = ActorPath::new("inventory.west");
-        let mut ctx = MsgCtx::new(&path, &trace, None, &view, &mut outbox, None);
+        let mut ctx = MsgCtx::new(&path, &trace, None, &view, &mut outbox, None, None);
 
         // When publishing an event.
         ctx.publish(StockReserved { qty: 2 });
@@ -884,7 +979,7 @@ mod tests {
         let trace = TraceCtx::root();
         let mut outbox = Outbox::new();
         let path = ActorPath::new("a");
-        let mut ctx = MsgCtx::new(&path, &trace, None, &view, &mut outbox, None);
+        let mut ctx = MsgCtx::new(&path, &trace, None, &view, &mut outbox, None, None);
         ctx.send(Address::Path(ActorPath::new("b")), Ping, None);
         ctx.send(Address::Path(ActorPath::new("c")), Pong, None);
 
@@ -903,7 +998,7 @@ mod tests {
         let trace = TraceCtx::root();
         let mut outbox = Outbox::new();
         let path = ActorPath::new("auditor");
-        let mut ctx = MsgCtx::new(&path, &trace, None, &view, &mut outbox, None);
+        let mut ctx = MsgCtx::new(&path, &trace, None, &view, &mut outbox, None, None);
 
         // When it sends.
         ctx.send(Address::Path(ActorPath::new("b")), Ping, None);
@@ -922,7 +1017,7 @@ mod tests {
         let trace = TraceCtx::root();
         let mut outbox = Outbox::new();
         let path = ActorPath::new("auditor");
-        let mut ctx = MsgCtx::new(&path, &trace, None, &view, &mut outbox, None);
+        let mut ctx = MsgCtx::new(&path, &trace, None, &view, &mut outbox, None, None);
 
         // When the handler replies.
         ctx.reply(Pong);
@@ -941,7 +1036,15 @@ mod tests {
         let reply_to = Address::Path(ActorPath::new("asker"));
         let mut outbox = Outbox::new();
         let path = ActorPath::new("auditor");
-        let mut ctx = MsgCtx::new(&path, &trace, Some(&reply_to), &view, &mut outbox, None);
+        let mut ctx = MsgCtx::new(
+            &path,
+            &trace,
+            Some(&reply_to),
+            &view,
+            &mut outbox,
+            None,
+            None,
+        );
 
         // When the handler replies.
         ctx.reply(Pong);
@@ -969,8 +1072,17 @@ mod tests {
                 &view,
                 &mut typed_outbox,
                 None,
+                None,
             );
-            let mut raw = MsgCtx::new(&path, &trace, Some(&reply_to), &view, &mut raw_outbox, None);
+            let mut raw = MsgCtx::new(
+                &path,
+                &trace,
+                Some(&reply_to),
+                &view,
+                &mut raw_outbox,
+                None,
+                None,
+            );
 
             // When replying the same outcome both ways.
             typed.reply(Reserved { ok: true });
@@ -1017,11 +1129,11 @@ mod tests {
         let mut typed_outbox = Outbox::new();
         let mut raw_outbox = Outbox::new();
         {
-            let mut typed = MsgCtx::new(&path, &trace, None, &view, &mut typed_outbox, None);
+            let mut typed = MsgCtx::new(&path, &trace, None, &view, &mut typed_outbox, None, None);
             typed.publish(StockReserved { qty: 2 });
         }
         {
-            let mut raw = MsgCtx::new(&path, &trace, None, &view, &mut raw_outbox, None);
+            let mut raw = MsgCtx::new(&path, &trace, None, &view, &mut raw_outbox, None, None);
             raw.publish_json(StockReserved::schema_id(), crate::json!({ "qty": 2 }));
         }
 
@@ -1050,7 +1162,7 @@ mod tests {
         let mut typed_outbox = Outbox::new();
         let mut raw_outbox = Outbox::new();
         {
-            let mut typed = MsgCtx::new(&path, &trace, None, &view, &mut typed_outbox, None);
+            let mut typed = MsgCtx::new(&path, &trace, None, &view, &mut typed_outbox, None, None);
             typed.send(
                 Address::Path(ActorPath::new("inventory")),
                 ReserveStock { qty: 2 },
@@ -1058,7 +1170,7 @@ mod tests {
             );
         }
         {
-            let mut raw = MsgCtx::new(&path, &trace, None, &view, &mut raw_outbox, None);
+            let mut raw = MsgCtx::new(&path, &trace, None, &view, &mut raw_outbox, None, None);
             raw.send_json(
                 Address::Path(ActorPath::new("inventory")),
                 ReserveStock::schema_id(),

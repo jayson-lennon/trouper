@@ -7,7 +7,7 @@
 //! storage (`Box<PayloadCell>` or `Arc<PayloadCell>`). Handlers downcast;
 //! nothing on the message path walks a JSON tree. Cold JSON and wire memoization
 //! lives in a lazily allocated side box. Serde exists at exactly two doors —
-//! erased ingress ([`PayloadBytes`] from outside the system) and the journal
+//! erased ingress (`PayloadBytes` from outside the system) and the journal
 //! (the payload's memoized compact encoding) — and every shared payload value
 //! serializes at most once, however many readers ask.
 
@@ -73,7 +73,7 @@ impl TraceCtx {
 /// The many simultaneous owners (the channel copy and inbox cursor; fan-out
 /// copies; the journal entry and outbox intent) all read ONE shared value.
 ///
-/// The fabric holds live typed values (downcast via [`AnyPayload`]) OR wire
+/// The fabric holds live typed values (downcast via `AnyPayload`) OR wire
 /// bytes that arrived erased (decoded on demand); serde exists only at the
 /// doors — the journal and erased ingress. There is no `Bytes` fabric arm: a
 /// message that is not in memory is not a message.
@@ -434,7 +434,7 @@ impl PayloadBytes {
     /// Wraps already-encoded bytes (journal replay, bench fixtures).
     ///
     /// The caller guarantees the bytes are valid JSON text —
-    /// [`PayloadBytes::assert_json_text`] is the debug-gate for the
+    /// `assert_json_text` is the debug-gate for the
     /// boundary constructors; replay trusts its own writer.
     pub fn from_bytes(bytes: impl Into<Arc<[u8]>>) -> Self {
         Self(bytes.into())

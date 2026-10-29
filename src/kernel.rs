@@ -39,7 +39,7 @@
 //! ## Ownership rule (cell-local vs kernel tables)
 //!
 //! Per-actor bookkeeping that only the actor's own loop (plus its spawn/
-//! restart path) writes lives on the [`ActorCell`] as atomics/`RwLock`s:
+//! restart path) writes lives on the `ActorCell` as atomics/`RwLock`s:
 //! crash flag, watermark mark + latch, last-work stamp, last committed seq
 //! (`u64::MAX` = never committed, preserving the seq-0 rule), snapshot
 //! anchor (`u64::MAX` = unanchored), snapshot cadence + passivation config
@@ -47,7 +47,7 @@
 //! override spawn config before the first idle), dispatch entries, and the
 //! declared-emits mirror (spawn-seeded from the manifest, re-synced at the
 //! declaration-mutation point — `ActorSystemCore::declare_emits`). The
-//! [`EsLoop`] likewise carries its own clone of the live state Arc,
+//! `EsLoop` likewise carries its own clone of the live state Arc,
 //! captured at spawn and rebound at boot recovery / restart / projector
 //! catch-up — the only moments the table's Arc is ever replaced. Step-hot
 //! reads (state shell, emit declarations) touch NEITHER global lock.
@@ -2121,6 +2121,11 @@ pub(crate) async fn run_on_stop(ctx: &EsLoop) {
             kernel: ctx.kernel.clone(),
             clock: ctx.clock.clone(),
         };
+        let scheduler = crate::context::Scheduler::new(
+            ctx.registry.clone(),
+            ctx.kernel.clone(),
+            ctx.shutting_down.clone(),
+        );
         let mut outbox = Outbox::new();
         let trace = crate::envelope::TraceCtx::root();
         {
@@ -2132,6 +2137,7 @@ pub(crate) async fn run_on_stop(ctx: &EsLoop) {
                 ctx.view.as_ref(),
                 &mut outbox,
                 Some(&ask_port),
+                Some(scheduler),
             );
             svc.on_stop_erased(&mut msg_ctx).await;
         }
@@ -2526,6 +2532,12 @@ async fn fan_out_emits(
 /// with the envelope retained, plus a tracing error — and never route.
 /// The declared remainder dispatches normally, in order.
 ///
+/// One exemption: a send addressed to the actor's OWN path is always
+/// declared — self-messages are self-contained, not system edges (a
+/// scheduled self-tick is the actor talking to itself, and an actor may
+/// always talk to itself). Publishes, replies, and sends to any other
+/// destination stay gated.
+///
 /// The gate sits at flush time (not record time) so there is exactly one
 /// choke point next to the routing it guards; observably the message
 /// leaves the actor at send time, so nothing else may see the intent.
@@ -2546,9 +2558,15 @@ async fn flush_outbox(ctx: &EsLoop, mut outbox: Outbox) -> bool {
             // clone (its schema must outlive it for the tracing error
             // and the dead-letter record). StopSelf is not a message —
             // it passes untouched.
-            let undeclared = intent
-                .emitted_schema()
-                .is_some_and(|schema| !declared_emits.contains(schema));
+            let self_addressed = matches!(
+                &intent,
+                crate::context::Intent::Send(envelope)
+                    if matches!(&envelope.dest, Address::Path(p) if *p == ctx.path)
+            );
+            let undeclared = !self_addressed
+                && intent
+                    .emitted_schema()
+                    .is_some_and(|schema| !declared_emits.contains(schema));
             if undeclared {
                 let schema = intent
                     .emitted_schema()
@@ -3184,6 +3202,11 @@ async fn step_service(
                 view.as_ref(),
                 &mut outbox,
                 Some(&ask_port),
+                Some(crate::context::Scheduler::new(
+                    ctx.es.registry.clone(),
+                    ctx.es.kernel.clone(),
+                    ctx.es.shutting_down.clone(),
+                )),
             );
             let mut service = service.lock().await;
             match entry.dispatch(service.as_mut(), &envelope.payload, &mut msg_ctx) {
