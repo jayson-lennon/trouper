@@ -4,7 +4,7 @@
 //! - Typed: `spawn_es_builder::<Inventory>()` with `.handles::<C>()` /
 //!   `.emits::<E>()` / `.snapshot()` / `.mailbox()`.
 //!   The builder constructs the erased adapters internally.
-//! - Foreign: `spawn_foreign()` with named `handle`/`apply` closures —
+//! - Foreign: `spawn_foreign_builder()` with named `handle`/`apply` closures —
 //!   the same event-sourced contract with no Rust actor types.
 //!
 //! Run: `cargo run --example builder`
@@ -113,7 +113,7 @@ async fn main() {
 
     // -- Foreign spawn: named handle/apply closures, JSON only -------------
     println!("== foreign builder ==");
-    let tally = trouper::builder::spawn_foreign(&system)
+    let tally = trouper::builder::spawn_foreign_builder(&system)
         .at(ActorPath::new("tally"))
         .schema(trouper::json!({
             "name": "TallyAdd", "version": 1, "kind": "command",

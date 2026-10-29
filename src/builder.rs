@@ -38,8 +38,8 @@ use crate::system::SpawnOpts;
 /// ```
 pub fn spawn_es_builder<A: crate::actor::EventSourcedActor>(
     system: &crate::system::ActorSystem,
-) -> SpawnBuilder<A> {
-    SpawnBuilder {
+) -> EsBuilder<A> {
+    EsBuilder {
         system: system.clone(),
         path: None,
         args: Json::default(),
@@ -58,7 +58,7 @@ pub fn spawn_service_builder<A: ServiceActor>(
         system: system.clone(),
         path: None,
         args: Json::default(),
-        start_override: None,
+        init_override: None,
         entries: Vec::new(),
         emits: Vec::new(),
         opts: SpawnOpts::default(),
@@ -68,7 +68,7 @@ pub fn spawn_service_builder<A: ServiceActor>(
 }
 
 /// Begins a foreign (no-Rust-types) event-sourced spawn.
-pub fn spawn_foreign(system: &crate::system::ActorSystem) -> ForeignBuilder {
+pub fn spawn_foreign_builder(system: &crate::system::ActorSystem) -> ForeignBuilder {
     ForeignBuilder {
         system: system.clone(),
         path: None,
@@ -82,9 +82,9 @@ pub fn spawn_foreign(system: &crate::system::ActorSystem) -> ForeignBuilder {
 }
 
 /// The typed event-sourced builder. Every type is named exactly once:
-/// `A` at [`spawn_es_builder`], each command `C` at [`SpawnBuilder::handles`],
-/// each event `E` at [`SpawnBuilder::emits`].
-pub struct SpawnBuilder<A: crate::actor::EventSourcedActor> {
+/// `A` at [`spawn_es_builder`], each command `C` at [`EsBuilder::handles`],
+/// each event `E` at [`EsBuilder::emits`].
+pub struct EsBuilder<A: crate::actor::EventSourcedActor> {
     system: crate::system::ActorSystem,
     path: Option<ActorPath>,
     args: Json,
@@ -94,7 +94,7 @@ pub struct SpawnBuilder<A: crate::actor::EventSourcedActor> {
     _actor: std::marker::PhantomData<fn(&A)>,
 }
 
-impl<A: crate::actor::EventSourcedActor> SpawnBuilder<A> {
+impl<A: crate::actor::EventSourcedActor> EsBuilder<A> {
     /// The path to spawn the actor at (required).
     pub fn at(mut self, path: impl Into<ActorPath>) -> Self {
         self.path = Some(path.into());
@@ -236,7 +236,7 @@ pub struct ServiceBuilder<A: ServiceActor> {
     system: crate::system::ActorSystem,
     path: Option<ActorPath>,
     args: Json,
-    start_override: Option<crate::system::ServiceStart>,
+    init_override: Option<crate::system::ServiceInit>,
     entries: Vec<Arc<dyn MsgEntry>>,
     emits: Vec<SchemaId>,
     opts: SpawnOpts,
@@ -251,7 +251,7 @@ impl<A: ServiceActor> ServiceBuilder<A> {
         self
     }
 
-    /// Start arguments (I/O allowed inside `start`).
+    /// Init arguments (I/O allowed inside `init`).
     ///
     /// Accepts any serializable value; it serializes once, here.
     /// Serialization failure panics (a programmer error).
@@ -261,16 +261,16 @@ impl<A: ServiceActor> ServiceBuilder<A> {
     }
 
     /// Overrides the constructor used at spawn: instead of
-    /// `A::start(&args)`, the provided future builds the instance.
+    /// `A::init(&args)`, the provided future builds the instance.
     ///
     /// For actors whose dependencies are typed values that cannot ride
     /// JSON args (cells, channels, backend handles): capture them in a
     /// closure and hand the future here. The manifest, edges, and
-    /// options are unaffected — `A::start` remains the default
+    /// options are unaffected — `A::init` remains the default
     /// constructor when this is not called.
-    pub fn start_with(
+    pub fn init_with(
         mut self,
-        start: impl FnOnce() -> std::pin::Pin<
+        init: impl FnOnce() -> std::pin::Pin<
             Box<
                 dyn std::future::Future<
                         Output = Result<A, error_stack::Report<crate::registry::RegistryError>>,
@@ -279,8 +279,8 @@ impl<A: ServiceActor> ServiceBuilder<A> {
         > + Send
         + 'static,
     ) -> Self {
-        self.start_override = Some(Box::pin(async move {
-            start().await.map(|instance| {
+        self.init_override = Some(Box::pin(async move {
+            init().await.map(|instance| {
                 Box::new(crate::actor::TypedServiceState::new(instance))
                     as Box<dyn crate::actor::DynServiceActor>
             })
@@ -419,11 +419,11 @@ impl<A: ServiceActor> ServiceBuilder<A> {
             }
         }
         manifest = manifest.kind(ActorKind::Service);
-        let start_args = self.args.clone();
-        let start: crate::system::ServiceStart = match self.start_override {
+        let init_args = self.args.clone();
+        let init: crate::system::ServiceInit = match self.init_override {
             Some(overridden) => overridden,
             None => Box::pin(async move {
-                A::start(&start_args).await.map(|instance| {
+                A::init(&init_args).await.map(|instance| {
                     Box::new(crate::actor::TypedServiceState::new(instance))
                         as Box<dyn crate::actor::DynServiceActor>
                 })
@@ -435,7 +435,7 @@ impl<A: ServiceActor> ServiceBuilder<A> {
             &self.args,
             self.entries,
             self.opts,
-            start,
+            init,
         );
         // Arm the kickoff AFTER the spawn call returns: registration is
         // synchronous (slot + routes + inbox exist by here), so a timer

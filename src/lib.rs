@@ -55,7 +55,7 @@ pub mod prelude {
         StopReason,
     };
     pub use crate::builder::{
-        spawn_es_builder, spawn_foreign, spawn_projector_builder, spawn_service_builder,
+        spawn_es_builder, spawn_foreign_builder, spawn_projector_builder, spawn_service_builder,
     };
     pub use crate::clock::Timestamp;
     pub use crate::context::*;

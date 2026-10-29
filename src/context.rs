@@ -317,7 +317,7 @@ pub(crate) trait AskPort: Send + Sync {
 #[error(debug)]
 pub enum AskError {
     /// No handler for the message schema is registered at the
-    /// destination (`SpawnBuilder::handles` was never called for it),
+    /// destination (`EsBuilder::handles` was never called for it),
     /// or nothing is registered at the destination at all.
     Unresolved(String),
     /// The reply did not decode into the asker's declared reply type —

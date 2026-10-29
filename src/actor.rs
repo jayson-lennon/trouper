@@ -155,8 +155,8 @@ pub trait ServiceActor: Send + 'static {
     ///
     /// # Errors
     ///
-    /// Fails when the service cannot start (the spawn fails).
-    fn start(
+    /// Fails when the service cannot be constructed (the spawn fails).
+    fn init(
         args: &Json,
     ) -> impl Future<Output = Result<Self, error_stack::Report<crate::registry::RegistryError>>> + Send
     where
@@ -635,7 +635,7 @@ impl CommandEntry for ForeignCommandEntry {
 
 /// The object-safe service shell the runtime drives: one erased instance.
 /// Not journaled — restart constructs a fresh instance via
-/// [`ServiceActor::start`]. Dispatch runs through a [`MsgEntry`] adapter,
+/// [`ServiceActor::init`]. Dispatch runs through a [`MsgEntry`] adapter,
 /// which downcasts the shell and the decoded message by type.
 pub trait DynServiceActor: std::any::Any + Send {
     /// The erased graceful-stop hook: forwards to [`ServiceActor::on_stop`].

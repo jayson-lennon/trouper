@@ -45,7 +45,7 @@ impl ServiceActor for PoolService {
     fn manifest() -> ActorManifest {
         ActorManifest::new().kind(ActorKind::Service)
     }
-    async fn start(_args: &Json) -> Result<Self, error_stack::Report<RegistryError>> {
+    async fn init(_args: &Json) -> Result<Self, error_stack::Report<RegistryError>> {
         Ok(Self)
     }
 }

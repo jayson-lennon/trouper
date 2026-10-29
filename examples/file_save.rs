@@ -125,7 +125,7 @@ impl<S: FileStore> FileSaver<S> {
 }
 
 impl<S: FileStore + Default> ServiceActor for FileSaver<S> {
-    async fn start(_args: &Json) -> Result<Self, Report<RegistryError>> {
+    async fn init(_args: &Json) -> Result<Self, Report<RegistryError>> {
         Ok(Self {
             store: S::default(),
         })
@@ -166,7 +166,7 @@ static AUDIT: parking_lot::Mutex<Vec<String>> = parking_lot::Mutex::new(Vec::new
 struct SaveAudit;
 
 impl ServiceActor for SaveAudit {
-    async fn start(_args: &Json) -> Result<Self, Report<RegistryError>> {
+    async fn init(_args: &Json) -> Result<Self, Report<RegistryError>> {
         Ok(Self)
     }
 }

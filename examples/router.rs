@@ -61,7 +61,7 @@ impl ServiceActor for ParseRouter {
         ActorManifest::new().kind(ActorKind::Service)
     }
 
-    async fn start(_args: &Json) -> Result<Self, error_stack::Report<RegistryError>> {
+    async fn init(_args: &Json) -> Result<Self, error_stack::Report<RegistryError>> {
         Ok(Self)
     }
 }
@@ -94,7 +94,7 @@ impl ServiceActor for Parser {
         ActorManifest::new().kind(ActorKind::Service)
     }
 
-    async fn start(args: &Json) -> Result<Self, error_stack::Report<RegistryError>> {
+    async fn init(args: &Json) -> Result<Self, error_stack::Report<RegistryError>> {
         Ok(Self::new(args["id"].as_u64().unwrap_or(0) as u32))
     }
 }
@@ -117,7 +117,7 @@ impl ServiceActor for MetricsRecorder {
         ActorManifest::new().kind(ActorKind::Service)
     }
 
-    async fn start(_args: &Json) -> Result<Self, error_stack::Report<RegistryError>> {
+    async fn init(_args: &Json) -> Result<Self, error_stack::Report<RegistryError>> {
         Ok(Self)
     }
 }
@@ -157,7 +157,7 @@ async fn main() {
         fn manifest() -> ActorManifest {
             ActorManifest::new().kind(ActorKind::Service)
         }
-        async fn start(_args: &Json) -> Result<Self, error_stack::Report<RegistryError>> {
+        async fn init(_args: &Json) -> Result<Self, error_stack::Report<RegistryError>> {
             Ok(Self)
         }
     }

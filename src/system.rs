@@ -88,9 +88,9 @@ impl Default for SpawnOpts {
     }
 }
 
-/// The erased async start a typed service wrapper hands to the funnel:
-/// builds the boxed instance (I/O allowed inside `start`).
-pub(crate) type ServiceStart = std::pin::Pin<
+/// The erased async constructor a typed service wrapper hands to the funnel:
+/// builds the boxed instance (I/O allowed inside `init`).
+pub(crate) type ServiceInit = std::pin::Pin<
     Box<
         dyn std::future::Future<
                 Output = Result<
@@ -780,7 +780,7 @@ impl ActorSystemCore {
     /// the seam the port tier will reuse.
     ///
     /// Deprecated positional flavor — prefer the builder:
-    /// [`crate::builder::spawn_foreign`] (named `handle`/`apply` methods).
+    /// [`crate::builder::spawn_foreign_builder`] (named `handle`/`apply` methods).
     #[doc(hidden)]
     pub fn spawn_es_foreign(
         &self,
@@ -1218,17 +1218,17 @@ impl ActorSystemCore {
         F: FnOnce() -> Vec<Arc<dyn MsgEntry>>,
     {
         let manifest = A::manifest();
-        let start_args = args.clone();
-        let start = Box::pin(async move {
-            A::start(&start_args).await.map(|instance| {
+        let init_args = args.clone();
+        let init = Box::pin(async move {
+            A::init(&init_args).await.map(|instance| {
                 Box::new(TypedServiceState::new(instance)) as Box<dyn DynServiceActor>
             })
         });
-        self.spawn_service_erased(path, manifest, args, entries(), opts, start);
+        self.spawn_service_erased(path, manifest, args, entries(), opts, init);
     }
 
     /// The erased service spawn shared by typed and builder spawns (the
-    /// service-side funnel). `start` builds the erased instance (async,
+    /// service-side funnel). `init` builds the erased instance (async,
     /// I/O allowed) — constructed by the typed wrapper.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn spawn_service_erased(
@@ -1238,10 +1238,10 @@ impl ActorSystemCore {
         args: &Json,
         entries: Vec<Arc<dyn MsgEntry>>,
         opts: SpawnOpts,
-        start: ServiceStart,
+        init: ServiceInit,
     ) {
-        // `A::start` is async (I/O allowed); block briefly on a runtime
-        // thread is not done — spawn the start inside the actor task and
+        // `A::init` is async (I/O allowed); block briefly on a runtime
+        // thread is not done — spawn the init inside the actor task and
         // register the slot immediately so senders never see a gap.
         let opts = self.resolve_opts(opts);
         let (tx, rx) =
@@ -1336,10 +1336,10 @@ impl ActorSystemCore {
         let front_kernel = self.kernel.clone();
         let front_endpoint = endpoint.clone();
         crate::kernel::spawn_tracked(async move {
-            // Start the instance inside the task; a start failure leaves
+            // Init the instance inside the task; an init failure leaves
             // the slot present (senders get a closed door) and the crash
             // recorded for supervision.
-            let started = start.await;
+            let started = init.await;
             match started {
                 Ok(instance) => {
                     let mut kernel = kernel_table.lock();
@@ -1451,7 +1451,7 @@ impl ActorSystemCore {
     ///
     /// [`crate::context::AskError::Unresolved`] when no handler for `C`
     /// is registered at `dest` via
-    /// [`crate::builder::SpawnBuilder::handles`], when the ask times
+    /// [`crate::builder::EsBuilder::handles`], when the ask times
     /// out, or when the lease dies before the reply.
     pub async fn ask<C>(
         &self,
@@ -1782,7 +1782,7 @@ impl ActorSystemCore {
             }
         }
 
-        // 1.5 SERVICE START SETTLE: a service actor's `start` runs inside
+        // 1.5 SERVICE INIT SETTLE: a service actor's `init` runs inside
         // its task; stopping before it completes would skip on_stop for an
         // actor that never got the chance to live. Bounded wait for the
         // instance (or a crash) to appear.
@@ -2867,7 +2867,7 @@ mod tests {
                 .handles::<PingAsk>()
                 .kind(ActorKind::Service)
         }
-        async fn start(
+        async fn init(
             _args: &Json,
         ) -> Result<Self, error_stack::Report<crate::registry::RegistryError>> {
             Ok(Self)
@@ -3077,7 +3077,7 @@ mod tests {
             fn manifest() -> ActorManifest {
                 ActorManifest::new().kind(ActorKind::Service)
             }
-            async fn start(
+            async fn init(
                 _args: &Json,
             ) -> Result<Self, error_stack::Report<crate::registry::RegistryError>> {
                 Ok(Self)
@@ -3515,7 +3515,7 @@ mod tests {
                     .emits::<Ping>()
                     .kind(ActorKind::Service)
             }
-            async fn start(
+            async fn init(
                 _args: &Json,
             ) -> Result<Self, error_stack::Report<crate::registry::RegistryError>> {
                 Ok(Self)
@@ -3534,7 +3534,7 @@ mod tests {
                     .handles::<Ping>()
                     .kind(ActorKind::Service)
             }
-            async fn start(
+            async fn init(
                 _args: &Json,
             ) -> Result<Self, error_stack::Report<crate::registry::RegistryError>> {
                 Ok(Self)
@@ -3780,7 +3780,7 @@ mod tests {
                     .handles::<Added>()
                     .kind(ActorKind::Service)
             }
-            async fn start(
+            async fn init(
                 _args: &Json,
             ) -> Result<Self, error_stack::Report<crate::registry::RegistryError>> {
                 Ok(Self)
@@ -4158,7 +4158,7 @@ mod tests {
     }
 
     /// A service actor appending to a shared sink (impure by design).
-    /// `start` receives JSON args, so the test passes the sink through a
+    /// `init` receives JSON args, so the test passes the sink through a
     /// well-known args key serialized as a slot index into a static table.
     type SinkList = Vec<Arc<Mutex<Vec<String>>>>;
     static SINKS: std::sync::OnceLock<Mutex<SinkList>> = std::sync::OnceLock::new();
@@ -4206,7 +4206,7 @@ mod tests {
                 .kind(ActorKind::Service)
         }
 
-        async fn start(
+        async fn init(
             args: &Json,
         ) -> Result<Self, error_stack::Report<crate::registry::RegistryError>> {
             let idx = args["sink"].as_u64().expect("sink index") as usize;
@@ -4290,7 +4290,7 @@ mod tests {
                     .handles::<BoomService>()
                     .kind(ActorKind::Service)
             }
-            async fn start(
+            async fn init(
                 args: &Json,
             ) -> Result<Self, error_stack::Report<crate::registry::RegistryError>> {
                 let idx = args["sink"].as_i64().expect("sink idx") as usize;
@@ -4407,7 +4407,7 @@ mod tests {
                     .handles::<Mark>()
                     .kind(ActorKind::Service)
             }
-            async fn start(
+            async fn init(
                 args: &Json,
             ) -> Result<Self, error_stack::Report<crate::registry::RegistryError>> {
                 let idx = args["sink"].as_i64().expect("sink idx") as usize;
@@ -4588,7 +4588,7 @@ mod tests {
                     .handles::<Mark>()
                     .kind(ActorKind::Service)
             }
-            async fn start(
+            async fn init(
                 args: &Json,
             ) -> Result<Self, error_stack::Report<crate::registry::RegistryError>> {
                 let idx = args["sink"].as_i64().expect("sink idx") as usize;
@@ -4821,7 +4821,7 @@ mod tests {
                     .emits::<Note>()
                     .kind(ActorKind::Service)
             }
-            async fn start(
+            async fn init(
                 _args: &Json,
             ) -> Result<Self, error_stack::Report<crate::registry::RegistryError>> {
                 Ok(Self)
@@ -4912,7 +4912,7 @@ mod tests {
                     .handles::<Add>()
                     .kind(ActorKind::Service)
             }
-            async fn start(
+            async fn init(
                 _args: &Json,
             ) -> Result<Self, error_stack::Report<crate::registry::RegistryError>> {
                 Ok(Self)
@@ -5133,7 +5133,7 @@ mod tests {
                     .emits::<Add>()
                     .kind(ActorKind::Service)
             }
-            async fn start(
+            async fn init(
                 _args: &Json,
             ) -> Result<Self, error_stack::Report<crate::registry::RegistryError>> {
                 Ok(Self)
@@ -5152,7 +5152,7 @@ mod tests {
                     .handles::<Boom>()
                     .kind(ActorKind::Service)
             }
-            async fn start(
+            async fn init(
                 _args: &Json,
             ) -> Result<Self, error_stack::Report<crate::registry::RegistryError>> {
                 Ok(Self)
@@ -5232,7 +5232,7 @@ mod tests {
                     .handles::<Add>()
                     .kind(ActorKind::Service)
             }
-            async fn start(
+            async fn init(
                 _args: &Json,
             ) -> Result<Self, error_stack::Report<crate::registry::RegistryError>> {
                 Ok(Self)
@@ -5249,7 +5249,7 @@ mod tests {
                     .handles::<Boom>()
                     .kind(ActorKind::Service)
             }
-            async fn start(
+            async fn init(
                 _args: &Json,
             ) -> Result<Self, error_stack::Report<crate::registry::RegistryError>> {
                 Ok(Self)
@@ -5344,7 +5344,7 @@ mod tests {
                     .handles::<Add>()
                     .kind(ActorKind::Service)
             }
-            async fn start(
+            async fn init(
                 _args: &Json,
             ) -> Result<Self, error_stack::Report<crate::registry::RegistryError>> {
                 Ok(Self)
@@ -5363,7 +5363,7 @@ mod tests {
                     .handles::<Boom>()
                     .kind(ActorKind::Service)
             }
-            async fn start(
+            async fn init(
                 _args: &Json,
             ) -> Result<Self, error_stack::Report<crate::registry::RegistryError>> {
                 Ok(Self)
@@ -5481,7 +5481,7 @@ mod tests {
                     .handles::<Added>()
                     .kind(ActorKind::Service)
             }
-            async fn start(
+            async fn init(
                 _args: &Json,
             ) -> Result<Self, error_stack::Report<crate::registry::RegistryError>> {
                 Ok(Self)
@@ -5505,7 +5505,7 @@ mod tests {
                     .emits::<Added>()
                     .kind(ActorKind::Service)
             }
-            async fn start(
+            async fn init(
                 _args: &Json,
             ) -> Result<Self, error_stack::Report<crate::registry::RegistryError>> {
                 Ok(Self)
@@ -6061,7 +6061,7 @@ mod tests {
                     .handles::<EscalatedMsg2>()
                     .kind(ActorKind::Service)
             }
-            async fn start(
+            async fn init(
                 _args: &Json,
             ) -> Result<Self, error_stack::Report<crate::registry::RegistryError>> {
                 Ok(Self)
@@ -7170,7 +7170,7 @@ mod tests {
                 }
             })
         };
-        crate::builder::spawn_foreign(&system)
+        crate::builder::spawn_foreign_builder(&system)
             .at(ActorPath::new("t-built"))
             .schema(json!({
                 "name": "tally2", "kind": "command",
@@ -7283,7 +7283,7 @@ mod tests {
         let decision: crate::actor::ForeignDecision = Arc::new(|_state, _cmd, _ctx| vec![]);
         let fold: crate::actor::ForeignFold =
             Arc::new(|_state: &mut Json, _ev: &crate::envelope::Event| {});
-        crate::builder::spawn_foreign(&system)
+        crate::builder::spawn_foreign_builder(&system)
             .at(ActorPath::new("f-reg"))
             .schema(json!({
                 "name": "fbuildcmd", "kind": "command",
@@ -7427,7 +7427,7 @@ mod tests {
 
         struct Echo;
         impl ServiceActor for Echo {
-            async fn start(
+            async fn init(
                 _args: &Json,
             ) -> Result<Self, error_stack::Report<crate::registry::RegistryError>> {
                 Ok(Self)
@@ -7477,7 +7477,7 @@ mod tests {
 
         struct Silent;
         impl ServiceActor for Silent {
-            async fn start(
+            async fn init(
                 _args: &Json,
             ) -> Result<Self, error_stack::Report<crate::registry::RegistryError>> {
                 Ok(Self)
@@ -7540,7 +7540,7 @@ mod tests {
 
         struct Silent;
         impl ServiceActor for Silent {
-            async fn start(
+            async fn init(
                 _args: &Json,
             ) -> Result<Self, error_stack::Report<crate::registry::RegistryError>> {
                 Ok(Self)
@@ -8848,7 +8848,7 @@ mod tests {
                     .emits::<Add>()
                     .kind(ActorKind::Service)
             }
-            async fn start(
+            async fn init(
                 args: &Json,
             ) -> Result<Self, error_stack::Report<crate::registry::RegistryError>> {
                 let (sink, forward_to) = (
@@ -8873,7 +8873,7 @@ mod tests {
             fn manifest() -> ActorManifest {
                 ActorManifest::new().kind(ActorKind::Service)
             }
-            async fn start(
+            async fn init(
                 args: &Json,
             ) -> Result<Self, error_stack::Report<crate::registry::RegistryError>> {
                 Ok(Self {
@@ -8978,7 +8978,7 @@ mod tests {
         fn manifest() -> ActorManifest {
             ActorManifest::new().kind(ActorKind::Service)
         }
-        async fn start(
+        async fn init(
             args: &Json,
         ) -> Result<Self, error_stack::Report<crate::registry::RegistryError>> {
             let idx = args["sink"].as_u64().expect("sink index") as usize;
@@ -9449,7 +9449,7 @@ mod tests {
                 .handles::<Add>()
                 .kind(ActorKind::Service)
         }
-        async fn start(
+        async fn init(
             _args: &Json,
         ) -> Result<Self, error_stack::Report<crate::registry::RegistryError>> {
             Ok(Self { log: hook_log() })
@@ -9477,7 +9477,7 @@ mod tests {
                     .handles::<Add>()
                     .kind(ActorKind::Service)
             }
-            async fn start(
+            async fn init(
                 _args: &Json,
             ) -> Result<Self, error_stack::Report<crate::registry::RegistryError>> {
                 Ok(Self)
@@ -9648,7 +9648,7 @@ mod tests {
                     .emits::<Add>()
                     .kind(ActorKind::Service)
             }
-            async fn start(
+            async fn init(
                 _args: &Json,
             ) -> Result<Self, error_stack::Report<crate::registry::RegistryError>> {
                 Ok(Self {
@@ -9706,7 +9706,7 @@ mod tests {
                     .handles::<Add>()
                     .kind(ActorKind::Service)
             }
-            async fn start(
+            async fn init(
                 _args: &Json,
             ) -> Result<Self, error_stack::Report<crate::registry::RegistryError>> {
                 Ok(Self)
@@ -9764,7 +9764,7 @@ mod tests {
                     .handles::<Add>()
                     .kind(ActorKind::Service)
             }
-            async fn start(
+            async fn init(
                 _args: &Json,
             ) -> Result<Self, error_stack::Report<crate::registry::RegistryError>> {
                 Ok(Self)
@@ -10623,7 +10623,7 @@ mod tests {
                     .handles::<Add>()
                     .kind(ActorKind::Service)
             }
-            async fn start(
+            async fn init(
                 args: &Json,
             ) -> Result<Self, error_stack::Report<crate::registry::RegistryError>> {
                 Ok(Self {
@@ -10767,7 +10767,7 @@ mod tests {
             ActorManifest::new().kind(ActorKind::Service)
         }
 
-        async fn start(
+        async fn init(
             args: &Json,
         ) -> Result<Self, error_stack::Report<crate::registry::RegistryError>> {
             let idx = args["sink"].as_u64().expect("sink index") as usize;
@@ -11358,7 +11358,7 @@ mod tests {
                 .handles::<Add>()
                 .kind(ActorKind::Service)
         }
-        async fn start(
+        async fn init(
             _args: &Json,
         ) -> Result<Self, error_stack::Report<crate::registry::RegistryError>> {
             Ok(Self)
@@ -11645,7 +11645,7 @@ mod tests {
                     .emits::<Pack>()
                     .kind(ActorKind::Service)
             }
-            async fn start(
+            async fn init(
                 _args: &Json,
             ) -> Result<Self, error_stack::Report<crate::registry::RegistryError>> {
                 Ok(Self)
@@ -11843,7 +11843,7 @@ mod tests {
             fn manifest() -> ActorManifest {
                 ActorManifest::new().kind(ActorKind::Service)
             }
-            async fn start(
+            async fn init(
                 _args: &Json,
             ) -> Result<Self, error_stack::Report<crate::registry::RegistryError>> {
                 Ok(Self)
@@ -11905,7 +11905,7 @@ mod tests {
             fn manifest() -> ActorManifest {
                 ActorManifest::new().kind(ActorKind::Service)
             }
-            async fn start(
+            async fn init(
                 _args: &Json,
             ) -> Result<Self, error_stack::Report<crate::registry::RegistryError>> {
                 Ok(Self)
@@ -11962,7 +11962,7 @@ mod tests {
             fn manifest() -> ActorManifest {
                 ActorManifest::new().kind(ActorKind::Service)
             }
-            async fn start(
+            async fn init(
                 _args: &Json,
             ) -> Result<Self, error_stack::Report<crate::registry::RegistryError>> {
                 Ok(Self)
@@ -12013,7 +12013,7 @@ mod tests {
             fn manifest() -> ActorManifest {
                 ActorManifest::new().kind(ActorKind::Service)
             }
-            async fn start(
+            async fn init(
                 _args: &Json,
             ) -> Result<Self, error_stack::Report<crate::registry::RegistryError>> {
                 Ok(Self)
@@ -12044,7 +12044,7 @@ mod tests {
                     .emits::<AskRes>()
                     .kind(ActorKind::Service)
             }
-            async fn start(
+            async fn init(
                 _args: &Json,
             ) -> Result<Self, error_stack::Report<crate::registry::RegistryError>> {
                 Ok(Self)
@@ -12285,7 +12285,7 @@ mod tests {
                     .handles::<Shipped>()
                     .kind(ActorKind::Service)
             }
-            async fn start(
+            async fn init(
                 _args: &Json,
             ) -> Result<Self, error_stack::Report<crate::registry::RegistryError>> {
                 unreachable!("subscriber starts with test channels")
@@ -12312,7 +12312,7 @@ mod tests {
             .at(path.clone())
             .handles::<Shipped>()
             .mailbox(1, OverloadPolicy::Block)
-            .start_with({
+            .init_with({
                 let seen = seen.clone();
                 move || {
                     Box::pin(async move {
@@ -12380,7 +12380,7 @@ mod tests {
                     .handles::<Shipped>()
                     .kind(ActorKind::Service)
             }
-            async fn start(
+            async fn init(
                 _args: &Json,
             ) -> Result<Self, error_stack::Report<crate::registry::RegistryError>> {
                 unreachable!("subscriber starts with test channels")
@@ -12407,7 +12407,7 @@ mod tests {
             .at(path.clone())
             .handles::<Shipped>()
             .mailbox(1, OverloadPolicy::DropOld)
-            .start_with({
+            .init_with({
                 let seen = seen.clone();
                 move || {
                     Box::pin(async move {
@@ -13006,7 +13006,7 @@ mod tests {
             Arc::new(|_state: &Json, _cmd: &Json, _ctx: &mut CmdCtx<'_>| Vec::new());
         let fold: crate::actor::ForeignFold =
             Arc::new(|_state: &mut Json, _ev: &crate::envelope::Event| {});
-        crate::builder::spawn_foreign(&system)
+        crate::builder::spawn_foreign_builder(&system)
             .at(ActorPath::new("foreign"))
             .schema(json!({
                 "name": "tick", "kind": "command",
@@ -13927,7 +13927,7 @@ mod lifecycle_census_tests {
         fn manifest() -> ActorManifest {
             ActorManifest::new()
         }
-        async fn start(
+        async fn init(
             _args: &Json,
         ) -> Result<Self, error_stack::Report<crate::registry::RegistryError>> {
             Ok(Self {
@@ -13950,7 +13950,7 @@ mod lifecycle_census_tests {
         fn manifest() -> ActorManifest {
             ActorManifest::new()
         }
-        async fn start(
+        async fn init(
             _args: &Json,
         ) -> Result<Self, error_stack::Report<crate::registry::RegistryError>> {
             Ok(Self)
@@ -13960,15 +13960,15 @@ mod lifecycle_census_tests {
     /// Spawns the census subscriber and returns its recording handle.
     fn subscribe(system: &ActorSystem) -> std::sync::Arc<std::sync::Mutex<Vec<ActorLifecycle>>> {
         let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-        // The actor's own instance is constructed by `start`; hand the
-        // test the SAME Arc by seeding it through the start override.
-        let for_start = seen.clone();
+        // The actor's own instance is constructed by `init`; hand the
+        // test the SAME Arc by seeding it through the init override.
+        let for_init = seen.clone();
         crate::builder::spawn_service_builder::<Census>(system)
             .at(ActorPath::new("census"))
-            .start_with(move || {
+            .init_with(move || {
                 Box::pin(async move {
                     Ok(Census {
-                        seen: for_start.clone(),
+                        seen: for_init.clone(),
                     })
                 })
             })
@@ -14130,7 +14130,7 @@ mod self_messaging_tests {
         n: i64,
     }
 
-    /// Shared recording sink (per-test Arc, seeded through `start_with`).
+    /// Shared recording sink (per-test Arc, seeded through `init_with`).
     type Sink = Arc<Mutex<Vec<String>>>;
 
     /// Polls until `cond` holds (≈2s budget), or fails the test.
@@ -14166,10 +14166,10 @@ mod self_messaging_tests {
         fn manifest() -> ActorManifest {
             ActorManifest::new().kind(ActorKind::Service)
         }
-        async fn start(
+        async fn init(
             _args: &Json,
         ) -> Result<Self, error_stack::Report<crate::registry::RegistryError>> {
-            panic!("built through start_with only")
+            panic!("built through init_with only")
         }
     }
     impl MsgHandler<Work> for GateProbe {
@@ -14195,13 +14195,13 @@ mod self_messaging_tests {
         ) -> crate::builder::ServiceBuilder<GateProbe>,
     ) -> Sink {
         let sink: Sink = Arc::new(Mutex::new(Vec::new()));
-        let for_start = sink.clone();
+        let for_init = sink.clone();
         let builder = spawn_service_builder::<GateProbe>(system)
             .at(path.clone())
-            .start_with(move || {
+            .init_with(move || {
                 Box::pin(async move {
                     Ok(GateProbe {
-                        sink: for_start.clone(),
+                        sink: for_init.clone(),
                         effect,
                     })
                 })
@@ -14291,10 +14291,10 @@ mod self_messaging_tests {
         fn manifest() -> ActorManifest {
             ActorManifest::new().kind(ActorKind::Service)
         }
-        async fn start(
+        async fn init(
             _args: &Json,
         ) -> Result<Self, error_stack::Report<crate::registry::RegistryError>> {
-            panic!("built through start_with only")
+            panic!("built through init_with only")
         }
     }
     impl MsgHandler<Kick> for OneShotTicker {
@@ -14314,13 +14314,13 @@ mod self_messaging_tests {
         let (system, _clock) = ActorSystem::test();
         let path = ActorPath::new("one-shot");
         let sink = Arc::new(Mutex::new(Vec::new()));
-        let for_start = sink.clone();
+        let for_init = sink.clone();
         spawn_service_builder::<OneShotTicker>(&system)
             .at(path.clone())
-            .start_with(move || {
+            .init_with(move || {
                 Box::pin(async move {
                     Ok(OneShotTicker {
-                        sink: for_start.clone(),
+                        sink: for_init.clone(),
                         delay: std::time::Duration::from_millis(40),
                     })
                 })
@@ -14358,10 +14358,10 @@ mod self_messaging_tests {
         fn manifest() -> ActorManifest {
             ActorManifest::new().kind(ActorKind::Service)
         }
-        async fn start(
+        async fn init(
             _args: &Json,
         ) -> Result<Self, error_stack::Report<crate::registry::RegistryError>> {
-            panic!("built through start_with only")
+            panic!("built through init_with only")
         }
     }
     impl MsgHandler<Tick> for Metronome {
@@ -14387,13 +14387,13 @@ mod self_messaging_tests {
         let (system, _clock) = ActorSystem::test();
         let spawn = |path: &ActorPath, top: bool| {
             let stamps = Arc::new(Mutex::new(Vec::new()));
-            let for_start = stamps.clone();
+            let for_init = stamps.clone();
             spawn_service_builder::<Metronome>(&system)
                 .at(path.clone())
-                .start_with(move || {
+                .init_with(move || {
                     Box::pin(async move {
                         Ok(Metronome {
-                            stamps: for_start.clone(),
+                            stamps: for_init.clone(),
                             delay: std::time::Duration::from_millis(60),
                             work: std::time::Duration::from_millis(30),
                             top,
@@ -14458,7 +14458,7 @@ mod self_messaging_tests {
             fn manifest() -> ActorManifest {
                 ActorManifest::new().kind(ActorKind::Service)
             }
-            async fn start(
+            async fn init(
                 _args: &Json,
             ) -> Result<Self, error_stack::Report<crate::registry::RegistryError>> {
                 Ok(Self)
@@ -14544,13 +14544,13 @@ mod self_messaging_tests {
         let (system, _clock) = ActorSystem::test();
         let path = ActorPath::new("kicked");
         let sink: Sink = Arc::new(Mutex::new(Vec::new()));
-        let for_start = sink.clone();
+        let for_init = sink.clone();
         spawn_service_builder::<OneShotTicker>(&system)
             .at(path.clone())
-            .start_with(move || {
+            .init_with(move || {
                 Box::pin(async move {
                     Ok(OneShotTicker {
-                        sink: for_start.clone(),
+                        sink: for_init.clone(),
                         delay: std::time::Duration::ZERO,
                     })
                 })
@@ -14580,10 +14580,10 @@ mod self_messaging_tests {
                 .emits::<Work>()
                 .kind(ActorKind::Service)
         }
-        async fn start(
+        async fn init(
             _args: &Json,
         ) -> Result<Self, error_stack::Report<crate::registry::RegistryError>> {
-            panic!("built through start_with only")
+            panic!("built through init_with only")
         }
     }
     impl MsgHandler<Kick> for Seeder {
@@ -14606,10 +14606,10 @@ mod self_messaging_tests {
         fn manifest() -> ActorManifest {
             ActorManifest::new().kind(ActorKind::Service)
         }
-        async fn start(
+        async fn init(
             _args: &Json,
         ) -> Result<Self, error_stack::Report<crate::registry::RegistryError>> {
-            panic!("built through start_with only")
+            panic!("built through init_with only")
         }
     }
     impl MsgHandler<Work> for Recorder {
@@ -14631,13 +14631,13 @@ mod self_messaging_tests {
         let target = ActorPath::new("zero-kick");
         let seeder_path = ActorPath::new("seeder");
         let sink: Sink = Arc::new(Mutex::new(Vec::new()));
-        let for_start = sink.clone();
+        let for_init = sink.clone();
         spawn_service_builder::<Recorder>(&system)
             .at(target.clone())
-            .start_with(move || {
+            .init_with(move || {
                 Box::pin(async move {
                     Ok(Recorder {
-                        sink: for_start.clone(),
+                        sink: for_init.clone(),
                     })
                 })
             })
@@ -14645,13 +14645,13 @@ mod self_messaging_tests {
             .handles::<Tick>()
             .kickoff(Tick, std::time::Duration::from_millis(60))
             .start();
-        let for_start = target.clone();
+        let for_init = target.clone();
         spawn_service_builder::<Seeder>(&system)
             .at(seeder_path.clone())
-            .start_with(move || {
+            .init_with(move || {
                 Box::pin(async move {
                     Ok(Seeder {
-                        target: for_start.clone(),
+                        target: for_init.clone(),
                     })
                 })
             })
@@ -14678,10 +14678,10 @@ mod self_messaging_tests {
         fn manifest() -> ActorManifest {
             ActorManifest::new().kind(ActorKind::Service)
         }
-        async fn start(
+        async fn init(
             _args: &Json,
         ) -> Result<Self, error_stack::Report<crate::registry::RegistryError>> {
-            panic!("built through start_with only")
+            panic!("built through init_with only")
         }
     }
     impl MsgHandler<Work> for Phoenix {
@@ -14724,7 +14724,7 @@ mod self_messaging_tests {
                     let child = child.clone();
                     spawn_service_builder::<Phoenix>(sys)
                         .at(child.clone())
-                        .start_with(move || {
+                        .init_with(move || {
                             let sink = sink.clone();
                             Box::pin(async move { Ok(Phoenix { sink }) })
                         })

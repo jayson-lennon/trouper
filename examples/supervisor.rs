@@ -79,7 +79,7 @@ impl ServiceActor for Worker {
         ActorManifest::new().kind(ActorKind::Service)
     }
 
-    async fn start(args: &Json) -> Result<Self, error_stack::Report<RegistryError>> {
+    async fn init(args: &Json) -> Result<Self, error_stack::Report<RegistryError>> {
         Ok(Self::new(args["id"].as_u64().unwrap_or(0) as u32))
     }
 }
@@ -102,7 +102,7 @@ impl ServiceActor for JobSupervisor {
         ActorManifest::new().kind(ActorKind::Service)
     }
 
-    async fn start(_args: &Json) -> Result<Self, error_stack::Report<RegistryError>> {
+    async fn init(_args: &Json) -> Result<Self, error_stack::Report<RegistryError>> {
         Ok(Self)
     }
 }
@@ -229,7 +229,7 @@ fn spawn_crashy(sys: &ActorSystem, path: ActorPath, args: &serde_json::Value) {
         fn manifest() -> ActorManifest {
             ActorManifest::new().kind(ActorKind::Service)
         }
-        async fn start(a: &Json) -> Result<Self, error_stack::Report<RegistryError>> {
+        async fn init(a: &Json) -> Result<Self, error_stack::Report<RegistryError>> {
             Ok(Crashy {
                 _id: a["id"].as_u64().unwrap_or(0) as u32,
             })

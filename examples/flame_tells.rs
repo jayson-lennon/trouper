@@ -73,7 +73,7 @@ impl ServiceActor for Sink {
             .handles::<Ping>()
             .kind(ActorKind::Service)
     }
-    async fn start(
+    async fn init(
         _args: &Json,
     ) -> Result<Self, error_stack::Report<trouper::registry::RegistryError>> {
         Ok(Sink)

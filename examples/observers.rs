@@ -75,7 +75,7 @@ impl CommandHandler<StrictCmd> for TickBouncer {
 struct Ticker;
 
 impl ServiceActor for Ticker {
-    async fn start(_args: &Json) -> Result<Self, Report<RegistryError>> {
+    async fn init(_args: &Json) -> Result<Self, Report<RegistryError>> {
         Ok(Self)
     }
 }

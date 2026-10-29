@@ -183,7 +183,7 @@ impl ServiceActor for Ticker {
             .emits::<Tick>()
             .kind(ActorKind::Service)
     }
-    async fn start(
+    async fn init(
         _args: &Json,
     ) -> Result<Self, error_stack::Report<trouper::registry::RegistryError>> {
         Ok(Self::default())
@@ -241,7 +241,7 @@ impl ServiceActor for TransferService {
             .emits::<TransferCompleted>() // the service RE-publishes settled transfers
             .kind(ActorKind::Service)
     }
-    async fn start(
+    async fn init(
         _args: &Json,
     ) -> Result<Self, error_stack::Report<trouper::registry::RegistryError>> {
         Ok(Self::default())

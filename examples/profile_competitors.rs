@@ -88,10 +88,10 @@ impl ServiceActor for Producer {
     fn manifest() -> ActorManifest {
         ActorManifest::new().kind(ActorKind::Service)
     }
-    async fn start(_args: &Json) -> Result<Self, error_stack::Report<RegistryError>> {
-        // Unused: the spawn rides `.start_with` (kanal handles
+    async fn init(_args: &Json) -> Result<Self, error_stack::Report<RegistryError>> {
+        // Unused: the spawn rides `.init_with` (kanal handles
         // cannot ride JSON args).
-        unreachable!("trouper producer spawns via start_with")
+        unreachable!("trouper producer spawns via init_with")
     }
 }
 
@@ -131,9 +131,9 @@ impl ServiceActor for Sink {
     fn manifest() -> ActorManifest {
         ActorManifest::new().kind(ActorKind::Service)
     }
-    async fn start(_args: &Json) -> Result<Self, error_stack::Report<RegistryError>> {
-        // Unused: the spawn rides `.start_with`.
-        unreachable!("trouper sink spawns via start_with")
+    async fn init(_args: &Json) -> Result<Self, error_stack::Report<RegistryError>> {
+        // Unused: the spawn rides `.init_with`.
+        unreachable!("trouper sink spawns via init_with")
     }
 }
 
@@ -186,7 +186,7 @@ fn trouper_leg(
                     .at(sink_path.clone())
                     .handles::<Tick>()
                     .mailbox(capacity, policy)
-                    .start_with({
+                    .init_with({
                         let done = done_tx.clone().to_async();
                         move || {
                             let done = done.clone();
@@ -206,7 +206,7 @@ fn trouper_leg(
                     .handles::<Prime>()
                     .emits::<Tick>()
                     .mailbox(capacity, policy)
-                    .start_with({
+                    .init_with({
                         let ack = prime_tx.clone().to_async();
                         let go = start_rx.clone().to_async();
                         move || {

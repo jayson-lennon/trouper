@@ -536,7 +536,7 @@ pub(crate) struct ActorCell {
     /// Teardown-begun flag (see [`ActorCell::mark_stopping`]).
     stopping: std::sync::atomic::AtomicBool,
     // --- CELL-LOCAL BOOKKEEPING (single-writer: the actor's own loop) ---
-    /// Whether this actor's loop died to a panic (or its service `start`
+    /// Whether this actor's loop died to a panic (or its service `init`
     /// failed) and it is awaiting supervision. Written by the loop's
     /// crash paths, read lock-free by the supervision engine.
     pub(crate) crashed: std::sync::atomic::AtomicBool,
@@ -3226,7 +3226,7 @@ async fn step_service(
             Ok(()) => {}
             Err(DispatchFailure::Panic) => {
                 // Handler panicked: mark crashed (supervision restarts via
-                // `start`). This message was already consumed at handoff (the
+                // `init`). This message was already consumed at handoff (the
                 // same at-most-once window as the single-message step); every
                 // LATER claim is still un-committed, so the guard restores
                 // them to their original slots on the way out (nothing was
