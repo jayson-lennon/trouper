@@ -72,7 +72,9 @@ Entries are added or amended **only with human approval**.
 - (journal) Payload evolution follows the additive-fields contract; a payload that fails boundary decode dead-letters as Decode and fails rebuild loudly.
 - (routing) A declared edge accepts any payload under its schema name, delivered as the registered type.
 - (queries) Typed asks deliver typed replies through lease slots; a reply type mismatch surfaces as a named ask error.
-- (runtime) Spawn arguments are provided as typed Serialize values on builders and decoded in restore via Json; partition entities receive the shard key merged as a "key" field.
+- (runtime) Spawn arguments are provided as typed Serialize values on builders and decoded in restore (event-sourced) and init (service) via Json; partition entities receive the shard key merged as a "key" field.
+- (builders) A builder chain ends in .start(), which registers and launches the actor synchronously; the four factory fns are spawn_es_builder, spawn_service_builder, spawn_projector_builder, and spawn_foreign_builder.
+- (actors) Service actors construct instances through a fallible init(args) in the Erlang init/1 style; event-sourced actors rebuild state through restore(args) journal replay.
 - (contexts) MsgCtx exposes typed send/publish/send_to_any/ask/reply/stop_self/schedule_self, all emits-gated at flush except a send addressed to the actor's own path; CmdCtx is pure introspection — an event-sourced entity announces only by returning facts from its decision.
 - (scheduling) MsgCtx::schedule_self delivers a message to the calling actor after a caller-supplied std::time::Duration counted from the call; the delayed delivery is a system-root send riding the ordinary tell path, and cadence is the caller's placement (top of handler = fixed interval, end = gap between work).
 - (scheduling) ServiceBuilder::kickoff arms one delayed self-delivery when the spawned actor goes live, and a supervised restart re-arms it (the spawn closure re-runs the whole builder chain).
